@@ -189,12 +189,11 @@ mod tests {
     use indra_core::{
         types::{
             crypto::HybridSignature,
-            primitives::TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            primitives::TRANSACTION_PROTOCOL_VERSION,
             transaction::{InputV1, OutputV1, TransactionV1},
         },
-        Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
+        Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{constants::ML_KEM_1024_CT_BYTES, sha256, PaymentBlindingNoteV1};
 
     fn temp_path(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -208,7 +207,7 @@ mod tests {
 
     fn dummy_tx(nonce: u8) -> TransactionV1 {
         TransactionV1 {
-            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([nonce; 32]),
@@ -216,29 +215,13 @@ mod tests {
             }],
             outputs: vec![OutputV1 {
                 value_spark: 1_000,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::ZERO,
-                },
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::ZERO,
                     pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 },
-                range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: vec![PaymentBlindingNoteV1 {
-                version: 1,
-                owner_id: sha256(&[0; 32]),
-                payment_pubkey_hash: [0; 32],
-                sender_x25519_ephemeral_pk: [0; 32],
-                ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-                note_nonce: [0; 32],
-            }],
             fee_amount: 10_000,
-            fee_blinding: Bytes32::ZERO,
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
-            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),

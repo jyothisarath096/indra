@@ -76,14 +76,10 @@ pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
 pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> Bytes32 {
     state.state_commitment_v2_root(height)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::{
-        crypto::{CommitmentV1, HybridPubKey},
-        transaction::OutputV1,
-    };
+    use indra_core::types::{crypto::HybridPubKey, transaction::OutputV1};
 
     #[test]
     fn state_root_is_deterministic_and_changes_with_canonical_state() {
@@ -98,14 +94,10 @@ mod tests {
             .insert(
                 OutputV1 {
                     value_spark: 1_000,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from([2; 32]),
-                    },
                     owner_pubkey: HybridPubKey {
                         classical_pk: Bytes32::from([1; 32]),
                         pq_pk: indra_core::VariableBytes::from_slice(&[1; 32]).unwrap(),
                     },
-                    range_proof: indra_core::VariableBytes::from_slice(&[1]).unwrap(),
                     lock_height: 0,
                 },
                 1,

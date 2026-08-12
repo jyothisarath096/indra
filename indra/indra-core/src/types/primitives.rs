@@ -498,7 +498,7 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 // ── Protocol Version ──────────────────────────────────────────────────────────
 
 /// Canonical transaction format carrying mandatory payment notes.
-pub const TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES: u16 = 2;
+pub const TRANSACTION_PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed discriminator for the sole genesis-native block format.
 pub const BLOCK_FORMAT_VERSION: u16 = 1;
@@ -668,7 +668,7 @@ impl Encode for ProtocolVersion {
 impl Decode for ProtocolVersion {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let v = r.read_u16_le()?;
-        if v != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES && v != BLOCK_FORMAT_VERSION {
+        if v != TRANSACTION_PROTOCOL_VERSION && v != BLOCK_FORMAT_VERSION {
             return Err(IndraError::UnsupportedVersion { version: v });
         }
         Ok(Self(v))

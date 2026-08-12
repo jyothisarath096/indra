@@ -109,28 +109,22 @@ INDRA currently has:
 
 - `InputV1 { utxo_id, nullifier }`; the exact spent output is public
   ([transaction.rs lines 28-44](../indra-core/src/types/transaction.rs));
-- `OutputV1 { value_spark, commitment, owner_pubkey, range_proof,
-  lock_height }`, with a visible hybrid Ed25519 + ML-DSA-87 owner
+- `OutputV1 { value_spark, owner_pubkey, lock_height }`, with a visible
+  amount and hybrid Ed25519 + ML-DSA-87 owner
   ([transaction.rs lines 56-93](../indra-core/src/types/transaction.rs));
 - one transaction-wide hybrid signature, and a rule that every input has the
   same owner key
   ([apply.rs lines 950-1023](../indra-state/src/apply.rs));
-- Ristretto255 commitments `C = vG + rH`
-  ([pedersen.rs lines 1-25](../indra-crypto/src/pedersen.rs));
 - public lookup, validation, then deletion of each exact `utxo_id`
   ([apply.rs lines 960-1008](../indra-state/src/apply.rs) and
   [1091-1108](../indra-state/src/apply.rs));
-- curve Bulletproof range verification and curve commitment balance
-  ([apply.rs lines 1064-1083](../indra-state/src/apply.rs)); and
-- a separate X25519 + ML-KEM-1024 payment-delivery key type, deliberately
-  distinct from signing identity
-  ([payment.rs lines 1-45](../indra-crypto/src/payment.rs)).
+- checked-`u64` public conservation and dust validation as the sole monetary
+  validity mechanism; and
+- direct wallet ownership detection by full canonical hybrid-key equality.
 
-`OutputV1.value_spark` is public despite the "confidential-value" description.
-The source warns that it is unverified metadata, and validation also sums it
-publicly. Full amount privacy therefore additionally requires removing or
-redesigning this field. Neither requested paper specifies how to retain
-INDRA's staking logic that consumes it.
+`OutputV1.value_spark` is authoritative public consensus data. Full amount
+privacy therefore requires replacing this transparent baseline, including the
+staking logic that derives principal directly from referenced UTXOs.
 
 # Part I - recipient privacy: Module-LWE SAP
 
@@ -595,7 +589,7 @@ ring-signature witness and commitment witness would live in unrelated algebraic
 structures.
 
 > [!CAUTION]
-> **No faithful composition with existing INDRA Pedersen/Bulletproofs exists.**
+> **No faithful composition with INDRA's former Pedersen/Bulletproof design existed.**
 >
 > A proof that simultaneously establishes ownership of one ring member and
 > balance of INDRA curve commitments would be a new cross-algebra
@@ -772,13 +766,13 @@ one payment to Bob plus one change output.
 
 LRCT Algorithm 6 requires the output address and coin commitment to be in
 LRCT's key/commitment system. SAP26 gives a different `P_B`; INDRA gives a
-Ristretto commitment and Bulletproof.
+the former Ristretto commitment and Bulletproof design.
 
 There is no published operation in the selected sources that produces:
 
 ```text
 LRCT-compatible output ownership secret for Bob
-+ INDRA-compatible Pedersen output commitment
++ compatibility layer for the former Pedersen output commitment
 + one ring proof hiding Alice's real input
 + a binding to SAP announcement (R_B, tag_B)
 ```
@@ -822,7 +816,7 @@ A defensible **lower-bound illustration**, not a transaction specification, is:
 |---|---:|
 | LRCT Version-I ring-16 signature | 86.6 KB, paper-reported |
 | SAP Kyber512 announcement | 769 bytes exact payload |
-| one current INDRA range proof | 674 bytes in repository test/codec usage |
+| one former INDRA range proof | 674 bytes in archived repository test/codec usage |
 | subtotal | over 88 KB before ring list, keys, outputs, framing, second output, or balance-proof replacement |
 
 For the paper's Version III ring-16 row, the signature alone is 113.2 KB. None
@@ -905,4 +899,3 @@ The honest result is therefore:
 > papers do not yet define a sound complete INDRA transaction. The next step is
 > cryptographic expert review and source clarification, not implementation of a
 > combined OutputV2.
-

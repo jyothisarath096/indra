@@ -3,7 +3,6 @@
 //! These tests verify multi-block scenarios, epoch transitions,
 //! and fee evolution over sequences of blocks.
 
-use curve25519_dalek::scalar::Scalar;
 use indra_core::{
     codec::{Decode, Encode},
     types::{
@@ -11,26 +10,21 @@ use indra_core::{
         crypto::PQVoteSig,
         primitives::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES,
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, TRANSACTION_PROTOCOL_VERSION,
         },
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
-    Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
+    Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
-use indra_crypto::{
-    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
-};
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{
     apply_block, compute_state_root,
     epoch::{apply_epoch_transition, EpochTransitionContext},
     utxo::UtxoSet,
     ChainState, ValidatorEntry, ValidatorStatus,
 };
-use rand::{rngs::StdRng, SeedableRng};
 
 const TEST_INPUT_VALUE: u64 = 1_000_000;
 
@@ -167,30 +161,12 @@ fn sign_transaction(
     }
 }
 
-fn derive_fee_blinding(input_blindings: &[[u8; 32]], output_blindings: &[[u8; 32]]) -> [u8; 32] {
-    let input_sum = input_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
-        acc + Scalar::from_bytes_mod_order(*blinding)
-    });
-    let output_sum = output_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
-        acc + Scalar::from_bytes_mod_order(*blinding)
-    });
-    (input_sum - output_sum).to_bytes()
-}
-
 fn make_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
     let value = TEST_INPUT_VALUE + byte as u64;
-    let blinding = [byte; 32];
-    let commitment = commit(value, &blinding);
-    let mut rng = StdRng::from_seed([byte; 32]);
-    let proof = prove_range(value, &blinding, &mut rng).unwrap();
 
     OutputV1 {
         value_spark: value,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey,
-        range_proof: VariableBytes::from_slice(&proof).unwrap(),
         lock_height: 0,
     }
 }
@@ -201,20 +177,14 @@ fn make_tx(
     owner_pubkey: HybridPubKey,
     utxo_id: Bytes32,
     input_value: u64,
-    input_blinding: [u8; 32],
+    _input_blinding: [u8; 32],
     nullifier_byte: u8,
-    out_byte: u8,
+    _out_byte: u8,
 ) -> TransactionV1 {
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
     let output_value = input_value - fee;
-    let blinding = [out_byte; 32];
-    let fee_blinding = derive_fee_blinding(&[input_blinding], &[blinding]);
-    let commitment = commit(output_value, &blinding);
-    let fee_commitment = commit(fee, &fee_blinding);
-    let mut rng = StdRng::from_seed([out_byte; 32]);
-    let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
@@ -222,26 +192,10 @@ fn make_tx(
         }],
         outputs: vec![OutputV1 {
             value_spark: output_value,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey: owner_pubkey.clone(),
-            range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }],
-        payment_notes: vec![PaymentBlindingNoteV1 {
-            version: 1,
-            owner_id: sha256(&owner_pubkey.classical_pk.0),
-            payment_pubkey_hash: [0; 32],
-            sender_x25519_ephemeral_pk: [0; 32],
-            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-            note_nonce: [0; 32],
-        }],
         fee_amount: fee,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
         signature: dummy_sig(),
     };
     tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
@@ -573,18 +527,10 @@ fn utxo_lifecycle_across_blocks() {
 
     // Block 2: spend the new UTXO
     // Find the new UTXO id — it was inserted at height 1, tx 0, output 0
-    let blinding = [0x02u8; 32];
-    let commitment = commit(block1_output_value, &blinding);
-    let mut rng = StdRng::from_seed([0x02u8; 32]);
-    let proof = prove_range(block1_output_value, &blinding, &mut rng).unwrap();
     let new_utxo_id = UtxoSet::compute_utxo_id(
         &OutputV1 {
             value_spark: block1_output_value,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey: owner_pubkey.clone(),
-            range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         },
         1,

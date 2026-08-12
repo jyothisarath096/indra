@@ -223,7 +223,6 @@ pub fn with_cold_manifest(
         hybrid_pq_pk: hex::decode(&entry.hybrid_pq_pk)
             .map_err(|_| CliError::Genesis("hot PQ key is invalid hex".into()))?,
         vrf_pk,
-        payment_pubkey: None,
     };
     crate::keygen::validate_cold_share_manifest(manifest, &expected_hot)?;
     if manifest.validator_id != entry.validator_id {

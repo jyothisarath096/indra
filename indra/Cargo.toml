@@ -2,7 +2,6 @@
 members  = [
     "indra-core",
     "indra-crypto",
-    "indra-bulletproofs",
     "indra-state",
     "indra-consensus",
     "indra-storage",
@@ -31,11 +30,7 @@ bip39              = { version = "2.0", default-features = false, features = ["r
 ed25519-dalek      = { version = "2.1", default-features = false, features = ["alloc"] }
 curve25519-dalek   = { version = "4.1", default-features = false, features = ["alloc", "digest"] }
 ml-dsa             = { version = "0.1.1", features = ["alloc", "getrandom"] }
-ml-kem             = { version = "0.3.2", features = ["getrandom"] }
-x25519-dalek       = { version = "2.0.1", features = ["getrandom", "static_secrets"] }
-blake3             = { version = "1.8.5" }
 proptest           = { version = "1.4", default-features = false, features = ["std"] }
-indra-bulletproofs = { path = "./indra-bulletproofs" }
 subtle             = { version = "2.5", default-features = false }
 zeroize            = { version = "1.7", default-features = false, features = ["alloc", "derive"] }
 rand_core          = { version = "0.6", default-features = false, features = ["getrandom"] }

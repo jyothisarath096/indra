@@ -6,22 +6,21 @@ use indra_core::{
         crypto::HybridSignature,
         primitives::{
             INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-            MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION,
         },
         transaction::{InputV1, OutputV1, TransactionV1},
     },
-    Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
+    Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{
-    constants::ML_KEM_1024_CT_BYTES,
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
-    sha256, PaymentBlindingNoteV1, VrfKeypair,
+    VrfKeypair,
 };
 
 /// A pre-built transaction for benchmarks.
 pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
     TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id: Bytes32::from([nonce; 32]),
@@ -29,29 +28,13 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
         }],
         outputs: vec![OutputV1 {
             value_spark: 1_000_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
-            },
             owner_pubkey: HybridPubKey {
                 classical_pk: Bytes32::ZERO,
                 pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
-            range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             lock_height: 0,
         }],
-        payment_notes: vec![PaymentBlindingNoteV1 {
-            version: 1,
-            owner_id: sha256(&[0; 32]),
-            payment_pubkey_hash: [0; 32],
-            sender_x25519_ephemeral_pk: [0; 32],
-            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-            note_nonce: [0; 32],
-        }],
         fee_amount: fee,
-        fee_blinding: Bytes32::ZERO,
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::ZERO,
-        },
         signature: HybridSignature {
             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0u8; 64])
                 .unwrap(),

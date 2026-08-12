@@ -38,13 +38,12 @@ use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
         block::BlockV1,
-        crypto::{CommitmentV1, HybridPubKey},
+        crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
             bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX,
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
         qc::QuorumCertificateV1,
         slash_membership::SlashMembershipRootRecord,
@@ -56,11 +55,7 @@ use indra_core::{
     },
     EpochRecord,
 };
-use indra_crypto::{
-    verify_balance, verify_hybrid, verify_opening, verify_range, PedersenCommitment,
-    PedersenOpening,
-};
-use rand::{rngs::StdRng, SeedableRng};
+use indra_crypto::verify_hybrid;
 
 use crate::{
     chain::ChainState,
@@ -178,1363 +173,6 @@ pub fn try_apply_verified_slash_candidate(
     txn.commit_scratch();
     Ok(())
 }
-
-fn slash_membership_record_for_validation(
-    state: &ChainState,
-    infraction_height: u64,
-) -> StateResult<SlashMembershipRootRecord> {
-    state
-        .slash_membership_root_for_height(infraction_height)
-        .copied()
-        .map_err(|_| StateError::InvalidSlashEvidence {
-            reason: format!("missing membership root for height {infraction_height}"),
-        })
-}
-
-fn apply_slash_common(
-    state: &mut ChainState,
-    evidence: &SlashEvidenceV1,
-    evidence_hash: Bytes32,
-    historical_keys: Option<([u8; 32], Vec<u8>)>,
-    chain_id: &str,
-    height: u64,
-    reporter_pubkey: Option<&HybridPubKey>,
-    verify_vote_crypto: bool,
-) -> StateResult<SlashAccounting> {
-    use crate::ValidatorStatus;
-    use indra_core::types::{
-        primitives::{DUST_LIMIT_SPARK, SLASH_REPORTER_REWARD_BPS},
-        vote::VoteStep,
-    };
-
-    if state.applied_slash_hashes.contains(&evidence_hash) {
-        return Err(StateError::SlashAlreadyApplied);
-    }
-
-    let validator_id = evidence.validator_id;
-
-    let live_validator = state.validators.get(&validator_id);
-    let tombstone = state.evicted_validator_tombstones.get(&validator_id);
-    if live_validator.is_none() {
-        let tombstone = tombstone.ok_or(StateError::ValidatorNotFound)?;
-        if historical_keys.is_none() || tombstone.eviction_height < evidence.vote_1.height {
-            return Err(StateError::InvalidSlashEvidence {
-                reason: "validator was evicted before the alleged infraction height".into(),
-            });
-        }
-    }
-    let current_keys =
-        live_validator.and_then(|v| match (v.hybrid_classical_pk, v.hybrid_pq_pk.clone()) {
-            (Some(classical), Some(pq)) => Some((classical, pq)),
-            _ => None,
-        });
-    let (classical_pk, pq_pk_bytes) = match historical_keys {
-        Some(keys) => keys,
-        None => current_keys.ok_or_else(|| StateError::InvalidSlashEvidence {
-            reason: "validator has incomplete current hybrid public keys".into(),
-        })?,
-    };
-
-    if let Some(v) = live_validator {
-        if matches!(v.status, ValidatorStatus::Slashed | ValidatorStatus::Exited) {
-            return Err(StateError::InvalidSlashEvidence {
-                reason: "validator already slashed or exited".into(),
-            });
-        }
-    }
-
-    if verify_vote_crypto {
-        verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id)
-            .map_err(|e| StateError::InvalidSlashEvidence {
-                reason: format!("vote_1 signature invalid: {e}"),
-            })?;
-        verify_vote_sig_with_keys(&evidence.vote_2, &classical_pk, &pq_pk_bytes, chain_id)
-            .map_err(|e| StateError::InvalidSlashEvidence {
-                reason: format!("vote_2 signature invalid: {e}"),
-            })?;
-    }
-
-    if evidence.vote_1.validator_id != validator_id || evidence.vote_2.validator_id != validator_id
-    {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "votes not from claimed validator".into(),
-        });
-    }
-
-    if evidence.vote_1.height != evidence.vote_2.height
-        || evidence.vote_1.round != evidence.vote_2.round
-    {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "votes not at same height and round".into(),
-        });
-    }
-
-    let infraction_epoch = epoch_for_height(evidence.vote_1.height);
-    let current_epoch = epoch_for_height(height);
-    if current_epoch > infraction_epoch.saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS) {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: format!(
-                "slash evidence outside evidence window: infraction_epoch={infraction_epoch}, current_epoch={current_epoch}, window={SLASH_EVIDENCE_WINDOW_EPOCHS}",
-            ),
-        });
-    }
-
-    if evidence.vote_1.block_hash == evidence.vote_2.block_hash {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "votes have same block hash — not equivocation".into(),
-        });
-    }
-    if evidence.vote_1.block_hash == Bytes32::ZERO || evidence.vote_2.block_hash == Bytes32::ZERO {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "nil vote is not slashable equivocation".into(),
-        });
-    }
-
-    if evidence.vote_1.step != evidence.vote_2.step {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "votes must both be precommits or both be prevotes".into(),
-        });
-    }
-
-    let slash_bps = match evidence.vote_1.step {
-        VoteStep::Precommit => state.governance.params.slash_double_precommit_bps,
-        VoteStep::Prevote => {
-            // Prevote conflicts are intentionally not slashable right now.
-            // POLC/valid-round logic can make prevote semantics more subtle
-            // than precommit equivocation, and node-side detection only emits
-            // automatic evidence for double precommits. Keep the state layer
-            // aligned with the enforced slashing model until a future protocol
-            // version explicitly enables prevote slashing.
-            return Err(StateError::InvalidSlashEvidence {
-                reason: "prevote conflicts are not slashable".into(),
-            });
-        }
-    };
-
-    let bps = |amount, rate| bps_of(amount, rate);
-
-    let mut position_ids = Vec::new();
-    let mut tranche_ids = Vec::new();
-    if let Some(tombstone) = tombstone {
-        let positions = state
-            .stake_positions
-            .iter()
-            .map(|(id, value)| (*id, value.clone()))
-            .collect();
-        let tranches = state
-            .unbonding_tranches
-            .iter()
-            .map(|(id, value)| (*id, value.clone()))
-            .collect();
-        (position_ids, tranche_ids) = crate::tranche_tombstone::slashable_self_targets_v2(
-            tombstone,
-            &positions,
-            &tranches,
-            evidence.vote_1.height,
-        )?;
-    } else {
-        for position in state.stake_positions.values().filter(|position| {
-            position.validator_id == validator_id
-                && matches!(position.custody,
-                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { validator_id: id }
-                        if id == validator_id)
-        }) {
-            if position.active.is_some() {
-                position_ids.push(position.position_id);
-            }
-            tranche_ids.extend(
-                state
-                    .tranche_ids_for_position(&position.position_id)
-                    .iter()
-                    .filter(|id| state.unbonding_tranches.get(id).is_some_and(|tranche| {
-                        tranche.timing.start_height() >= evidence.vote_1.height
-                    }))
-                    .copied(),
-            );
-        }
-    }
-    if live_validator.is_none() && position_ids.is_empty() && tranche_ids.is_empty() {
-        return Err(StateError::InvalidSlashEvidence {
-            reason: "tombstone has no retained self principal slashable at the infraction height"
-                .into(),
-        });
-    }
-    let slashable_position_stake = position_ids.iter().fold(0u64, |acc, id| {
-        acc.saturating_add(
-            state
-                .stake_positions
-                .get(id)
-                .and_then(|position| position.active)
-                .map(|active| active.principal_spark)
-                .unwrap_or(0),
-        )
-    });
-    let slashable_tranche_stake = tranche_ids.iter().fold(0u64, |acc, id| {
-        acc.saturating_add(
-            state
-                .unbonding_tranches
-                .get(id)
-                .map(|tranche| tranche.principal_spark)
-                .unwrap_or(0),
-        )
-    });
-    let slashable_principal = slashable_position_stake.saturating_add(slashable_tranche_stake);
-    let current_stake = state
-        .validators
-        .get(&validator_id)
-        .map(|v| v.stake_spark)
-        .unwrap_or(0);
-    let slash_base = slashable_principal.max(current_stake);
-    let slash_amount = bps(slash_base, slash_bps);
-    let potential_reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
-
-    let mut total_principal_slashed: u64 = 0;
-    let mut active_principal_slashed: u64 = 0;
-    for position_id in &position_ids {
-        if let Some(mut position) = state.stake_positions.get(position_id).cloned() {
-            if let Some(active) = position.active {
-                let amount = bps(active.principal_spark, slash_bps);
-                let remaining = active.principal_spark.saturating_sub(amount);
-                position.active = (remaining > 0).then(|| {
-                    indra_core::types::stake_position::ActiveStakeAggregateV1 {
-                        principal_spark: remaining,
-                        ..active
-                    }
-                });
-                active_principal_slashed = active_principal_slashed.saturating_add(amount);
-                total_principal_slashed = total_principal_slashed.saturating_add(amount);
-                state.stake_positions.insert(*position_id, position.clone());
-                if let Some(commitment) = state.state_commitment_v2.as_mut() {
-                    commitment.put_stake_position(&position);
-                }
-                crate::txn::complex_mutation_checkpoint()?;
-            }
-        }
-    }
-    let mut tranche_successors = Vec::new();
-    for tranche_id in &tranche_ids {
-        if let Some(tranche) = state.unbonding_tranches.get(tranche_id).cloned() {
-            let amount = bps(tranche.principal_spark, slash_bps);
-            let remaining = tranche.principal_spark.saturating_sub(amount);
-            total_principal_slashed = total_principal_slashed.saturating_add(amount);
-            if remaining == 0 {
-                tranche_successors.push((*tranche_id, None));
-            } else {
-                let successor_id = indra_core::types::stake_position::derive_tranche_id(
-                    tranche.position_id,
-                    tranche.creation_op_id,
-                    tranche.creation_ordinal,
-                    tranche.timing,
-                    remaining,
-                );
-                let source_blinding = indra_crypto::derive_tranche_source_blinding_v1(
-                    &indra_crypto::TrancheSourceBlindingInputsV1 {
-                        chain_id: state.chain_id.as_bytes(),
-                        position_id: tranche.position_id.0,
-                        tranche_id: successor_id.0,
-                        principal_spark: remaining,
-                        start_height: tranche.timing.start_height(),
-                        creation_op_id: tranche.creation_op_id.0,
-                    },
-                )
-                .map_err(|error| StateError::InvalidSlashEvidence {
-                    reason: error.to_string(),
-                })?;
-                let successor = indra_core::types::stake_position::UnbondingTrancheV1::new(
-                    tranche.position_id,
-                    remaining,
-                    indra_crypto::commit(remaining, &source_blinding),
-                    tranche.timing,
-                    tranche.custody,
-                    tranche.creation_op_id,
-                    tranche.creation_ordinal,
-                )
-                .map_err(|error| StateError::InvalidSlashEvidence {
-                    reason: error.to_string(),
-                })?;
-                if successor.tranche_id != successor_id
-                    || (successor_id != *tranche_id
-                        && state.unbonding_tranches.contains_key(&successor_id))
-                {
-                    return Err(StateError::InvariantViolation {
-                        message: "slash successor tranche identity collision",
-                    });
-                }
-                tranche_successors.push((*tranche_id, Some(successor)));
-            }
-        }
-    }
-    // A slash is a canonical consume-and-successor transition. Nonzero
-    // reductions are exactly one-for-one and therefore cannot consume tranche
-    // capacity; a complete slash only decreases the count.
-    for (old_id, successor) in &tranche_successors {
-        state.unbonding_tranches.remove(old_id);
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.delete_unbonding_tranche(old_id);
-        }
-        crate::txn::complex_mutation_checkpoint()?;
-        if let Some(successor) = successor {
-            state
-                .unbonding_tranches
-                .insert(successor.tranche_id, successor.clone());
-            if let Some(commitment) = state.state_commitment_v2.as_mut() {
-                commitment.put_unbonding_tranche(successor);
-            }
-            crate::txn::complex_mutation_checkpoint()?;
-        }
-    }
-    if let Some(mut tombstone) = state
-        .evicted_validator_tombstones
-        .get(&validator_id)
-        .cloned()
-    {
-        for (old_id, successor) in &tranche_successors {
-            let index = tombstone
-                .retained_tranche_ids
-                .binary_search(old_id)
-                .map_err(|_| StateError::InvariantViolation {
-                    message: "slash target is absent from tombstone",
-                })?;
-            tombstone.retained_tranche_ids.remove(index);
-            if let Some(successor) = successor {
-                tombstone.retained_tranche_ids.push(successor.tranche_id);
-            }
-        }
-        tombstone.retained_tranche_ids.sort();
-        tombstone
-            .validate(false)
-            .map_err(|error| StateError::InvalidSlashEvidence {
-                reason: error.to_string(),
-            })?;
-        state
-            .evicted_validator_tombstones
-            .insert(validator_id, tombstone.clone());
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_evicted_validator_tombstone(&tombstone);
-        }
-        crate::txn::complex_mutation_checkpoint()?;
-    }
-    state
-        .rebuild_position_tranche_index()
-        .map_err(|error| StateError::InvalidSlashEvidence {
-            reason: error.to_string(),
-        })?;
-
-    let mut updated_validator = None;
-    if let Some(v) = state.validators.get_mut(&validator_id) {
-        let stake_slash = if slashable_principal > 0 {
-            active_principal_slashed
-        } else {
-            slash_amount
-        };
-        v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
-        // Equivocation slashing is prospective-only by policy. Rewards already
-        // credited to `pending_rewards` are never clawed back retroactively;
-        // the penalty is the immediate stake reduction here plus permanent
-        // exclusion from future reward eligibility through `Slashed` status.
-        v.status = ValidatorStatus::Slashed;
-        updated_validator = Some(v.clone());
-        crate::txn::complex_mutation_checkpoint()?;
-    }
-    if let (Some(commitment), Some(validator)) =
-        (state.state_commitment_v2.as_mut(), updated_validator)
-    {
-        commitment.put_validator(&validator, height);
-    }
-
-    let reporter_reward = if potential_reporter_reward >= DUST_LIMIT_SPARK {
-        if let Some(pubkey) = reporter_pubkey {
-            create_slash_reporter_reward_utxo(
-                state,
-                &evidence_hash,
-                height,
-                potential_reporter_reward,
-                pubkey,
-            )?;
-            potential_reporter_reward
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    let burned = slash_amount.saturating_sub(reporter_reward);
-    state.total_supply = state.total_supply.saturating_sub(burned);
-    crate::txn::complex_mutation_checkpoint()?;
-    state.applied_slash_hashes.insert(evidence_hash);
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_slash_hash(&evidence_hash);
-    }
-    crate::txn::complex_mutation_checkpoint()?;
-
-    Ok(SlashAccounting {
-        validator_id,
-        slash_bps,
-        slash_amount,
-        burned,
-        self_principal_slashed: total_principal_slashed,
-        reporter_reward,
-    })
-}
-
-/// Compute the canonical proof-carrying evidence hash used for deduplication.
-pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
-}
-
-fn derive_slash_reward_blinding(evidence_hash: &Bytes32, block_height: u64) -> [u8; 32] {
-    let mut data = b"INDRA-SLASH-REWARD-BLINDING-v1".to_vec();
-    data.extend_from_slice(&evidence_hash.0);
-    data.extend_from_slice(&block_height.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-fn create_slash_reporter_reward_utxo(
-    state: &mut ChainState,
-    evidence_hash: &Bytes32,
-    block_height: u64,
-    reporter_reward: u64,
-    reporter_pubkey: &HybridPubKey,
-) -> StateResult<Bytes32> {
-    let blinding = derive_slash_reward_blinding(evidence_hash, block_height);
-    let commitment = indra_crypto::commit(reporter_reward, &blinding);
-    let mut rng = StdRng::from_seed(blinding);
-    let proof = indra_crypto::prove_range(reporter_reward, &blinding, &mut rng).map_err(|_| {
-        StateError::InvalidSlashEvidence {
-            reason: "failed to generate range proof for slash reporter reward".into(),
-        }
-    })?;
-    let output = OutputV1 {
-        value_spark: reporter_reward,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
-        owner_pubkey: reporter_pubkey.clone(),
-        range_proof: indra_core::VariableBytes::from_slice(&proof).map_err(|_| {
-            StateError::InvalidSlashEvidence {
-                reason: "slash reporter reward range proof too large".into(),
-            }
-        })?,
-        lock_height: 0,
-    };
-    let reward_utxo_id = state
-        .utxos
-        .insert(output, block_height, STAKING_TX_IDX, 0)
-        .map_err(|_| StateError::InvariantViolation {
-            message: "UTXO ID collision in slash reporter reward output",
-        })?;
-    eprintln!(
-        "[slash] reporter reward {} Spark -> UTXO {} for proposer {}",
-        reporter_reward,
-        hex::encode(&reward_utxo_id.0[..4]),
-        hex::encode(&reporter_pubkey.classical_pk.0[..4]),
-    );
-    Ok(reward_utxo_id)
-}
-
-const VRF_FALLBACK_OUTPUT_BYTES: Bytes32 = Bytes32([0xFF; 32]);
-
-fn slash_reporter_pubkey_for_block(
-    state: &ChainState,
-    block: &BlockV1,
-) -> StateResult<Option<HybridPubKey>> {
-    let snapshot = state
-        .snapshot_for_consensus_height(block.header.height)
-        .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
-    let proposer_id = slash_reporter_validator_id_from_candidate_ids(
-        snapshot.entries().iter().map(|entry| entry.validator_id),
-        block,
-    );
-    Ok(proposer_id.and_then(|proposer_id| {
-        snapshot
-            .entries()
-            .iter()
-            .find(|entry| entry.validator_id == proposer_id)
-            .and_then(|entry| {
-                Some(HybridPubKey {
-                    classical_pk: Bytes32::from(entry.classical_vote_pk),
-                    pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
-                })
-            })
-    }))
-}
-
-fn slash_reporter_validator_id_from_candidate_ids<I>(
-    candidate_ids: I,
-    block: &BlockV1,
-) -> Option<Bytes32>
-where
-    I: IntoIterator<Item = Bytes32>,
-{
-    let header_hash = block.header.election_result_hash?;
-    let mut matches = candidate_ids.into_iter().filter_map(|validator_id| {
-        let normal = VrfElectionResult {
-            height: block.header.height,
-            round: block.header.proposer_round,
-            elected_validator_id: validator_id,
-            elected_vrf_output: block.header.proposer_vrf_output,
-            fallback_used: false,
-            reveal_set_commitment: Bytes32::ZERO,
-        }
-        .hash();
-        let fallback = VrfElectionResult {
-            height: block.header.height,
-            round: block.header.proposer_round,
-            elected_validator_id: validator_id,
-            elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
-            fallback_used: true,
-            reveal_set_commitment: Bytes32::ZERO,
-        }
-        .hash();
-        (header_hash == normal || header_hash == fallback).then_some(validator_id)
-    });
-    let proposer_id = matches.next()?;
-    matches.next().is_none().then_some(proposer_id)
-}
-
-fn verify_vote_sig_with_keys(
-    vote: &VoteV1,
-    classical_pk: &[u8; 32],
-    pq_pk_bytes: &[u8],
-    chain_id: &str,
-) -> Result<(), String> {
-    use indra_crypto::{
-        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
-    };
-
-    let pq_pk: [u8; PQ_PK_BYTES] = pq_pk_bytes.try_into().map_err(|_| {
-        format!(
-            "pq public key must be {} bytes, got {}",
-            PQ_PK_BYTES,
-            pq_pk_bytes.len()
-        )
-    })?;
-    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
-        vote.height,
-        vote.round,
-        vote.step,
-        &vote.block_hash,
-        &vote.validator_id,
-        vote.election_result_hash.as_ref(),
-        chain_id,
-    );
-    let pk = HybridPublicKey {
-        classical: ClassicalPublicKey(*classical_pk),
-        pq: PqPublicKey(pq_pk),
-    };
-    let sig = vote.signature.to_crypto_sig().map_err(|e| e.to_string())?;
-    verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| e.to_string())
-}
-
-/// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
-pub fn apply_block(
-    state: &mut ChainState,
-    block: &BlockV1,
-    timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
-) -> StateResult<Option<EpochRecord>> {
-    apply_block_with_effects(state, block, timestamp_secs).map(|outcome| outcome.epoch_record)
-}
-
-/// Apply a block and return the effects of the committed canonical transition.
-///
-/// Effects are produced by the same transaction that performs mutation and
-/// are returned only after that transaction commits successfully.
-pub fn apply_block_with_effects(
-    state: &mut ChainState,
-    block: &BlockV1,
-    timestamp_secs: u64,
-) -> StateResult<crate::AppliedBlockOutcome> {
-    // Consensus atomicity: validation is read-only, then mutations happen
-    // through a scoped undo log. If any mutation step fails, the transaction
-    // drops without commit and rolls back every recorded change.
-    let mut txn = StateTxn::begin(state, block.header.height);
-    let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
-    let effects = txn.commit();
-    Ok(crate::AppliedBlockOutcome {
-        epoch_record,
-        effects,
-    })
-}
-
-/// Atomically validate/apply a candidate with a block-attempt-frozen dust floor.
-pub fn try_apply_transaction_candidate_with_dust(
-    state: &mut ChainState,
-    tx: &TransactionV1,
-    height: u64,
-    tx_index: u32,
-    dust_limit_spark: u64,
-) -> StateResult<()> {
-    let mut block_nullifiers = HashSet::new();
-    let mut block_input_utxos = HashSet::new();
-    validate_transaction_with_dust(
-        state,
-        tx,
-        &state.chain_id,
-        &mut block_nullifiers,
-        &mut block_input_utxos,
-        height,
-        dust_limit_spark,
-    )?;
-    let mut txn = StateTxn::begin(state, height);
-    apply_transaction(&mut txn, tx, height, tx_index)?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Atomically apply one staking operation to an evolving candidate state.
-pub fn try_apply_staking_candidate(
-    state: &mut ChainState,
-    op: &StakingOp,
-    height: u64,
-) -> StateResult<()> {
-    let chain_id = state.chain_id.clone();
-    let mut txn = StateTxn::begin(state, height);
-    txn.snapshot_staking_scope();
-    txn.snapshot_delegator_identity_scope();
-    apply_staking_op(txn.state_mut(), op, &chain_id, height)?;
-    txn.after_mutation()?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Atomically apply an admission-certified staking candidate using state-only checks.
-pub fn try_apply_verified_staking_candidate(
-    state: &mut ChainState,
-    op: &StakingOp,
-    verified: &crate::pending::VerifiedPendingStaking,
-    height: u64,
-) -> StateResult<()> {
-    let chain_id = state.chain_id.clone();
-    let mut txn = StateTxn::begin(state, height);
-    txn.snapshot_staking_scope();
-    txn.snapshot_delegator_identity_scope();
-    crate::apply_verified_staking_op(txn.state_mut(), op, verified, &chain_id, height)?;
-    txn.after_mutation()?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Atomically apply one governance operation to an evolving candidate state.
-pub fn try_apply_governance_candidate(
-    state: &mut ChainState,
-    op: &GovernanceOpV2,
-    current_epoch: u64,
-    height: u64,
-) -> StateResult<()> {
-    let chain_id = state.chain_id.clone();
-    let mut txn = StateTxn::begin(state, height);
-    txn.snapshot_governance_scope();
-    txn.snapshot_delegator_identity_scope();
-    apply_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
-    txn.after_mutation()?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Atomically apply an admission-certified governance candidate using state-only checks.
-pub fn try_apply_verified_governance_candidate(
-    state: &mut ChainState,
-    op: &GovernanceOpV2,
-    verified: &crate::pending::VerifiedPendingGovernance,
-    current_epoch: u64,
-    height: u64,
-) -> StateResult<()> {
-    let chain_id = state.chain_id.clone();
-    let mut txn = StateTxn::begin(state, height);
-    txn.snapshot_governance_scope();
-    txn.snapshot_delegator_identity_scope();
-    crate::apply_verified_governance_op(
-        txn.state_mut(),
-        op,
-        verified,
-        current_epoch,
-        height,
-        &chain_id,
-    )?;
-    txn.after_mutation()?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Atomically validate and apply one proof-carrying slash-evidence candidate.
-///
-/// `reporter_pubkey` is the elected proposer's reward destination when this is
-/// used during block construction. Admission validation passes `None`.
-pub fn try_apply_slash_candidate(
-    state: &mut ChainState,
-    evidence: &SlashEvidenceV2,
-    height: u64,
-    reporter_pubkey: Option<&HybridPubKey>,
-) -> StateResult<()> {
-    let chain_id = state.chain_id.clone();
-    let mut txn = StateTxn::begin(state, height);
-    txn.snapshot_slashing_scope();
-    let accounting = apply_slash_v2_at_height_with_accounting(
-        txn.state_mut(),
-        evidence,
-        &chain_id,
-        height,
-        reporter_pubkey,
-    )?;
-    txn.add_slash_accounting(accounting.slash_amount)?;
-    txn.commit_scratch();
-    Ok(())
-}
-
-/// Temporarily apply a block, compute its post-state roots, then roll back.
-///
-/// This helper is intentionally fully synchronous. It mutates `state` only
-/// inside a scoped [`StateTxn`], never commits that transaction, and restores the
-/// exact pre-call in-memory cache presence before returning. It is used by block
-/// production/reproposal to fill candidate headers without paying for a full
-/// detached `ChainState` clone.
-pub fn project_block_for_roots(
-    state: &mut ChainState,
-    block: &BlockV1,
-    timestamp_secs: u64,
-) -> StateResult<ProjectedBlockRoots> {
-    let started_without_state_commitment_v2 = state.state_commitment_v2.is_none();
-    let projected = {
-        let mut txn = StateTxn::begin(state, block.header.height);
-        match apply_block_inner(&mut txn, block, timestamp_secs) {
-            Ok(epoch_record) => {
-                let projected_state = txn.state();
-                let roots = crate::state_root::compute_state_roots(projected_state);
-                let mut value_block = block.clone();
-                value_block.header.state_root = roots.state_root;
-                value_block.header.validator_set_root = roots.validator_set_root;
-                Ok(ProjectedBlockRoots {
-                    state_root: roots.state_root,
-                    validator_set_root: roots.validator_set_root,
-                    value_hash: value_block.compute_value_hash(projected_state.total_supply),
-                    total_supply: projected_state.total_supply,
-                    epoch_record,
-                })
-            }
-            Err(error) => Err(error),
-        }
-    };
-    if started_without_state_commitment_v2 {
-        state.state_commitment_v2 = None;
-    }
-    projected
-}
-
-fn apply_block_inner(
-    txn: &mut StateTxn<'_>,
-    block: &BlockV1,
-    timestamp_secs: u64,
-) -> StateResult<Option<EpochRecord>> {
-    // DETERMINISM NOTE: timestamp_secs is NOT written into ChainState.
-    // It is only stored in the returned EpochRecord for historical records.
-    // Replay passes 0 for this parameter — this is intentional and safe
-    // because timestamp_secs does not affect state root computation.
-    //
-    // WARNING: Do NOT use timestamp_secs in any computation that writes
-    // to ChainState fields. If epoch-based timing logic is ever needed,
-    // use block.header.timestamp (committed, deterministic) instead.
-
-    // ── Phase 1: Block-level validation (read-only) ───────────────────────
-
-    validate_block_header(txn.state(), block)?;
-    let transition_context = if is_epoch_boundary(block.header.height) {
-        let expected_parent =
-            block
-                .header
-                .height
-                .checked_sub(1)
-                .ok_or(StateError::InvariantViolation {
-                    message: "epoch boundary has no certified parent",
-                })?;
-        if block.header.quorum_certificate.as_slice().is_empty() {
-            return Err(StateError::InvariantViolation {
-                message: "boundary block is missing its parent quorum certificate",
-            });
-        }
-        let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
-        let qc = QuorumCertificateV1::decode(&mut reader).map_err(|_| {
-            StateError::InvariantViolation {
-                message: "boundary block has malformed quorum certificate",
-            }
-        })?;
-        if qc.height != expected_parent {
-            return Err(StateError::InvariantViolation {
-                message: "boundary quorum certificate does not certify the parent height",
-            });
-        }
-        Some(crate::epoch::EpochTransitionContext::new(
-            block.header.height,
-            expected_parent,
-        )?)
-    } else {
-        None
-    };
-    let state = txn.state();
-
-    if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
-        return Err(StateError::TooManyStakingOps {
-            actual: block.staking_ops.len(),
-            max: MAX_STAKING_OPS_PER_BLOCK,
-        });
-    }
-    if block.governance_ops.len() > MAX_GOV_OPS_PER_BLOCK {
-        return Err(StateError::TooManyGovernanceOps {
-            actual: block.governance_ops.len(),
-            max: MAX_GOV_OPS_PER_BLOCK,
-        });
-    }
-    let mut seen_slash_hashes: HashSet<Bytes32> = HashSet::new();
-    for evidence in &block.slashing_evidence {
-        if !seen_slash_hashes.insert(compute_slash_evidence_v2_hash(evidence)) {
-            return Err(StateError::DuplicateSlashEvidence);
-        }
-    }
-
-    // ── Phase 2: Transaction validation (read-only) ───────────────────────
-
-    // Check for duplicate transactions within the block
-    let mut seen_tx_hashes: HashSet<Vec<u8>> = HashSet::new();
-    for tx in &block.transactions {
-        let tx_bytes = tx.encode_to_vec();
-        if !seen_tx_hashes.insert(tx_bytes) {
-            return Err(StateError::DuplicateTransaction);
-        }
-    }
-
-    // Validate each transaction against current state
-    // We do a dry-run: check but don't mutate yet
-    // Track nullifiers and input UTXO IDs seen in THIS block to catch
-    // intra-block double spends before any mutation occurs.
-    let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
-    let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
-    let transaction_dust_limit =
-        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len());
-
-    for tx in &block.transactions {
-        validate_transaction_with_dust(
-            state,
-            tx,
-            &state.chain_id,
-            &mut block_nullifiers,
-            &mut block_input_utxos,
-            block.header.height,
-            transaction_dust_limit,
-        )?;
-    }
-
-    if !block.staking_ops.is_empty() {
-        let mut shadow = state.clone();
-        let chain_id = state.chain_id.clone();
-        for op in &block.staking_ops {
-            op.validate_structure()
-                .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
-            apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
-        }
-    }
-
-    if !block.governance_ops.is_empty() {
-        let mut shadow = state.clone();
-        let chain_id = state.chain_id.clone();
-        let current_epoch =
-            governance_operation_epoch(block.header.height, transition_context.as_ref());
-        for op in &block.governance_ops {
-            apply_governance_op(
-                &mut shadow,
-                op,
-                current_epoch,
-                block.header.height,
-                &chain_id,
-            )?;
-        }
-    }
-
-    if !block.slashing_evidence.is_empty() {
-        let mut shadow = state.clone();
-        let chain_id_clone = state.chain_id.clone();
-        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
-        for evidence in &block.slashing_evidence {
-            apply_slash_v2_at_height_with_accounting(
-                &mut shadow,
-                evidence,
-                &chain_id_clone,
-                block.header.height,
-                reporter_pubkey.as_ref(),
-            )?;
-        }
-    }
-
-    // ── Phase 3: State mutation (all validation passed) ───────────────────
-
-    txn.ensure_state_commitment_v2()?;
-
-    // Apply each transaction
-    for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        apply_transaction(txn, tx, block.header.height, tx_idx as u32)?;
-    }
-
-    let chain_id = txn.state().chain_id.clone();
-    for op in &block.staking_ops {
-        txn.snapshot_staking_scope();
-        txn.snapshot_delegator_identity_scope();
-        apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
-            StateError::InvariantViolation {
-                message: "staking op failed on real state after shadow validation",
-            }
-        })?;
-        txn.after_mutation()?;
-    }
-
-    let current_epoch =
-        governance_operation_epoch(block.header.height, transition_context.as_ref());
-    let chain_id = txn.state().chain_id.clone();
-    for op in &block.governance_ops {
-        txn.snapshot_governance_scope();
-        txn.snapshot_delegator_identity_scope();
-        apply_governance_op(
-            txn.state_mut(),
-            op,
-            current_epoch,
-            block.header.height,
-            &chain_id,
-        )
-        .map_err(|_| StateError::InvariantViolation {
-            message: "governance op failed on real state after shadow validation",
-        })?;
-        txn.after_mutation()?;
-    }
-
-    let chain_id_for_slash = txn.state().chain_id.clone();
-    let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
-    for evidence in &block.slashing_evidence {
-        txn.snapshot_slashing_scope();
-        let accounting = apply_slash_v2_at_height_with_accounting(
-            txn.state_mut(),
-            evidence,
-            &chain_id_for_slash,
-            block.header.height,
-            reporter_pubkey.as_ref(),
-        )
-        .map_err(|_| StateError::InvariantViolation {
-            message: "slash failed on real state after shadow validation",
-        })?;
-        txn.add_slash_accounting(accounting.slash_amount)?;
-        txn.record_slash_event(crate::CommittedSlashEvent {
-            validator_id: accounting.validator_id,
-            slash_bps: accounting.slash_bps,
-            burned: accounting.burned,
-            self_principal_slashed: accounting.self_principal_slashed,
-            reporter_reward: accounting.reporter_reward,
-        });
-    }
-    // Update base fee for next block
-    let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
-    txn.set_base_fee(next_fee)?;
-
-    // Advance height and tip hash
-    txn.set_tip(block.header.height, block.header.block_hash())?;
-
-    // Credit the certified parent's activity before the transition
-    // so the closing epoch's final QC participates in liveness evaluation.
-    if let Some(context) = transition_context {
-        txn.snapshot_validator_activity_scope();
-        update_last_active_epoch_from_block_qc(txn.state_mut(), block, Some(&context))?;
-        txn.after_mutation()?;
-    }
-
-    // Apply epoch transition if this is the last block of an epoch.
-    let epoch_record = if let Some(context) = transition_context {
-        txn.snapshot_epoch_scope();
-        Some(crate::epoch::apply_epoch_transition_at_height(
-            txn.state_mut(),
-            &context,
-            timestamp_secs,
-        )?)
-    } else {
-        None
-    };
-    if epoch_record.is_some() {
-        txn.after_mutation()?;
-    }
-
-    if txn.state().total_supply > HARD_CAP_SPARK {
-        return Err(StateError::InvariantViolation {
-            message: "CRITICAL: total supply exceeds hard cap — constitutional invariant violated",
-        });
-    }
-
-    if transition_context.is_none() {
-        txn.snapshot_validator_activity_scope();
-        update_last_active_epoch_from_block_qc(txn.state_mut(), block, None)?;
-        txn.after_mutation()?;
-    }
-
-    // Snapshot rotation is deliberately last: it must observe the fully
-    // settled post-boundary validator state after reselection, rewards,
-    // releases, liveness penalties, and QC activity accounting.
-    if let Some(context) = transition_context {
-        let boundary_height = context.boundary_height;
-        txn.state_mut()
-            .create_consensus_snapshot_after_boundary(boundary_height)?;
-        txn.state_mut().rebuild_state_commitment_v2(boundary_height);
-        txn.after_mutation()?;
-    }
-
-    Ok(epoch_record)
-}
-
-fn governance_operation_epoch(
-    height: u64,
-    context: Option<&crate::epoch::EpochTransitionContext>,
-) -> u64 {
-    context.map_or_else(|| epoch_for_height(height), |context| context.closing_epoch)
-}
-
-/// Update validator liveness from the QC embedded in the applied block.
-///
-/// This is consensus state because `last_active_epoch` is committed in the
-/// validator-set root. Keeping this mutation inside `apply_block` ensures live
-/// import, sync import, snapshot replay, and block-production projection all
-/// execute the same state transition.
-fn update_last_active_epoch_from_block_qc(
-    state: &mut ChainState,
-    block: &BlockV1,
-    context: Option<&crate::epoch::EpochTransitionContext>,
-) -> StateResult<()> {
-    if block.header.quorum_certificate.as_slice().is_empty() {
-        return Ok(());
-    }
-
-    let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
-    let Ok(qc) = QuorumCertificateV1::decode(&mut reader) else {
-        return Ok(());
-    };
-
-    let current_epoch = if let Some(context) = context {
-        if qc.height != context.certified_parent_height {
-            return Err(StateError::InvariantViolation {
-                message: "QC activity height does not match epoch transition context",
-            });
-        }
-        epoch_for_height(context.certified_parent_height)
-    } else {
-        epoch_for_height(block.header.height)
-    };
-    let mut changed = Vec::new();
-    for signature in qc.pq_signatures {
-        if let Some(validator) = state.validators.get_mut(&signature.validator_id) {
-            validator.last_active_epoch = current_epoch;
-            changed.push(signature.validator_id);
-        }
-    }
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        for validator_id in changed {
-            if let Some(validator) = state.validators.get(&validator_id) {
-                commitment.put_validator(validator, block.header.height);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validate block-level invariants (does not touch state).
-fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()> {
-    // Protocol version
-    if block.header.protocol_version.0 != BLOCK_FORMAT_VERSION {
-        return Err(StateError::UnsupportedVersion {
-            version: block.header.protocol_version.0,
-        });
-    }
-
-    // Height must be exactly state.height + 1
-    let expected_height = state.height + 1;
-    if block.header.height != expected_height {
-        return Err(StateError::InvalidHeight {
-            expected: expected_height,
-            actual: block.header.height,
-        });
-    }
-
-    // prev_hash must match our current tip
-    if block.header.prev_hash != state.tip_hash {
-        return Err(StateError::PrevHashMismatchDetailed {
-            height: block.header.height,
-            expected: state.tip_hash,
-            got: block.header.prev_hash,
-        });
-    }
-
-    // Block size
-    let block_size = block.encode_to_vec().len();
-    if block_size > MAX_BLOCK_SIZE_BYTES {
-        return Err(StateError::BlockTooLarge {
-            actual: block_size,
-            max: MAX_BLOCK_SIZE_BYTES,
-        });
-    }
-
-    // Transaction count
-    if block.transactions.len() > MAX_TX_PER_BLOCK {
-        return Err(StateError::TooManyTransactions {
-            actual: block.transactions.len(),
-            max: MAX_TX_PER_BLOCK,
-        });
-    }
-    let spent_inputs = block
-        .transactions
-        .iter()
-        .map(|tx| tx.inputs.len())
-        .sum::<usize>();
-    validate_block_nullifier_count(spent_inputs)?;
-
-    // base_fee field must match what we computed for this height
-    // (the block proposer must use the correct fee or be rejected)
-    if block.header.base_fee != state.base_fee {
-        return Err(StateError::BaseFeeIncorrect {
-            block_fee: block.header.base_fee,
-            computed_fee: state.base_fee,
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_block_nullifier_count(spent_inputs: usize) -> StateResult<()> {
-    if spent_inputs > indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK {
-        return Err(StateError::TooManyNullifiers {
-            actual: spent_inputs,
-            max: indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK,
-        });
-    }
-    Ok(())
-}
-
-/// Validate one transaction against the current state.
-///
-/// `block_nullifiers` accumulates nullifiers seen so far in THIS block,
-/// allowing detection of intra-block double spends.
-/// `block_input_utxos` accumulates input UTXO IDs seen so far in THIS block,
-/// preventing the same UTXO from being counted more than once with distinct
-/// nullifiers.
-pub fn validate_transaction(
-    state: &ChainState,
-    tx: &TransactionV1,
-    chain_id: &str,
-    block_nullifiers: &mut HashSet<Bytes32>,
-    block_input_utxos: &mut HashSet<Bytes32>,
-    current_height: u64,
-) -> StateResult<()> {
-    validate_transaction_with_dust(
-        state,
-        tx,
-        chain_id,
-        block_nullifiers,
-        block_input_utxos,
-        current_height,
-        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len()),
-    )
-}
-
-/// Validate a transaction with the dust floor frozen from block pre-state.
-pub fn validate_transaction_with_dust(
-    state: &ChainState,
-    tx: &TransactionV1,
-    chain_id: &str,
-    block_nullifiers: &mut HashSet<Bytes32>,
-    block_input_utxos: &mut HashSet<Bytes32>,
-    current_height: u64,
-    dust_limit_spark: u64,
-) -> StateResult<()> {
-    if tx.inputs.is_empty() {
-        return Err(StateError::ZeroInputs);
-    }
-    if tx.outputs.is_empty() {
-        return Err(StateError::ZeroOutputs);
-    }
-    if tx.version.0 != TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES {
-        return Err(StateError::UnsupportedTxVersion {
-            version: tx.version.0,
-        });
-    }
-    if tx.payment_notes.len() != tx.outputs.len() {
-        return Err(StateError::InvariantViolation {
-            message: "payment_notes length must equal outputs length",
-        });
-    }
-    for (output, note) in tx.outputs.iter().zip(&tx.payment_notes) {
-        if note.owner_id != indra_crypto::sha256(&output.owner_pubkey.classical_pk.0) {
-            return Err(StateError::InvariantViolation {
-                message: "payment note owner_id does not match output owner",
-            });
-        }
-    }
-    if tx.signature_module_id != 1 {
-        return Err(StateError::UnsupportedSignatureModule {
-            module_id: tx.signature_module_id,
-        });
-    }
-
-    let mut total_input_value = 0u64;
-    let mut owner_pubkey: Option<indra_core::types::crypto::HybridPubKey> = None;
-    let mut input_commitments = Vec::with_capacity(tx.inputs.len());
-
-    for input in &tx.inputs {
-        if !block_input_utxos.insert(input.utxo_id) {
-            return Err(StateError::DuplicateUtxoSpend {
-                utxo_id: input.utxo_id,
-            });
-        }
-
-        // Duplicate nullifier within this transaction
-        if block_nullifiers.contains(&input.nullifier) {
-            return Err(StateError::DuplicateNullifier);
-        }
-
-        // Already spent in a previous block
-        if state.nullifiers.contains(&input.nullifier) {
-            return Err(StateError::DoubleSpend);
-        }
-
-        // Referenced UTXO must exist
-        let entry = state
-            .utxos
-            .get(&input.utxo_id)
-            .ok_or(StateError::UnknownUtxo)?;
-        input_commitments.push(PedersenCommitment(
-            entry.output.commitment.compressed_point.0,
-        ));
-
-        total_input_value = total_input_value
-            .checked_add(entry.output.value_spark)
-            .ok_or(StateError::ValueOverflow)?;
-        match &owner_pubkey {
-            Some(existing) if existing != &entry.output.owner_pubkey => {
-                return Err(StateError::InvariantViolation {
-                    message: "all transaction inputs must belong to the same owner",
-                });
-            }
-            None => owner_pubkey = Some(entry.output.owner_pubkey.clone()),
-            _ => {}
-        }
-
-        // UTXO must be past its lock height
-        if entry.output.lock_height > current_height {
-            return Err(StateError::OutputLocked {
-                lock_height: entry.output.lock_height,
-                current_height,
-            });
-        }
-
-        block_nullifiers.insert(input.nullifier);
-    }
-
-    let owner_pubkey = owner_pubkey.ok_or(StateError::UnknownUtxo)?;
-    let crypto_pk = owner_pubkey
-        .to_crypto_pubkey()
-        .map_err(|reason| StateError::SignatureInvalid { reason })?;
-    let crypto_sig = tx
-        .signature
-        .to_crypto_sig()
-        .map_err(|reason| StateError::SignatureInvalid { reason })?;
-    let signing_bytes = tx.signing_bytes(chain_id);
-    verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk).map_err(|e| {
-        StateError::SignatureInvalid {
-            reason: e.to_string(),
-        }
-    })?;
-
-    verify_opening(
-        &PedersenCommitment(tx.fee_commitment.compressed_point.0),
-        &PedersenOpening {
-            value: tx.fee_amount,
-            blinding: tx.fee_blinding.0,
-        },
-    )
-    .map_err(|_| StateError::FeeCommitmentMismatch)?;
-
-    // Fee check: fee_amount must cover base_fee × weight
-    let weight_kb = {
-        let bytes = tx.encode_to_vec().len() as u64;
-        bytes.div_ceil(1024)
-    };
-    let required_fee = state
-        .base_fee
-        .checked_mul(weight_kb)
-        .ok_or(StateError::ValueOverflow)?;
-    if tx.fee_amount < required_fee {
-        return Err(StateError::FeeTooLow {
-            actual: tx.fee_amount,
-            required: required_fee,
-        });
-    }
-
-    let total_output_value = tx
-        .outputs
-        .iter()
-        .try_fold(0u64, |acc, output| acc.checked_add(output.value_spark))
-        .ok_or(StateError::ValueOverflow)?;
-    let required_total = total_output_value
-        .checked_add(tx.fee_amount)
-        .ok_or(StateError::ValueOverflow)?;
-    if total_input_value != required_total {
-        return Err(StateError::InvariantViolation {
-            message: "transaction inputs must equal outputs plus fee",
-        });
-    }
-
-    let mut output_commitments = Vec::with_capacity(tx.outputs.len());
-    for (idx, output) in tx.outputs.iter().enumerate() {
-        if output.value_spark < dust_limit_spark {
-            return Err(StateError::InvariantViolation {
-                message: "transaction output below dust limit",
-            });
-        }
-        output_commitments.push(PedersenCommitment(output.commitment.compressed_point.0));
-        let commitment_bytes = output.commitment.compressed_point.0;
-        let proof_bytes = output.range_proof.as_slice();
-        verify_range(&commitment_bytes, proof_bytes)
-            .map_err(|_| StateError::RangeProofInvalid { index: idx })?;
-    }
-
-    verify_balance(
-        &input_commitments,
-        &output_commitments,
-        &PedersenCommitment(tx.fee_commitment.compressed_point.0),
-    )
-    .map_err(|_| StateError::CommitmentBalanceInvalid)?;
-
-    Ok(())
-}
-
-/// Apply one transaction's state changes.
-///
-/// Called only after validate_transaction has passed for all transactions.
-fn apply_transaction(
-    txn: &mut StateTxn<'_>,
-    tx: &TransactionV1,
-    height: u64,
-    tx_index: u32,
-) -> StateResult<()> {
-    for input in &tx.inputs {
-        if txn.spend_utxo(&input.utxo_id)?.is_none() {
-            return Err(StateError::InvariantViolation {
-                message: "attempted to spend an already-spent UTXO during apply_transaction",
-            });
-        }
-        txn.insert_nullifier(input.nullifier)?;
-    }
-
-    // Create outputs: insert new UTXOs
-    for (out_idx, output) in tx.outputs.iter().enumerate() {
-        txn.insert_utxo(output.clone(), height, tx_index, out_idx as u32)?;
-    }
-
-    let burn_amount = tx.fee_amount / 2;
-    let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
-    txn.apply_fee_accounting(burn_amount, validator_amount)?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1561,7 +199,6 @@ mod tests {
     };
     use crate::state_root::compute_state_root;
     use crate::validator::{ValidatorEntry, ValidatorStatus};
-    use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         codec::Encode,
         types::{
@@ -1574,7 +211,7 @@ mod tests {
             primitives::{
                 BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_STAKING_OPS_PER_BLOCK,
-                MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+                MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION,
             },
             slash_membership::build_slash_membership_proof,
             slashing::SlashEvidenceV2,
@@ -1582,13 +219,9 @@ mod tests {
             transaction::{InputV1, OutputV1, TransactionV1},
             vote::{VoteStep, VoteV1},
         },
-        Bytes32, CommitmentV1, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
+        Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{
-        commit, prove_range, sha256, ClassicalKeypair, HybridKeypair, PaymentBlindingNoteV1,
-        PqKeypair, PAYMENT_VERSION_V1,
-    };
-    use rand::{rngs::StdRng, SeedableRng};
+    use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PqKeypair};
     use std::collections::BTreeMap;
 
     const TEST_INPUT_VALUE: u64 = 1_000_000;
@@ -1623,17 +256,6 @@ mod tests {
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-        }
-    }
-
-    fn mandatory_note(owner_pubkey: &HybridPubKey, seed: u8) -> PaymentBlindingNoteV1 {
-        PaymentBlindingNoteV1 {
-            version: PAYMENT_VERSION_V1,
-            owner_id: sha256(&owner_pubkey.classical_pk.0),
-            payment_pubkey_hash: [seed; 32],
-            sender_x25519_ephemeral_pk: [seed.wrapping_add(1); 32],
-            ml_kem_1024_ciphertext: [seed.wrapping_add(2); 1568],
-            note_nonce: [seed.wrapping_add(3); 32],
         }
     }
 
@@ -1932,10 +554,6 @@ mod tests {
                 deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
-                deposit_proof: Some(indra_core::types::staking::StakeDepositProof {
-                    committed_value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-                    blinding_factor: Bytes32::from([seed[0]; 32]),
-                }),
                 cold_pubkey: indra_core::types::crypto::ColdHybridPubKey {
                     classical_pk: cold_pubkey.classical_pk,
                     pq_pk: cold_pubkey.pq_pk,
@@ -1973,23 +591,11 @@ mod tests {
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
-            (0u8..=u8::MAX).find_map(|seed| {
-                let candidate = commit(entry.output.value_spark, &[seed; 32]);
-                (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                    indra_core::types::staking::StakeDepositProof {
-                        committed_value_spark: entry.output.value_spark,
-                        blinding_factor: Bytes32::from([seed; 32]),
-                    }
-                })
-            })
-        });
         let mut op = StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id,
                 deposit_utxo_id,
                 delegator_pubkey,
-                deposit_proof,
             },
             nonce,
             signature: dummy_sig(),
@@ -2055,22 +661,10 @@ mod tests {
         keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let deposit_proof = state.utxos.get(&deposit_utxo_id).and_then(|entry| {
-            (0u8..=u8::MAX).find_map(|seed| {
-                let candidate = commit(entry.output.value_spark, &[seed; 32]);
-                (candidate.0 == entry.output.commitment.compressed_point.0).then(|| {
-                    indra_core::types::staking::StakeDepositProof {
-                        committed_value_spark: entry.output.value_spark,
-                        blinding_factor: Bytes32::from([seed; 32]),
-                    }
-                })
-            })
-        });
         let mut op = StakingOp {
             body: StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey,
-                deposit_proof,
                 cold_authorization: None,
             },
             nonce,
@@ -2659,37 +1253,15 @@ mod tests {
         }
     }
 
-    fn derive_fee_blinding(
-        input_blindings: &[[u8; 32]],
-        output_blindings: &[[u8; 32]],
-    ) -> [u8; 32] {
-        let input_sum = input_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
-            acc + Scalar::from_bytes_mod_order(*blinding)
-        });
-        let output_sum = output_blindings.iter().fold(Scalar::ZERO, |acc, blinding| {
-            acc + Scalar::from_bytes_mod_order(*blinding)
-        });
-        (input_sum - output_sum).to_bytes()
-    }
-
     fn dummy_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
         let value = TEST_INPUT_VALUE + byte as u64;
         output_with_value(value, owner_pubkey, byte)
     }
 
-    fn output_with_value(value: u64, owner_pubkey: HybridPubKey, byte: u8) -> OutputV1 {
-        let blinding = [byte; 32];
-        let commitment = commit(value, &blinding);
-        let mut rng = StdRng::from_seed([byte; 32]);
-        let proof = prove_range(value, &blinding, &mut rng).unwrap();
-
+    fn output_with_value(value: u64, owner_pubkey: HybridPubKey, _byte: u8) -> OutputV1 {
         OutputV1 {
             value_spark: value,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey,
-            range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }
     }
@@ -2710,37 +1282,22 @@ mod tests {
         keypair: &HybridKeypair,
         utxo_id: Bytes32,
         input_value: u64,
-        input_blinding: [u8; 32],
+        _input_blinding: [u8; 32],
         nullifier: Bytes32,
     ) -> TransactionV1 {
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
         let output_value = input_value - fee;
-        let blinding = [0x02u8; 32];
-        let fee_blinding = derive_fee_blinding(&[input_blinding], &[blinding]);
-        let commitment = commit(output_value, &blinding);
-        let fee_commitment = commit(fee, &fee_blinding);
-        let mut rng = StdRng::from_seed([0x02u8; 32]);
-        let proof = prove_range(output_value, &blinding, &mut rng).unwrap();
         let (owner_pubkey, _) = make_test_keypair([0x11; 32]);
         let mut tx = TransactionV1 {
-            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 { utxo_id, nullifier }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::from(commitment.0),
-                },
-                owner_pubkey: owner_pubkey.clone(),
-                range_proof: VariableBytes::from_slice(&proof).unwrap(),
+                owner_pubkey,
                 lock_height: 0,
             }],
-            payment_notes: vec![mandatory_note(&owner_pubkey, 0x41)],
             fee_amount: fee,
-            fee_blinding: Bytes32::from(fee_blinding),
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(fee_commitment.0),
-            },
             signature: dummy_sig(),
         };
         tx.signature = sign_transaction(keypair, &state.chain_id, &tx);
@@ -3864,10 +2421,6 @@ mod tests {
             Bytes32::from([0x01u8; 32]),
         );
         tx.fee_amount = 0; // too low
-        let fee_commitment = commit(tx.fee_amount, &tx.fee_blinding.0);
-        tx.fee_commitment = CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        };
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
@@ -4068,52 +2621,6 @@ mod tests {
         assert_eq!(
             apply_block(&mut state, &block, 0),
             Err(StateError::UnsupportedSignatureModule { module_id: 7 })
-        );
-    }
-
-    #[test]
-    fn fee_commitment_mismatch_rejected() {
-        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x4A; 32]),
-        );
-        tx.fee_commitment = CommitmentV1 {
-            compressed_point: Bytes32::from([0x77; 32]),
-        };
-        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
-        let block = make_block(&state, vec![tx]);
-        assert_eq!(
-            apply_block(&mut state, &block, 0),
-            Err(StateError::FeeCommitmentMismatch)
-        );
-    }
-
-    #[test]
-    fn commitment_balance_mismatch_rejected() {
-        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x4B; 32]),
-        );
-        tx.fee_blinding = Bytes32::from([0x09; 32]);
-        let fee_commitment = commit(tx.fee_amount, &tx.fee_blinding.0);
-        tx.fee_commitment = CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        };
-        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
-        let block = make_block(&state, vec![tx]);
-        assert_eq!(
-            apply_block(&mut state, &block, 0),
-            Err(StateError::CommitmentBalanceInvalid)
         );
     }
 
@@ -4472,28 +2979,9 @@ mod tests {
         let timing =
             indra_core::types::stake_position::UnbondingTimingV1::height_precise(u64::MAX).unwrap();
         let creation_op_id = Bytes32::from([0xD4; 32]);
-        let provisional_id = indra_core::types::stake_position::derive_tranche_id(
-            position.position_id,
-            creation_op_id,
-            0,
-            timing,
-            1_000_000,
-        );
-        let blinding = indra_crypto::derive_tranche_source_blinding_v1(
-            &indra_crypto::TrancheSourceBlindingInputsV1 {
-                chain_id: state.chain_id.as_bytes(),
-                position_id: position.position_id.0,
-                tranche_id: provisional_id.0,
-                principal_spark: 1_000_000,
-                start_height: u64::MAX,
-                creation_op_id: creation_op_id.0,
-            },
-        )
-        .unwrap();
         let tranche = indra_core::types::stake_position::UnbondingTrancheV1::new(
             position.position_id,
             1_000_000,
-            indra_crypto::commit(1_000_000, &blinding),
             timing,
             custody,
             creation_op_id,
@@ -4732,17 +3220,1284 @@ mod tests {
             "ambiguous candidate matches must preserve the prior uniqueness-required behavior"
         );
     }
+}
 
-    #[test]
-    fn slash_reward_utxo_blinding_is_deterministic() {
-        let hash = Bytes32::from([0xC7; 32]);
-        assert_eq!(
-            derive_slash_reward_blinding(&hash, 123),
-            derive_slash_reward_blinding(&hash, 123)
-        );
-        assert_ne!(
-            derive_slash_reward_blinding(&hash, 123),
-            derive_slash_reward_blinding(&hash, 124)
-        );
+fn slash_membership_record_for_validation(
+    state: &ChainState,
+    infraction_height: u64,
+) -> StateResult<SlashMembershipRootRecord> {
+    state
+        .slash_membership_root_for_height(infraction_height)
+        .copied()
+        .map_err(|_| StateError::InvalidSlashEvidence {
+            reason: format!("missing membership root for height {infraction_height}"),
+        })
+}
+
+fn apply_slash_common(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV1,
+    evidence_hash: Bytes32,
+    historical_keys: Option<([u8; 32], Vec<u8>)>,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+    verify_vote_crypto: bool,
+) -> StateResult<SlashAccounting> {
+    use crate::ValidatorStatus;
+    use indra_core::types::{
+        primitives::{DUST_LIMIT_SPARK, SLASH_REPORTER_REWARD_BPS},
+        vote::VoteStep,
+    };
+
+    if state.applied_slash_hashes.contains(&evidence_hash) {
+        return Err(StateError::SlashAlreadyApplied);
     }
+
+    let validator_id = evidence.validator_id;
+
+    let live_validator = state.validators.get(&validator_id);
+    let tombstone = state.evicted_validator_tombstones.get(&validator_id);
+    if live_validator.is_none() {
+        let tombstone = tombstone.ok_or(StateError::ValidatorNotFound)?;
+        if historical_keys.is_none() || tombstone.eviction_height < evidence.vote_1.height {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "validator was evicted before the alleged infraction height".into(),
+            });
+        }
+    }
+    let current_keys =
+        live_validator.and_then(|v| match (v.hybrid_classical_pk, v.hybrid_pq_pk.clone()) {
+            (Some(classical), Some(pq)) => Some((classical, pq)),
+            _ => None,
+        });
+    let (classical_pk, pq_pk_bytes) = match historical_keys {
+        Some(keys) => keys,
+        None => current_keys.ok_or_else(|| StateError::InvalidSlashEvidence {
+            reason: "validator has incomplete current hybrid public keys".into(),
+        })?,
+    };
+
+    if let Some(v) = live_validator {
+        if matches!(v.status, ValidatorStatus::Slashed | ValidatorStatus::Exited) {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "validator already slashed or exited".into(),
+            });
+        }
+    }
+
+    if verify_vote_crypto {
+        verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id)
+            .map_err(|e| StateError::InvalidSlashEvidence {
+                reason: format!("vote_1 signature invalid: {e}"),
+            })?;
+        verify_vote_sig_with_keys(&evidence.vote_2, &classical_pk, &pq_pk_bytes, chain_id)
+            .map_err(|e| StateError::InvalidSlashEvidence {
+                reason: format!("vote_2 signature invalid: {e}"),
+            })?;
+    }
+
+    if evidence.vote_1.validator_id != validator_id || evidence.vote_2.validator_id != validator_id
+    {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes not from claimed validator".into(),
+        });
+    }
+
+    if evidence.vote_1.height != evidence.vote_2.height
+        || evidence.vote_1.round != evidence.vote_2.round
+    {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes not at same height and round".into(),
+        });
+    }
+
+    let infraction_epoch = epoch_for_height(evidence.vote_1.height);
+    let current_epoch = epoch_for_height(height);
+    if current_epoch > infraction_epoch.saturating_add(SLASH_EVIDENCE_WINDOW_EPOCHS) {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: format!(
+                "slash evidence outside evidence window: infraction_epoch={infraction_epoch}, current_epoch={current_epoch}, window={SLASH_EVIDENCE_WINDOW_EPOCHS}",
+            ),
+        });
+    }
+
+    if evidence.vote_1.block_hash == evidence.vote_2.block_hash {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes have same block hash — not equivocation".into(),
+        });
+    }
+    if evidence.vote_1.block_hash == Bytes32::ZERO || evidence.vote_2.block_hash == Bytes32::ZERO {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "nil vote is not slashable equivocation".into(),
+        });
+    }
+
+    if evidence.vote_1.step != evidence.vote_2.step {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "votes must both be precommits or both be prevotes".into(),
+        });
+    }
+
+    let slash_bps = match evidence.vote_1.step {
+        VoteStep::Precommit => state.governance.params.slash_double_precommit_bps,
+        VoteStep::Prevote => {
+            // Prevote conflicts are intentionally not slashable right now.
+            // POLC/valid-round logic can make prevote semantics more subtle
+            // than precommit equivocation, and node-side detection only emits
+            // automatic evidence for double precommits. Keep the state layer
+            // aligned with the enforced slashing model until a future protocol
+            // version explicitly enables prevote slashing.
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "prevote conflicts are not slashable".into(),
+            });
+        }
+    };
+
+    let bps = |amount, rate| bps_of(amount, rate);
+
+    let mut position_ids = Vec::new();
+    let mut tranche_ids = Vec::new();
+    if let Some(tombstone) = tombstone {
+        let positions = state
+            .stake_positions
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        let tranches = state
+            .unbonding_tranches
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        (position_ids, tranche_ids) = crate::tranche_tombstone::slashable_self_targets_v2(
+            tombstone,
+            &positions,
+            &tranches,
+            evidence.vote_1.height,
+        )?;
+    } else {
+        for position in state.stake_positions.values().filter(|position| {
+            position.validator_id == validator_id
+                && matches!(position.custody,
+                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity { validator_id: id }
+                        if id == validator_id)
+        }) {
+            if position.active.is_some() {
+                position_ids.push(position.position_id);
+            }
+            tranche_ids.extend(
+                state
+                    .tranche_ids_for_position(&position.position_id)
+                    .iter()
+                    .filter(|id| state.unbonding_tranches.get(id).is_some_and(|tranche| {
+                        tranche.timing.start_height() >= evidence.vote_1.height
+                    }))
+                    .copied(),
+            );
+        }
+    }
+    if live_validator.is_none() && position_ids.is_empty() && tranche_ids.is_empty() {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "tombstone has no retained self principal slashable at the infraction height"
+                .into(),
+        });
+    }
+    let slashable_position_stake = position_ids.iter().fold(0u64, |acc, id| {
+        acc.saturating_add(
+            state
+                .stake_positions
+                .get(id)
+                .and_then(|position| position.active)
+                .map(|active| active.principal_spark)
+                .unwrap_or(0),
+        )
+    });
+    let slashable_tranche_stake = tranche_ids.iter().fold(0u64, |acc, id| {
+        acc.saturating_add(
+            state
+                .unbonding_tranches
+                .get(id)
+                .map(|tranche| tranche.principal_spark)
+                .unwrap_or(0),
+        )
+    });
+    let slashable_principal = slashable_position_stake.saturating_add(slashable_tranche_stake);
+    let current_stake = state
+        .validators
+        .get(&validator_id)
+        .map(|v| v.stake_spark)
+        .unwrap_or(0);
+    let slash_base = slashable_principal.max(current_stake);
+    let slash_amount = bps(slash_base, slash_bps);
+    let potential_reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
+
+    let mut total_principal_slashed: u64 = 0;
+    let mut active_principal_slashed: u64 = 0;
+    for position_id in &position_ids {
+        if let Some(mut position) = state.stake_positions.get(position_id).cloned() {
+            if let Some(active) = position.active {
+                let amount = bps(active.principal_spark, slash_bps);
+                let remaining = active.principal_spark.saturating_sub(amount);
+                position.active = (remaining > 0).then(|| {
+                    indra_core::types::stake_position::ActiveStakeAggregateV1 {
+                        principal_spark: remaining,
+                        ..active
+                    }
+                });
+                active_principal_slashed = active_principal_slashed.saturating_add(amount);
+                total_principal_slashed = total_principal_slashed.saturating_add(amount);
+                state.stake_positions.insert(*position_id, position.clone());
+                if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                    commitment.put_stake_position(&position);
+                }
+                crate::txn::complex_mutation_checkpoint()?;
+            }
+        }
+    }
+    let mut tranche_successors = Vec::new();
+    for tranche_id in &tranche_ids {
+        if let Some(tranche) = state.unbonding_tranches.get(tranche_id).cloned() {
+            let amount = bps(tranche.principal_spark, slash_bps);
+            let remaining = tranche.principal_spark.saturating_sub(amount);
+            total_principal_slashed = total_principal_slashed.saturating_add(amount);
+            if remaining == 0 {
+                tranche_successors.push((*tranche_id, None));
+            } else {
+                let successor_id = indra_core::types::stake_position::derive_tranche_id(
+                    tranche.position_id,
+                    tranche.creation_op_id,
+                    tranche.creation_ordinal,
+                    tranche.timing,
+                    remaining,
+                );
+                let successor = indra_core::types::stake_position::UnbondingTrancheV1::new(
+                    tranche.position_id,
+                    remaining,
+                    tranche.timing,
+                    tranche.custody,
+                    tranche.creation_op_id,
+                    tranche.creation_ordinal,
+                )
+                .map_err(|error| StateError::InvalidSlashEvidence {
+                    reason: error.to_string(),
+                })?;
+                if successor.tranche_id != successor_id
+                    || (successor_id != *tranche_id
+                        && state.unbonding_tranches.contains_key(&successor_id))
+                {
+                    return Err(StateError::InvariantViolation {
+                        message: "slash successor tranche identity collision",
+                    });
+                }
+                tranche_successors.push((*tranche_id, Some(successor)));
+            }
+        }
+    }
+    // A slash is a canonical consume-and-successor transition. Nonzero
+    // reductions are exactly one-for-one and therefore cannot consume tranche
+    // capacity; a complete slash only decreases the count.
+    for (old_id, successor) in &tranche_successors {
+        state.unbonding_tranches.remove(old_id);
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.delete_unbonding_tranche(old_id);
+        }
+        crate::txn::complex_mutation_checkpoint()?;
+        if let Some(successor) = successor {
+            state
+                .unbonding_tranches
+                .insert(successor.tranche_id, successor.clone());
+            if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                commitment.put_unbonding_tranche(successor);
+            }
+            crate::txn::complex_mutation_checkpoint()?;
+        }
+    }
+    if let Some(mut tombstone) = state
+        .evicted_validator_tombstones
+        .get(&validator_id)
+        .cloned()
+    {
+        for (old_id, successor) in &tranche_successors {
+            let index = tombstone
+                .retained_tranche_ids
+                .binary_search(old_id)
+                .map_err(|_| StateError::InvariantViolation {
+                    message: "slash target is absent from tombstone",
+                })?;
+            tombstone.retained_tranche_ids.remove(index);
+            if let Some(successor) = successor {
+                tombstone.retained_tranche_ids.push(successor.tranche_id);
+            }
+        }
+        tombstone.retained_tranche_ids.sort();
+        tombstone
+            .validate(false)
+            .map_err(|error| StateError::InvalidSlashEvidence {
+                reason: error.to_string(),
+            })?;
+        state
+            .evicted_validator_tombstones
+            .insert(validator_id, tombstone.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_evicted_validator_tombstone(&tombstone);
+        }
+        crate::txn::complex_mutation_checkpoint()?;
+    }
+    state
+        .rebuild_position_tranche_index()
+        .map_err(|error| StateError::InvalidSlashEvidence {
+            reason: error.to_string(),
+        })?;
+
+    let mut updated_validator = None;
+    if let Some(v) = state.validators.get_mut(&validator_id) {
+        let stake_slash = if slashable_principal > 0 {
+            active_principal_slashed
+        } else {
+            slash_amount
+        };
+        v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
+        // Equivocation slashing is prospective-only by policy. Rewards already
+        // credited to `pending_rewards` are never clawed back retroactively;
+        // the penalty is the immediate stake reduction here plus permanent
+        // exclusion from future reward eligibility through `Slashed` status.
+        v.status = ValidatorStatus::Slashed;
+        updated_validator = Some(v.clone());
+        crate::txn::complex_mutation_checkpoint()?;
+    }
+    if let (Some(commitment), Some(validator)) =
+        (state.state_commitment_v2.as_mut(), updated_validator)
+    {
+        commitment.put_validator(&validator, height);
+    }
+
+    let reporter_reward = if potential_reporter_reward >= DUST_LIMIT_SPARK {
+        if let Some(pubkey) = reporter_pubkey {
+            create_slash_reporter_reward_utxo(
+                state,
+                &evidence_hash,
+                height,
+                potential_reporter_reward,
+                pubkey,
+            )?;
+            potential_reporter_reward
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let burned = slash_amount.saturating_sub(reporter_reward);
+    state.total_supply = state.total_supply.saturating_sub(burned);
+    crate::txn::complex_mutation_checkpoint()?;
+    state.applied_slash_hashes.insert(evidence_hash);
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        commitment.put_slash_hash(&evidence_hash);
+    }
+    crate::txn::complex_mutation_checkpoint()?;
+
+    Ok(SlashAccounting {
+        validator_id,
+        slash_bps,
+        slash_amount,
+        burned,
+        self_principal_slashed: total_principal_slashed,
+        reporter_reward,
+    })
+}
+
+/// Compute the canonical proof-carrying evidence hash used for deduplication.
+pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
+    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
+}
+
+fn create_slash_reporter_reward_utxo(
+    state: &mut ChainState,
+    _evidence_hash: &Bytes32,
+    block_height: u64,
+    reporter_reward: u64,
+    reporter_pubkey: &HybridPubKey,
+) -> StateResult<Bytes32> {
+    let output = OutputV1 {
+        value_spark: reporter_reward,
+        owner_pubkey: reporter_pubkey.clone(),
+        lock_height: 0,
+    };
+    let reward_utxo_id = state
+        .utxos
+        .insert(output, block_height, STAKING_TX_IDX, 0)
+        .map_err(|_| StateError::InvariantViolation {
+            message: "UTXO ID collision in slash reporter reward output",
+        })?;
+    eprintln!(
+        "[slash] reporter reward {} Spark -> UTXO {} for proposer {}",
+        reporter_reward,
+        hex::encode(&reward_utxo_id.0[..4]),
+        hex::encode(&reporter_pubkey.classical_pk.0[..4]),
+    );
+    Ok(reward_utxo_id)
+}
+
+const VRF_FALLBACK_OUTPUT_BYTES: Bytes32 = Bytes32([0xFF; 32]);
+
+fn slash_reporter_pubkey_for_block(
+    state: &ChainState,
+    block: &BlockV1,
+) -> StateResult<Option<HybridPubKey>> {
+    let snapshot = state
+        .snapshot_for_consensus_height(block.header.height)
+        .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
+    let proposer_id = slash_reporter_validator_id_from_candidate_ids(
+        snapshot.entries().iter().map(|entry| entry.validator_id),
+        block,
+    );
+    Ok(proposer_id.and_then(|proposer_id| {
+        snapshot
+            .entries()
+            .iter()
+            .find(|entry| entry.validator_id == proposer_id)
+            .and_then(|entry| {
+                Some(HybridPubKey {
+                    classical_pk: Bytes32::from(entry.classical_vote_pk),
+                    pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
+                })
+            })
+    }))
+}
+
+fn slash_reporter_validator_id_from_candidate_ids<I>(
+    candidate_ids: I,
+    block: &BlockV1,
+) -> Option<Bytes32>
+where
+    I: IntoIterator<Item = Bytes32>,
+{
+    let header_hash = block.header.election_result_hash?;
+    let mut matches = candidate_ids.into_iter().filter_map(|validator_id| {
+        let normal = VrfElectionResult {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            elected_validator_id: validator_id,
+            elected_vrf_output: block.header.proposer_vrf_output,
+            fallback_used: false,
+            reveal_set_commitment: Bytes32::ZERO,
+        }
+        .hash();
+        let fallback = VrfElectionResult {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            elected_validator_id: validator_id,
+            elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
+            fallback_used: true,
+            reveal_set_commitment: Bytes32::ZERO,
+        }
+        .hash();
+        (header_hash == normal || header_hash == fallback).then_some(validator_id)
+    });
+    let proposer_id = matches.next()?;
+    matches.next().is_none().then_some(proposer_id)
+}
+
+fn verify_vote_sig_with_keys(
+    vote: &VoteV1,
+    classical_pk: &[u8; 32],
+    pq_pk_bytes: &[u8],
+    chain_id: &str,
+) -> Result<(), String> {
+    use indra_crypto::{
+        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
+    };
+
+    let pq_pk: [u8; PQ_PK_BYTES] = pq_pk_bytes.try_into().map_err(|_| {
+        format!(
+            "pq public key must be {} bytes, got {}",
+            PQ_PK_BYTES,
+            pq_pk_bytes.len()
+        )
+    })?;
+    let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+        vote.height,
+        vote.round,
+        vote.step,
+        &vote.block_hash,
+        &vote.validator_id,
+        vote.election_result_hash.as_ref(),
+        chain_id,
+    );
+    let pk = HybridPublicKey {
+        classical: ClassicalPublicKey(*classical_pk),
+        pq: PqPublicKey(pq_pk),
+    };
+    let sig = vote.signature.to_crypto_sig().map_err(|e| e.to_string())?;
+    verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| e.to_string())
+}
+
+/// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
+pub fn apply_block(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
+) -> StateResult<Option<EpochRecord>> {
+    apply_block_with_effects(state, block, timestamp_secs).map(|outcome| outcome.epoch_record)
+}
+
+/// Apply a block and return the effects of the committed canonical transition.
+///
+/// Effects are produced by the same transaction that performs mutation and
+/// are returned only after that transaction commits successfully.
+pub fn apply_block_with_effects(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<crate::AppliedBlockOutcome> {
+    // Consensus atomicity: validation is read-only, then mutations happen
+    // through a scoped undo log. If any mutation step fails, the transaction
+    // drops without commit and rolls back every recorded change.
+    let mut txn = StateTxn::begin(state, block.header.height);
+    let epoch_record = apply_block_inner(&mut txn, block, timestamp_secs)?;
+    let effects = txn.commit();
+    Ok(crate::AppliedBlockOutcome {
+        epoch_record,
+        effects,
+    })
+}
+
+/// Atomically validate/apply a candidate with a block-attempt-frozen dust floor.
+pub fn try_apply_transaction_candidate_with_dust(
+    state: &mut ChainState,
+    tx: &TransactionV1,
+    height: u64,
+    tx_index: u32,
+    dust_limit_spark: u64,
+) -> StateResult<()> {
+    let mut block_nullifiers = HashSet::new();
+    let mut block_input_utxos = HashSet::new();
+    validate_transaction_with_dust(
+        state,
+        tx,
+        &state.chain_id,
+        &mut block_nullifiers,
+        &mut block_input_utxos,
+        height,
+        dust_limit_spark,
+    )?;
+    let mut txn = StateTxn::begin(state, height);
+    apply_transaction(&mut txn, tx, height, tx_index)?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply one staking operation to an evolving candidate state.
+pub fn try_apply_staking_candidate(
+    state: &mut ChainState,
+    op: &StakingOp,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_staking_scope();
+    txn.snapshot_delegator_identity_scope();
+    apply_staking_op(txn.state_mut(), op, &chain_id, height)?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply an admission-certified staking candidate using state-only checks.
+pub fn try_apply_verified_staking_candidate(
+    state: &mut ChainState,
+    op: &StakingOp,
+    verified: &crate::pending::VerifiedPendingStaking,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_staking_scope();
+    txn.snapshot_delegator_identity_scope();
+    crate::apply_verified_staking_op(txn.state_mut(), op, verified, &chain_id, height)?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply one governance operation to an evolving candidate state.
+pub fn try_apply_governance_candidate(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    current_epoch: u64,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_governance_scope();
+    txn.snapshot_delegator_identity_scope();
+    apply_governance_op(txn.state_mut(), op, current_epoch, height, &chain_id)?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically apply an admission-certified governance candidate using state-only checks.
+pub fn try_apply_verified_governance_candidate(
+    state: &mut ChainState,
+    op: &GovernanceOpV2,
+    verified: &crate::pending::VerifiedPendingGovernance,
+    current_epoch: u64,
+    height: u64,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_governance_scope();
+    txn.snapshot_delegator_identity_scope();
+    crate::apply_verified_governance_op(
+        txn.state_mut(),
+        op,
+        verified,
+        current_epoch,
+        height,
+        &chain_id,
+    )?;
+    txn.after_mutation()?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Atomically validate and apply one proof-carrying slash-evidence candidate.
+///
+/// `reporter_pubkey` is the elected proposer's reward destination when this is
+/// used during block construction. Admission validation passes `None`.
+pub fn try_apply_slash_candidate(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+) -> StateResult<()> {
+    let chain_id = state.chain_id.clone();
+    let mut txn = StateTxn::begin(state, height);
+    txn.snapshot_slashing_scope();
+    let accounting = apply_slash_v2_at_height_with_accounting(
+        txn.state_mut(),
+        evidence,
+        &chain_id,
+        height,
+        reporter_pubkey,
+    )?;
+    txn.add_slash_accounting(accounting.slash_amount)?;
+    txn.commit_scratch();
+    Ok(())
+}
+
+/// Temporarily apply a block, compute its post-state roots, then roll back.
+///
+/// This helper is intentionally fully synchronous. It mutates `state` only
+/// inside a scoped [`StateTxn`], never commits that transaction, and restores the
+/// exact pre-call in-memory cache presence before returning. It is used by block
+/// production/reproposal to fill candidate headers without paying for a full
+/// detached `ChainState` clone.
+pub fn project_block_for_roots(
+    state: &mut ChainState,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<ProjectedBlockRoots> {
+    let started_without_state_commitment_v2 = state.state_commitment_v2.is_none();
+    let projected = {
+        let mut txn = StateTxn::begin(state, block.header.height);
+        match apply_block_inner(&mut txn, block, timestamp_secs) {
+            Ok(epoch_record) => {
+                let projected_state = txn.state();
+                let roots = crate::state_root::compute_state_roots(projected_state);
+                let mut value_block = block.clone();
+                value_block.header.state_root = roots.state_root;
+                value_block.header.validator_set_root = roots.validator_set_root;
+                Ok(ProjectedBlockRoots {
+                    state_root: roots.state_root,
+                    validator_set_root: roots.validator_set_root,
+                    value_hash: value_block.compute_value_hash(projected_state.total_supply),
+                    total_supply: projected_state.total_supply,
+                    epoch_record,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    };
+    if started_without_state_commitment_v2 {
+        state.state_commitment_v2 = None;
+    }
+    projected
+}
+
+fn apply_block_inner(
+    txn: &mut StateTxn<'_>,
+    block: &BlockV1,
+    timestamp_secs: u64,
+) -> StateResult<Option<EpochRecord>> {
+    // DETERMINISM NOTE: timestamp_secs is NOT written into ChainState.
+    // It is only stored in the returned EpochRecord for historical records.
+    // Replay passes 0 for this parameter — this is intentional and safe
+    // because timestamp_secs does not affect state root computation.
+    //
+    // WARNING: Do NOT use timestamp_secs in any computation that writes
+    // to ChainState fields. If epoch-based timing logic is ever needed,
+    // use block.header.timestamp (committed, deterministic) instead.
+
+    // ── Phase 1: Block-level validation (read-only) ───────────────────────
+
+    validate_block_header(txn.state(), block)?;
+    let transition_context = if is_epoch_boundary(block.header.height) {
+        let expected_parent =
+            block
+                .header
+                .height
+                .checked_sub(1)
+                .ok_or(StateError::InvariantViolation {
+                    message: "epoch boundary has no certified parent",
+                })?;
+        if block.header.quorum_certificate.as_slice().is_empty() {
+            return Err(StateError::InvariantViolation {
+                message: "boundary block is missing its parent quorum certificate",
+            });
+        }
+        let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
+        let qc = QuorumCertificateV1::decode(&mut reader).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "boundary block has malformed quorum certificate",
+            }
+        })?;
+        if qc.height != expected_parent {
+            return Err(StateError::InvariantViolation {
+                message: "boundary quorum certificate does not certify the parent height",
+            });
+        }
+        Some(crate::epoch::EpochTransitionContext::new(
+            block.header.height,
+            expected_parent,
+        )?)
+    } else {
+        None
+    };
+    let state = txn.state();
+
+    if block.staking_ops.len() > MAX_STAKING_OPS_PER_BLOCK {
+        return Err(StateError::TooManyStakingOps {
+            actual: block.staking_ops.len(),
+            max: MAX_STAKING_OPS_PER_BLOCK,
+        });
+    }
+    if block.governance_ops.len() > MAX_GOV_OPS_PER_BLOCK {
+        return Err(StateError::TooManyGovernanceOps {
+            actual: block.governance_ops.len(),
+            max: MAX_GOV_OPS_PER_BLOCK,
+        });
+    }
+    let mut seen_slash_hashes: HashSet<Bytes32> = HashSet::new();
+    for evidence in &block.slashing_evidence {
+        if !seen_slash_hashes.insert(compute_slash_evidence_v2_hash(evidence)) {
+            return Err(StateError::DuplicateSlashEvidence);
+        }
+    }
+
+    // ── Phase 2: Transaction validation (read-only) ───────────────────────
+
+    // Check for duplicate transactions within the block
+    let mut seen_tx_hashes: HashSet<Vec<u8>> = HashSet::new();
+    for tx in &block.transactions {
+        let tx_bytes = tx.encode_to_vec();
+        if !seen_tx_hashes.insert(tx_bytes) {
+            return Err(StateError::DuplicateTransaction);
+        }
+    }
+
+    // Validate each transaction against current state
+    // We do a dry-run: check but don't mutate yet
+    // Track nullifiers and input UTXO IDs seen in THIS block to catch
+    // intra-block double spends before any mutation occurs.
+    let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
+    let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
+    let transaction_dust_limit =
+        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len());
+
+    for tx in &block.transactions {
+        validate_transaction_with_dust(
+            state,
+            tx,
+            &state.chain_id,
+            &mut block_nullifiers,
+            &mut block_input_utxos,
+            block.header.height,
+            transaction_dust_limit,
+        )?;
+    }
+
+    if !block.staking_ops.is_empty() {
+        let mut shadow = state.clone();
+        let chain_id = state.chain_id.clone();
+        for op in &block.staking_ops {
+            op.validate_structure()
+                .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+            apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
+        }
+    }
+
+    if !block.governance_ops.is_empty() {
+        let mut shadow = state.clone();
+        let chain_id = state.chain_id.clone();
+        let current_epoch =
+            governance_operation_epoch(block.header.height, transition_context.as_ref());
+        for op in &block.governance_ops {
+            apply_governance_op(
+                &mut shadow,
+                op,
+                current_epoch,
+                block.header.height,
+                &chain_id,
+            )?;
+        }
+    }
+
+    if !block.slashing_evidence.is_empty() {
+        let mut shadow = state.clone();
+        let chain_id_clone = state.chain_id.clone();
+        let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
+        for evidence in &block.slashing_evidence {
+            apply_slash_v2_at_height_with_accounting(
+                &mut shadow,
+                evidence,
+                &chain_id_clone,
+                block.header.height,
+                reporter_pubkey.as_ref(),
+            )?;
+        }
+    }
+
+    // ── Phase 3: State mutation (all validation passed) ───────────────────
+
+    txn.ensure_state_commitment_v2()?;
+
+    // Apply each transaction
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
+        apply_transaction(txn, tx, block.header.height, tx_idx as u32)?;
+    }
+
+    let chain_id = txn.state().chain_id.clone();
+    for op in &block.staking_ops {
+        txn.snapshot_staking_scope();
+        txn.snapshot_delegator_identity_scope();
+        apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
+            StateError::InvariantViolation {
+                message: "staking op failed on real state after shadow validation",
+            }
+        })?;
+        txn.after_mutation()?;
+    }
+
+    let current_epoch =
+        governance_operation_epoch(block.header.height, transition_context.as_ref());
+    let chain_id = txn.state().chain_id.clone();
+    for op in &block.governance_ops {
+        txn.snapshot_governance_scope();
+        txn.snapshot_delegator_identity_scope();
+        apply_governance_op(
+            txn.state_mut(),
+            op,
+            current_epoch,
+            block.header.height,
+            &chain_id,
+        )
+        .map_err(|_| StateError::InvariantViolation {
+            message: "governance op failed on real state after shadow validation",
+        })?;
+        txn.after_mutation()?;
+    }
+
+    let chain_id_for_slash = txn.state().chain_id.clone();
+    let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
+    for evidence in &block.slashing_evidence {
+        txn.snapshot_slashing_scope();
+        let accounting = apply_slash_v2_at_height_with_accounting(
+            txn.state_mut(),
+            evidence,
+            &chain_id_for_slash,
+            block.header.height,
+            reporter_pubkey.as_ref(),
+        )
+        .map_err(|_| StateError::InvariantViolation {
+            message: "slash failed on real state after shadow validation",
+        })?;
+        txn.add_slash_accounting(accounting.slash_amount)?;
+        txn.record_slash_event(crate::CommittedSlashEvent {
+            validator_id: accounting.validator_id,
+            slash_bps: accounting.slash_bps,
+            burned: accounting.burned,
+            self_principal_slashed: accounting.self_principal_slashed,
+            reporter_reward: accounting.reporter_reward,
+        });
+    }
+    // Update base fee for next block
+    let next_fee = compute_next_base_fee(txn.state().base_fee, block.transactions.len());
+    txn.set_base_fee(next_fee)?;
+
+    // Advance height and tip hash
+    txn.set_tip(block.header.height, block.header.block_hash())?;
+
+    // Credit the certified parent's activity before the transition
+    // so the closing epoch's final QC participates in liveness evaluation.
+    if let Some(context) = transition_context {
+        txn.snapshot_validator_activity_scope();
+        update_last_active_epoch_from_block_qc(txn.state_mut(), block, Some(&context))?;
+        txn.after_mutation()?;
+    }
+
+    // Apply epoch transition if this is the last block of an epoch.
+    let epoch_record = if let Some(context) = transition_context {
+        txn.snapshot_epoch_scope();
+        Some(crate::epoch::apply_epoch_transition_at_height(
+            txn.state_mut(),
+            &context,
+            timestamp_secs,
+        )?)
+    } else {
+        None
+    };
+    if epoch_record.is_some() {
+        txn.after_mutation()?;
+    }
+
+    if txn.state().total_supply > HARD_CAP_SPARK {
+        return Err(StateError::InvariantViolation {
+            message: "CRITICAL: total supply exceeds hard cap — constitutional invariant violated",
+        });
+    }
+
+    if transition_context.is_none() {
+        txn.snapshot_validator_activity_scope();
+        update_last_active_epoch_from_block_qc(txn.state_mut(), block, None)?;
+        txn.after_mutation()?;
+    }
+
+    // Snapshot rotation is deliberately last: it must observe the fully
+    // settled post-boundary validator state after reselection, rewards,
+    // releases, liveness penalties, and QC activity accounting.
+    if let Some(context) = transition_context {
+        let boundary_height = context.boundary_height;
+        txn.state_mut()
+            .create_consensus_snapshot_after_boundary(boundary_height)?;
+        txn.state_mut().rebuild_state_commitment_v2(boundary_height);
+        txn.after_mutation()?;
+    }
+
+    Ok(epoch_record)
+}
+
+fn governance_operation_epoch(
+    height: u64,
+    context: Option<&crate::epoch::EpochTransitionContext>,
+) -> u64 {
+    context.map_or_else(|| epoch_for_height(height), |context| context.closing_epoch)
+}
+
+/// Update validator liveness from the QC embedded in the applied block.
+///
+/// This is consensus state because `last_active_epoch` is committed in the
+/// validator-set root. Keeping this mutation inside `apply_block` ensures live
+/// import, sync import, snapshot replay, and block-production projection all
+/// execute the same state transition.
+fn update_last_active_epoch_from_block_qc(
+    state: &mut ChainState,
+    block: &BlockV1,
+    context: Option<&crate::epoch::EpochTransitionContext>,
+) -> StateResult<()> {
+    if block.header.quorum_certificate.as_slice().is_empty() {
+        return Ok(());
+    }
+
+    let mut reader = ByteReader::new(block.header.quorum_certificate.as_slice());
+    let Ok(qc) = QuorumCertificateV1::decode(&mut reader) else {
+        return Ok(());
+    };
+
+    let current_epoch = if let Some(context) = context {
+        if qc.height != context.certified_parent_height {
+            return Err(StateError::InvariantViolation {
+                message: "QC activity height does not match epoch transition context",
+            });
+        }
+        epoch_for_height(context.certified_parent_height)
+    } else {
+        epoch_for_height(block.header.height)
+    };
+    let mut changed = Vec::new();
+    for signature in qc.pq_signatures {
+        if let Some(validator) = state.validators.get_mut(&signature.validator_id) {
+            validator.last_active_epoch = current_epoch;
+            changed.push(signature.validator_id);
+        }
+    }
+    if let Some(commitment) = state.state_commitment_v2.as_mut() {
+        for validator_id in changed {
+            if let Some(validator) = state.validators.get(&validator_id) {
+                commitment.put_validator(validator, block.header.height);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate block-level invariants (does not touch state).
+fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()> {
+    // Protocol version
+    if block.header.protocol_version.0 != BLOCK_FORMAT_VERSION {
+        return Err(StateError::UnsupportedVersion {
+            version: block.header.protocol_version.0,
+        });
+    }
+
+    // Height must be exactly state.height + 1
+    let expected_height = state.height + 1;
+    if block.header.height != expected_height {
+        return Err(StateError::InvalidHeight {
+            expected: expected_height,
+            actual: block.header.height,
+        });
+    }
+
+    // prev_hash must match our current tip
+    if block.header.prev_hash != state.tip_hash {
+        return Err(StateError::PrevHashMismatchDetailed {
+            height: block.header.height,
+            expected: state.tip_hash,
+            got: block.header.prev_hash,
+        });
+    }
+
+    // Block size
+    let block_size = block.encode_to_vec().len();
+    if block_size > MAX_BLOCK_SIZE_BYTES {
+        return Err(StateError::BlockTooLarge {
+            actual: block_size,
+            max: MAX_BLOCK_SIZE_BYTES,
+        });
+    }
+
+    // Transaction count
+    if block.transactions.len() > MAX_TX_PER_BLOCK {
+        return Err(StateError::TooManyTransactions {
+            actual: block.transactions.len(),
+            max: MAX_TX_PER_BLOCK,
+        });
+    }
+    let spent_inputs = block
+        .transactions
+        .iter()
+        .map(|tx| tx.inputs.len())
+        .sum::<usize>();
+    validate_block_nullifier_count(spent_inputs)?;
+
+    // base_fee field must match what we computed for this height
+    // (the block proposer must use the correct fee or be rejected)
+    if block.header.base_fee != state.base_fee {
+        return Err(StateError::BaseFeeIncorrect {
+            block_fee: block.header.base_fee,
+            computed_fee: state.base_fee,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_block_nullifier_count(spent_inputs: usize) -> StateResult<()> {
+    if spent_inputs > indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK {
+        return Err(StateError::TooManyNullifiers {
+            actual: spent_inputs,
+            max: indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK,
+        });
+    }
+    Ok(())
+}
+
+/// Validate one transaction against the current state.
+///
+/// `block_nullifiers` accumulates nullifiers seen so far in THIS block,
+/// allowing detection of intra-block double spends.
+/// `block_input_utxos` accumulates input UTXO IDs seen so far in THIS block,
+/// preventing the same UTXO from being counted more than once with distinct
+/// nullifiers.
+pub fn validate_transaction(
+    state: &ChainState,
+    tx: &TransactionV1,
+    chain_id: &str,
+    block_nullifiers: &mut HashSet<Bytes32>,
+    block_input_utxos: &mut HashSet<Bytes32>,
+    current_height: u64,
+) -> StateResult<()> {
+    validate_transaction_with_dust(
+        state,
+        tx,
+        chain_id,
+        block_nullifiers,
+        block_input_utxos,
+        current_height,
+        indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len()),
+    )
+}
+
+/// Validate a transaction with the dust floor frozen from block pre-state.
+pub fn validate_transaction_with_dust(
+    state: &ChainState,
+    tx: &TransactionV1,
+    chain_id: &str,
+    block_nullifiers: &mut HashSet<Bytes32>,
+    block_input_utxos: &mut HashSet<Bytes32>,
+    current_height: u64,
+    dust_limit_spark: u64,
+) -> StateResult<()> {
+    if tx.inputs.is_empty() {
+        return Err(StateError::ZeroInputs);
+    }
+    if tx.outputs.is_empty() {
+        return Err(StateError::ZeroOutputs);
+    }
+    if tx.version.0 != TRANSACTION_PROTOCOL_VERSION {
+        return Err(StateError::UnsupportedTxVersion {
+            version: tx.version.0,
+        });
+    }
+    if tx.signature_module_id != 1 {
+        return Err(StateError::UnsupportedSignatureModule {
+            module_id: tx.signature_module_id,
+        });
+    }
+
+    let mut total_input_value = 0u64;
+    let mut owner_pubkey: Option<indra_core::types::crypto::HybridPubKey> = None;
+
+    for input in &tx.inputs {
+        if !block_input_utxos.insert(input.utxo_id) {
+            return Err(StateError::DuplicateUtxoSpend {
+                utxo_id: input.utxo_id,
+            });
+        }
+
+        // Duplicate nullifier within this transaction
+        if block_nullifiers.contains(&input.nullifier) {
+            return Err(StateError::DuplicateNullifier);
+        }
+
+        // Already spent in a previous block
+        if state.nullifiers.contains(&input.nullifier) {
+            return Err(StateError::DoubleSpend);
+        }
+
+        // Referenced UTXO must exist
+        let entry = state
+            .utxos
+            .get(&input.utxo_id)
+            .ok_or(StateError::UnknownUtxo)?;
+        total_input_value = total_input_value
+            .checked_add(entry.output.value_spark)
+            .ok_or(StateError::ValueOverflow)?;
+        match &owner_pubkey {
+            Some(existing) if existing != &entry.output.owner_pubkey => {
+                return Err(StateError::InvariantViolation {
+                    message: "all transaction inputs must belong to the same owner",
+                });
+            }
+            None => owner_pubkey = Some(entry.output.owner_pubkey.clone()),
+            _ => {}
+        }
+
+        // UTXO must be past its lock height
+        if entry.output.lock_height > current_height {
+            return Err(StateError::OutputLocked {
+                lock_height: entry.output.lock_height,
+                current_height,
+            });
+        }
+
+        block_nullifiers.insert(input.nullifier);
+    }
+
+    let owner_pubkey = owner_pubkey.ok_or(StateError::UnknownUtxo)?;
+    let crypto_pk = owner_pubkey
+        .to_crypto_pubkey()
+        .map_err(|reason| StateError::SignatureInvalid { reason })?;
+    let crypto_sig = tx
+        .signature
+        .to_crypto_sig()
+        .map_err(|reason| StateError::SignatureInvalid { reason })?;
+    let signing_bytes = tx.signing_bytes(chain_id);
+    verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk).map_err(|e| {
+        StateError::SignatureInvalid {
+            reason: e.to_string(),
+        }
+    })?;
+
+    // Fee check: fee_amount must cover base_fee × weight
+    let weight_kb = {
+        let bytes = tx.encode_to_vec().len() as u64;
+        bytes.div_ceil(1024)
+    };
+    let required_fee = state
+        .base_fee
+        .checked_mul(weight_kb)
+        .ok_or(StateError::ValueOverflow)?;
+    if tx.fee_amount < required_fee {
+        return Err(StateError::FeeTooLow {
+            actual: tx.fee_amount,
+            required: required_fee,
+        });
+    }
+
+    let total_output_value = tx
+        .outputs
+        .iter()
+        .try_fold(0u64, |acc, output| acc.checked_add(output.value_spark))
+        .ok_or(StateError::ValueOverflow)?;
+    let required_total = total_output_value
+        .checked_add(tx.fee_amount)
+        .ok_or(StateError::ValueOverflow)?;
+    if total_input_value != required_total {
+        return Err(StateError::InvariantViolation {
+            message: "transaction inputs must equal outputs plus fee",
+        });
+    }
+
+    for output in &tx.outputs {
+        if output.value_spark < dust_limit_spark {
+            return Err(StateError::InvariantViolation {
+                message: "transaction output below dust limit",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply one transaction's state changes.
+///
+/// Called only after validate_transaction has passed for all transactions.
+fn apply_transaction(
+    txn: &mut StateTxn<'_>,
+    tx: &TransactionV1,
+    height: u64,
+    tx_index: u32,
+) -> StateResult<()> {
+    for input in &tx.inputs {
+        if txn.spend_utxo(&input.utxo_id)?.is_none() {
+            return Err(StateError::InvariantViolation {
+                message: "attempted to spend an already-spent UTXO during apply_transaction",
+            });
+        }
+        txn.insert_nullifier(input.nullifier)?;
+    }
+
+    // Create outputs: insert new UTXOs
+    for (out_idx, output) in tx.outputs.iter().enumerate() {
+        txn.insert_utxo(output.clone(), height, tx_index, out_idx as u32)?;
+    }
+
+    let burn_amount = tx.fee_amount / 2;
+    let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
+    txn.apply_fee_accounting(burn_amount, validator_amount)?;
+
+    Ok(())
 }

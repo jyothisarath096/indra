@@ -27,10 +27,10 @@ OutputV1 still stores owner public-key data and value metadata in raw chain
 state. Anyone running a full node, operating an archive, or reading raw blocks
 directly can still inspect that data without using public RPC at all.
 
-That means INDRA's current owner-level transaction visibility is equivalent to
-Bitcoin-style transparent ownership metadata, with Pedersen commitments and
-Bulletproof range proofs providing cryptographic value-validation machinery but
-not full recipient/owner privacy against node-level observers.
+INDRA is therefore a transparent-amount, pseudonymous ledger. Ownership uses
+full hybrid public keys and monetary validity uses checked-`u64` conservation
+plus dust rules. Values and owners remain linkable in raw chain data, so amount
+correlation can deanonymize transaction flows even when users avoid key reuse.
 
 The previous broad “optional view keys” wording was inaccurate. This document
 corrects that claim; it does not remove a privacy guarantee that was actually

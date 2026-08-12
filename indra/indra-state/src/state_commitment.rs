@@ -404,7 +404,6 @@ pub(crate) fn delegator_identity_value_hash(
     pubkey.encode(&mut value);
     sha256(&value)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,16 +870,8 @@ mod tests {
         )
         .unwrap();
         let timing = UnbondingTimingV1::height_precise(301).unwrap();
-        let tranche = UnbondingTrancheV1::new(
-            position.position_id,
-            400,
-            indra_crypto::commit(400, &[9; 32]),
-            timing,
-            custody,
-            id(3),
-            0,
-        )
-        .unwrap();
+        let tranche =
+            UnbondingTrancheV1::new(position.position_id, 400, timing, custody, id(3), 0).unwrap();
         let position_leaf = stake_position_commitment_leaf(&position);
         let tranche_leaf = unbonding_tranche_commitment_leaf(&tranche);
         assert_ne!(position_leaf.0, tranche_leaf.0);
@@ -899,16 +890,8 @@ mod tests {
             stake_position_commitment_leaf(&changed_position),
             position_leaf
         );
-        let changed_tranche = UnbondingTrancheV1::new(
-            position.position_id,
-            401,
-            indra_crypto::commit(401, &[9; 32]),
-            timing,
-            custody,
-            id(3),
-            0,
-        )
-        .unwrap();
+        let changed_tranche =
+            UnbondingTrancheV1::new(position.position_id, 401, timing, custody, id(3), 0).unwrap();
         assert_ne!(
             unbonding_tranche_commitment_leaf(&changed_tranche),
             tranche_leaf

@@ -572,7 +572,6 @@ Vote flags:\n\
   Abstain by not submitting a reveal op."
     );
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,8 +664,8 @@ mod tests {
         let deposit_utxo_id = Bytes32::from([0xD1; 32]);
         let other_utxo_id = Bytes32::from([0xD2; 32]);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(deposit_utxo_id, 1_000_000, [0xA1; 32], 12, 0, 0);
-        wallet.add_utxo(other_utxo_id, 2_000_000, [0xA2; 32], 12, 0, 1);
+        wallet.add_utxo(deposit_utxo_id, 1_000_000, 12, 0, 0);
+        wallet.add_utxo(other_utxo_id, 2_000_000, 12, 0, 1);
         wallet.save(&wallet_path_str).unwrap();
 
         assert!(mark_governance_deposit_spent(&wallet_path_str, deposit_utxo_id).unwrap());

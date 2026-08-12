@@ -11,16 +11,15 @@
 
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1},
-    crypto::{CommitmentV1, HybridPubKey},
+    crypto::HybridPubKey,
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
         INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
     },
     transaction::OutputV1,
 };
-use indra_crypto::{commit, derive_genesis_utxo_blinding, prove_range, sha256};
+use indra_crypto::sha256;
 use indra_state::ChainState;
-use rand::{rngs::StdRng, SeedableRng};
 use serde::Deserialize;
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
@@ -407,28 +406,19 @@ fn load_genesis_validators_with_minimum(
                 "hybrid_pq_pk",
             )?),
         ) {
-            let blinding = derive_genesis_utxo_blinding(&validator_id.0);
-            let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
-            let mut rng = StdRng::from_seed(validator_id.0);
-            if let Ok(proof) = prove_range(GENESIS_VALIDATOR_UTXO_SPARK, &blinding, &mut rng) {
-                let output = OutputV1 {
-                    value_spark: GENESIS_VALIDATOR_UTXO_SPARK,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from(commitment.0),
-                    },
-                    owner_pubkey: HybridPubKey {
-                        classical_pk: Bytes32::from(classical_pk),
-                        pq_pk: VariableBytes::from_slice(&hybrid_pq_pk).unwrap_or_default(),
-                    },
-                    range_proof: VariableBytes::from_slice(&proof).unwrap_or_default(),
-                    lock_height: 0,
-                };
-                let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
-                eprintln!(
-                    "[genesis] created UTXO {} Spark for {}",
-                    GENESIS_VALIDATOR_UTXO_SPARK, name
-                );
-            }
+            let output = OutputV1 {
+                value_spark: GENESIS_VALIDATOR_UTXO_SPARK,
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from(classical_pk),
+                    pq_pk: VariableBytes::from_slice(&hybrid_pq_pk).unwrap_or_default(),
+                },
+                lock_height: 0,
+            };
+            let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
+            eprintln!(
+                "[genesis] created UTXO {} Spark for {}",
+                GENESIS_VALIDATOR_UTXO_SPARK, name
+            );
         }
         // NOTE: startup logging for node bootstrap; replace with structured tracing later.
         println!(
@@ -475,7 +465,6 @@ pub fn load_genesis_seed_peers(genesis_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_crypto::derive_genesis_utxo_blinding_from_classical_pk;
 
     fn valid_manifest() -> GenesisManifest {
         let validators = (0..4u8)
@@ -614,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn genesis_utxo_blinding_opens_loaded_genesis_commitment() {
+    fn genesis_utxo_uses_authoritative_public_value() {
         let classical_pk = [0x42u8; 32];
         let validator_id = Bytes32::from(sha256(&classical_pk));
         let pq_pk = vec![0x24u8; 2592];
@@ -669,8 +658,6 @@ mod tests {
             .all_entries()
             .find(|entry| entry.output.owner_pubkey.classical_pk.0 == classical_pk)
             .unwrap();
-        let blinding = derive_genesis_utxo_blinding_from_classical_pk(&classical_pk);
-        let commitment = commit(GENESIS_VALIDATOR_UTXO_SPARK, &blinding);
-        assert_eq!(entry.output.commitment.compressed_point.0, commitment.0);
+        assert_eq!(entry.output.value_spark, GENESIS_VALIDATOR_UTXO_SPARK);
     }
 }

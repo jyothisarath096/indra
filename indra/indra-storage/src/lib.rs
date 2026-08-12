@@ -22,7 +22,7 @@
 //! Phase 6 replaces flat files with a RocksDB backend for:
 //! - O(1) block lookup by hash
 //! - Persistent Merkle trie for state roots
-//! - UTXO set indexed by commitment
+//! - UTXO set indexed by canonical UTXO identifier
 //!
 //! ## Invariants
 //!

@@ -932,41 +932,35 @@ pub(crate) fn complex_mutation_checkpoint() -> StateResult<()> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn set_fail_after_mutation(target: Option<usize>) {
     FAIL_AFTER_MUTATION.with(|cell| cell.set(target));
     MUTATION_COUNT.with(|cell| cell.set(0));
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn mutation_count() -> usize {
     MUTATION_COUNT.with(std::cell::Cell::get)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::{
-        types::{
-            consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
-            crypto::HybridPubKey,
-            primitives::VariableBytes,
-            reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
-            stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
-        },
-        CommitmentV1,
+    use indra_core::types::{
+        consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
+        crypto::HybridPubKey,
+        primitives::VariableBytes,
+        reward_economic_snapshot::{RewardEconomicSnapshot, RewardEconomicValidatorEntry},
+        stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
     };
 
     fn test_output(byte: u8) -> OutputV1 {
         OutputV1 {
             value_spark: 1_000_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte; 32]),
-            },
             owner_pubkey: HybridPubKey {
                 classical_pk: Bytes32::from([byte; 32]),
                 pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
             },
-            range_proof: VariableBytes::from_slice(&[byte; 32]).unwrap(),
             lock_height: 0,
         }
     }

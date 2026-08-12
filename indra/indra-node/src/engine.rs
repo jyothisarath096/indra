@@ -1854,21 +1854,17 @@ mod tests {
         GovernanceActionType, GovernanceOpV2, GovernancePayload,
     };
     use indra_core::types::primitives::{
-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_RANGE_PROOF_BYTES,
-        TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, TRANSACTION_PROTOCOL_VERSION,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::stake_position::{
         ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1,
     };
-    use indra_core::types::staking::{StakeDepositProof, StakingOpBody};
+    use indra_core::types::staking::StakingOpBody;
     use indra_core::types::transaction::{InputV1, OutputV1, TransactionV1};
     use indra_core::types::vote::VoteStep;
-    use indra_core::CommitmentV1;
     use indra_core::VariableBytes;
-    use indra_crypto::{constants::ML_KEM_1024_CT_BYTES, PaymentBlindingNoteV1};
     use indra_state::{ValidatorEntry, ValidatorStatus};
-    use rand::{rngs::StdRng, SeedableRng};
 
     fn temp_dir(suffix: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -1999,7 +1995,6 @@ mod tests {
                     classical_pk: Bytes32::from([seed; 32]),
                     pq_pk: VariableBytes::from_slice(&[seed; 2592]).unwrap(),
                 },
-                deposit_proof: None,
             },
             nonce,
             signature: dummy_signature(),
@@ -2028,19 +2023,13 @@ mod tests {
             .proposal_deposit_spark
             .max(engine.state.governance.params.min_delegation_spark)
             .max(DUST_LIMIT_SPARK);
-        let blinding = [0; 32];
-        let commitment = indra_crypto::commit(value, &blinding);
         let deposit_utxo_id = engine
             .state
             .utxos
             .insert(
                 OutputV1 {
                     value_spark: value,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from(commitment.0),
-                    },
                     owner_pubkey: delegator_pubkey.clone(),
-                    range_proof: VariableBytes::from_slice(&[]).unwrap(),
                     lock_height: 0,
                 },
                 0,
@@ -2053,10 +2042,6 @@ mod tests {
                 validator_id,
                 deposit_utxo_id,
                 delegator_pubkey,
-                deposit_proof: Some(StakeDepositProof {
-                    committed_value_spark: value,
-                    blinding_factor: Bytes32::from(blinding),
-                }),
             },
             nonce: 1,
             signature: dummy_signature(),
@@ -2069,23 +2054,15 @@ mod tests {
         engine: &NodeEngine,
         utxo_id: Bytes32,
         owner: &HybridKeypair,
-        input_blinding: [u8; 32],
+        _input_blinding: [u8; 32],
         seed: u8,
     ) -> TransactionV1 {
         let input = engine.state.utxos.get(&utxo_id).unwrap().output.clone();
         let owner_pubkey = governance_pubkey_from_keypair(owner);
         let fee = engine.state.base_fee.saturating_mul(10);
         let output_value = input.value_spark.checked_sub(fee).unwrap();
-        assert_eq!(input_blinding, [0; 32]);
-        let output_blinding = [0; 32];
-        let fee_blinding = [0; 32];
-        let output_commitment = indra_crypto::commit(output_value, &output_blinding);
-        let mut rng = StdRng::from_seed([seed; 32]);
-        let range_proof =
-            indra_crypto::prove_range(output_value, &output_blinding, &mut rng).unwrap();
-        let fee_commitment = indra_crypto::commit(fee, &fee_blinding);
         let mut tx = TransactionV1 {
-            version: indra_core::ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            version: indra_core::ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id,
@@ -2093,27 +2070,10 @@ mod tests {
             }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::from(output_commitment.0),
-                },
                 owner_pubkey: owner_pubkey.clone(),
-                range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&range_proof)
-                    .unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: vec![PaymentBlindingNoteV1 {
-                version: 1,
-                owner_id: indra_crypto::sha256(&owner_pubkey.classical_pk.0),
-                payment_pubkey_hash: [0; 32],
-                sender_x25519_ephemeral_pk: [0; 32],
-                ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-                note_nonce: [0; 32],
-            }],
             fee_amount: fee,
-            fee_blinding: Bytes32::ZERO,
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(fee_commitment.0),
-            },
             signature: dummy_signature(),
         };
         let signature = owner
@@ -2206,14 +2166,9 @@ mod tests {
     }
 
     fn governance_deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
-        let commitment = indra_crypto::commit(value_spark, &[0; 32]);
         OutputV1 {
             value_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey,
-            range_proof: VariableBytes::from_slice(&[]).unwrap(),
             lock_height: 0,
         }
     }
@@ -4562,16 +4517,11 @@ mod tests {
             } => (*deposit_utxo_id, proposer_pubkey.clone()),
             _ => unreachable!(),
         };
-        let value = engine.state.governance.params.proposal_deposit_spark;
         let mut staking = StakingOp {
             body: StakingOpBody::Delegate {
                 validator_id,
                 deposit_utxo_id,
                 delegator_pubkey,
-                deposit_proof: Some(StakeDepositProof {
-                    committed_value_spark: value,
-                    blinding_factor: Bytes32::ZERO,
-                }),
             },
             nonce: 1,
             signature: dummy_signature(),

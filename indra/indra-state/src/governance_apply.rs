@@ -9,8 +9,7 @@ use indra_core::types::{
     primitives::Bytes32,
     transaction::OutputV1,
 };
-use indra_crypto::{commit, prove_range, sha256, verify_hybrid};
-use rand::{rngs::StdRng, SeedableRng};
+use indra_crypto::{sha256, verify_hybrid};
 
 use crate::{
     delegation::active_delegated_position_stake,
@@ -215,7 +214,13 @@ fn apply_propose(
     if state.governance.proposals.contains_key(&proposal_id) {
         return invalid("proposal already exists");
     }
-    let change_spark = deposit.output.value_spark.saturating_sub(required_deposit);
+    let change_spark = deposit
+        .output
+        .value_spark
+        .checked_sub(required_deposit)
+        .ok_or_else(|| StateError::InvalidGovernanceOp {
+            reason: "deposit value underflow".into(),
+        })?;
     let change_output = if change_spark > 0 {
         Some(governance_change_output(
             proposer_pubkey,
@@ -801,33 +806,11 @@ pub fn return_governance_deposit(
 fn governance_refund_output(
     owner: &HybridPubKey,
     amount_spark: u64,
-    proposal_id: Bytes32,
+    _proposal_id: Bytes32,
 ) -> StateResult<OutputV1> {
-    let blinding = sha256(
-        &[
-            b"governance-refund-blinding".as_slice(),
-            proposal_id.0.as_slice(),
-        ]
-        .concat(),
-    );
-    let commitment = commit(amount_spark, &blinding);
-    let mut rng = StdRng::from_seed(proposal_id.0);
-    let proof = prove_range(amount_spark, &blinding, &mut rng).map_err(|_| {
-        StateError::InvalidGovernanceOp {
-            reason: "failed to generate governance refund range proof".into(),
-        }
-    })?;
     Ok(OutputV1 {
         value_spark: amount_spark,
-        commitment: indra_core::types::crypto::CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey: owner.clone(),
-        range_proof: indra_core::VariableBytes::from_slice(&proof).map_err(|_| {
-            StateError::InvalidGovernanceOp {
-                reason: "governance refund range proof too large".into(),
-            }
-        })?,
         lock_height: 0,
     })
 }
@@ -835,39 +818,11 @@ fn governance_refund_output(
 fn governance_change_output(
     owner: &HybridPubKey,
     amount_spark: u64,
-    proposal_id: Bytes32,
+    _proposal_id: Bytes32,
 ) -> StateResult<OutputV1> {
-    let blinding = sha256(
-        &[
-            b"governance-deposit-change-blinding".as_slice(),
-            proposal_id.0.as_slice(),
-        ]
-        .concat(),
-    );
-    let commitment = commit(amount_spark, &blinding);
-    let mut rng = StdRng::from_seed(sha256(
-        &[
-            b"governance-deposit-change-proof".as_slice(),
-            proposal_id.0.as_slice(),
-        ]
-        .concat(),
-    ));
-    let proof = prove_range(amount_spark, &blinding, &mut rng).map_err(|_| {
-        StateError::InvalidGovernanceOp {
-            reason: "failed to generate governance change range proof".into(),
-        }
-    })?;
     Ok(OutputV1 {
         value_spark: amount_spark,
-        commitment: indra_core::types::crypto::CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey: owner.clone(),
-        range_proof: indra_core::VariableBytes::from_slice(&proof).map_err(|_| {
-            StateError::InvalidGovernanceOp {
-                reason: "governance change range proof too large".into(),
-            }
-        })?,
         lock_height: 0,
     })
 }
@@ -881,14 +836,13 @@ fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
         reason: reason.into(),
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use indra_core::{
         codec::Encode,
         types::{
-            crypto::{ColdHybridPubKey, CommitmentV1, HybridSignature},
+            crypto::{ColdHybridPubKey, HybridSignature},
             governance::{ColdGovernanceAuthorization, GovernableAction, GovernanceActionType},
             primitives::{
                 VariableBytes, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
@@ -1130,11 +1084,7 @@ mod tests {
     fn deposit_output(owner_pubkey: HybridPubKey, value_spark: u64) -> OutputV1 {
         OutputV1 {
             value_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
-            },
             owner_pubkey,
-            range_proof: VariableBytes::from_slice(&[]).unwrap(),
             lock_height: 0,
         }
     }

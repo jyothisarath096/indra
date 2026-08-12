@@ -4,8 +4,8 @@
 
 INDRA is a post-quantum Layer 1 blockchain written in Rust. It implements
 ML-DSA-87 + Ed25519 hybrid signatures, hybrid X25519 + ML-KEM-1024
-encrypted transport, OutputV1 value commitments and Bulletproof range
-proofs, BFT consensus with 6-second absolute
+encrypted transport, transparent checked-`u64` transaction amounts,
+BFT consensus with 6-second absolute
 finality, and on-chain five-phase commit-reveal governance.
 
 One billion INDRA. No new coins ever. No foundation. No pre-mine.
@@ -26,7 +26,7 @@ Finality:         Instant (BFT — no forks possible)
 Tx signatures:    Ed25519 + ML-DSA-87 (NIST FIPS 204, level 5)
 QC signatures:    ML-DSA-87 only (fully post-quantum)
 Transport:        X25519 + ML-KEM-1024 + ChaCha20-Poly1305 + ML-DSA-87
-Transactions:     OutputV1 value commitments + Bulletproofs; owner/value metadata still public
+Transactions:     Transparent amounts and pseudonymous hybrid-key ownership
 Era 1 reward:     11.892 INDRA/block (Year 1–4)
 Fee split:        50% burned / 50% to validators
 Consensus:        Proof of Stake (Tendermint-style BFT)
@@ -41,8 +41,7 @@ Language:         Rust
 ```
 indra/
 ├── indra-core/           Types, codec, primitives, protocol constants
-├── indra-crypto/         ML-DSA-87, Ed25519, ML-KEM-1024, VRF, Pedersen
-├── indra-bulletproofs/   Range proof implementation
+├── indra-crypto/         ML-DSA-87, Ed25519, ML-KEM-1024, VRF
 ├── indra-state/          State machine, UTXO set, epoch logic, governance
 ├── indra-consensus/      BFT consensus, mempool, proposer election
 ├── indra-network/        P2P networking, gossip, observer protocol
@@ -344,11 +343,11 @@ Supply direction:  Decreasing over time (fee burn)
 | QC finality proofs | ML-DSA-87 only | Yes |
 | Validator transport | X25519 + ML-KEM-1024 | Yes (hybrid) |
 | Block hashing | SHA-256 | Partial (Grover) |
-| Value commitments | Ristretto255 / Pedersen | Classical only |
+| Value conservation | Checked `u64` public arithmetic | Exact arithmetic invariant |
 
 Transaction ownership and consensus finality are fully post-quantum.
-Current OutputV1 owner/value metadata is public to raw-chain observers;
-RPC-based legacy address scans require ownership authorization. See the
+Current OutputV1 owner/value metadata is public to raw-chain observers and
+amount correlation can deanonymize flows. See the
 [whitepaper](docs/WHITEPAPER.md) Section 4 and [privacy status](docs/PRIVACY_STATUS.md).
 
 ---

@@ -5569,6 +5569,7 @@ impl Drop for RpcRequestMetricsGuard<'_> {
         );
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6932,18 +6933,11 @@ mod tests {
     fn snapshot_test_output(byte: u8) -> indra_core::types::transaction::OutputV1 {
         indra_core::types::transaction::OutputV1 {
             value_spark: 1_000_000,
-            commitment: indra_core::types::crypto::CommitmentV1 {
-                compressed_point: indra_core::Bytes32::from([byte; 32]),
-            },
             owner_pubkey: indra_core::types::crypto::HybridPubKey {
                 classical_pk: indra_core::Bytes32::from([byte.wrapping_add(1); 32]),
                 pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[byte; 32])
                     .unwrap_or_default(),
             },
-            range_proof: indra_core::types::primitives::VariableBytes::<
-                { indra_core::types::primitives::MAX_RANGE_PROOF_BYTES },
-            >::from_slice(&[byte; 32])
-            .unwrap_or_default(),
             lock_height: 0,
         }
     }
@@ -7001,7 +6995,7 @@ mod tests {
     fn snapshot_test_transaction(byte: u8) -> indra_core::types::transaction::TransactionV1 {
         indra_core::types::transaction::TransactionV1 {
             version: indra_core::ProtocolVersion(
-                indra_core::types::primitives::TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+                indra_core::types::primitives::TRANSACTION_PROTOCOL_VERSION,
             ),
             signature_module_id: 1,
             inputs: vec![indra_core::types::transaction::InputV1 {
@@ -7009,19 +7003,7 @@ mod tests {
                 nullifier: indra_core::Bytes32::from([byte.wrapping_add(1); 32]),
             }],
             outputs: vec![snapshot_test_output(byte.wrapping_add(2))],
-            payment_notes: vec![indra_crypto::PaymentBlindingNoteV1 {
-                version: 1,
-                owner_id: indra_crypto::sha256(&[byte.wrapping_add(1); 32]),
-                payment_pubkey_hash: [0; 32],
-                sender_x25519_ephemeral_pk: [0; 32],
-                ml_kem_1024_ciphertext: [0; indra_crypto::constants::ML_KEM_1024_CT_BYTES],
-                note_nonce: [0; 32],
-            }],
             fee_amount: 500,
-            fee_blinding: indra_core::Bytes32::from([byte.wrapping_add(3); 32]),
-            fee_commitment: indra_core::types::crypto::CommitmentV1 {
-                compressed_point: indra_core::Bytes32::from([byte.wrapping_add(4); 32]),
-            },
             signature: indra_core::types::crypto::HybridSignature {
                 classical_sig: indra_core::types::primitives::VariableBytes::from_slice(
                     &[byte.wrapping_add(5); 64],

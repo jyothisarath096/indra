@@ -101,21 +101,6 @@ int32_t indra_key_handle_public(
     IndraPublicKeyInfo* out_public
 );
 
-int32_t indra_payment_keygen(
-    uint8_t* out_keypair,
-    uint8_t* out_pubkey
-);
-
-int32_t indra_key_handle_payment_pubkey(
-    IndraKeyHandle handle,
-    uint8_t* out_pubkey
-);
-
-int32_t indra_key_handle_payment_keypair(
-    IndraKeyHandle handle,
-    uint8_t* out_keypair
-);
-
 int32_t indra_destroy_key_handle(IndraKeyHandle handle);
 int32_t indra_destroy_all_key_handles(void);
 
@@ -133,37 +118,6 @@ int32_t indra_build_tx_with_handle(
     IndraTxResult* out
 );
 
-int32_t indra_derive_payment_note(
-    const uint8_t* payment_pubkey,
-    const uint8_t* owner_id,
-    const char* chain_id,
-    uint32_t output_index,
-    uint64_t value_spark,
-    uint64_t lock_height,
-    uint8_t* out_note,
-    uint8_t* out_blinding
-);
-
-int32_t indra_recover_payment_blinding(
-    const uint8_t* payment_keypair,
-    const uint8_t* note,
-    const char* chain_id,
-    uint32_t output_index,
-    uint64_t value_spark,
-    uint64_t lock_height,
-    uint8_t* out_blinding
-);
-
-int32_t indra_recover_payment_blinding_with_handle(
-    IndraKeyHandle handle,
-    const uint8_t* note,
-    const char* chain_id,
-    uint32_t output_index,
-    uint64_t value_spark,
-    uint64_t lock_height,
-    uint8_t* out_blinding
-);
-
 int32_t indra_tx_to_hex(
     const uint8_t* tx_bytes,
     size_t tx_bytes_len,
@@ -171,22 +125,9 @@ int32_t indra_tx_to_hex(
     size_t out_hex_len
 );
 
-int32_t indra_genesis_utxo_blinding(
-    const uint8_t* classical_pk,
-    uint8_t* out_blinding
-);
-
-int32_t indra_verify_range_proof(
-    const uint8_t* commitment_bytes,
-    const uint8_t* proof_bytes,
-    size_t proof_len
-);
-
 int32_t indra_build_register_validator_with_handle(
     uint32_t commission_bps,
     const uint8_t* deposit_utxo_id,
-    uint64_t bond_value_spark,
-    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -196,8 +137,6 @@ int32_t indra_build_register_validator_with_handle(
 
 int32_t indra_build_self_stake_with_handle(
     const uint8_t* deposit_utxo_id,
-    uint64_t bond_value_spark,
-    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -208,8 +147,6 @@ int32_t indra_build_self_stake_with_handle(
 int32_t indra_build_delegate_with_handle(
     const uint8_t* validator_id,
     const uint8_t* deposit_utxo_id,
-    uint64_t bond_value_spark,
-    const uint8_t* deposit_blinding_factor,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,

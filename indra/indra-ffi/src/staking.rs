@@ -10,7 +10,6 @@ use indra_cli::tx_builder::{
     build_set_auto_delegate_op, build_set_commission_op,
 };
 use indra_core::types::primitives::Bytes32;
-use indra_core::types::staking::StakeDepositProof;
 use indra_crypto::hybrid::HybridKeypair;
 
 use crate::{bounded_cstr, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES};
@@ -19,19 +18,6 @@ pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(std::slice::from_raw_parts(ptr, 32));
     out
-}
-
-pub(crate) unsafe fn read_staking_deposit_proof(
-    bond_value_spark: u64,
-    deposit_blinding_factor: *const u8,
-) -> StakeDepositProof {
-    let mut blinding = read_bytes32(deposit_blinding_factor);
-    let proof = StakeDepositProof {
-        committed_value_spark: bond_value_spark,
-        blinding_factor: Bytes32::from(blinding),
-    };
-    blinding.fill(0);
-    proof
 }
 
 pub(crate) unsafe fn read_chain_id(chain_id: *const c_char) -> Result<String, IndraError> {
@@ -92,15 +78,13 @@ struct StakingHandleArgs {
 pub unsafe extern "C" fn indra_build_register_validator_with_handle(
     commission_bps: u32,
     deposit_utxo_id: *const u8,
-    bond_value_spark: u64,
-    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
+    if deposit_utxo_id.is_null() {
         return IndraError::NullPointer.code();
     }
     if commission_bps > 10_000 {
@@ -116,9 +100,8 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
         },
         |keypair, _validator_id, nonce, chain| {
             let bond = Bytes32::from(read_bytes32(deposit_utxo_id));
-            let proof = read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor);
             let vrf = handles::public_info(handle)?.vrf_pk;
-            build_register_validator_op(commission_bps, bond, proof, keypair, vrf, nonce, chain)
+            build_register_validator_op(commission_bps, bond, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
         },
@@ -128,15 +111,13 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake_with_handle(
     deposit_utxo_id: *const u8,
-    bond_value_spark: u64,
-    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
+    if deposit_utxo_id.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_handle(
@@ -150,7 +131,6 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
         |keypair, _validator_id, nonce, chain| {
             build_self_stake_op(
                 Bytes32::from(read_bytes32(deposit_utxo_id)),
-                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,
@@ -165,15 +145,13 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
 pub unsafe extern "C" fn indra_build_delegate_with_handle(
     validator_id: *const u8,
     deposit_utxo_id: *const u8,
-    bond_value_spark: u64,
-    deposit_blinding_factor: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if validator_id.is_null() || deposit_utxo_id.is_null() || deposit_blinding_factor.is_null() {
+    if validator_id.is_null() || deposit_utxo_id.is_null() {
         return IndraError::NullPointer.code();
     }
     build_with_handle(
@@ -188,7 +166,6 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
             build_delegate_op(
                 Bytes32::from(read_bytes32(validator_id)),
                 Bytes32::from(read_bytes32(deposit_utxo_id)),
-                read_staking_deposit_proof(bond_value_spark, deposit_blinding_factor),
                 keypair,
                 nonce,
                 chain,

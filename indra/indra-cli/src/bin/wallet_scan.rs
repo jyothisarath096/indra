@@ -10,7 +10,6 @@ use indra_core::types::{
     crypto::HybridPubKey,
     primitives::{Bytes32, VariableBytes},
 };
-use indra_crypto::PaymentKeypairV1;
 
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
 
@@ -50,9 +49,11 @@ fn main() {
     println!("Existing wallet balance: {} Spark", wallet.balance());
 
     if let Some(utxo_spec) = add_utxo {
-        let parts: Vec<&str> = utxo_spec.splitn(6, ':').collect();
-        if parts.len() < 3 {
-            eprintln!("Error: --add-utxo format: <utxo_id>:<value_spark>:<blinding_hex>[:<height>:<tx_idx>:<out_idx>]");
+        let parts: Vec<&str> = utxo_spec.splitn(5, ':').collect();
+        if parts.len() < 2 {
+            eprintln!(
+                "Error: --add-utxo format: <utxo_id>:<value_spark>[:<height>:<tx_idx>:<out_idx>]"
+            );
             std::process::exit(1);
         }
 
@@ -64,25 +65,19 @@ fn main() {
             eprintln!("Error: bad value");
             std::process::exit(1);
         });
-        let blinding_bytes = hex::decode(parts[2]).unwrap_or_else(|_| {
-            eprintln!("Error: bad blinding hex");
-            std::process::exit(1);
-        });
-        if utxo_id_bytes.len() != 32 || blinding_bytes.len() != 32 {
-            eprintln!("Error: utxo_id and blinding must be 32 bytes each");
+        if utxo_id_bytes.len() != 32 {
+            eprintln!("Error: utxo_id must be 32 bytes");
             std::process::exit(1);
         }
 
-        let height: u64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let tx_idx: u32 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let out_idx: u32 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let height: u64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let tx_idx: u32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let out_idx: u32 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut id_arr = [0u8; 32];
-        let mut bl_arr = [0u8; 32];
         id_arr.copy_from_slice(&utxo_id_bytes);
-        bl_arr.copy_from_slice(&blinding_bytes);
         let utxo_id = Bytes32::from(id_arr);
 
-        wallet.add_utxo(utxo_id, value, bl_arr, height, tx_idx, out_idx);
+        wallet.add_utxo(utxo_id, value, height, tx_idx, out_idx);
         wallet.save(&wallet_path).unwrap_or_else(|e| {
             eprintln!("Error saving wallet: {}", e);
             std::process::exit(1);
@@ -97,17 +92,6 @@ fn main() {
     }
 
     println!("\\nScanning canonical blocks locally...");
-    let payment_keys = keys.payment_keypairs().cloned().collect::<Vec<_>>();
-    if payment_keys.is_empty() {
-        eprintln!("Error: canonical keystore contains no payment keys");
-        std::process::exit(1);
-    }
-    wallet.set_payment_key_hashes(
-        payment_keys
-            .iter()
-            .map(|keypair| keypair.public_key().hash())
-            .collect(),
-    );
     let owner_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
         pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
@@ -115,7 +99,7 @@ fn main() {
             std::process::exit(1);
         }),
     };
-    match scan_canonical_blocks(&node_url, &mut wallet, &payment_keys, &[owner_pubkey]) {
+    match scan_canonical_blocks(&node_url, &mut wallet, &[owner_pubkey]) {
         Ok(discovered) => {
             wallet.save(&wallet_path).unwrap_or_else(|error| {
                 eprintln!("Error saving wallet: {error}");
@@ -139,8 +123,7 @@ fn main() {
 fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut indra_cli::Wallet,
-    payment_keys: &[PaymentKeypairV1],
     owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
-    indra_cli::scan_canonical_blocks(node_url, wallet, payment_keys, owner_pubkeys)
+    indra_cli::scan_canonical_blocks(node_url, wallet, owner_pubkeys)
 }

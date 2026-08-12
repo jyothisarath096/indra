@@ -5,16 +5,15 @@
 //! contains StakingOp entries.
 
 use indra_core::types::{
-    crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
+    crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
+        Bytes32, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
         MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-        MIN_COMMISSION_BPS, STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        MIN_COMMISSION_BPS, STAKING_TX_IDX,
     },
-    staking::{validate_network_addr_string, StakeDepositProof, StakingOp, StakingOpBody},
+    staking::{validate_network_addr_string, StakingOp, StakingOpBody},
     transaction::OutputV1,
 };
-use rand::SeedableRng;
 
 use crate::{
     chain::ChainState,
@@ -298,16 +297,13 @@ fn apply_staking_op_mode(
             validator_id,
             deposit_utxo_id,
             delegator_pubkey,
-            deposit_proof,
         } => apply_delegate(
             state,
             validator_id,
             *deposit_utxo_id,
             delegator_pubkey,
-            deposit_proof.as_ref(),
             current_height,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
-            verify_crypto,
         ),
         StakingOpBody::ExitStakePosition { .. } => {
             crate::stake_positions::exit_stake_position(state, op, current_height).map(|_| ())
@@ -322,7 +318,6 @@ fn apply_staking_op_mode(
             deposit_utxo_id,
             validator_pubkey,
             vrf_pk,
-            deposit_proof,
             cold_pubkey,
             ..
         } => apply_register_validator(
@@ -331,10 +326,8 @@ fn apply_staking_op_mode(
             *deposit_utxo_id,
             validator_pubkey,
             *vrf_pk,
-            deposit_proof.as_ref(),
             cold_pubkey,
             current_height,
-            verify_crypto,
         ),
         StakingOpBody::SetCommission {
             validator_id,
@@ -355,16 +348,13 @@ fn apply_staking_op_mode(
         StakingOpBody::SelfStake {
             deposit_utxo_id,
             validator_pubkey,
-            deposit_proof,
             ..
         } => apply_self_stake(
             state,
             *deposit_utxo_id,
             validator_pubkey,
-            deposit_proof.as_ref(),
             current_height,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
-            verify_crypto,
         ),
         StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
     };
@@ -575,66 +565,14 @@ fn verify_staking_sig(
     })
 }
 
-/// Verify that a stake-deposit opening proof correctly opens the source UTXO
-/// commitment to its public `value_spark`.
-///
-/// This must be called before spending the UTXO so a failed proof leaves
-/// spendable state untouched.
-pub fn validate_staking_deposit_proof(
-    output: &OutputV1,
-    proof: &StakeDepositProof,
-) -> StateResult<()> {
-    use indra_crypto::{verify_opening, PedersenCommitment, PedersenOpening};
-
-    let opening = PedersenOpening {
-        value: proof.committed_value_spark,
-        blinding: proof.blinding_factor.0,
-    };
-    verify_opening(
-        &PedersenCommitment(output.commitment.compressed_point.0),
-        &opening,
-    )
-    .map_err(|_| StateError::StakeDepositCommitmentMismatch)?;
-
-    if proof.committed_value_spark != output.value_spark {
-        return Err(StateError::StakeDepositValueMismatch {
-            public_value: output.value_spark,
-            committed_value: proof.committed_value_spark,
-        });
-    }
-
-    Ok(())
-}
-
-fn require_and_validate_deposit_proof(
-    _current_height: u64,
-    output: &OutputV1,
-    proof: Option<&StakeDepositProof>,
-    verify_crypto: bool,
-) -> StateResult<()> {
-    match proof {
-        Some(proof) if verify_crypto => validate_staking_deposit_proof(output, proof),
-        Some(proof) if proof.committed_value_spark != output.value_spark => {
-            Err(StateError::StakeDepositValueMismatch {
-                public_value: output.value_spark,
-                committed_value: proof.committed_value_spark,
-            })
-        }
-        Some(_) => Ok(()),
-        None => Err(StateError::DepositProofRequired),
-    }
-}
-
 fn apply_register_validator(
     state: &mut ChainState,
     commission_bps: u32,
     deposit_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
-    deposit_proof: Option<&StakeDepositProof>,
     cold_pubkey: &ColdHybridPubKey,
     current_height: u64,
-    verify_crypto: bool,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
@@ -721,18 +659,7 @@ fn apply_register_validator(
             "registration bond UTXO is not owned by the proposed cold hybrid key".into(),
         ));
     }
-    require_and_validate_deposit_proof(
-        current_height,
-        &utxo_entry.output,
-        deposit_proof,
-        verify_crypto,
-    )?;
-
-    // Bond amount is taken from output.value_spark (public metadata field).
-    // This field is not individually proven to match the Pedersen commitment;
-    // the transaction-level aggregate balance equation prevents total-value
-    // inflation, but individual output commitment binding is not enforced here.
-    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
+    // Principal is derived exclusively from the referenced, custody-checked UTXO.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < MINIMUM_VALIDATOR_SELF_STAKE_SPARK {
         return Err(StateError::InvalidStakingOp(format!(
@@ -783,9 +710,6 @@ fn apply_register_validator(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         commitment.put_validator(&entry, current_height);
     }
-    let proof = deposit_proof.ok_or_else(|| {
-        StateError::InvalidStakingOp("registration position requires a bond opening".into())
-    })?;
     crate::stake_positions::deposit_stake_position(
         state,
         validator_id,
@@ -794,10 +718,6 @@ fn apply_register_validator(
             validator_id,
         },
         deposit_utxo_id,
-        crate::stake_positions::PositionDepositOpeningV1 {
-            principal_spark: amount_spark,
-            blinding: proof.blinding_factor.0,
-        },
         current_height,
     )?;
     check_or_insert_validator_identity(state, &validator_id, validator_pubkey)?;
@@ -1002,10 +922,8 @@ fn apply_delegate(
     validator_id: &Bytes32,
     deposit_utxo_id: Bytes32,
     delegator_pubkey: &HybridPubKey,
-    deposit_proof: Option<&StakeDepositProof>,
     current_height: u64,
     bond_count_cap: Option<usize>,
-    verify_crypto: bool,
 ) -> StateResult<()> {
     let validator = state
         .validators
@@ -1037,18 +955,7 @@ fn apply_delegate(
     }
     let identity_outcome = resolve_and_check_identity(&delegator_id, delegator_pubkey, state)
         .map_err(identity_error_to_state_error)?;
-    require_and_validate_deposit_proof(
-        current_height,
-        &utxo_entry.output,
-        deposit_proof,
-        verify_crypto,
-    )?;
-
-    // Bond amount is taken from output.value_spark (public metadata field).
-    // This field is not individually proven to match the Pedersen commitment;
-    // the transaction-level aggregate balance equation prevents total-value
-    // inflation, but individual output commitment binding is not enforced here.
-    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
+    // Principal is derived exclusively from the referenced, custody-checked UTXO.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < min_delegation {
         return Err(StateError::InvalidStakingOp(format!(
@@ -1057,19 +964,12 @@ fn apply_delegate(
         )));
     }
 
-    let proof = deposit_proof.ok_or_else(|| {
-        StateError::InvalidStakingOp("position deposit requires a bond opening".into())
-    })?;
     crate::stake_positions::deposit_stake_position(
         state,
         *validator_id,
         delegator_id,
         indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity { delegator_id },
         deposit_utxo_id,
-        crate::stake_positions::PositionDepositOpeningV1 {
-            principal_spark: amount_spark,
-            blinding: proof.blinding_factor.0,
-        },
         current_height,
     )?;
 
@@ -1120,10 +1020,8 @@ fn apply_self_stake(
     state: &mut ChainState,
     deposit_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
-    deposit_proof: Option<&StakeDepositProof>,
     current_height: u64,
     bond_count_cap: Option<usize>,
-    verify_crypto: bool,
 ) -> StateResult<()> {
     let validator_id = pubkey_to_id(validator_pubkey);
     let validator = state
@@ -1151,18 +1049,7 @@ fn apply_self_stake(
             "self-stake UTXO is not owned by the validator's cold key".into(),
         ));
     }
-    require_and_validate_deposit_proof(
-        current_height,
-        &utxo_entry.output,
-        deposit_proof,
-        verify_crypto,
-    )?;
-
-    // Bond amount is taken from output.value_spark (public metadata field).
-    // This field is not individually proven to match the Pedersen commitment;
-    // the transaction-level aggregate balance equation prevents total-value
-    // inflation, but individual output commitment binding is not enforced here.
-    // See: docs/SECURITY_AUDIT_PHASE4.md ST-03 and Phase 2 T-08.
+    // Principal is derived exclusively from the referenced, custody-checked UTXO.
     let amount_spark = utxo_entry.output.value_spark;
     if amount_spark < DUST_LIMIT_SPARK {
         return Err(StateError::InvalidStakingOp(format!(
@@ -1171,9 +1058,6 @@ fn apply_self_stake(
         )));
     }
 
-    let proof = deposit_proof.ok_or_else(|| {
-        StateError::InvalidStakingOp("self-position deposit requires a bond opening".into())
-    })?;
     crate::stake_positions::deposit_stake_position(
         state,
         validator_id,
@@ -1182,10 +1066,6 @@ fn apply_self_stake(
             validator_id,
         },
         deposit_utxo_id,
-        crate::stake_positions::PositionDepositOpeningV1 {
-            principal_spark: amount_spark,
-            blinding: proof.blinding_factor.0,
-        },
         current_height,
     )?;
     let mut updated_validator = None;
@@ -1337,26 +1217,9 @@ fn apply_claim_rewards(
         }
     }
 
-    let mut blinding_input = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
-    blinding_input.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
-    blinding_input.extend_from_slice(&validator_id.0);
-    blinding_input.extend_from_slice(&delegator_id.0);
-    blinding_input.extend_from_slice(&current_height.to_le_bytes());
-    let blinding = indra_crypto::sha256(&blinding_input);
-    let commitment = indra_crypto::commit(claimed, &blinding);
-    let mut rng = rand::rngs::StdRng::from_seed(blinding);
-    let proof = indra_crypto::prove_range(claimed, &blinding, &mut rng).map_err(|_| {
-        StateError::InvalidStakingOp("failed to generate range proof for reward UTXO".into())
-    })?;
-
     let output = OutputV1 {
         value_spark: claimed,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey: payout_pubkey,
-        range_proof: VariableBytes::from_slice(&proof)
-            .map_err(|_| StateError::InvalidStakingOp("range proof too large".into()))?,
         lock_height: 0,
     };
 
@@ -1560,7 +1423,6 @@ fn pubkey_to_id(pubkey: &indra_core::types::crypto::HybridPubKey) -> Bytes32 {
     let hash = indra_crypto::sha256(&pubkey.classical_pk.0);
     Bytes32::from(hash)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1569,16 +1431,11 @@ mod tests {
         validator::{ValidatorEntry, ValidatorStatus},
     };
     use indra_core::types::{
-        crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
+        crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
         primitives::VariableBytes,
         transaction::OutputV1,
     };
-    use indra_crypto::{
-        commit,
-        hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
-        prove_range,
-    };
-    use rand::{rngs::StdRng, SeedableRng};
+    use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
     fn keypair(seed: u8) -> HybridKeypair {
         HybridKeypair::new(
@@ -1617,40 +1474,12 @@ mod tests {
         }
     }
 
-    fn test_output(value_spark: u64, owner_pubkey: HybridPubKey, seed: u8) -> OutputV1 {
-        let blinding = [seed; 32];
-        let commitment = commit(value_spark, &blinding);
-        let mut rng = StdRng::from_seed([seed; 32]);
-        let proof = prove_range(value_spark, &blinding, &mut rng).unwrap();
+    fn test_output(value_spark: u64, owner_pubkey: HybridPubKey, _seed: u8) -> OutputV1 {
         OutputV1 {
             value_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey,
-            range_proof: VariableBytes::from_slice(&proof).unwrap(),
             lock_height: 0,
         }
-    }
-
-    fn deposit_proof(value_spark: u64, seed: u8) -> StakeDepositProof {
-        StakeDepositProof {
-            committed_value_spark: value_spark,
-            blinding_factor: Bytes32::from([seed; 32]),
-        }
-    }
-
-    fn proof_for_bond_utxo(state: &ChainState, deposit_utxo_id: Bytes32) -> StakeDepositProof {
-        let Some(entry) = state.utxos.get(&deposit_utxo_id) else {
-            return deposit_proof(0, 0);
-        };
-        for seed in 0u8..=u8::MAX {
-            let candidate = commit(entry.output.value_spark, &[seed; 32]);
-            if candidate.0 == entry.output.commitment.compressed_point.0 {
-                return deposit_proof(entry.output.value_spark, seed);
-            }
-        }
-        deposit_proof(entry.output.value_spark, 0)
     }
 
     fn insert_delegator_utxo(
@@ -1678,78 +1507,6 @@ mod tests {
     ) -> Bytes32 {
         let cold = derived_test_cold_keypair_from_classical(&hot_pubkey.classical_pk.0);
         insert_delegator_utxo(state, pubkey_from_keypair(&cold), value_spark, seed)
-    }
-
-    fn insert_self_stake_utxo(
-        state: &mut ChainState,
-        hot_pubkey: HybridPubKey,
-        value_spark: u64,
-        seed: u8,
-    ) -> Bytes32 {
-        insert_registration_utxo(state, hot_pubkey, value_spark, seed)
-    }
-
-    fn insert_mismatched_public_value_utxo(
-        state: &mut ChainState,
-        owner_pubkey: HybridPubKey,
-        public_value_spark: u64,
-        committed_value_spark: u64,
-        seed: u8,
-    ) -> Bytes32 {
-        let blinding = [seed; 32];
-        let commitment = commit(committed_value_spark, &blinding);
-        let mut rng = StdRng::from_seed([seed; 32]);
-        let proof = prove_range(committed_value_spark, &blinding, &mut rng).unwrap();
-        state
-            .utxos
-            .insert(
-                OutputV1 {
-                    value_spark: public_value_spark,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from(commitment.0),
-                    },
-                    owner_pubkey,
-                    range_proof: VariableBytes::from_slice(&proof).unwrap(),
-                    lock_height: 0,
-                },
-                1,
-                0,
-                seed as u32,
-            )
-            .unwrap()
-    }
-
-    fn insert_mismatched_self_stake_utxo(
-        state: &mut ChainState,
-        hot_pubkey: HybridPubKey,
-        public_value_spark: u64,
-        committed_value_spark: u64,
-        seed: u8,
-    ) -> Bytes32 {
-        let cold = derived_test_cold_keypair_from_classical(&hot_pubkey.classical_pk.0);
-        insert_mismatched_public_value_utxo(
-            state,
-            pubkey_from_keypair(&cold),
-            public_value_spark,
-            committed_value_spark,
-            seed,
-        )
-    }
-
-    fn insert_mismatched_registration_utxo(
-        state: &mut ChainState,
-        hot_pubkey: HybridPubKey,
-        public_value_spark: u64,
-        committed_value_spark: u64,
-        seed: u8,
-    ) -> Bytes32 {
-        insert_mismatched_self_stake_utxo(
-            state,
-            hot_pubkey,
-            public_value_spark,
-            committed_value_spark,
-            seed,
-        )
     }
 
     fn dummy_signature() -> HybridSignature {
@@ -1892,7 +1649,7 @@ mod tests {
         nonce: u64,
         chain_id: &str,
         vrf_pk: [u8; 32],
-        bond_seed: u8,
+        _bond_seed: u8,
     ) -> StakingOp {
         let mut op = StakingOp {
             body: StakingOpBody::RegisterValidator {
@@ -1900,7 +1657,6 @@ mod tests {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(hot_keypair),
                 vrf_pk,
-                deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK, bond_seed)),
                 cold_pubkey: cold_pubkey_from_keypair(cold_keypair),
                 cold_signature: dummy_signature(),
             },
@@ -2016,33 +1772,6 @@ mod tests {
         state.validators.upsert(entry).unwrap();
     }
 
-    #[test]
-    fn staking_deposit_proof_accepts_correct_opening() {
-        let owner = pubkey_from_keypair(&keypair(0xE1));
-        let output = test_output(1_000, owner, 0xE1);
-        assert!(validate_staking_deposit_proof(&output, &deposit_proof(1_000, 0xE1)).is_ok());
-    }
-
-    #[test]
-    fn staking_deposit_proof_rejects_wrong_blinding() {
-        let owner = pubkey_from_keypair(&keypair(0xE2));
-        let output = test_output(1_000, owner, 0xE2);
-        assert_eq!(
-            validate_staking_deposit_proof(&output, &deposit_proof(1_000, 0xE3)),
-            Err(StateError::StakeDepositCommitmentMismatch)
-        );
-    }
-
-    #[test]
-    fn staking_deposit_proof_rejects_committed_value_mismatch() {
-        let owner = pubkey_from_keypair(&keypair(0xE4));
-        let output = test_output(1_000, owner, 0xE4);
-        assert_eq!(
-            validate_staking_deposit_proof(&output, &deposit_proof(999, 0xE4)),
-            Err(StateError::StakeDepositCommitmentMismatch)
-        );
-    }
-
     fn delegate_op(
         state: &ChainState,
         validator_id: Bytes32,
@@ -2050,13 +1779,11 @@ mod tests {
         delegator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let deposit_proof = proof_for_bond_utxo(state, deposit_utxo_id);
         signed_op(
             StakingOpBody::Delegate {
                 validator_id,
                 deposit_utxo_id,
                 delegator_pubkey: pubkey_from_keypair(delegator_keypair),
-                deposit_proof: Some(deposit_proof),
             },
             nonce,
             delegator_keypair,
@@ -2070,12 +1797,10 @@ mod tests {
         validator_keypair: &HybridKeypair,
         nonce: u64,
     ) -> StakingOp {
-        let deposit_proof = proof_for_bond_utxo(state, deposit_utxo_id);
         signed_op(
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
-                deposit_proof: Some(deposit_proof),
                 cold_authorization: None,
             },
             nonce,
@@ -2120,75 +1845,6 @@ mod tests {
             validator_keypair,
             &state.chain_id,
         )
-    }
-
-    #[test]
-    fn delegate_without_proof_fails_at_activation() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = make_active_validator(&mut state, 0x01);
-        let delegator_keypair = keypair(0x02);
-        let pubkey = pubkey_from_keypair(&delegator_keypair);
-        let deposit_utxo_id = insert_delegator_utxo(&mut state, pubkey, 1_000_000, 0x18);
-
-        let op = signed_op(
-            StakingOpBody::Delegate {
-                validator_id,
-                deposit_utxo_id,
-                delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                deposit_proof: None,
-            },
-            1,
-            &delegator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::DepositProofRequired)
-        );
-        assert!(state.utxos.contains(&deposit_utxo_id));
-    }
-
-    #[test]
-    fn register_validator_rejects_mismatched_public_value_commitment() {
-        let mut state = ChainState::new_genesis();
-        let validator_keypair = keypair(0x20);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let validator_id = pubkey_to_id(&validator_pubkey);
-        let deposit_utxo_id = insert_mismatched_registration_utxo(
-            &mut state,
-            validator_pubkey.clone(),
-            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-            MINIMUM_VALIDATOR_SELF_STAKE_SPARK / 2,
-            0x21,
-        );
-
-        let op = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                deposit_utxo_id,
-                validator_pubkey,
-                vrf_pk: [0x20; 32],
-                deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK / 2, 0x21)),
-                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
-                    &validator_keypair,
-                )),
-                cold_signature: dummy_signature(),
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::StakeDepositValueMismatch {
-                public_value: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-                committed_value: MINIMUM_VALIDATOR_SELF_STAKE_SPARK / 2,
-            })
-        );
-        assert!(state.utxos.contains(&deposit_utxo_id));
-        assert!(state.validators.get(&validator_id).is_none());
     }
 
     #[test]
@@ -2288,7 +1944,6 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: attacker_pubkey,
-                deposit_proof: Some(deposit_proof(2_000_000, 0x54)),
                 cold_authorization: None,
             },
             1,
@@ -2334,56 +1989,6 @@ mod tests {
                 if message.contains("validator identity registry pubkey mismatch")
         ));
         assert_eq!(state, before);
-    }
-
-    #[test]
-    fn self_stake_without_proof_fails_at_activation() {
-        let mut state = ChainState::new_genesis();
-        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let deposit_utxo_id = insert_self_stake_utxo(&mut state, pubkey.clone(), 2_000_000, 0x3B);
-        let op = signed_op(
-            StakingOpBody::SelfStake {
-                deposit_utxo_id,
-                validator_pubkey: pubkey,
-                deposit_proof: None,
-                cold_authorization: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::DepositProofRequired)
-        );
-        assert!(state.utxos.contains(&deposit_utxo_id));
-    }
-
-    #[test]
-    fn self_stake_mismatch_does_not_spend_utxo() {
-        let mut state = ChainState::new_genesis();
-        let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
-        let pubkey = pubkey_from_keypair(&validator_keypair);
-        let deposit_utxo_id = insert_self_stake_utxo(&mut state, pubkey.clone(), 2_000_000, 0x3C);
-        let op = signed_op(
-            StakingOpBody::SelfStake {
-                deposit_utxo_id,
-                validator_pubkey: pubkey,
-                deposit_proof: Some(deposit_proof(2_000_000, 0x3D)),
-                cold_authorization: None,
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::StakeDepositCommitmentMismatch)
-        );
-        assert!(state.utxos.contains(&deposit_utxo_id));
     }
 
     #[test]
@@ -2456,7 +2061,6 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey,
-                deposit_proof: Some(deposit_proof(2_000_000, 0x36)),
                 cold_authorization: None,
             },
             1,
@@ -2480,7 +2084,6 @@ mod tests {
                 validator_id,
                 deposit_utxo_id: Bytes32::from([0x31; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                deposit_proof: None,
             },
             5,
             &delegator_keypair,
@@ -2526,7 +2129,6 @@ mod tests {
                 validator_id,
                 deposit_utxo_id: Bytes32::from([0x32; 32]),
                 delegator_pubkey: pubkey_from_keypair(&delegator_keypair),
-                deposit_proof: None,
             },
             1,
             &wrong_keypair,
@@ -2563,7 +2165,6 @@ mod tests {
                 deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk: [0xB2; 32],
-                deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK, 0xB2)),
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2776,7 +2377,6 @@ mod tests {
                 deposit_utxo_id: Bytes32::from([0xFE; 32]),
                 validator_pubkey,
                 vrf_pk: [0x44; 32],
-                deposit_proof: None,
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2791,41 +2391,6 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::UnknownUtxo)
         );
-    }
-
-    #[test]
-    fn register_validator_without_proof_fails_at_activation() {
-        let mut state = ChainState::new_genesis();
-        let validator_keypair = keypair(0x4E);
-        let validator_pubkey = pubkey_from_keypair(&validator_keypair);
-        let deposit_utxo_id = insert_registration_utxo(
-            &mut state,
-            validator_pubkey.clone(),
-            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-            0xAB,
-        );
-        let op = signed_op(
-            StakingOpBody::RegisterValidator {
-                commission_bps: 1_000,
-                deposit_utxo_id,
-                validator_pubkey,
-                vrf_pk: [0x4E; 32],
-                deposit_proof: None,
-                cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
-                    &validator_keypair,
-                )),
-                cold_signature: dummy_signature(),
-            },
-            1,
-            &validator_keypair,
-            &state.chain_id,
-        );
-        let chain_id = state.chain_id.clone();
-        assert_eq!(
-            apply_staking_op(&mut state, &op, &chain_id, 1),
-            Err(StateError::DepositProofRequired)
-        );
-        assert!(state.utxos.contains(&deposit_utxo_id));
     }
 
     #[test]
@@ -2845,7 +2410,6 @@ mod tests {
                 deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk: [0x45; 32],
-                deposit_proof: Some(deposit_proof(MINIMUM_VALIDATOR_SELF_STAKE_SPARK - 1, 0xA2)),
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2991,7 +2555,6 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(hot),
-                deposit_proof: Some(proof_for_bond_utxo(state, deposit_utxo_id)),
                 cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
                     cold_key_version,
                     cold_nonce,

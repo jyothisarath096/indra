@@ -86,15 +86,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    let sender_payment_pubkey = keys
-        .payment_keypair
-        .as_ref()
-        .map(indra_crypto::PaymentKeypairV1::public_key)
-        .unwrap_or_else(|| {
-            eprintln!("Error: canonical keystore is missing payment key material");
-            std::process::exit(1);
-        });
-
     // Build transaction
     let params = indra_cli::tx_builder::TxParams {
         chain_id: &chain_id,
@@ -105,7 +96,6 @@ fn main() {
         ed25519_seed,
         ml_dsa_seed_bytes,
         sender_pubkey,
-        sender_payment_pubkey,
     };
 
     let built = indra_cli::build_transaction(&params).unwrap_or_else(|e| {

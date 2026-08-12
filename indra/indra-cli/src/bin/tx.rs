@@ -6,7 +6,6 @@ use indra_core::types::{
     crypto::HybridPubKey,
     primitives::{Bytes32, VariableBytes},
 };
-use indra_crypto::sha256;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,8 +35,15 @@ fn cmd_address(args: &[String]) {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let address = sha256(&keys.public.hybrid_classical_pk);
-    println!("{}", hex::encode(address));
+    let chain_id = get_arg(args, "--chain-id")
+        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
+    let address = keys
+        .payment_address(chain_id.as_bytes())
+        .unwrap_or_else(|e| {
+            eprintln!("Error constructing payment address: {e}");
+            std::process::exit(1);
+        });
+    println!("{}", address.to_text());
 }
 
 fn cmd_balance(args: &[String]) {
@@ -54,7 +60,15 @@ fn cmd_balance(args: &[String]) {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let derived_address = hex::encode(sha256(&keys.public.hybrid_classical_pk));
+    let chain_id = get_arg(args, "--chain-id")
+        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
+    let derived_address = keys
+        .payment_address(chain_id.as_bytes())
+        .unwrap_or_else(|e| {
+            eprintln!("Error constructing payment address: {e}");
+            std::process::exit(1);
+        })
+        .to_text();
     let address = get_arg(args, "--address").unwrap_or_else(|| derived_address.clone());
     if address != derived_address {
         eprintln!(
@@ -97,15 +111,6 @@ fn cmd_send(args: &[String]) {
     let pq_pk = keys.public.hybrid_pq_pk.clone();
     let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
 
-    let sender_payment_pubkey = keys
-        .payment_keypair
-        .as_ref()
-        .map(indra_crypto::PaymentKeypairV1::public_key)
-        .unwrap_or_else(|| {
-            eprintln!("Error: canonical keystore is missing payment key material");
-            std::process::exit(1);
-        });
-
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(classical_pk),
         pq_pk: VariableBytes::from_slice(&pq_pk).unwrap_or_else(|_| {
@@ -123,7 +128,6 @@ fn cmd_send(args: &[String]) {
         ed25519_seed,
         ml_dsa_seed_bytes,
         sender_pubkey,
-        sender_payment_pubkey,
     })
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
@@ -162,17 +166,6 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
         eprintln!("Error loading wallet {}: {}", wallet_path, error);
         std::process::exit(1);
     });
-    let payment_keys = keys.payment_keypairs().cloned().collect::<Vec<_>>();
-    if payment_keys.is_empty() {
-        eprintln!("Error: canonical keystore contains no payment keys");
-        std::process::exit(1);
-    }
-    wallet.set_payment_key_hashes(
-        payment_keys
-            .iter()
-            .map(|keypair| keypair.public_key().hash())
-            .collect(),
-    );
     let owner_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
         pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
@@ -180,11 +173,10 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
             std::process::exit(1);
         }),
     };
-    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &payment_keys, &[owner_pubkey])
-        .unwrap_or_else(|error| {
-            eprintln!("Error scanning canonical blocks: {}", error);
-            std::process::exit(1);
-        });
+    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &[owner_pubkey]).unwrap_or_else(|error| {
+        eprintln!("Error scanning canonical blocks: {}", error);
+        std::process::exit(1);
+    });
     wallet.save(wallet_path).unwrap_or_else(|error| {
         eprintln!("Error saving wallet {}: {}", wallet_path, error);
         std::process::exit(1);
@@ -244,7 +236,6 @@ fn required_arg(args: &[String], flag: &str) -> String {
         std::process::exit(1);
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,19 +263,16 @@ mod tests {
         let spent_id = Bytes32::from([0xC1; 32]);
         let other_id = Bytes32::from([0xC2; 32]);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(spent_id, 1_000_000, [0x31; 32], 9, 0, 0);
-        wallet.add_utxo(other_id, 2_000_000, [0x32; 32], 9, 0, 1);
+        wallet.add_utxo(spent_id, 1_000_000, 9, 0, 0);
+        wallet.add_utxo(other_id, 2_000_000, 9, 0, 1);
         wallet.save(&wallet_path_str).unwrap();
         let built = indra_cli::BuiltTransaction {
             tx_hex: "00".to_string(),
             tx_id: hex::encode([0x44; 32]),
             change_spark: 750_000,
-            recipient_blinding: [0x55; 32],
-            change_blinding: Some([0x56; 32]),
             spent_utxo_ids: vec![spent_id],
             pending_change: Some(indra_cli::PendingChange {
                 output: sample_output(750_000),
-                blinding: [0x56; 32],
             }),
         };
 
@@ -319,11 +307,7 @@ mod tests {
     fn sample_output(value_spark: u64) -> OutputV1 {
         OutputV1 {
             value_spark,
-            commitment: indra_core::types::crypto::CommitmentV1 {
-                compressed_point: Bytes32::from([0x91; 32]),
-            },
             owner_pubkey: key_material(0x91).2,
-            range_proof: VariableBytes::from_slice(&[0x92; 32]).unwrap(),
             lock_height: 0,
         }
     }

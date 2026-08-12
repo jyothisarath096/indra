@@ -185,28 +185,9 @@ pub enum StateError {
         current_height: u64,
     },
 
-    /// A transaction output carries an invalid Bulletproof range proof.
-    #[error("output {index} has an invalid range proof")]
-    RangeProofInvalid {
-        /// Output index within the transaction.
-        index: usize,
-    },
-
-    /// The public fee commitment does not match the fee amount and opening.
-    #[error("fee commitment mismatch")]
-    FeeCommitmentMismatch,
-
     /// The transaction nullifier does not match the expected derivation.
     #[error("nullifier derivation invalid")]
     NullifierInvalid,
-
-    /// An output commitment failed validation.
-    #[error("output commitment invalid")]
-    CommitmentInvalid,
-
-    /// Confidential commitments do not balance.
-    #[error("commitment balance invalid")]
-    CommitmentBalanceInvalid,
 
     /// Transaction value arithmetic overflowed.
     #[error("transaction value arithmetic overflow")]
@@ -237,23 +218,6 @@ pub enum StateError {
     /// Reward-economic snapshot state or pairing is malformed.
     #[error("invalid reward economic snapshot: {0}")]
     InvalidRewardEconomicSnapshot(String),
-
-    /// A stake deposit omitted the required commitment-opening proof.
-    #[error("stake-deposit proof required")]
-    DepositProofRequired,
-
-    /// A stake-deposit proof does not open the source UTXO commitment.
-    #[error("stake-deposit commitment mismatch")]
-    StakeDepositCommitmentMismatch,
-
-    /// A stake-deposit proof opens to a value different from the UTXO public value.
-    #[error("stake-deposit value mismatch: public {public_value}, committed {committed_value}")]
-    StakeDepositValueMismatch {
-        /// Public `OutputV1.value_spark` on the source UTXO.
-        public_value: u64,
-        /// Value proven by the commitment opening.
-        committed_value: u64,
-    },
 
     /// Validator is already registered.
     #[error("validator already registered")]

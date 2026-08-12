@@ -1,5 +1,7 @@
 > **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
 
+> **Topic 3 supersession:** Transaction-value commitments, range proofs, and staking deposit openings were later deleted. Those references below are historical only.
+
 # INDRA Security Audit — Phase 2: Transaction and UTXO Security
 
 ## Summary Table

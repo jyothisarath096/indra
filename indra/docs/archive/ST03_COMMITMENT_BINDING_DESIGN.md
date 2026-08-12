@@ -1,10 +1,11 @@
-# ST-03 Per-Output Commitment Binding
+# ST-03 Per-Output Commitment Binding (Archived)
 
 ## Status
 
-Resolved in the canonical genesis-native transaction and staking formats.
-There is no activation height, proofless staking-operation tag, or legacy raw
-FFI builder.
+Superseded by Topic 3 Phase 1. Transaction-value Pedersen commitments,
+Bulletproofs, deposit openings, and their wallet/FFI support were deleted.
+This file is retained only as a historical design record and does not describe
+the current protocol.
 
 ## Invariant
 

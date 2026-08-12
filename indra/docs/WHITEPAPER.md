@@ -20,9 +20,9 @@ signature scheme for all transactions, ensuring security under both
 classical and quantum threat models simultaneously. Consensus finality
 uses ML-DSA-87-only Quorum Certificates — fully post-quantum. Validator
 transport is encrypted with hybrid X25519 + ML-KEM-1024 (NIST FIPS 203)
-key encapsulation. The current OutputV1 transaction format includes
-Pedersen commitments and Bulletproof range proofs for value-validation
-machinery, but it still stores owner and value metadata publicly.
+key encapsulation. The current OutputV1 transaction format stores authoritative
+amounts and full hybrid owner keys publicly; checked-`u64` conservation and
+dust validation are the sole monetary-validity rules.
 
 **Important scope note:** INDRA transaction ownership and consensus
 finality are post-quantum secure. The current chain format does not
@@ -164,7 +164,6 @@ INDRA is implemented in Rust. The workspace:
 
 ```
 indra-crypto        Post-quantum and classical cryptography
-indra-bulletproofs  Zero-knowledge range proof implementation
 indra-core          Protocol types, serialisation, primitives
 indra-state         State machine, UTXO set, epoch logic, governance
 indra-consensus     BFT consensus, mempool, proposer election
@@ -234,33 +233,20 @@ forward secrecy under both classical and quantum adversaries.
 | QC finality proofs | ML-DSA-87 only | Yes |
 | Validator transport | X25519 + ML-KEM-1024 | Yes (hybrid) |
 | Block hashing | SHA-256 | Partial (Grover, 2x) |
-| Pedersen commitments | Ristretto255 | Classical only |
-| Bulletproof range proofs | Ristretto255 | Classical only |
+| Transparent value conservation | Checked `u64` arithmetic | Information-theoretic arithmetic invariant |
 
 Transaction ownership, consensus finality, and validator transport are
-post-quantum secure. Current OutputV1 owner/value metadata is not hidden
-from raw-chain observers; the classical Pedersen/Bulletproof machinery is
-therefore not described here as full transaction privacy.
+post-quantum secure. OutputV1 owner/value metadata is not hidden from raw-chain
+observers. INDRA is transparent-amount and pseudonymous; value correlation can
+deanonymize flows even without key reuse.
 
-### 2.6 Value commitments and range proofs
+### 2.6 Transparent value validation
 
-INDRA includes Pedersen commitments on the Ristretto255 group:
-
-```
-C = v·G + r·H
-```
-
-where G and H are independent generators, v is the amount, and r is a
-randomly chosen blinding factor known only to the sender and receiver.
-The commitment construction can hide v cryptographically, and Bulletproof
-range proofs prove that each committed value lies in [0, 2^64) without
-opening the commitment.
-
-However, the current OutputV1 format also stores `value_spark` as public
-metadata. That public field is read by validation, staking, governance
-deposit, and wallet tooling. As a result, today's chain does not provide
-amount privacy against anyone reading raw block/state data, even though
-the commitment/proof machinery exists.
+`OutputV1.value_spark` is authoritative public consensus data. Validators sum
+inputs and outputs with checked `u64` arithmetic and require inputs to equal
+outputs plus the public fee; any overflow fails consensus validation. Dust
+rules reject uneconomic outputs. No transaction-value commitment, opening, or
+range-proof system exists in the current protocol.
 
 ### 2.7 UTXO model
 
@@ -457,11 +443,10 @@ transaction privacy.
 
 ### 4.3 Current privacy boundary and future view-key work
 
-INDRA currently includes Pedersen commitments and Bulletproof range proofs,
-but the current OutputV1 format still exposes recipient public keys and
-value metadata to anyone reading raw chain data directly. This is the same
-owner/value transparency model as Bitcoin, not a full transaction-privacy
-model.
+INDRA exposes recipient hybrid public keys and authoritative value metadata to
+anyone reading raw chain data directly. It is a transparent-amount,
+pseudonymous model, not a full transaction-privacy model; amount correlation
+can deanonymize flows.
 
 Remote RPC-based legacy address scanning requires authorization: a caller
 must prove ownership of the address before using the legacy UTXO/balance
@@ -797,12 +782,6 @@ observers. Full owner/amount privacy requires a future OutputV2 protocol
 upgrade with stealth destinations, encrypted recipient notes, and reviewed
 post-quantum-appropriate view-key machinery.
 
-**Bulletproof generation on mobile is unbenchmarked.** Proof generation
-on server hardware takes 300–500ms. Performance on low-end devices has
-not been systematically measured. OutputV1 currently exposes value
-metadata publicly, but still includes range-proof machinery; mobile proof
-generation benchmarks will be published before mainnet.
-
 **No smart contracts.** INDRA is a settlement layer. This is a
 deliberate design choice.
 
@@ -925,8 +904,8 @@ public testnet before proceeding.
 
 **Phase 3 — Audit and hardening**
 Professional security audit by independent firm. All findings resolved
-and published. Fuzz testing. Network stress testing. Mobile Bulletproof
-benchmarks published. Economic security analysis published. Hot/cold
+and published. Fuzz testing. Network stress testing. Economic security
+analysis published. Hot/cold
 key separation implemented.
 
 **Phase 4 — Mainnet**
@@ -975,8 +954,7 @@ Repository: github.com/jyothisarath096/indra
 | ML-KEM-1024 | Transport key encap | Level 5 | Yes | NIST FIPS 203 |
 | X25519 | Transport classical ECDH | 128-bit | No | RFC 7748 |
 | ChaCha20-Poly1305 | Transport encryption | 256-bit | Partial | RFC 8439 |
-| Ristretto255 | Value commitments (OutputV1 still public) | 128-bit classical | No | draft-irtf-cfrg |
-| Bulletproofs | Range proofs (OutputV1 still public) | 128-bit classical | No | IEEE S&P 2018 |
+| Checked `u64` | Public monetary conservation | Exact arithmetic invariant | Yes | Rust checked arithmetic |
 | SHA-256 | Hashing | 128-bit* | Partial | FIPS 180-4 |
 | VRF/Ed25519 | Proposer election | 128-bit | No | draft-irtf-cfrg-vrf |
 
@@ -1063,7 +1041,6 @@ At 20 validators:  17,838,000,000 Spark/epoch = 178.38 INDRA/epoch
 | Quantum attack on QC | Forge consensus | ML-DSA-87-only QC — fully PQ |
 | Break X25519 transport | Intercept P2P | ML-KEM-1024 still protects |
 | Break ML-KEM-1024 | Intercept P2P | X25519 still protects |
-| Break Pedersen commitment | Undermine commitment hiding | Does not enable theft; OutputV1 values are already public metadata |
 | Grover on SHA-256 | Weaken hashing | 2x speedup only, acceptable |
 
 The hybrid construction at every layer ensures that breaking one
@@ -1115,7 +1092,6 @@ Alternative: if YES = 270k (>67%), proposal passes → executes at epoch 171.
 3. NIST (2024). FIPS 203 — ML-KEM. https://csrc.nist.gov/pubs/fips/203/final
 4. NIST (2024). Post-Quantum Cryptography Standardization. https://csrc.nist.gov/pqcrypto
 5. Nakamoto, S. (2008). Bitcoin: A Peer-to-Peer Electronic Cash System. https://bitcoin.org/bitcoin.pdf
-6. Bunz, B. et al. (2018). Bulletproofs: Short Proofs for Confidential Transactions. IEEE S&P 2018.
 7. Buchman, E. (2016). Tendermint: Byzantine Fault Tolerance in the Age of Blockchains. University of Guelph.
 8. CRYSTALS-Dilithium Team (2021). Algorithm Specifications and Supporting Documentation. https://pq-crystals.org/dilithium/
 9. Bernstein, D.J. & Lange, T. (2017). Post-quantum cryptography. Nature 549, 188–194.

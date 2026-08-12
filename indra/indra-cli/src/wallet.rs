@@ -1,8 +1,7 @@
 //! UTXO wallet — tracks outputs owned by this node's keypair.
 //!
 //! A UTXO is "owned" if its owner_pubkey matches our hybrid public key.
-//! The wallet tracks unspent outputs, their values, and blinding factors
-//! so we can spend them later.
+//! The wallet tracks unspent outputs and their public values.
 //!
 //! ## Storage
 //!
@@ -35,8 +34,6 @@ pub struct WalletEntry {
     pub utxo_id: Bytes32,
     /// The actual value in Spark.
     pub value_spark: u64,
-    /// The blinding factor used in the Pedersen commitment.
-    pub blinding: [u8; 32],
     /// Block height when this UTXO was created.
     pub created_height: u64,
     /// Transaction index within the block.
@@ -54,8 +51,6 @@ pub struct WalletEntry {
 pub struct PendingChange {
     /// The change output exactly as constructed in the signed transaction.
     pub output: OutputV1,
-    /// The blinding factor for the output commitment.
-    pub blinding: [u8; 32],
 }
 
 /// The wallet: a collection of UTXO entries keyed by UTXO ID.
@@ -64,7 +59,6 @@ pub struct Wallet {
     entries: HashMap<Bytes32, WalletEntry>,
     pending_changes: Vec<PendingChange>,
     scan_block_hashes: BTreeMap<u64, Bytes32>,
-    payment_key_hashes: Vec<[u8; 32]>,
 }
 
 impl Wallet {
@@ -74,7 +68,6 @@ impl Wallet {
             entries: HashMap::new(),
             pending_changes: Vec::new(),
             scan_block_hashes: BTreeMap::new(),
-            payment_key_hashes: Vec::new(),
         }
     }
 
@@ -83,7 +76,6 @@ impl Wallet {
         &mut self,
         utxo_id: Bytes32,
         value_spark: u64,
-        blinding: [u8; 32],
         created_height: u64,
         tx_index: u32,
         out_index: u32,
@@ -93,7 +85,6 @@ impl Wallet {
             WalletEntry {
                 utxo_id,
                 value_spark,
-                blinding,
                 created_height,
                 tx_index,
                 out_index,
@@ -131,11 +122,6 @@ impl Wallet {
             .map(|(height, hash)| (*height, *hash))
     }
 
-    /// Replace the public payment-key hash index used by local scanning.
-    pub fn set_payment_key_hashes(&mut self, hashes: Vec<[u8; 32]>) {
-        self.payment_key_hashes = hashes;
-    }
-
     /// Roll back discoveries and confirmed spends at or above a reorg height.
     pub fn rollback_scan_from(&mut self, height: u64) {
         self.entries
@@ -166,7 +152,7 @@ impl Wallet {
             self.mark_spent(id);
         }
         if let Some(change) = pending_change {
-            self.add_pending_change(change.output, change.blinding);
+            self.add_pending_change(change.output);
         }
     }
 
@@ -181,9 +167,8 @@ impl Wallet {
     }
 
     /// Record a change output until it is mined and can be assigned a real UTXO ID.
-    pub fn add_pending_change(&mut self, output: OutputV1, blinding: [u8; 32]) {
-        self.pending_changes
-            .push(PendingChange { output, blinding });
+    pub fn add_pending_change(&mut self, output: OutputV1) {
+        self.pending_changes.push(PendingChange { output });
     }
 
     /// Number of pending change outputs awaiting confirmation.
@@ -210,7 +195,6 @@ impl Wallet {
         self.add_utxo(
             utxo_id,
             pending.output.value_spark,
-            pending.blinding,
             created_height,
             tx_index,
             out_index,
@@ -260,10 +244,9 @@ impl Wallet {
     pub fn to_json(&self) -> String {
         let entries: Vec<String> = self.entries.values().map(|e| {
             format!(
-                r#"  {{"utxo_id":"{}","value_spark":{},"blinding":"{}","created_height":{},"tx_index":{},"out_index":{},"spent":{},"spent_height":{}}}"#,
+                r#"  {{"utxo_id":"{}","value_spark":{},"created_height":{},"tx_index":{},"out_index":{},"spent":{},"spent_height":{}}}"#,
                 hex::encode(e.utxo_id.0),
                 e.value_spark,
-                hex::encode(e.blinding),
                 e.created_height,
                 e.tx_index,
                 e.out_index,
@@ -276,9 +259,8 @@ impl Wallet {
             .iter()
             .map(|pending| {
                 format!(
-                    r#"  {{"output_hex":"{}","blinding":"{}"}}"#,
-                    hex::encode(pending.output.encode_to_vec()),
-                    hex::encode(pending.blinding),
+                    r#"  {{"output_hex":"{}"}}"#,
+                    hex::encode(pending.output.encode_to_vec())
                 )
             })
             .collect();
@@ -294,17 +276,11 @@ impl Wallet {
                 )
             })
             .collect::<Vec<_>>();
-        let payment_hashes = self
-            .payment_key_hashes
-            .iter()
-            .map(|hash| format!(r#""{}""#, hex::encode(hash)))
-            .collect::<Vec<_>>();
         format!(
-            "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ],\n  \"scan_blocks\": [\n{}\n  ],\n  \"payment_key_hashes\": [{}]\n}}",
+            "{{\n  \"entries\": [\n{}\n  ],\n  \"pending_changes\": [\n{}\n  ],\n  \"scan_blocks\": [\n{}\n  ]\n}}",
             entries.join(",\n"),
             pending.join(",\n"),
             scan_blocks.join(",\n"),
-            payment_hashes.join(","),
         )
     }
 
@@ -334,7 +310,6 @@ impl Wallet {
 
             let utxo_id = parse_str_field(obj, "utxo_id")?;
             let value = parse_u64_field(obj, "value_spark")?;
-            let blinding_hex = parse_str_field(obj, "blinding")?;
             let height = parse_u64_field(obj, "created_height")?;
             let tx_idx = parse_u64_field(obj, "tx_index")? as u32;
             let out_idx = parse_u64_field(obj, "out_index")? as u32;
@@ -343,17 +318,12 @@ impl Wallet {
 
             let id_bytes =
                 hex::decode(&utxo_id).map_err(|_| CliError::Parse("bad utxo_id hex".into()))?;
-            let blinding_bytes = hex::decode(&blinding_hex)
-                .map_err(|_| CliError::Parse("bad blinding hex".into()))?;
-
-            if id_bytes.len() != 32 || blinding_bytes.len() != 32 {
+            if id_bytes.len() != 32 {
                 return Err(CliError::Parse("wrong field length".into()));
             }
 
             let mut id_arr = [0u8; 32];
-            let mut bl_arr = [0u8; 32];
             id_arr.copy_from_slice(&id_bytes);
-            bl_arr.copy_from_slice(&blinding_bytes);
 
             let utxo = Bytes32::from(id_arr);
             wallet.entries.insert(
@@ -361,7 +331,6 @@ impl Wallet {
                 WalletEntry {
                     utxo_id: utxo,
                     value_spark: value,
-                    blinding: bl_arr,
                     created_height: height,
                     tx_index: tx_idx,
                     out_index: out_idx,
@@ -393,24 +362,6 @@ impl Wallet {
                 pos = end;
             }
         }
-        if let Some(hashes_json) = extract_array(json, "payment_key_hashes") {
-            for raw in hashes_json
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                let value = raw.trim_matches('"');
-                let bytes = hex::decode(value)
-                    .map_err(|_| CliError::Parse("bad payment key hash".into()))?;
-                if bytes.len() != 32 {
-                    return Err(CliError::Parse("bad payment key hash length".into()));
-                }
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&bytes);
-                wallet.payment_key_hashes.push(hash);
-            }
-        }
-
         if let Some(pending_json) = extract_array(json, "pending_changes") {
             let mut pos = 0;
             while pos < pending_json.len() {
@@ -426,21 +377,11 @@ impl Wallet {
                 pos = obj_end;
 
                 let output_hex = parse_str_field(obj, "output_hex")?;
-                let blinding_hex = parse_str_field(obj, "blinding")?;
                 let output_bytes = hex::decode(&output_hex)
                     .map_err(|_| CliError::Parse("bad pending output hex".into()))?;
-                let blinding_bytes = hex::decode(&blinding_hex)
-                    .map_err(|_| CliError::Parse("bad pending blinding hex".into()))?;
-                if blinding_bytes.len() != 32 {
-                    return Err(CliError::Parse("wrong pending blinding length".into()));
-                }
                 let output = OutputV1::decode_exact(&output_bytes)
                     .map_err(|_| CliError::Parse("bad pending output encoding".into()))?;
-                let mut blinding = [0u8; 32];
-                blinding.copy_from_slice(&blinding_bytes);
-                wallet
-                    .pending_changes
-                    .push(PendingChange { output, blinding });
+                wallet.pending_changes.push(PendingChange { output });
             }
         }
 
@@ -596,6 +537,16 @@ fn parse_optional_u64_field(json: &str, field: &str) -> CliResult<Option<u64>> {
 }
 
 #[cfg(test)]
+mod transparent_wallet_tests {
+    use super::*;
+
+    #[test]
+    fn wallet_json_rejects_negative_value_spark() {
+        let json = r#"{"entries":[{"utxo_id":"0000000000000000000000000000000000000000000000000000000000000000","value_spark":-1,"created_height":0,"tx_index":0,"out_index":0,"spent":false,"spent_height":null}],"pending_changes":[],"scan_blocks":[]}"#;
+        assert!(Wallet::from_json(json).is_err());
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -619,8 +570,8 @@ mod tests {
     #[test]
     fn add_and_balance() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 1_000_000, [0u8; 32], 1, 0, 0);
-        w.add_utxo(make_id(2), 2_000_000, [0u8; 32], 1, 0, 1);
+        w.add_utxo(make_id(1), 1_000_000, 1, 0, 0);
+        w.add_utxo(make_id(2), 2_000_000, 1, 0, 1);
         assert_eq!(w.balance(), 3_000_000);
     }
 
@@ -628,7 +579,7 @@ mod tests {
     fn mark_spent_reduces_balance() {
         let mut w = Wallet::new();
         let id = make_id(1);
-        w.add_utxo(id, 1_000_000, [0u8; 32], 1, 0, 0);
+        w.add_utxo(id, 1_000_000, 1, 0, 0);
         w.mark_spent(&id);
         assert_eq!(w.balance(), 0);
     }
@@ -636,8 +587,8 @@ mod tests {
     #[test]
     fn coin_selection_sufficient() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 5_000_000, [0u8; 32], 1, 0, 0);
-        w.add_utxo(make_id(2), 3_000_000, [0u8; 32], 1, 0, 1);
+        w.add_utxo(make_id(1), 5_000_000, 1, 0, 0);
+        w.add_utxo(make_id(2), 3_000_000, 1, 0, 1);
         let selected = w.select_utxos(4_000_000, 100_000).unwrap();
         let total: u64 = selected.iter().map(|e| e.value_spark).sum();
         assert!(total >= 4_100_000);
@@ -646,14 +597,14 @@ mod tests {
     #[test]
     fn coin_selection_insufficient_errors() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 100, [0u8; 32], 1, 0, 0);
+        w.add_utxo(make_id(1), 100, 1, 0, 0);
         assert!(w.select_utxos(1_000_000, 0).is_err());
     }
 
     #[test]
     fn wallet_json_round_trip() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(0xAB), 999_000, [0x42u8; 32], 5, 1, 2);
+        w.add_utxo(make_id(0xAB), 999_000, 5, 1, 2);
         let json = w.to_json();
         let w2 = Wallet::from_json(&json).unwrap();
         assert_eq!(w2.balance(), 999_000);
@@ -665,7 +616,7 @@ mod tests {
         let path = temp_wallet_path("mode");
         let path_str = path.to_string_lossy().to_string();
         let mut wallet = Wallet::new();
-        wallet.add_utxo(make_id(0xC1), 999_000, [0x42u8; 32], 5, 1, 2);
+        wallet.add_utxo(make_id(0xC1), 999_000, 5, 1, 2);
 
         wallet.save(&path_str).unwrap();
 
@@ -681,11 +632,11 @@ mod tests {
         let path = temp_wallet_path("atomic");
         let path_str = path.to_string_lossy().to_string();
         let mut original = Wallet::new();
-        original.add_utxo(make_id(0xD1), 1_000_000, [0x11u8; 32], 5, 1, 2);
+        original.add_utxo(make_id(0xD1), 1_000_000, 5, 1, 2);
         original.save(&path_str).unwrap();
         let original_json = std::fs::read_to_string(&path).unwrap();
         let mut replacement = Wallet::new();
-        replacement.add_utxo(make_id(0xD2), 2_000_000, [0x22u8; 32], 6, 1, 2);
+        replacement.add_utxo(make_id(0xD2), 2_000_000, 6, 1, 2);
 
         let err = write_wallet_file_atomic(&path, &replacement.to_json(), || {
             Err(CliError::Io("simulated interruption before rename".into()))
@@ -712,7 +663,7 @@ mod tests {
     fn pending_change_round_trip() {
         let mut wallet = Wallet::new();
         let output = sample_output(123_456);
-        wallet.add_pending_change(output.clone(), [0x55; 32]);
+        wallet.add_pending_change(output.clone());
 
         let restored = Wallet::from_json(&wallet.to_json()).unwrap();
         assert_eq!(restored.pending_change_count(), 1);
@@ -729,11 +680,10 @@ mod tests {
         let spent_id = make_id(0xA1);
         let other_id = make_id(0xA2);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(spent_id, 700_000, [0x11; 32], 4, 0, 0);
-        wallet.add_utxo(other_id, 900_000, [0x22; 32], 4, 0, 1);
+        wallet.add_utxo(spent_id, 700_000, 4, 0, 0);
+        wallet.add_utxo(other_id, 900_000, 4, 0, 1);
         let change = PendingChange {
             output: sample_output(550_000),
-            blinding: [0x33; 32],
         };
 
         wallet.record_accepted_transaction(&[spent_id], Some(change));
@@ -749,16 +699,11 @@ mod tests {
     fn sample_output(value_spark: u64) -> OutputV1 {
         OutputV1 {
             value_spark,
-            commitment: indra_core::types::crypto::CommitmentV1 {
-                compressed_point: Bytes32::from([0x11; 32]),
-            },
             owner_pubkey: indra_core::types::crypto::HybridPubKey {
                 classical_pk: Bytes32::from([0x22; 32]),
                 pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0x33; 32])
                     .unwrap(),
             },
-            range_proof: indra_core::types::primitives::VariableBytes::from_slice(&[0x44; 32])
-                .unwrap(),
             lock_height: 0,
         }
     }

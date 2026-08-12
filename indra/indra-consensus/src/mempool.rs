@@ -553,24 +553,18 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::scalar::Scalar;
     use indra_core::{
         types::{
-            crypto::{CommitmentV1, HybridSignature},
+            crypto::HybridSignature,
             primitives::{
-                DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_RANGE_PROOF_BYTES,
-                TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+                DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, TRANSACTION_PROTOCOL_VERSION,
             },
             transaction::{InputV1, OutputV1, TransactionV1},
         },
         Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{
-        commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair,
-        HybridKeypair, PaymentBlindingNoteV1, PqKeypair,
-    };
+    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
     use indra_state::ChainState;
-    use rand::{rngs::StdRng, SeedableRng};
 
     fn dummy_tx(fee: u64, nullifier_byte: u8) -> TransactionV1 {
         let owner_pubkey = HybridPubKey {
@@ -578,7 +572,7 @@ mod tests {
             pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
         };
         TransactionV1 {
-            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([nullifier_byte; 32]),
@@ -586,34 +580,14 @@ mod tests {
             }],
             outputs: vec![OutputV1 {
                 value_spark: DUST_LIMIT_SPARK,
-                commitment: CommitmentV1 {
-                    compressed_point: Bytes32::ZERO,
-                },
                 owner_pubkey: owner_pubkey.clone(),
-                range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
                 lock_height: 0,
             }],
-            payment_notes: vec![dummy_note(&owner_pubkey)],
             fee_amount: fee,
-            fee_blinding: Bytes32::ZERO,
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
-            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
             },
-        }
-    }
-
-    fn dummy_note(owner: &HybridPubKey) -> PaymentBlindingNoteV1 {
-        PaymentBlindingNoteV1 {
-            version: 1,
-            owner_id: sha256(&owner.classical_pk.0),
-            payment_pubkey_hash: [0; 32],
-            sender_x25519_ephemeral_pk: [0; 32],
-            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-            note_nonce: [0; 32],
         }
     }
 
@@ -633,20 +607,13 @@ mod tests {
 
     fn output(
         value: u64,
-        blinding: [u8; 32],
+        _blinding: [u8; 32],
         owner_pubkey: HybridPubKey,
-        proof_seed: [u8; 32],
+        _proof_seed: [u8; 32],
     ) -> OutputV1 {
-        let commitment = commit(value, &blinding);
-        let mut rng = StdRng::from_seed(proof_seed);
-        let proof = prove_range(value, &blinding, &mut rng).unwrap();
         OutputV1 {
             value_spark: value,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey,
-            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&proof).unwrap(),
             lock_height: 0,
         }
     }
@@ -674,12 +641,8 @@ mod tests {
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
         let output_value = input_value - fee;
         let output_blinding = [0x21; 32];
-        let fee_blinding = (Scalar::from_bytes_mod_order(input_blinding)
-            - Scalar::from_bytes_mod_order(output_blinding))
-        .to_bytes();
-        let fee_commitment = commit(fee, &fee_blinding);
         let mut tx = TransactionV1 {
-            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id,
@@ -691,12 +654,7 @@ mod tests {
                 owner_pubkey.clone(),
                 [0x61; 32],
             )],
-            payment_notes: vec![dummy_note(&owner_pubkey)],
             fee_amount: fee,
-            fee_blinding: Bytes32::from(fee_blinding),
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(fee_commitment.0),
-            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

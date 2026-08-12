@@ -340,7 +340,6 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto",
- "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -846,21 +845,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "indra-bulletproofs"
-version = "0.1.0"
-dependencies = [
- "curve25519-dalek",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "sha2",
-]
-
-[[package]]
 name = "indra-cli"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "curve25519-dalek",
  "hex",
  "indra-core",
  "indra-crypto",
@@ -878,7 +865,6 @@ dependencies = [
 name = "indra-consensus"
 version = "0.1.0"
 dependencies = [
- "curve25519-dalek",
  "indra-core",
  "indra-crypto",
  "indra-state",
@@ -902,19 +888,15 @@ name = "indra-crypto"
 version = "0.1.0"
 dependencies = [
  "bip39",
- "blake3",
  "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "hmac",
- "indra-bulletproofs",
  "ml-dsa",
- "ml-kem",
  "rand_core 0.6.4",
  "sha2",
  "subtle",
  "thiserror 1.0.69",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -924,7 +906,6 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "hex",
- "indra-bulletproofs",
  "indra-cli",
  "indra-core",
  "indra-crypto",
@@ -1006,7 +987,6 @@ dependencies = [
 name = "indra-state"
 version = "0.1.0"
 dependencies = [
- "curve25519-dalek",
  "hex",
  "indra-core",
  "indra-crypto",

@@ -2,7 +2,6 @@
 //!
 //! Tests the complete path: mempool → block production → voting → QC.
 
-use curve25519_dalek::scalar::Scalar;
 use indra_consensus::{
     mempool::Mempool,
     producer::{produce_block, BlockTemplate},
@@ -13,19 +12,15 @@ use indra_consensus::{
 use indra_core::{
     types::{
         crypto::HybridSignature,
-        primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES},
+        primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
         vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     },
-    Bytes32, CommitmentV1, HybridPubKey, ProtocolVersion, VariableBytes,
+    Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
 };
-use indra_crypto::{
-    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair,
-};
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_state::{ChainState, ValidatorEntry, ValidatorStatus};
-use rand::{rngs::StdRng, SeedableRng};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,23 +39,10 @@ fn make_user_keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
     )
 }
 
-fn derive_fee_blinding(input_blinding: [u8; 32], output_blinding: [u8; 32]) -> [u8; 32] {
-    (Scalar::from_bytes_mod_order(input_blinding) - Scalar::from_bytes_mod_order(output_blinding))
-        .to_bytes()
-}
-
-fn dummy_output(nonce: u8, value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
-    let blinding = [nonce; 32];
-    let commitment = commit(value_spark, &blinding);
-    let mut rng = StdRng::from_seed([nonce; 32]);
-    let proof = prove_range(value_spark, &blinding, &mut rng).unwrap();
+fn dummy_output(_nonce: u8, value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
     OutputV1 {
         value_spark,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey,
-        range_proof: VariableBytes::from_slice(&proof).unwrap(),
         lock_height: 0,
     }
 }
@@ -74,30 +56,15 @@ fn dummy_tx(
     nonce: u8,
 ) -> TransactionV1 {
     let output_value = 1_100_000u64.saturating_sub(fee);
-    let output_blinding = [nonce; 32];
-    let fee_blinding = derive_fee_blinding([nonce; 32], output_blinding);
-    let fee_commitment = commit(fee, &fee_blinding);
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![InputV1 {
             utxo_id,
             nullifier: Bytes32::from([nonce; 32]),
         }],
         outputs: vec![dummy_output(nonce, output_value, owner_pubkey.clone())],
-        payment_notes: vec![PaymentBlindingNoteV1 {
-            version: 1,
-            owner_id: sha256(&owner_pubkey.classical_pk.0),
-            payment_pubkey_hash: [0; 32],
-            sender_x25519_ephemeral_pk: [0; 32],
-            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-            note_nonce: [0; 32],
-        }],
         fee_amount: fee,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

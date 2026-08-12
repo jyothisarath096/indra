@@ -1,8 +1,10 @@
 > **Historical archive:** This records completed audit work and intermediate designs. It is not current guidance; canonical specifications and current code take precedence.
 
+> **Topic 3 supersession:** Transaction-value Pedersen commitments, Bulletproofs, payment notes, and their FFI paths were later deleted. Those references below are historical only.
+
 # INDRA Security Audit — Phase 1: Cryptographic Security
 
-Scope: `indra-crypto/`, `indra-bulletproofs/`, `indra-ffi/src/keygen.rs`, plus the consensus/state call sites needed to determine exploitability.
+Scope: `indra-crypto/`, the former range-proof crate, `indra-ffi/src/keygen.rs`, plus the consensus/state call sites needed to determine exploitability.
 
 This report began as an audit and proof-of-concept report. It now also records the Phase 1 remediation status for the high, medium, and low findings that have been fixed in the Rust codebase.
 

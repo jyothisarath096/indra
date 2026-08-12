@@ -7,8 +7,7 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        Bytes32 as CoreBytes32, EPOCH_DURATION_BLOCKS, MAX_TRANCHES_PER_POSITION,
-        STAKING_REWARD_BLINDING_DOMAIN, STAKING_TX_IDX,
+        Bytes32 as CoreBytes32, EPOCH_DURATION_BLOCKS, MAX_TRANCHES_PER_POSITION, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -1042,7 +1041,7 @@ fn explain_utxo_provenance_authorized(
 
     let explanation = classify_utxo_provenance(entry, state);
     Ok(format!(
-        r#"{{"address":"{}","utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{},"commitment":"{}","output_hex":"{}","category":"{}","recoverable":{},"context":{},"reason":{},"privacy_note":"{}"}}"#,
+        r#"{{"address":"{}","utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{},"output_hex":"{}","category":"{}","recoverable":{},"context":{},"reason":{},"privacy_note":"{}"}}"#,
         address_hex,
         hex::encode(entry.utxo_id.0),
         entry.output.value_spark,
@@ -1050,7 +1049,6 @@ fn explain_utxo_provenance_authorized(
         entry.tx_index,
         entry.output_index,
         entry.output.lock_height,
-        hex::encode(entry.output.commitment.compressed_point.0),
         hex::encode(entry.output.encode_to_vec()),
         explanation.category,
         explanation.recoverable,
@@ -1113,25 +1111,10 @@ fn classify_staking_provenance(
 ) -> UtxoProvenanceExplanation {
     if let Some(event) = &entry.tranche_refund {
         let custody = event.custody.encode_to_vec();
-        let blinding = match indra_crypto::derive_tranche_refund_blinding_v1(
-            &indra_crypto::TrancheRefundBlindingInputsV1 {
-                chain_id: state.chain.chain_id.as_bytes(),
-                position_id: event.position_id.0,
-                tranche_id: event.tranche_id.0,
-                principal_owner_id: event.principal_owner_id.0,
-                custody_encoding: &custody,
-                principal_spark: event.principal_spark,
-                release_height: event.release_height,
-                end_epoch: event.end_epoch,
-            },
-        ) {
-            Ok(value) => value,
-            Err(error) => return unrecoverable("tranche_refund", error.to_string()),
-        };
-        if !commitment_matches(entry, &blinding) {
+        if event.principal_spark != entry.output.value_spark {
             return unrecoverable(
                 "tranche_refund",
-                "retained tranche refund provenance does not open this UTXO commitment",
+                "retained tranche refund provenance value does not match this UTXO",
             );
         }
         return recoverable(
@@ -1161,19 +1144,30 @@ fn classify_staking_provenance(
         Err(reason) => return unrecoverable("staking_protocol_output_unavailable", reason),
     };
 
-    for evidence in &block.slashing_evidence {
+    let matching_claims = block.staking_ops.iter().filter(|op| {
+        matches!(
+            &op.body,
+            StakingOpBody::ClaimRewards { delegator_pubkey, .. }
+                if *delegator_pubkey == entry.output.owner_pubkey
+        )
+    });
+    let mut evidence = block.slashing_evidence.iter();
+    if let (Some(evidence), None, 0) = (evidence.next(), evidence.next(), matching_claims.count()) {
         let evidence_hash = Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()));
-        let blinding = derive_slash_reward_blinding(&evidence_hash, entry.created_height);
-        if commitment_matches(entry, &blinding) {
-            return recoverable(
-                "slash_reporter_reward",
-                format!(
-                    r#"{{"evidence_hash":"{}","block_height":{}}}"#,
-                    hex::encode(evidence_hash.0),
-                    entry.created_height
-                ),
-            );
-        }
+        return recoverable(
+            "slash_reporter_reward",
+            format!(
+                r#"{{"evidence_hash":"{}","block_height":{}}}"#,
+                hex::encode(evidence_hash.0),
+                entry.created_height
+            ),
+        );
+    }
+    if !block.slashing_evidence.is_empty() {
+        return unrecoverable(
+            "staking_protocol_output_ambiguous",
+            "retained block contains multiple possible slash events or a reward claim for this owner",
+        );
     }
 
     for op in &block.staking_ops {
@@ -1184,9 +1178,7 @@ fn classify_staking_provenance(
         } = &op.body
         {
             let delegator_id = staking_pubkey_to_id(delegator_pubkey);
-            let blinding =
-                derive_staking_reward_blinding(validator_id, &delegator_id, entry.created_height);
-            if commitment_matches(entry, &blinding) {
+            if entry.output.owner_pubkey == *delegator_pubkey {
                 return recoverable(
                     "staking_reward_claim",
                     format!(
@@ -1202,7 +1194,7 @@ fn classify_staking_provenance(
 
     unrecoverable(
         "staking_protocol_output_unclassified",
-        "retained staking provenance did not open this UTXO commitment",
+        "retained staking provenance did not identify this UTXO",
     )
 }
 
@@ -1221,27 +1213,41 @@ fn classify_governance_change(
         Err(reason) => return unrecoverable("governance_deposit_change_unavailable", reason),
     };
     let proposed_epoch = epoch_for_height(entry.created_height);
-    for op in &block.governance_ops {
-        if let GovernancePayload::Propose { action, .. } = &op.payload {
-            let proposal_id =
-                compute_proposal_id(op.signer_id, action, proposed_epoch, &state.chain.chain_id);
-            let blinding = derive_governance_change_blinding(&proposal_id);
-            if commitment_matches(entry, &blinding) {
-                return recoverable(
-                    "governance_deposit_change",
-                    format!(
-                        r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":{}}}"#,
-                        hex::encode(proposal_id.0),
-                        hex::encode(op.signer_id.0),
-                        proposed_epoch
-                    ),
-                );
-            }
+    let mut candidates = block.governance_ops.iter().filter_map(|op| {
+        let GovernancePayload::Propose {
+            action,
+            proposer_pubkey,
+            ..
+        } = &op.payload
+        else {
+            return None;
+        };
+        if *proposer_pubkey != entry.output.owner_pubkey {
+            return None;
         }
+        let proposal_id =
+            compute_proposal_id(op.signer_id, action, proposed_epoch, &state.chain.chain_id);
+        state
+            .chain
+            .governance
+            .proposals
+            .contains_key(&proposal_id)
+            .then_some((op, proposal_id))
+    });
+    if let (Some((op, proposal_id)), None) = (candidates.next(), candidates.next()) {
+        return recoverable(
+            "governance_deposit_change",
+            format!(
+                r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":{}}}"#,
+                hex::encode(proposal_id.0),
+                hex::encode(op.signer_id.0),
+                proposed_epoch
+            ),
+        );
     }
     unrecoverable(
         "governance_deposit_change_unclassified",
-        "retained proposal block data did not open this governance change commitment",
+        "retained proposal block data did not identify this governance change output",
     )
 }
 
@@ -1249,22 +1255,26 @@ fn classify_governance_refund(
     entry: &indra_state::utxo::UtxoEntry,
     state: &NodeState<'_>,
 ) -> UtxoProvenanceExplanation {
-    for proposal in state.chain.governance.proposals.values() {
-        if proposal.proposer_pubkey != entry.output.owner_pubkey {
-            continue;
-        }
-        let blinding = derive_governance_refund_blinding(&proposal.proposal_id);
-        if commitment_matches(entry, &blinding) {
-            return recoverable(
-                "governance_deposit_refund",
-                format!(
-                    r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":{}}}"#,
-                    hex::encode(proposal.proposal_id.0),
-                    hex::encode(proposal.proposer_id.0),
-                    proposal.proposed_epoch
-                ),
-            );
-        }
+    let mut candidates = state
+        .chain
+        .governance
+        .proposals
+        .values()
+        .filter(|proposal| {
+            proposal.proposer_pubkey == entry.output.owner_pubkey
+                && proposal.deposit_spark == 0
+                && proposal.proposed_epoch <= epoch_for_height(entry.created_height)
+        });
+    if let (Some(proposal), None) = (candidates.next(), candidates.next()) {
+        return recoverable(
+            "governance_deposit_refund",
+            format!(
+                r#"{{"proposal_id":"{}","proposer_id":"{}","proposed_epoch":{}}}"#,
+                hex::encode(proposal.proposal_id.0),
+                hex::encode(proposal.proposer_id.0),
+                proposal.proposed_epoch
+            ),
+        );
     }
     unrecoverable(
         "governance_deposit_refund_unavailable",
@@ -1290,53 +1300,8 @@ fn retained_block_unavailable_reason(height: u64, state: &NodeState<'_>) -> Stri
     }
 }
 
-fn commitment_matches(entry: &indra_state::utxo::UtxoEntry, blinding: &[u8; 32]) -> bool {
-    indra_crypto::commit(entry.output.value_spark, blinding).0
-        == entry.output.commitment.compressed_point.0
-}
-
-fn derive_staking_reward_blinding(
-    validator_id: &CoreBytes32,
-    delegator_id: &CoreBytes32,
-    height: u64,
-) -> [u8; 32] {
-    let mut data = Vec::with_capacity(STAKING_REWARD_BLINDING_DOMAIN.len() + 32 + 32 + 8);
-    data.extend_from_slice(STAKING_REWARD_BLINDING_DOMAIN);
-    data.extend_from_slice(&validator_id.0);
-    data.extend_from_slice(&delegator_id.0);
-    data.extend_from_slice(&height.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
 fn staking_pubkey_to_id(pubkey: &HybridPubKey) -> CoreBytes32 {
     CoreBytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
-}
-
-fn derive_slash_reward_blinding(evidence_hash: &CoreBytes32, height: u64) -> [u8; 32] {
-    let mut data = b"INDRA-SLASH-REWARD-BLINDING-v1".to_vec();
-    data.extend_from_slice(&evidence_hash.0);
-    data.extend_from_slice(&height.to_le_bytes());
-    indra_crypto::sha256(&data)
-}
-
-fn derive_governance_refund_blinding(proposal_id: &CoreBytes32) -> [u8; 32] {
-    indra_crypto::sha256(
-        &[
-            b"governance-refund-blinding".as_slice(),
-            proposal_id.0.as_slice(),
-        ]
-        .concat(),
-    )
-}
-
-fn derive_governance_change_blinding(proposal_id: &CoreBytes32) -> [u8; 32] {
-    indra_crypto::sha256(
-        &[
-            b"governance-deposit-change-blinding".as_slice(),
-            proposal_id.0.as_slice(),
-        ]
-        .concat(),
-    )
 }
 
 fn json_string_or_null(value: Option<&str>) -> String {
@@ -2747,7 +2712,6 @@ fn send_transaction(params: &[String]) -> DispatchResult {
         ))),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2760,12 +2724,12 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
                 ProposalTier,
             },
-            primitives::{MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES},
+            primitives::MAX_VRF_PROOF_BYTES,
             stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
             staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
         },
-        Bytes32, CommitmentV1, ProtocolVersion, VariableBytes,
+        Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
     use indra_state::{
@@ -2845,12 +2809,7 @@ mod tests {
             signature_module_id: 1,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            payment_notes: Vec::new(),
             fee_amount: 50_000,
-            fee_blinding: Bytes32::from([0x44; 32]),
-            fee_commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([0x45; 32]),
-            },
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0x46; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0x47; 32]).unwrap(),
@@ -2904,14 +2863,10 @@ mod tests {
         }
     }
 
-    fn owned_output(amount: u64, blinding: [u8; 32]) -> OutputV1 {
+    fn owned_output(amount: u64, _blinding: [u8; 32]) -> OutputV1 {
         OutputV1 {
             value_spark: amount,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(indra_crypto::commit(amount, &blinding).0),
-            },
             owner_pubkey: scan_owner_pubkey(),
-            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0xAA; 32]).unwrap(),
             lock_height: 0,
         }
     }
@@ -2941,12 +2896,10 @@ mod tests {
         let height = 2;
         let validator_id = Bytes32::from([0x31; 32]);
         let delegator_pubkey = scan_owner_pubkey();
-        let delegator_id = staking_pubkey_to_id(&delegator_pubkey);
-        let blinding = derive_staking_reward_blinding(&validator_id, &delegator_id, height);
         let utxo_id = engine
             .chain
             .utxos
-            .insert(owned_output(7_000, blinding), height, STAKING_TX_IDX, 0)
+            .insert(owned_output(7_000, [0; 32]), height, STAKING_TX_IDX, 0)
             .unwrap();
         engine
             .blocks
@@ -2973,40 +2926,6 @@ mod tests {
     }
 
     #[test]
-    fn explain_utxo_provenance_authorized_rejects_bad_reward_derivation() {
-        let mut engine = block_backed_engine();
-        let height = 2;
-        let validator_id = Bytes32::from([0x32; 32]);
-        let delegator_pubkey = scan_owner_pubkey();
-        let utxo_id = engine
-            .chain
-            .utxos
-            .insert(owned_output(7_000, [0xFF; 32]), height, STAKING_TX_IDX, 0)
-            .unwrap();
-        engine
-            .blocks
-            .get_mut(&height)
-            .unwrap()
-            .staking_ops
-            .push(StakingOp {
-                body: StakingOpBody::ClaimRewards {
-                    validator_id,
-                    delegator_pubkey,
-                    cold_authorization: None,
-                },
-                nonce: 1,
-                signature: dummy_signature(0x32),
-            });
-
-        let result = explain(&engine, utxo_id);
-        assert!(
-            result.contains(r#""category":"staking_protocol_output_unclassified""#),
-            "{result}"
-        );
-        assert!(result.contains(r#""recoverable":false"#), "{result}");
-    }
-
-    #[test]
     fn explain_utxo_provenance_authorized_classifies_governance_change_and_refund() {
         let mut engine = block_backed_engine();
         let height = 2;
@@ -3016,11 +2935,10 @@ mod tests {
         let proposed_epoch = epoch_for_height(height);
         let proposal_id =
             compute_proposal_id(proposer_id, &action, proposed_epoch, &engine.chain.chain_id);
-        let change_blinding = derive_governance_change_blinding(&proposal_id);
         let change_utxo_id = engine
             .chain
             .utxos
-            .insert(owned_output(500, change_blinding), height, u32::MAX - 3, 0)
+            .insert(owned_output(500, [0; 32]), height, u32::MAX - 3, 0)
             .unwrap();
         engine
             .blocks
@@ -3047,7 +2965,7 @@ mod tests {
             ProposalRecord {
                 proposal_id,
                 proposer_id,
-                proposer_pubkey: owner,
+                proposer_pubkey: owner.clone(),
                 tier: ProposalTier::Standard,
                 action,
                 title: "title".into(),
@@ -3073,16 +2991,10 @@ mod tests {
                 passed: Some(true),
             },
         );
-        let refund_blinding = derive_governance_refund_blinding(&proposal_id);
         let refund_utxo_id = engine
             .chain
             .utxos
-            .insert(
-                owned_output(10_000, refund_blinding),
-                height,
-                u32::MAX - 2,
-                0,
-            )
+            .insert(owned_output(10_000, [0; 32]), height, u32::MAX - 2, 0)
             .unwrap();
 
         let change = explain(&engine, change_utxo_id);
@@ -3098,6 +3010,60 @@ mod tests {
             "{refund}"
         );
         assert!(refund.contains(r#""recoverable":true"#), "{refund}");
+
+        let second_action = GovernableAction::SetMinDelegationSpark { value: 45 };
+        let second_proposal_id = compute_proposal_id(
+            proposer_id,
+            &second_action,
+            proposed_epoch,
+            &engine.chain.chain_id,
+        );
+        let mut second_proposal = engine.chain.governance.proposals[&proposal_id].clone();
+        second_proposal.proposal_id = second_proposal_id;
+        second_proposal.action = second_action.clone();
+        engine
+            .chain
+            .governance
+            .proposals
+            .insert(second_proposal_id, second_proposal);
+        engine
+            .blocks
+            .get_mut(&height)
+            .unwrap()
+            .governance_ops
+            .push(GovernanceOpV2 {
+                action_type: GovernanceActionType::ProposeChange,
+                signer_id: proposer_id,
+                nonce: 2,
+                payload: GovernancePayload::Propose {
+                    action: second_action,
+                    deposit_utxo_id: Bytes32::from([0x73; 32]),
+                    proposer_pubkey: owner,
+                    title: VariableBytes::from_slice(b"second title").unwrap(),
+                    description: VariableBytes::from_slice(b"second description").unwrap(),
+                    cold_authorization: None,
+                },
+                signature: dummy_signature(0x74),
+            });
+
+        let ambiguous_change = explain(&engine, change_utxo_id);
+        assert!(
+            ambiguous_change.contains(r#""category":"governance_deposit_change_unclassified""#),
+            "{ambiguous_change}"
+        );
+        assert!(
+            ambiguous_change.contains(r#""recoverable":false"#),
+            "{ambiguous_change}"
+        );
+        let ambiguous_refund = explain(&engine, refund_utxo_id);
+        assert!(
+            ambiguous_refund.contains(r#""category":"governance_deposit_refund_unavailable""#),
+            "{ambiguous_refund}"
+        );
+        assert!(
+            ambiguous_refund.contains(r#""recoverable":false"#),
+            "{ambiguous_refund}"
+        );
     }
 
     #[test]

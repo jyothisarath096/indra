@@ -5,11 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use indra_core::types::{
     primitives::{Bytes32, EPOCH_DURATION_BLOCKS, SLASH_EVIDENCE_WINDOW_EPOCHS},
     stake_position::{
-        derive_tranche_id, eviction_tranche_creation_id_v1, PositionCustodyV1, StakePositionV1,
-        UnbondingTimingV1, UnbondingTrancheV1,
+        eviction_tranche_creation_id_v1, PositionCustodyV1, StakePositionV1, UnbondingTimingV1,
+        UnbondingTrancheV1,
     },
 };
-use indra_crypto::{derive_tranche_source_blinding_v1, TrancheSourceBlindingInputsV1};
 
 use crate::{
     error::{StateError, StateResult},
@@ -120,26 +119,9 @@ pub fn plan_tranche_native_eviction_v2(
             active.principal_spark,
         )
         .map_err(invalid)?;
-        let tranche_id = derive_tranche_id(
-            position.position_id,
-            creation,
-            0,
-            timing,
-            active.principal_spark,
-        );
-        let blinding = derive_tranche_source_blinding_v1(&TrancheSourceBlindingInputsV1 {
-            chain_id: chain_id.as_bytes(),
-            position_id: position.position_id.0,
-            tranche_id: tranche_id.0,
-            principal_spark: active.principal_spark,
-            start_height: eviction_height,
-            creation_op_id: creation.0,
-        })
-        .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
         let tranche = UnbondingTrancheV1::new(
             position.position_id,
             active.principal_spark,
-            indra_crypto::commit(active.principal_spark, &blinding),
             timing,
             position.custody,
             creation,
@@ -392,7 +374,6 @@ pub fn tombstone_is_prunable_v2(
 fn invalid(error: indra_core::error::IndraError) -> StateError {
     StateError::InvalidStakingOp(error.to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

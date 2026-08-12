@@ -143,12 +143,6 @@ fn main() {
         "  Classical PK:     {}",
         hex::encode(keys.public.hybrid_classical_pk)
     );
-    if let Some(payment_pubkey) = &keys.public.payment_pubkey {
-        println!(
-            "  Payment PK:       {}",
-            hex::encode(payment_pubkey.encode())
-        );
-    }
     let payment_address = keys
         .payment_address(chain_id.as_bytes())
         .unwrap_or_else(|error| {
@@ -181,11 +175,6 @@ fn cmd_inspect(args: &[String]) {
             );
             println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
             println!("VRF PK:         {}", hex::encode(public.vrf_pk));
-            if let Some(payment_pubkey) = &public.payment_pubkey {
-                println!("Payment PK:     {}", hex::encode(payment_pubkey.encode()));
-            } else {
-                println!("Payment PK:     <absent>");
-            }
         }
         indra_cli::KeyFilePublicMetadata::Cold {
             classical_pk,

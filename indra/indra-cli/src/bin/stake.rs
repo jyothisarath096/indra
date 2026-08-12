@@ -3,11 +3,9 @@
 use indra_cli::{
     fetch_chain_id, fetch_staking_nonce, fetch_validator_cold_replay, load_cold_keys,
     password_source_from_args, reconstruct_keypair, submit_staking_op, BuiltStakingOp, CliError,
-    CliResult, KeysFile, PasswordSource, StakePositionExitSigner, Wallet, WalletEntry,
+    CliResult, KeysFile, PasswordSource, StakePositionExitSigner, Wallet,
 };
-use indra_core::types::{
-    primitives::Bytes32, stake_position::PositionCustodyV1, staking::StakeDepositProof,
-};
+use indra_core::types::{primitives::Bytes32, stake_position::PositionCustodyV1};
 #[cfg(test)]
 use indra_core::{
     codec::{Decode, Encode},
@@ -66,7 +64,6 @@ fn run_register(args: &[String]) -> CliResult<()> {
     let commission_bps = parse_commission(args)?;
     let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
@@ -74,7 +71,6 @@ fn run_register(args: &[String]) -> CliResult<()> {
     let built = indra_cli::tx_builder::build_register_validator_op_with_cold(
         commission_bps,
         deposit_utxo_id,
-        deposit_proof,
         &keypair,
         &cold_keypair,
         keys.public.vrf_pk,
@@ -105,18 +101,12 @@ fn run_self_stake(args: &[String]) -> CliResult<()> {
     let keypair = reconstruct_keypair(&keys)?;
     let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
-    let built = indra_cli::tx_builder::build_self_stake_op(
-        deposit_utxo_id,
-        deposit_proof,
-        &keypair,
-        nonce,
-        &chain_id,
-    )?;
+    let built =
+        indra_cli::tx_builder::build_self_stake_op(deposit_utxo_id, &keypair, nonce, &chain_id)?;
     finish_op(
         args,
         "self-stake",
@@ -196,7 +186,6 @@ fn run_delegate(args: &[String]) -> CliResult<()> {
     let deposit_utxo_id = parse_required_bytes32(args, "--utxo")?;
     let validator_id = parse_required_bytes32(args, "--validator")?;
     let wallet_path = get(args, "--wallet").unwrap_or_else(|| DEFAULT_WALLET.to_string());
-    let deposit_proof = stake_deposit_proof_from_wallet(&wallet_path, &deposit_utxo_id)?;
     let signer_id = staking_signer_id(&keys)?;
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
@@ -204,7 +193,6 @@ fn run_delegate(args: &[String]) -> CliResult<()> {
     let built = indra_cli::tx_builder::build_delegate_op(
         validator_id,
         deposit_utxo_id,
-        deposit_proof,
         &keypair,
         nonce,
         &chain_id,
@@ -542,39 +530,6 @@ fn fetch_next_nonce(node_url: &str, signer_id: &Bytes32) -> CliResult<u64> {
 fn load_keys(args: &[String]) -> CliResult<KeysFile> {
     let path = get(args, "--keys").unwrap_or_else(|| DEFAULT_KEYS.to_string());
     indra_cli::load_keys_for_cli(&path, args)
-}
-
-fn stake_deposit_proof_from_wallet(
-    wallet_path: &str,
-    utxo_id: &Bytes32,
-) -> CliResult<StakeDepositProof> {
-    let wallet = Wallet::load(wallet_path)?;
-    match wallet.get(utxo_id) {
-        Some(entry) => stake_deposit_proof_from_wallet_entry(entry),
-        None => Err(CliError::Transaction(format!(
-            "UTXO {} not found in wallet {}; cannot construct stake-deposit proof without value and blinding factor",
-            hex::encode(utxo_id.0),
-            wallet_path
-        ))),
-    }
-}
-
-fn stake_deposit_proof_from_wallet_entry(entry: &WalletEntry) -> CliResult<StakeDepositProof> {
-    if entry.spent {
-        return Err(CliError::Transaction(
-            "UTXO is already marked spent in wallet; refusing to build stake-deposit proof".into(),
-        ));
-    }
-    if entry.blinding == [0u8; 32] {
-        return Err(CliError::Transaction(
-            "missing UTXO blinding factor; staking requires the original UTXO blinding factor"
-                .into(),
-        ));
-    }
-    Ok(StakeDepositProof {
-        committed_value_spark: entry.value_spark,
-        blinding_factor: Bytes32::from(entry.blinding),
-    })
 }
 
 fn get(args: &[String], flag: &str) -> Option<String> {

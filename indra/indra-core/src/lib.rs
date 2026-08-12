@@ -27,7 +27,7 @@ pub use error::{IndraError, IndraResult};
 pub use types::{
     block::{BlockHeaderV1, BlockV1},
     checkpoint::CheckpointV1,
-    crypto::{CommitmentV1, HybridPubKey, HybridSignature, PQVoteSig},
+    crypto::{HybridPubKey, HybridSignature, PQVoteSig},
     epoch_record::EpochRecord,
     governance::GovernanceOpV2,
     primitives::{Bytes32, ProtocolVersion, VariableBytes},

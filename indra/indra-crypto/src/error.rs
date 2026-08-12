@@ -42,14 +42,6 @@ pub enum CryptoError {
     #[error("invalid Ristretto255 point encoding")]
     InvalidPoint,
 
-    /// Pedersen commitment opening verification failed.
-    #[error("Pedersen commitment opening failed")]
-    CommitmentOpeningFailed,
-
-    /// Commitment balance check failed.
-    #[error("commitment balance failed: inputs do not equal outputs plus fee")]
-    CommitmentBalanceFailed,
-
     /// VRF proof verification failed.
     #[error("VRF proof verification failed")]
     VrfProofFailed,
@@ -76,7 +68,7 @@ pub enum CryptoError {
         actual: usize,
     },
 
-    /// A KDF input exceeded its stage-1 encoding limit.
+    /// An encoded input exceeded its protocol limit.
     #[error("KDF input '{field}' length {actual} exceeds maximum {max}")]
     LengthExceeded {
         /// Field name.
@@ -86,17 +78,6 @@ pub enum CryptoError {
         /// Actual length supplied.
         actual: usize,
     },
-
-    /// ML-KEM key material or ciphertext failed validation.
-    #[error("invalid ML-KEM-1024 {material}")]
-    InvalidMlKem {
-        /// Which material failed.
-        material: &'static str,
-    },
-
-    /// Payment blinding note did not target the provided recipient keypair.
-    #[error("payment blinding note target hash does not match recipient payment key")]
-    PaymentKeyHashMismatch,
 
     /// A payment address failed canonical decoding or validation.
     #[error("invalid payment address: {reason}")]

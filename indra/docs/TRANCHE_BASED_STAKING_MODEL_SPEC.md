@@ -38,10 +38,9 @@ without changing position identity or downstream reward/accounting semantics.
 ## Deposits
 
 `RegisterValidator`, `SelfStake`, and `Delegate` consume a real UTXO, verify
-its value/blinding proof and custody, and atomically add its value to the
+its public value and custody, and atomically add that UTXO-derived value to the
 derived position. Multiple deposits into the same tuple consolidate into the
-same active aggregate. Failed validation rolls back every state and commitment
-mutation.
+same active aggregate. Failed validation rolls back every state mutation.
 
 ## Partial and full exits
 
@@ -52,8 +51,8 @@ capacity and recording the tranche. A partial exit preserves the remaining
 active aggregate.
 
 Maturity is height/epoch precise according to `UnbondingTimingV1`. Matured
-tranches produce fresh canonical UTXOs whose commitment, range proof, owner,
-and provenance agree. Tranches are removed only after successful refund
+tranches produce fresh canonical UTXOs whose public value, owner, lock, and
+provenance agree. Tranches are removed only after successful refund
 insertion.
 
 ## Rewards, governance, slashing, and eviction

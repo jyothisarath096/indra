@@ -5,28 +5,20 @@
 //! stages will wire into rewards, governance, slashing, tombstones, RPC, and
 //! wallets.
 
-use indra_core::{
-    codec::Encode,
-    types::{
-        crypto::{CommitmentV1, HybridPubKey},
-        primitives::{
-            Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_STAKE_POSITIONS_PER_VALIDATOR,
-            MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
-            MAX_TRANCHES_TOTAL, STAKING_TX_IDX,
-        },
-        stake_position::{
-            derive_position_id, derive_tranche_id, ActiveStakeAggregateV1, PositionCustodyV1,
-            StakePositionV1, UnbondingTimingV1, UnbondingTrancheV1,
-        },
-        staking::{StakingOp, StakingOpBody},
-        transaction::OutputV1,
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{
+        Bytes32, VariableBytes, DUST_LIMIT_SPARK, MAX_STAKE_POSITIONS_PER_VALIDATOR,
+        MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
+        MAX_TRANCHES_TOTAL, STAKING_TX_IDX,
     },
+    stake_position::{
+        derive_position_id, derive_tranche_id, ActiveStakeAggregateV1, PositionCustodyV1,
+        StakePositionV1, UnbondingTimingV1, UnbondingTrancheV1,
+    },
+    staking::{StakingOp, StakingOpBody},
+    transaction::OutputV1,
 };
-use indra_crypto::{
-    derive_tranche_refund_blinding_v1, derive_tranche_source_blinding_v1,
-    TrancheRefundBlindingInputsV1, TrancheSourceBlindingInputsV1,
-};
-use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
     error::{StateError, StateResult},
@@ -35,15 +27,6 @@ use crate::{
     ChainState,
 };
 
-/// Verified opening supplied when principal enters an isolated position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PositionDepositOpeningV1 {
-    /// Public principal amount bound to the UTXO commitment.
-    pub principal_spark: u64,
-    /// Pedersen blinding factor opening the UTXO commitment.
-    pub blinding: [u8; 32],
-}
-
 /// Deposit one owned UTXO into a canonical position, aggregating by tuple.
 pub fn deposit_stake_position(
     state: &mut ChainState,
@@ -51,21 +34,21 @@ pub fn deposit_stake_position(
     principal_owner_id: Bytes32,
     custody: PositionCustodyV1,
     utxo_id: Bytes32,
-    opening: PositionDepositOpeningV1,
     current_height: u64,
 ) -> StateResult<Bytes32> {
     custody
         .validate_for(validator_id, principal_owner_id)
         .map_err(invalid_position)?;
-    if opening.principal_spark < DUST_LIMIT_SPARK {
-        return Err(StateError::BelowDustLimit {
-            limit: DUST_LIMIT_SPARK,
-        });
-    }
     if state.validators.get(&validator_id).is_none() {
         return Err(StateError::ValidatorNotFound);
     }
     let utxo = state.utxos.get(&utxo_id).ok_or(StateError::UnknownUtxo)?;
+    let principal_spark = utxo.output.value_spark;
+    if principal_spark < DUST_LIMIT_SPARK {
+        return Err(StateError::BelowDustLimit {
+            limit: DUST_LIMIT_SPARK,
+        });
+    }
     if current_height < utxo.output.lock_height {
         return Err(StateError::OutputLocked {
             lock_height: utxo.output.lock_height,
@@ -93,25 +76,6 @@ pub fn deposit_stake_position(
             "position deposit UTXO owner does not match custody authority".to_string(),
         ));
     }
-    if utxo.output.value_spark != opening.principal_spark {
-        return Err(StateError::InvalidStakingOp(
-            "position deposit public principal does not match intent".to_string(),
-        ));
-    }
-    let commitment = indra_crypto::PedersenCommitment(utxo.output.commitment.compressed_point.0);
-    indra_crypto::verify_opening(
-        &commitment,
-        &indra_crypto::PedersenOpening {
-            value: opening.principal_spark,
-            blinding: opening.blinding,
-        },
-    )
-    .map_err(|_| {
-        StateError::InvalidStakingOp(
-            "position deposit does not open the referenced UTXO commitment".to_string(),
-        )
-    })?;
-
     let position_id = derive_position_id(validator_id, principal_owner_id, custody);
     let existing = state.stake_positions.get(&position_id).cloned();
     preflight_deposit_capacity(state, validator_id, existing.is_none())?;
@@ -119,14 +83,12 @@ pub fn deposit_stake_position(
         Some(mut position) => {
             position.active = Some(match position.active {
                 Some(active) => active
-                    .checked_add_principal(opening.principal_spark, current_height)
+                    .checked_add_principal(principal_spark, current_height)
                     .map_err(invalid_position)?,
-                None => ActiveStakeAggregateV1::new(
-                    opening.principal_spark,
-                    current_height,
-                    current_height,
-                )
-                .map_err(invalid_position)?,
+                None => {
+                    ActiveStakeAggregateV1::new(principal_spark, current_height, current_height)
+                        .map_err(invalid_position)?
+                }
             });
             position
         }
@@ -135,12 +97,8 @@ pub fn deposit_stake_position(
             principal_owner_id,
             custody,
             Some(
-                ActiveStakeAggregateV1::new(
-                    opening.principal_spark,
-                    current_height,
-                    current_height,
-                )
-                .map_err(invalid_position)?,
+                ActiveStakeAggregateV1::new(principal_spark, current_height, current_height)
+                    .map_err(invalid_position)?,
             ),
             0,
             current_height / indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
@@ -217,20 +175,9 @@ pub fn exit_stake_position(
             "duplicate position exit intent".to_string(),
         ));
     }
-    let source_blinding = derive_tranche_source_blinding_v1(&TrancheSourceBlindingInputsV1 {
-        chain_id: state.chain_id.as_bytes(),
-        position_id: position.position_id.0,
-        tranche_id: tranche_id.0,
-        principal_spark: amount_spark,
-        start_height: current_height,
-        creation_op_id: creation_op_id.0,
-    })
-    .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
-    let source_commitment = indra_crypto::commit(amount_spark, &source_blinding);
     let tranche = UnbondingTrancheV1::new(
         position.position_id,
         amount_spark,
-        source_commitment,
         timing,
         position.custody,
         creation_op_id,
@@ -324,32 +271,10 @@ pub fn release_matured_position_tranches(
                 message: "mature tranche references missing position",
             })?;
         let owner = resolve_position_owner(state, position)?;
-        let custody_encoding = tranche.custody.encode_to_vec();
         let UnbondingTimingV1::HeightPrecise { end_epoch, .. } = tranche.timing;
-        let blinding = derive_tranche_refund_blinding_v1(&TrancheRefundBlindingInputsV1 {
-            chain_id: state.chain_id.as_bytes(),
-            position_id: tranche.position_id.0,
-            tranche_id: tranche.tranche_id.0,
-            principal_owner_id: position.principal_owner_id.0,
-            custody_encoding: &custody_encoding,
-            principal_spark: tranche.principal_spark,
-            release_height,
-            end_epoch,
-        })
-        .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
-        let commitment = indra_crypto::commit(tranche.principal_spark, &blinding);
-        let mut rng = StdRng::from_seed(blinding);
-        let range_proof = indra_crypto::prove_range(tranche.principal_spark, &blinding, &mut rng)
-            .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
         let output = OutputV1 {
             value_spark: tranche.principal_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(commitment.0),
-            },
             owner_pubkey: owner,
-            range_proof: VariableBytes::from_slice(&range_proof).map_err(|_| {
-                StateError::InvalidStakingOp("tranche refund range proof too large".to_string())
-            })?,
             lock_height: 0,
         };
         let output_index = u32::try_from(ordinal).map_err(|_| StateError::InvariantViolation {
@@ -634,7 +559,6 @@ fn check_capacity(condition: bool, reason: &'static str) -> StateResult<()> {
 fn invalid_position(error: indra_core::error::IndraError) -> StateError {
     StateError::InvalidStakingOp(error.to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,21 +678,16 @@ mod tests {
         state: &mut ChainState,
         owner_keys: &HybridKeypair,
         amount: u64,
-        blinding: [u8; 32],
+        _blinding: [u8; 32],
         height: u64,
         ordinal: u32,
     ) -> Bytes32 {
-        let commitment = indra_crypto::commit(amount, &blinding);
         state
             .utxos
             .insert(
                 OutputV1 {
                     value_spark: amount,
-                    commitment: CommitmentV1 {
-                        compressed_point: Bytes32::from(commitment.0),
-                    },
                     owner_pubkey: wire_pubkey(owner_keys),
-                    range_proof: VariableBytes::default(),
                     lock_height: 0,
                 },
                 height,
@@ -815,49 +734,18 @@ mod tests {
         let first = add_deposit_utxo(&mut state, &keys, 600_000, [1; 32], 10, 0);
         let before_failed_deposit = state.clone();
         set_fail_after_mutation(Some(1));
-        assert!(deposit_stake_position(
-            &mut state,
-            validator_id,
-            owner_id,
-            custody,
-            first,
-            PositionDepositOpeningV1 {
-                principal_spark: 600_000,
-                blinding: [1; 32],
-            },
-            11,
-        )
-        .is_err());
+        assert!(
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, first, 11,)
+                .is_err()
+        );
         set_fail_after_mutation(None);
         assert_eq!(state, before_failed_deposit);
-        let position_id = deposit_stake_position(
-            &mut state,
-            validator_id,
-            owner_id,
-            custody,
-            first,
-            PositionDepositOpeningV1 {
-                principal_spark: 600_000,
-                blinding: [1; 32],
-            },
-            11,
-        )
-        .unwrap();
+        let position_id =
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, first, 11).unwrap();
         let second = add_deposit_utxo(&mut state, &keys, 400_000, [2; 32], 12, 0);
         assert_eq!(
-            deposit_stake_position(
-                &mut state,
-                validator_id,
-                owner_id,
-                custody,
-                second,
-                PositionDepositOpeningV1 {
-                    principal_spark: 400_000,
-                    blinding: [2; 32],
-                },
-                13,
-            )
-            .unwrap(),
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, second, 13,)
+                .unwrap(),
             position_id
         );
         let active = state
@@ -906,10 +794,6 @@ mod tests {
                 owner_id,
                 custody,
                 input,
-                PositionDepositOpeningV1 {
-                    principal_spark: amount,
-                    blinding,
-                },
                 100 + u64::from(ordinal),
             )
             .unwrap();
@@ -952,19 +836,8 @@ mod tests {
             delegator_id: owner_id,
         };
         let input = add_deposit_utxo(&mut state, &keys, 6_400_000, [0xA1; 32], 10, 0);
-        let position_id = deposit_stake_position(
-            &mut state,
-            validator_id,
-            owner_id,
-            custody,
-            input,
-            PositionDepositOpeningV1 {
-                principal_spark: 6_400_000,
-                blinding: [0xA1; 32],
-            },
-            11,
-        )
-        .unwrap();
+        let position_id =
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 11).unwrap();
         for nonce in 1..MAX_TRANCHES_PER_POSITION as u64 {
             let intent = signed_exit(&keys, &state, position_id, owner_id, 100_000, nonce);
             exit_stake_position(&mut state, &intent, 100 + nonce).unwrap();
@@ -1022,19 +895,8 @@ mod tests {
         let input = add_deposit_utxo(&mut state, &keys, 1_000_000, [3; 32], 20, 0);
         state.total_supply = accounted_value(&state);
         let conserved = state.total_supply;
-        let position_id = deposit_stake_position(
-            &mut state,
-            validator_id,
-            owner_id,
-            custody,
-            input,
-            PositionDepositOpeningV1 {
-                principal_spark: 1_000_000,
-                blinding: [3; 32],
-            },
-            21,
-        )
-        .unwrap();
+        let position_id =
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 21).unwrap();
         assert_eq!(accounted_value(&state), conserved);
         let first_intent = signed_exit(&keys, &state, position_id, owner_id, 400_000, 1);
         let first = exit_stake_position(&mut state, &first_intent, 100).unwrap();
@@ -1108,19 +970,8 @@ mod tests {
             delegator_id: owner_id,
         };
         let input = add_deposit_utxo(&mut state, &keys, 1_000_000, [4; 32], 30, 0);
-        let position_id = deposit_stake_position(
-            &mut state,
-            validator_id,
-            owner_id,
-            custody,
-            input,
-            PositionDepositOpeningV1 {
-                principal_spark: 1_000_000,
-                blinding: [4; 32],
-            },
-            31,
-        )
-        .unwrap();
+        let position_id =
+            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 31).unwrap();
         let before = state.clone();
         let intent = signed_exit(&keys, &state, position_id, owner_id, 400_000, 1);
         set_fail_after_mutation(Some(2));
@@ -1137,19 +988,9 @@ mod tests {
                 delegator_id: owner_id,
             };
             let input = add_deposit_utxo(&mut state, &keys, 800_000, [5; 32], 40, 0);
-            let position_id = deposit_stake_position(
-                &mut state,
-                validator_id,
-                owner_id,
-                custody,
-                input,
-                PositionDepositOpeningV1 {
-                    principal_spark: 800_000,
-                    blinding: [5; 32],
-                },
-                41,
-            )
-            .unwrap();
+            let position_id =
+                deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 41)
+                    .unwrap();
             let intent = signed_exit(&keys, &state, position_id, owner_id, 200_000, 1);
             exit_stake_position(&mut state, &intent, 42).unwrap();
             state
@@ -1162,17 +1003,6 @@ mod tests {
         assert_eq!(decoded.stake_positions, first.stake_positions);
         assert_eq!(decoded.unbonding_tranches, first.unbonding_tranches);
         assert_eq!(decoded.position_tranche_index, first.position_tranche_index);
-
-        let mut malformed = first.clone();
-        let (tranche_id, mut tranche) = malformed
-            .unbonding_tranches
-            .iter()
-            .next()
-            .map(|(id, tranche)| (*id, tranche.clone()))
-            .unwrap();
-        tranche.source_commitment = indra_crypto::commit(tranche.principal_spark, &[0xEE; 32]);
-        malformed.unbonding_tranches.insert(tranche_id, tranche);
-        assert!(ChainState::decode_exact(&malformed.encode_to_vec()).is_err());
     }
 
     #[test]

@@ -6,23 +6,18 @@
 //!
 //!   cargo test -p indra-state --test audit_phase2 -- --ignored
 
-use curve25519_dalek::scalar::Scalar;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-    crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+    crypto::{HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
-        MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES, MAX_VRF_PROOF_BYTES,
-        MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+        MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+        TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
-use indra_crypto::{
-    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
-};
+use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
-use rand::{rngs::StdRng, SeedableRng};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
     let classical = ClassicalKeypair::from_seed(&seed);
@@ -83,33 +78,15 @@ fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> Hybri
     }
 }
 
-fn note(owner: &HybridPubKey) -> PaymentBlindingNoteV1 {
-    PaymentBlindingNoteV1 {
-        version: 1,
-        owner_id: sha256(&owner.classical_pk.0),
-        payment_pubkey_hash: [0; 32],
-        sender_x25519_ephemeral_pk: [0; 32],
-        ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-        note_nonce: [0; 32],
-    }
-}
-
 fn output(
     value: u64,
-    blinding: [u8; 32],
+    _blinding: [u8; 32],
     owner_pubkey: HybridPubKey,
-    proof_seed: [u8; 32],
+    _proof_seed: [u8; 32],
 ) -> OutputV1 {
-    let commitment = commit(value, &blinding);
-    let mut rng = StdRng::from_seed(proof_seed);
-    let proof = prove_range(value, &blinding, &mut rng).unwrap();
     OutputV1 {
         value_spark: value,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
         owner_pubkey,
-        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&proof).unwrap(),
         lock_height: 0,
     }
 }
@@ -118,7 +95,7 @@ fn tx_spending(
     utxo_id: Bytes32,
     nullifier: Bytes32,
     value_in: u64,
-    input_blinding: [u8; 32],
+    _input_blinding: [u8; 32],
     owner_pubkey: HybridPubKey,
     keypair: &HybridKeypair,
     output_blinding: [u8; 32],
@@ -126,13 +103,9 @@ fn tx_spending(
 ) -> TransactionV1 {
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
     let value_out = value_in - fee;
-    let fee_blinding = (Scalar::from_bytes_mod_order(input_blinding)
-        - Scalar::from_bytes_mod_order(output_blinding))
-    .to_bytes();
-    let fee_commitment = commit(fee, &fee_blinding);
 
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![InputV1 { utxo_id, nullifier }],
         outputs: vec![output(
@@ -141,12 +114,7 @@ fn tx_spending(
             owner_pubkey.clone(),
             proof_seed,
         )],
-        payment_notes: vec![note(&owner_pubkey)],
         fee_amount: fee,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
@@ -161,7 +129,7 @@ fn tx_spending_same_utxo_twice(
     nullifier_a: Bytes32,
     nullifier_b: Bytes32,
     value_in: u64,
-    input_blinding: [u8; 32],
+    _input_blinding: [u8; 32],
     owner_pubkey: HybridPubKey,
     keypair: &HybridKeypair,
 ) -> TransactionV1 {
@@ -171,14 +139,9 @@ fn tx_spending_same_utxo_twice(
         .and_then(|v| v.checked_sub(fee))
         .unwrap();
     let output_blinding = [0x31; 32];
-    let fee_blinding = (Scalar::from_bytes_mod_order(input_blinding)
-        + Scalar::from_bytes_mod_order(input_blinding)
-        - Scalar::from_bytes_mod_order(output_blinding))
-    .to_bytes();
-    let fee_commitment = commit(fee, &fee_blinding);
 
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![
             InputV1 {
@@ -196,12 +159,7 @@ fn tx_spending_same_utxo_twice(
             owner_pubkey.clone(),
             [0x71; 32],
         )],
-        payment_notes: vec![note(&owner_pubkey)],
         fee_amount: fee,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
@@ -244,20 +202,12 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
     let (owner_pubkey, _owner_keypair) = keypair([0x45; 32]);
     let huge_output_a = OutputV1 {
         value_spark: u64::MAX,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::ZERO,
-        },
         owner_pubkey: owner_pubkey.clone(),
-        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
         lock_height: 0,
     };
     let huge_output_b = OutputV1 {
         value_spark: 1,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::ZERO,
-        },
         owner_pubkey,
-        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
         lock_height: 0,
     };
     let utxo_a = state.utxos.insert(huge_output_a, 0, 0, 0).unwrap();
@@ -265,7 +215,7 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
 
     let overflow_owner = keypair([0x46; 32]).0;
     let tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs: vec![
             InputV1 {
@@ -279,19 +229,10 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
         ],
         outputs: vec![OutputV1 {
             value_spark: INITIAL_BASE_FEE_SPARK_PER_KB,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::ZERO,
-            },
             owner_pubkey: overflow_owner.clone(),
-            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&[0u8; 32]).unwrap(),
             lock_height: 0,
         }],
-        payment_notes: vec![note(&overflow_owner)],
         fee_amount: INITIAL_BASE_FEE_SPARK_PER_KB,
-        fee_blinding: Bytes32::ZERO,
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::ZERO,
-        },
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

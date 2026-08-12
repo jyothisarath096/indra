@@ -30,7 +30,6 @@ pub fn build_wallet_context(
         wallet.add_utxo(
             utxo_id,
             utxo.value_spark,
-            utxo.blinding,
             utxo.created_height,
             utxo.tx_index,
             utxo.out_index,

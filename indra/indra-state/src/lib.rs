@@ -85,7 +85,6 @@ pub use smt::{
 };
 pub use stake_positions::{
     deposit_stake_position, exit_stake_position, release_matured_position_tranches,
-    PositionDepositOpeningV1,
 };
 pub use state_commitment::StateCommitmentV2;
 pub use state_root::{compute_state_root, compute_state_roots, compute_validator_set_root};

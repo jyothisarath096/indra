@@ -8,7 +8,7 @@ use crate::{
         staking::StakingOp,
     },
 };
-use indra_crypto::{sha256, PedersenCommitment};
+use indra_crypto::sha256;
 
 /// Canonical `StakePositionV1` marker.
 pub const STAKE_POSITION_FORMAT_V1: u8 = 1;
@@ -470,8 +470,6 @@ pub struct UnbondingTrancheV1 {
     pub position_id: Bytes32,
     /// Remaining locked principal in Spark.
     pub principal_spark: u64,
-    /// Protocol-owned commitment binding the tranche principal.
-    pub source_commitment: PedersenCommitment,
     /// Exact-height unbonding schedule.
     pub timing: UnbondingTimingV1,
     /// Immutable refund authorization role.
@@ -487,7 +485,6 @@ impl UnbondingTrancheV1 {
     pub fn new(
         position_id: Bytes32,
         principal_spark: u64,
-        source_commitment: PedersenCommitment,
         timing: UnbondingTimingV1,
         custody: PositionCustodyV1,
         creation_op_id: Bytes32,
@@ -497,9 +494,6 @@ impl UnbondingTrancheV1 {
             return invalid("unbonding tranche principal is zero");
         }
         timing.validate()?;
-        source_commitment
-            .decompress()
-            .map_err(|_| invalid_error("source commitment is not a canonical Ristretto point"))?;
         let tranche_id = derive_tranche_id(
             position_id,
             creation_op_id,
@@ -511,7 +505,6 @@ impl UnbondingTrancheV1 {
             tranche_id,
             position_id,
             principal_spark,
-            source_commitment,
             timing,
             custody,
             creation_op_id,
@@ -525,9 +518,6 @@ impl UnbondingTrancheV1 {
             return invalid("unbonding tranche principal is zero");
         }
         self.timing.validate()?;
-        self.source_commitment
-            .decompress()
-            .map_err(|_| invalid_error("source commitment is not a canonical Ristretto point"))?;
         if self.tranche_id
             != derive_tranche_id(
                 self.position_id,
@@ -549,14 +539,13 @@ impl Encode for UnbondingTrancheV1 {
         self.tranche_id.encode(buf);
         self.position_id.encode(buf);
         self.principal_spark.encode(buf);
-        buf.extend_from_slice(&self.source_commitment.0);
         self.timing.encode(buf);
         self.custody.encode(buf);
         self.creation_op_id.encode(buf);
         self.creation_ordinal.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        1 + 32 + 32 + 8 + 32 + self.timing.encoded_len() + self.custody.encoded_len() + 32 + 4
+        1 + 32 + 32 + 8 + self.timing.encoded_len() + self.custody.encoded_len() + 32 + 4
     }
 }
 
@@ -570,17 +559,10 @@ impl Decode for UnbondingTrancheV1 {
         let tranche_id = Bytes32::decode(reader)?;
         let position_id = Bytes32::decode(reader)?;
         let principal_spark = u64::decode(reader)?;
-        let source_commitment = PedersenCommitment(
-            reader
-                .read_bytes(32)?
-                .try_into()
-                .map_err(|_| invalid_error("malformed source commitment"))?,
-        );
         let value = Self {
             tranche_id,
             position_id,
             principal_spark,
-            source_commitment,
             timing: UnbondingTimingV1::decode(reader)?,
             custody: PositionCustodyV1::decode(reader)?,
             creation_op_id: Bytes32::decode(reader)?,
@@ -691,7 +673,7 @@ mod tests {
         codec::{Decode, Encode},
         types::{
             crypto::{HybridPubKey, HybridSignature},
-            staking::{StakeDepositProof, StakingOpBody},
+            staking::StakingOpBody,
         },
         VariableBytes,
     };
@@ -740,16 +722,7 @@ mod tests {
     fn tranche() -> UnbondingTrancheV1 {
         let p = position();
         let timing = UnbondingTimingV1::height_precise(301).unwrap();
-        UnbondingTrancheV1::new(
-            p.position_id,
-            400,
-            indra_crypto::commit(400, &[9; 32]),
-            timing,
-            p.custody,
-            id(3),
-            0,
-        )
-        .unwrap()
+        UnbondingTrancheV1::new(p.position_id, 400, timing, p.custody, id(3), 0).unwrap()
     }
 
     #[test]
@@ -793,7 +766,7 @@ mod tests {
         .unwrap();
         assert_eq!(empty_active.encoded_len(), 148);
         let tranche = tranche();
-        assert_eq!(tranche.encoded_len(), 193);
+        assert_eq!(tranche.encoded_len(), 161);
         assert_eq!(
             UnbondingTrancheV1::decode_exact(&tranche.encode_to_vec()).unwrap(),
             tranche
@@ -947,10 +920,6 @@ mod tests {
                 validator_id: id(11),
                 deposit_utxo_id: id(12),
                 delegator_pubkey: dummy_pubkey(13),
-                deposit_proof: Some(StakeDepositProof {
-                    committed_value_spark: 14,
-                    blinding_factor: id(15),
-                }),
             },
             8,
             1,
@@ -962,10 +931,6 @@ mod tests {
                     validator_id: id(21),
                     deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(13),
-                    deposit_proof: Some(StakeDepositProof {
-                        committed_value_spark: 14,
-                        blinding_factor: id(15),
-                    }),
                 },
                 8,
                 1,
@@ -975,10 +940,6 @@ mod tests {
                     validator_id: id(11),
                     deposit_utxo_id: id(22),
                     delegator_pubkey: dummy_pubkey(13),
-                    deposit_proof: Some(StakeDepositProof {
-                        committed_value_spark: 14,
-                        blinding_factor: id(15),
-                    }),
                 },
                 8,
                 1,
@@ -988,46 +949,6 @@ mod tests {
                     validator_id: id(11),
                     deposit_utxo_id: id(12),
                     delegator_pubkey: dummy_pubkey(23),
-                    deposit_proof: Some(StakeDepositProof {
-                        committed_value_spark: 14,
-                        blinding_factor: id(15),
-                    }),
-                },
-                8,
-                1,
-            ),
-            operation(
-                StakingOpBody::Delegate {
-                    validator_id: id(11),
-                    deposit_utxo_id: id(12),
-                    delegator_pubkey: dummy_pubkey(13),
-                    deposit_proof: Some(StakeDepositProof {
-                        committed_value_spark: 24,
-                        blinding_factor: id(15),
-                    }),
-                },
-                8,
-                1,
-            ),
-            operation(
-                StakingOpBody::Delegate {
-                    validator_id: id(11),
-                    deposit_utxo_id: id(12),
-                    delegator_pubkey: dummy_pubkey(13),
-                    deposit_proof: Some(StakeDepositProof {
-                        committed_value_spark: 14,
-                        blinding_factor: id(25),
-                    }),
-                },
-                8,
-                1,
-            ),
-            operation(
-                StakingOpBody::Delegate {
-                    validator_id: id(11),
-                    deposit_utxo_id: id(12),
-                    delegator_pubkey: dummy_pubkey(13),
-                    deposit_proof: None,
                 },
                 8,
                 1,
@@ -1151,7 +1072,7 @@ mod tests {
     #[test]
     fn d10_stage1_encoded_size_and_algorithmic_measurement() {
         let sample = tranche();
-        assert_eq!(sample.encoded_len(), 193);
+        assert_eq!(sample.encoded_len(), 161);
         for count in [1usize, 63, 64, 128, 1024] {
             let start = Instant::now();
             let mut bytes = Vec::with_capacity(count * sample.encoded_len());
@@ -1160,7 +1081,6 @@ mod tests {
                 let item = UnbondingTrancheV1::new(
                     sample.position_id,
                     sample.principal_spark,
-                    sample.source_commitment,
                     timing,
                     sample.custody,
                     sample.creation_op_id,
@@ -1170,7 +1090,7 @@ mod tests {
                 item.encode(&mut bytes);
             }
             let elapsed = start.elapsed();
-            assert_eq!(bytes.len(), count * 193);
+            assert_eq!(bytes.len(), count * 161);
             println!(
                 "D10 count={count} bytes={} build_encode_ns={} ns_per_tranche={}",
                 bytes.len(),

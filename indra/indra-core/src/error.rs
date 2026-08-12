@@ -166,13 +166,6 @@ pub enum IndraError {
         scheme: &'static str,
     },
 
-    /// Range proof verification failed.
-    #[error("range proof failed for output index {index}")]
-    RangeProofInvalid {
-        /// Index of the failing output.
-        index: usize,
-    },
-
     /// Commitment balance equation not satisfied.
     #[error("commitment balance equation not satisfied")]
     CommitmentImbalance,

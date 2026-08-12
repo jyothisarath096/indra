@@ -1,159 +1,141 @@
-//! Self-contained, chain-bound payment addresses.
+//! Canonical machine-oriented payment addresses carrying one complete hybrid key.
 
 use crate::{
-    hash::{domain_hash, sha256},
+    hash::sha256,
     hybrid::{
-        validate_classical_public_key, validate_pq_public_key, verify_hybrid, ClassicalPublicKey,
-        ClassicalSignature, HybridKeypair, HybridPublicKey, HybridSignature, PqPublicKey,
-        PqSignature,
+        validate_classical_public_key, validate_pq_public_key, ClassicalPublicKey, HybridPublicKey,
+        PqPublicKey,
     },
-    CryptoError, CryptoResult, PaymentPubKeyV1, CLASSICAL_SIG_BYTES, PAYMENT_PUBKEY_V1_ENCODED_LEN,
-    PQ_PK_BYTES, PQ_SIG_BYTES,
+    CryptoError, CryptoResult, PQ_PK_BYTES,
 };
 
-/// Literal binary address domain.
-pub const PAYMENT_ADDRESS_DOMAIN: &[u8] = b"INDRA-PAYMENT-ADDRESS";
-/// Canonical address format version.
+/// Canonical binary address version.
 pub const PAYMENT_ADDRESS_VERSION: u8 = 1;
-/// Canonical textual prefix.
+/// Exact, case-sensitive textual prefix.
 pub const PAYMENT_ADDRESS_TEXT_PREFIX: &str = "indra:";
+/// Protocol maximum for a canonical chain identifier.
+pub const MAX_PAYMENT_CHAIN_ID_BYTES: usize = 64;
+
 const CHECKSUM_DOMAIN: &[u8] = b"INDRA-PAYMENT-ADDRESS-CHECKSUM-v1";
 const CHECKSUM_BYTES: usize = 8;
-const FIXED_BODY_BYTES: usize =
-    PAYMENT_ADDRESS_DOMAIN.len() + 1 + 2 + 32 + PQ_PK_BYTES + PAYMENT_PUBKEY_V1_ENCODED_LEN;
-const SIGNATURE_BYTES: usize = CLASSICAL_SIG_BYTES + PQ_SIG_BYTES;
+const PQ_LENGTH_BYTES: usize = 4;
+const FIXED_BYTES: usize = 1 + 2 + 32 + PQ_LENGTH_BYTES + PQ_PK_BYTES + CHECKSUM_BYTES;
+const MAX_BINARY_BYTES: usize = FIXED_BYTES + MAX_PAYMENT_CHAIN_ID_BYTES;
+const MAX_TEXT_PAYLOAD_BYTES: usize = (MAX_BINARY_BYTES * 4).div_ceil(3);
 
-/// A complete payment destination authenticated by its ownership key.
+/// A chain-bound raw hybrid-public-key payment address.
+///
+/// This intentionally large descriptor is meant for machine transport. Its
+/// checksum detects accidental corruption only; it is not authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaymentAddress {
+pub struct PaymentAddressV1 {
     chain_id: Vec<u8>,
     owner_pubkey: HybridPublicKey,
-    payment_pubkey: PaymentPubKeyV1,
-    owner_signature: HybridSignature,
 }
 
-impl PaymentAddress {
-    /// Construct and owner-sign a canonical descriptor.
-    pub fn new(
-        chain_id: &[u8],
-        owner_keypair: &HybridKeypair,
-        payment_pubkey: PaymentPubKeyV1,
-    ) -> CryptoResult<Self> {
-        let chain_len =
-            u16::try_from(chain_id.len()).map_err(|_| CryptoError::InvalidPaymentAddress {
-                reason: "chain ID exceeds u16 length",
-            })?;
-        if chain_len == 0 {
-            return Err(CryptoError::InvalidPaymentAddress {
-                reason: "chain ID is empty",
-            });
-        }
-        PaymentPubKeyV1::decode(&payment_pubkey.encode())?;
-        let owner_pubkey = owner_keypair.public_key();
+impl PaymentAddressV1 {
+    /// Construct and validate a canonical address.
+    pub fn new(chain_id: &[u8], owner_pubkey: HybridPublicKey) -> CryptoResult<Self> {
+        validate_chain_id(chain_id)?;
         validate_classical_public_key(&owner_pubkey.classical)?;
         validate_pq_public_key(&owner_pubkey.pq)?;
-        let payload = binding_payload(chain_id, &owner_pubkey, &payment_pubkey);
-        let owner_signature = owner_keypair.sign(&payload)?;
         Ok(Self {
             chain_id: chain_id.to_vec(),
             owner_pubkey,
-            payment_pubkey,
-            owner_signature,
         })
     }
 
-    /// Decode and fully validate a canonical binary descriptor.
+    /// Decode canonical binary bytes and require the expected local chain ID.
     pub fn decode(bytes: &[u8], expected_chain_id: &[u8]) -> CryptoResult<Self> {
-        if bytes.len() < FIXED_BODY_BYTES + SIGNATURE_BYTES + CHECKSUM_BYTES {
-            return Err(CryptoError::MalformedEncoding {
-                scheme: "PaymentAddress",
-                actual: bytes.len(),
-            });
+        validate_chain_id(expected_chain_id)?;
+        if bytes.len() < FIXED_BYTES || bytes.len() > MAX_BINARY_BYTES {
+            return malformed(bytes.len());
         }
-        let payload_end = bytes.len() - CHECKSUM_BYTES;
-        if checksum(&bytes[..payload_end]) != bytes[payload_end..] {
-            return Err(CryptoError::InvalidPaymentAddress {
-                reason: "checksum mismatch",
-            });
-        }
-        let mut cursor = 0;
-        if &bytes[..PAYMENT_ADDRESS_DOMAIN.len()] != PAYMENT_ADDRESS_DOMAIN {
-            return Err(CryptoError::InvalidPaymentAddress {
-                reason: "domain mismatch",
-            });
-        }
-        cursor += PAYMENT_ADDRESS_DOMAIN.len();
-        let version = bytes[cursor];
-        cursor += 1;
-        if version != PAYMENT_ADDRESS_VERSION {
+        if bytes[0] != PAYMENT_ADDRESS_VERSION {
             return Err(CryptoError::UnsupportedVersion {
-                scheme: "PaymentAddress",
-                version,
+                scheme: "PaymentAddressV1",
+                version: bytes[0],
             });
         }
-        let chain_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-        cursor += 2;
-        let expected_len = FIXED_BODY_BYTES + chain_len + SIGNATURE_BYTES + CHECKSUM_BYTES;
-        if bytes.len() != expected_len || chain_len == 0 {
-            return Err(CryptoError::MalformedEncoding {
-                scheme: "PaymentAddress",
-                actual: bytes.len(),
+        let chain_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+        if chain_len == 0 || chain_len > MAX_PAYMENT_CHAIN_ID_BYTES {
+            return Err(CryptoError::InvalidPaymentAddress {
+                reason: "chain ID length is outside protocol bounds",
             });
         }
-        let chain_id = bytes[cursor..cursor + chain_len].to_vec();
-        cursor += chain_len;
+        let expected_len = FIXED_BYTES + chain_len;
+        if bytes.len() != expected_len {
+            return malformed(bytes.len());
+        }
+        let chain_end = 3 + chain_len;
+        let chain_id = &bytes[3..chain_end];
         if chain_id != expected_chain_id {
             return Err(CryptoError::InvalidPaymentAddress {
                 reason: "chain ID mismatch",
             });
         }
-        let mut classical = [0u8; 32];
-        classical.copy_from_slice(&bytes[cursor..cursor + 32]);
-        cursor += 32;
-        let mut pq = [0u8; PQ_PK_BYTES];
-        pq.copy_from_slice(&bytes[cursor..cursor + PQ_PK_BYTES]);
-        cursor += PQ_PK_BYTES;
+
+        let key_start = chain_end;
+        let pq_len_start = key_start + 32;
+        let pq_start = pq_len_start + PQ_LENGTH_BYTES;
+        let pq_len = u32::from_le_bytes(bytes[pq_len_start..pq_start].try_into().map_err(|_| {
+            CryptoError::InvalidPaymentAddress {
+                reason: "malformed PQ key length",
+            }
+        })?) as usize;
+        if pq_len != PQ_PK_BYTES {
+            return Err(CryptoError::InvalidPaymentAddress {
+                reason: "PQ public key length must be exactly 2592 bytes",
+            });
+        }
+        let pq_end = pq_start + pq_len;
+        let checksum_start = bytes.len() - CHECKSUM_BYTES;
+        if pq_end != checksum_start {
+            return malformed(bytes.len());
+        }
+        if checksum(&bytes[..checksum_start]) != bytes[checksum_start..] {
+            return Err(CryptoError::InvalidPaymentAddress {
+                reason: "checksum mismatch",
+            });
+        }
+
+        let classical: [u8; 32] = bytes[key_start..pq_len_start].try_into().map_err(|_| {
+            CryptoError::InvalidPaymentAddress {
+                reason: "malformed classical public key",
+            }
+        })?;
+        let pq: [u8; PQ_PK_BYTES] =
+            bytes[pq_start..pq_end]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidPaymentAddress {
+                    reason: "malformed PQ public key",
+                })?;
         let owner_pubkey = HybridPublicKey {
             classical: ClassicalPublicKey(classical),
             pq: PqPublicKey(pq),
         };
         validate_classical_public_key(&owner_pubkey.classical)?;
         validate_pq_public_key(&owner_pubkey.pq)?;
-        let payment_pubkey =
-            PaymentPubKeyV1::decode(&bytes[cursor..cursor + PAYMENT_PUBKEY_V1_ENCODED_LEN])?;
-        cursor += PAYMENT_PUBKEY_V1_ENCODED_LEN;
-        let mut classical_sig = [0u8; CLASSICAL_SIG_BYTES];
-        classical_sig.copy_from_slice(&bytes[cursor..cursor + CLASSICAL_SIG_BYTES]);
-        cursor += CLASSICAL_SIG_BYTES;
-        let mut pq_sig = [0u8; PQ_SIG_BYTES];
-        pq_sig.copy_from_slice(&bytes[cursor..cursor + PQ_SIG_BYTES]);
-        let owner_signature = HybridSignature {
-            classical: ClassicalSignature(classical_sig),
-            pq: PqSignature(pq_sig),
-        };
-        let payload = binding_payload(&chain_id, &owner_pubkey, &payment_pubkey);
-        verify_hybrid(&payload, &owner_signature, &owner_pubkey).map_err(|_| {
-            CryptoError::InvalidPaymentAddress {
-                reason: "owner-binding signature failed",
-            }
-        })?;
         Ok(Self {
-            chain_id,
+            chain_id: chain_id.to_vec(),
             owner_pubkey,
-            payment_pubkey,
-            owner_signature,
         })
     }
 
-    /// Decode the canonical textual representation and validate its chain.
+    /// Decode exact lowercase-prefix, unpadded RFC 4648 Base64URL text.
     pub fn from_text(text: &str, expected_chain_id: &[u8]) -> CryptoResult<Self> {
-        let encoded = text.strip_prefix(PAYMENT_ADDRESS_TEXT_PREFIX).ok_or(
+        let payload = text.strip_prefix(PAYMENT_ADDRESS_TEXT_PREFIX).ok_or(
             CryptoError::InvalidPaymentAddress {
                 reason: "text prefix mismatch",
             },
         )?;
-        let bytes = decode_base64url(encoded)?;
-        if encode_base64url(&bytes) != encoded {
+        if payload.len() > MAX_TEXT_PAYLOAD_BYTES {
+            return Err(CryptoError::InvalidPaymentAddress {
+                reason: "encoded address exceeds protocol maximum",
+            });
+        }
+        let bytes = decode_base64url(payload)?;
+        if encode_base64url(&bytes) != payload {
             return Err(CryptoError::InvalidPaymentAddress {
                 reason: "non-canonical Base64URL",
             });
@@ -161,18 +143,21 @@ impl PaymentAddress {
         Self::decode(&bytes, expected_chain_id)
     }
 
-    /// Encode the canonical binary descriptor.
+    /// Encode the canonical binary representation.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = binding_payload(&self.chain_id, &self.owner_pubkey, &self.payment_pubkey);
-        out.extend_from_slice(&self.owner_signature.classical.0);
-        out.extend_from_slice(&self.owner_signature.pq.0);
-        let check = checksum(&out);
-        out.extend_from_slice(&check);
+        let mut out = Vec::with_capacity(FIXED_BYTES + self.chain_id.len());
+        out.push(PAYMENT_ADDRESS_VERSION);
+        out.extend_from_slice(&(self.chain_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.chain_id);
+        out.extend_from_slice(&self.owner_pubkey.classical.0);
+        out.extend_from_slice(&(PQ_PK_BYTES as u32).to_le_bytes());
+        out.extend_from_slice(&self.owner_pubkey.pq.0);
+        out.extend_from_slice(&checksum(&out));
         out
     }
 
-    /// Encode as `indra:` followed by canonical unpadded Base64URL.
+    /// Encode as `indra:` plus canonical unpadded RFC 4648 Base64URL.
     #[must_use]
     pub fn to_text(&self) -> String {
         format!(
@@ -181,53 +166,43 @@ impl PaymentAddress {
         )
     }
 
-    /// Chain identifier bound into this address.
+    /// Exact bound chain identifier.
     #[must_use]
     pub fn chain_id(&self) -> &[u8] {
         &self.chain_id
     }
 
-    /// Authenticated ownership public key.
+    /// Complete authenticated-at-spend ownership public key.
     #[must_use]
     pub fn owner_pubkey(&self) -> &HybridPublicKey {
         &self.owner_pubkey
     }
-
-    /// Authenticated payment public key.
-    #[must_use]
-    pub fn payment_pubkey(&self) -> &PaymentPubKeyV1 {
-        &self.payment_pubkey
-    }
-
-    /// Owner ID derived solely from the ownership key.
-    #[must_use]
-    pub fn owner_id(&self) -> [u8; 32] {
-        sha256(&self.owner_pubkey.classical.0)
-    }
 }
 
-fn binding_payload(
-    chain_id: &[u8],
-    owner_pubkey: &HybridPublicKey,
-    payment_pubkey: &PaymentPubKeyV1,
-) -> Vec<u8> {
-    let chain_len = chain_id.len() as u16;
-    let mut out = Vec::with_capacity(FIXED_BODY_BYTES + chain_id.len());
-    out.extend_from_slice(PAYMENT_ADDRESS_DOMAIN);
-    out.push(PAYMENT_ADDRESS_VERSION);
-    out.extend_from_slice(&chain_len.to_be_bytes());
-    out.extend_from_slice(chain_id);
-    out.extend_from_slice(&owner_pubkey.classical.0);
-    out.extend_from_slice(&owner_pubkey.pq.0);
-    out.extend_from_slice(&payment_pubkey.encode());
-    out
+fn validate_chain_id(chain_id: &[u8]) -> CryptoResult<()> {
+    if chain_id.is_empty() || chain_id.len() > MAX_PAYMENT_CHAIN_ID_BYTES {
+        return Err(CryptoError::InvalidPaymentAddress {
+            reason: "chain ID length is outside protocol bounds",
+        });
+    }
+    Ok(())
+}
+
+fn malformed(actual: usize) -> CryptoResult<PaymentAddressV1> {
+    Err(CryptoError::MalformedEncoding {
+        scheme: "PaymentAddressV1",
+        actual,
+    })
 }
 
 fn checksum(payload: &[u8]) -> [u8; CHECKSUM_BYTES] {
-    let digest = domain_hash(CHECKSUM_DOMAIN, payload);
-    let mut out = [0u8; CHECKSUM_BYTES];
-    out.copy_from_slice(&digest[..CHECKSUM_BYTES]);
-    out
+    let mut material = Vec::with_capacity(CHECKSUM_DOMAIN.len() + payload.len());
+    material.extend_from_slice(CHECKSUM_DOMAIN);
+    material.extend_from_slice(payload);
+    let digest = sha256(&material);
+    digest[..CHECKSUM_BYTES]
+        .try_into()
+        .unwrap_or([0; CHECKSUM_BYTES])
 }
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -251,7 +226,7 @@ fn encode_base64url(bytes: &[u8]) -> String {
 }
 
 fn decode_base64url(text: &str) -> CryptoResult<Vec<u8>> {
-    if text.contains('=') || text.len() % 4 == 1 {
+    if text.is_empty() || text.contains('=') || text.len() % 4 == 1 {
         return Err(CryptoError::InvalidPaymentAddress {
             reason: "invalid unpadded Base64URL",
         });
@@ -282,49 +257,58 @@ fn decode_base64url(text: &str) -> CryptoResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClassicalKeypair, PaymentKeypairV1, PqKeypair};
+    use crate::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
-    fn owner(seed: u8) -> HybridKeypair {
-        HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[seed; 32]),
-            PqKeypair::from_seed(&[seed; 32]).unwrap(),
-        )
+    fn address() -> PaymentAddressV1 {
+        let keys = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[7; 32]),
+            PqKeypair::from_seed(&[8; 32]).unwrap(),
+        );
+        PaymentAddressV1::new(b"indra-mainnet", keys.public_key()).unwrap()
     }
 
     #[test]
-    fn binary_and_text_round_trip() {
-        let address = PaymentAddress::new(
-            b"indra-mainnet",
-            &owner(7),
-            PaymentKeypairV1::generate().public_key(),
-        )
-        .unwrap();
+    fn canonical_binary_and_text_round_trip() {
+        let address = address();
         assert_eq!(
-            PaymentAddress::decode(&address.encode(), b"indra-mainnet").unwrap(),
+            PaymentAddressV1::decode(&address.encode(), b"indra-mainnet").unwrap(),
             address
         );
         assert_eq!(
-            PaymentAddress::from_text(&address.to_text(), b"indra-mainnet").unwrap(),
+            PaymentAddressV1::from_text(&address.to_text(), b"indra-mainnet").unwrap(),
             address
         );
     }
 
     #[test]
-    fn rejects_checksum_chain_and_substituted_payment_key() {
-        let address = PaymentAddress::new(
-            b"indra-mainnet",
-            &owner(8),
-            PaymentKeypairV1::generate().public_key(),
-        )
-        .unwrap();
-        let mut corrupt = address.encode();
-        let last = corrupt.len() - 1;
-        corrupt[last] ^= 1;
-        assert!(PaymentAddress::decode(&corrupt, b"indra-mainnet").is_err());
-        assert!(PaymentAddress::decode(&address.encode(), b"other-chain").is_err());
+    fn rejects_noncanonical_and_wrong_chain_encodings() {
+        let address = address();
+        assert!(
+            PaymentAddressV1::from_text(&format!("{}=", address.to_text()), b"indra-mainnet")
+                .is_err()
+        );
+        assert!(
+            PaymentAddressV1::from_text(&format!(" {}", address.to_text()), b"indra-mainnet")
+                .is_err()
+        );
+        assert!(PaymentAddressV1::decode(&address.encode(), b"other-chain").is_err());
+        let mut trailing = address.encode();
+        trailing.push(0);
+        assert!(PaymentAddressV1::decode(&trailing, b"indra-mainnet").is_err());
+    }
 
-        let mut substituted = address.clone();
-        substituted.payment_pubkey = PaymentKeypairV1::generate().public_key();
-        assert!(PaymentAddress::decode(&substituted.encode(), b"indra-mainnet").is_err());
+    #[test]
+    fn rejects_bad_lengths_checksum_and_oversized_text_before_decode() {
+        let address = address();
+        let mut bad_pq_len = address.encode();
+        let pq_len_offset = 3 + address.chain_id().len() + 32;
+        bad_pq_len[pq_len_offset..pq_len_offset + 4].copy_from_slice(&2591u32.to_le_bytes());
+        assert!(PaymentAddressV1::decode(&bad_pq_len, b"indra-mainnet").is_err());
+        let mut bad_checksum = address.encode();
+        let last = bad_checksum.len() - 1;
+        bad_checksum[last] ^= 1;
+        assert!(PaymentAddressV1::decode(&bad_checksum, b"indra-mainnet").is_err());
+        let oversized = format!("indra:{}", "A".repeat(MAX_TEXT_PAYLOAD_BYTES + 1));
+        assert!(PaymentAddressV1::from_text(&oversized, b"indra-mainnet").is_err());
     }
 }

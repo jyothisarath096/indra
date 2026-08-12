@@ -1,6 +1,5 @@
 use indra_cli::{build_transaction, TxParams};
 use indra_core::{codec::Decode, types::transaction::TransactionV1};
-use indra_crypto::PaymentPubKeyV1;
 
 use crate::{errors::IndraError, wallet::WalletContext};
 
@@ -9,7 +8,6 @@ pub struct BuiltTxOwned {
     pub tx_id: [u8; 32],
     pub tx_bytes: Box<[u8]>,
     pub change_spark: u64,
-    pub change_blinding: [u8; 32],
     pub spent_indices: Box<[usize]>,
 }
 
@@ -20,7 +18,6 @@ pub fn build(
     fee_spark: u64,
     sender_classical_seed: [u8; 32],
     sender_pq_sk: &[u8],
-    sender_payment_pubkey: PaymentPubKeyV1,
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
     build_with_address(
@@ -30,7 +27,6 @@ pub fn build(
         sender_classical_seed,
         sender_pq_sk,
         indra_core::types::primitives::DEFAULT_CHAIN_ID,
-        sender_payment_pubkey,
         wallet_context,
     )
 }
@@ -43,7 +39,6 @@ pub fn build_with_address(
     sender_classical_seed: [u8; 32],
     sender_pq_sk: &[u8],
     chain_id: &str,
-    sender_payment_pubkey: PaymentPubKeyV1,
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
     let mut params = TxParams {
@@ -55,7 +50,6 @@ pub fn build_with_address(
         ed25519_seed: sender_classical_seed,
         ml_dsa_seed_bytes: sender_pq_sk.to_vec(),
         sender_pubkey: wallet_context.sender_pubkey,
-        sender_payment_pubkey,
     };
 
     let built = match build_transaction(&params) {
@@ -84,7 +78,6 @@ pub fn build_with_address(
         tx_id,
         tx_bytes: tx_bytes.into_boxed_slice(),
         change_spark: built.change_spark,
-        change_blinding: built.change_blinding.unwrap_or([0u8; 32]),
         spent_indices: spent_indices.into_boxed_slice(),
     })
 }

@@ -8,7 +8,6 @@ use indra_core::types::{
     primitives::{Bytes32, VariableBytes},
     transaction::OutputV1,
 };
-use indra_core::CommitmentV1;
 use indra_rpc::types::parse_request;
 use indra_rpc::{
     handlers::{
@@ -30,14 +29,10 @@ fn engine(_suffix: &str) -> ChainState {
 fn dummy_output(byte: u8) -> OutputV1 {
     OutputV1 {
         value_spark: 1_000 + byte as u64,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from([byte; 32]),
-        },
         owner_pubkey: HybridPubKey {
             classical_pk: Bytes32::from([byte; 32]),
             pq_pk: VariableBytes::from_slice(&[byte; 32]).unwrap(),
         },
-        range_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
         lock_height: 0,
     }
 }

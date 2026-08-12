@@ -1,177 +1,123 @@
-//! Monetary-policy invariant tests for staking, slashing, rewards and fees.
+//! Consensus monetary invariants for the transparent-value transaction format.
 
-use curve25519_dalek::scalar::Scalar;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-    crypto::{CommitmentV1, HybridPubKey, HybridSignature},
+    crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, EPOCH_DURATION_BLOCKS,
-        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_RANGE_PROOF_BYTES,
-        MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
+        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
+        TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
-use indra_crypto::{
-    commit, constants::ML_KEM_1024_CT_BYTES, prove_range, sha256, ClassicalKeypair, HybridKeypair,
-    PaymentBlindingNoteV1, PqKeypair, VrfKeypair,
-};
-use indra_state::{
-    apply_block, apply_epoch_transition, ChainState, EpochTransitionContext, ValidatorEntry,
-    ValidatorStatus,
-};
-use rand::{rngs::StdRng, SeedableRng};
-
-const INPUT_VALUE: u64 = 1_000_000;
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
+use indra_state::{apply_epoch_transition, EpochTransitionContext};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
-    let classical = ClassicalKeypair::from_seed(&seed);
-    let pq = PqKeypair::from_seed(&seed).unwrap();
-    let keypair = HybridKeypair::new(classical, pq);
-    let public = keypair.public_key();
+    let pair = HybridKeypair::new(
+        ClassicalKeypair::from_seed(&seed),
+        PqKeypair::from_seed(&seed).unwrap(),
+    );
+    let public = pair.public_key();
     (
         HybridPubKey {
             classical_pk: Bytes32::from(public.classical.0),
             pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
         },
-        keypair,
+        pair,
     )
-}
-
-fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
 }
 
 fn dummy_sig() -> HybridSignature {
     HybridSignature {
-        classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
-        pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+        classical_sig: VariableBytes::from_slice(&[0; 64]).unwrap(),
+        pq_sig: VariableBytes::from_slice(&[0; 4627]).unwrap(),
     }
 }
 
-fn sign_transaction(
-    tx: &TransactionV1,
-    keypair: &HybridKeypair,
-    chain_id: &str,
-) -> HybridSignature {
-    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
-    HybridSignature {
-        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
-        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
-    }
-}
-
-fn output(
-    value: u64,
-    blinding: [u8; 32],
-    owner_pubkey: HybridPubKey,
-    proof_seed: [u8; 32],
-) -> OutputV1 {
-    let commitment = commit(value, &blinding);
-    let mut rng = StdRng::from_seed(proof_seed);
-    let proof = prove_range(value, &blinding, &mut rng).unwrap();
+fn output(value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
     OutputV1 {
-        value_spark: value,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(commitment.0),
-        },
+        value_spark,
         owner_pubkey,
-        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&proof).unwrap(),
         lock_height: 0,
     }
 }
 
-fn make_validator(pubkey: &HybridPubKey, seed: [u8; 32], stake: u64) -> ValidatorEntry {
+fn validator(owner: &HybridPubKey) -> ValidatorEntry {
     ValidatorEntry {
-        validator_id: pubkey_to_id(pubkey),
-        name: "monetary-test-validator".into(),
-        hybrid_classical_pk: Some(pubkey.classical_pk.0),
-        hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-        vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
-        stake_spark: stake,
+        validator_id: Bytes32::from(indra_crypto::sha256(&owner.classical_pk.0)),
+        name: "money".into(),
+        hybrid_classical_pk: Some(owner.classical_pk.0),
+        hybrid_pq_pk: Some(owner.pq_pk.as_slice().to_vec()),
+        vrf_pk: Some(VrfKeypair::from_seed(&[7; 32]).public_key()),
+        stake_spark: 1_000_000,
         status: ValidatorStatus::Active,
         registered_epoch: 0,
         last_active_epoch: 0,
         pending_rewards: 0,
         rewards_last_epoch: 0,
         self_report_count: 0,
-        commission_bps: 1_000,
+        commission_bps: 0,
         pending_commission_bps: None,
         pending_commission_effective_epoch: None,
         min_delegation_spark: 1,
         auto_delegate_to: None,
         network_addr: None,
         network_addr_last_updated_epoch: None,
-        cold_hybrid_classical_pk: Some(pubkey.classical_pk.0),
-        cold_hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().try_into().unwrap()),
+        cold_hybrid_classical_pk: Some(owner.classical_pk.0),
+        cold_hybrid_pq_pk: Some(owner.pq_pk.as_slice().try_into().unwrap()),
         cold_key_version: 1,
         cold_nonce: 0,
     }
 }
 
-fn finalize_with_default_validator(state: &mut ChainState) {
-    if state.validators.is_empty() {
-        let (pubkey, _) = keypair([0xF0; 32]);
-        state
-            .validators
-            .upsert(make_validator(&pubkey, [0xF0; 32], INPUT_VALUE))
-            .unwrap();
-    }
+fn state() -> (ChainState, HybridPubKey, HybridKeypair) {
+    let (owner, pair) = keypair([9; 32]);
+    let mut state = ChainState::new_genesis();
+    state.validators.upsert(validator(&owner)).unwrap();
     state.finalize_genesis().unwrap();
+    // Isolate value conservation and dust from fee-market policy.
+    state.base_fee = 0;
+    (state, owner, pair)
 }
 
-fn fee_tx(
+fn signed_tx(
     state: &ChainState,
-    utxo_id: Bytes32,
-    keypair: &HybridKeypair,
-    owner_pubkey: HybridPubKey,
-    input_blinding: [u8; 32],
+    pair: &HybridKeypair,
+    inputs: Vec<Bytes32>,
+    outputs: Vec<OutputV1>,
+    fee_amount: u64,
 ) -> TransactionV1 {
-    let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-    let output_value = INPUT_VALUE - fee;
-    let output_blinding = [0x42; 32];
-    let fee_blinding = (Scalar::from_bytes_mod_order(input_blinding)
-        - Scalar::from_bytes_mod_order(output_blinding))
-    .to_bytes();
-    let fee_commitment = commit(fee, &fee_blinding);
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![InputV1 {
-            utxo_id,
-            nullifier: Bytes32::from([0x99; 32]),
-        }],
-        outputs: vec![output(
-            output_value,
-            output_blinding,
-            owner_pubkey.clone(),
-            [0x43; 32],
-        )],
-        payment_notes: vec![PaymentBlindingNoteV1 {
-            version: 1,
-            owner_id: sha256(&owner_pubkey.classical_pk.0),
-            payment_pubkey_hash: [0; 32],
-            sender_x25519_ephemeral_pk: [0; 32],
-            ml_kem_1024_ciphertext: [0; ML_KEM_1024_CT_BYTES],
-            note_nonce: [0; 32],
-        }],
-        fee_amount: fee,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
+        inputs: inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, utxo_id)| InputV1 {
+                utxo_id,
+                nullifier: Bytes32::from([i as u8 + 1; 32]),
+            })
+            .collect(),
+        outputs,
+        fee_amount,
         signature: dummy_sig(),
     };
-    tx.signature = sign_transaction(&tx, keypair, &state.chain_id);
+    let sig = pair.sign(&tx.signing_bytes(&state.chain_id)).unwrap();
+    tx.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+    };
     tx
 }
 
-fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>) -> BlockV1 {
+fn block(state: &ChainState, tx: TransactionV1) -> BlockV1 {
     BlockV1 {
         header: BlockHeaderV1 {
             protocol_version: ProtocolVersion::CURRENT,
             height: state.height + 1,
             prev_hash: state.tip_hash,
-            timestamp: 1_700_000_000,
+            timestamp: 1_700_000_001,
             state_root: Bytes32::ZERO,
             validator_set_root: Bytes32::ZERO,
             mempool_set_root: Bytes32::ZERO,
@@ -184,7 +130,7 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
             election_result_hash: None,
         },
-        transactions,
+        transactions: vec![tx],
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
@@ -192,151 +138,150 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
     }
 }
 
+fn apply_values(inputs: &[u64], outputs: &[u64], fee: u64) -> Result<(), StateError> {
+    let (mut state, owner, pair) = state();
+    let ids = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            state
+                .utxos
+                .insert(output(*value, owner.clone()), 0, i as u32, 0)
+                .unwrap()
+        })
+        .collect();
+    let tx = signed_tx(
+        &state,
+        &pair,
+        ids,
+        outputs.iter().map(|v| output(*v, owner.clone())).collect(),
+        fee,
+    );
+    let block = block(&state, tx);
+    apply_block(&mut state, &block, 0).map(|_| ())
+}
+
+#[test]
+fn outputs_plus_fee_greater_than_inputs_is_rejected() {
+    assert!(apply_values(&[1_000_000], &[900_001], 100_000).is_err());
+}
+
+#[test]
+fn output_plus_fee_overflow_is_rejected() {
+    assert!(matches!(
+        apply_values(&[u64::MAX], &[u64::MAX], 1),
+        Err(StateError::ValueOverflow)
+    ));
+}
+
+#[test]
+fn multi_input_sum_overflow_is_rejected() {
+    assert!(matches!(
+        apply_values(&[u64::MAX, 1], &[u64::MAX], 1),
+        Err(StateError::ValueOverflow)
+    ));
+}
+
+#[test]
+fn output_accumulation_overflow_is_rejected() {
+    assert!(matches!(
+        apply_values(&[u64::MAX], &[u64::MAX, 1], 0),
+        Err(StateError::ValueOverflow)
+    ));
+}
+
+#[test]
+fn exact_public_conservation_succeeds_without_commitment_fields() {
+    assert!(apply_values(&[1_000_000, 2_000_000], &[2_900_000], 100_000).is_ok());
+}
+
+#[test]
+fn dust_boundaries_are_consensus_enforced() {
+    let dust = indra_core::types::primitives::DUST_LIMIT_SPARK;
+    assert!(apply_values(&[dust], &[0], dust).is_err());
+    assert!(apply_values(&[dust], &[dust - 1], 1).is_err());
+    assert!(apply_values(&[dust], &[dust], 0).is_ok());
+    assert!(apply_values(&[1_000_000_000], &[999_900_000], 100_000).is_ok());
+}
+
 #[test]
 fn epoch_reward_does_not_increase_total_supply() {
-    let mut state = ChainState::new_genesis();
-    let (validator_pubkey, _) = keypair([0x30; 32]);
-    state
-        .validators
-        .upsert(make_validator(&validator_pubkey, [0x30; 32], INPUT_VALUE))
-        .unwrap();
-    state.finalize_genesis().unwrap();
+    let (mut state, _, _) = state();
     let supply_before = state.total_supply;
-
+    let height = indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
     apply_epoch_transition(
         &mut state,
-        &EpochTransitionContext::new(
-            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (1u64)
-                .saturating_mul(EPOCH_DURATION_BLOCKS)
-                .saturating_sub(1),
-        )
-        .unwrap(),
+        &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
     )
     .unwrap();
-
     assert_eq!(state.total_supply, supply_before);
 }
 
 #[test]
 fn fee_burn_reduces_total_supply() {
-    let mut state = ChainState::new_genesis();
-    finalize_with_default_validator(&mut state);
-    let (owner_pubkey, owner_keypair) = keypair([0x40; 32]);
-    let input_blinding = [0x41; 32];
-    let utxo_id = state
+    let (mut state, owner, pair) = state();
+    let input_value = 1_000_000;
+    let fee = 100_000;
+    let utxo = state
         .utxos
-        .insert(
-            output(
-                INPUT_VALUE,
-                input_blinding,
-                owner_pubkey.clone(),
-                [0x44; 32],
-            ),
-            0,
-            0,
-            0,
-        )
+        .insert(output(input_value, owner.clone()), 0, 0, 0)
         .unwrap();
-    let tx = fee_tx(
+    let tx = signed_tx(
         &state,
-        utxo_id,
-        &owner_keypair,
-        owner_pubkey,
-        input_blinding,
+        &pair,
+        vec![utxo],
+        vec![output(input_value - fee, owner)],
+        fee,
     );
-    let burned = tx.fee_amount / 2;
     let supply_before = state.total_supply;
-
-    let block = block_with_transactions(&state, vec![tx]);
+    let block = block(&state, tx);
     apply_block(&mut state, &block, 0).unwrap();
-
-    assert_eq!(state.total_supply, supply_before - burned);
+    assert_eq!(state.total_supply, supply_before - fee / 2);
 }
 
 #[test]
 fn liveness_penalty_burn_reduces_total_supply_if_active() {
-    let mut state = ChainState::new_genesis();
-    let (validator_pubkey, _) = keypair([0x50; 32]);
-    state
-        .validators
-        .upsert(make_validator(&validator_pubkey, [0x50; 32], INPUT_VALUE))
-        .unwrap();
-    state.finalize_genesis().unwrap();
+    let (mut state, _, _) = state();
     let supply_before = state.total_supply;
-
+    let height = 4 * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
     apply_epoch_transition(
         &mut state,
-        &EpochTransitionContext::new(
-            (4u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (4u64)
-                .saturating_mul(EPOCH_DURATION_BLOCKS)
-                .saturating_sub(1),
-        )
-        .unwrap(),
+        &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
     )
     .unwrap();
-
     assert!(state.total_supply < supply_before);
-    assert_eq!(supply_before - state.total_supply, INPUT_VALUE / 1_000);
+    assert_eq!(supply_before - state.total_supply, 1_000);
 }
 
 #[test]
 fn total_supply_invariant_across_full_epoch_cycle() {
-    let mut state = ChainState::new_genesis();
-    let (validator_pubkey, _) = keypair([0x60; 32]);
-    state
-        .validators
-        .upsert(make_validator(&validator_pubkey, [0x60; 32], INPUT_VALUE))
-        .unwrap();
-    state.finalize_genesis().unwrap();
-    let (owner_pubkey, owner_keypair) = keypair([0x61; 32]);
-    let input_blinding = [0x62; 32];
-    let utxo_id = state
+    let (mut state, owner, pair) = state();
+    let input_value = 1_000_000;
+    let fee = 100_000;
+    let utxo = state
         .utxos
-        .insert(
-            output(
-                INPUT_VALUE,
-                input_blinding,
-                owner_pubkey.clone(),
-                [0x63; 32],
-            ),
-            0,
-            0,
-            0,
-        )
+        .insert(output(input_value, owner.clone()), 0, 0, 0)
         .unwrap();
-    let tx = fee_tx(
+    let tx = signed_tx(
         &state,
-        utxo_id,
-        &owner_keypair,
-        owner_pubkey,
-        input_blinding,
+        &pair,
+        vec![utxo],
+        vec![output(input_value - fee, owner)],
+        fee,
     );
-    let expected_burn = tx.fee_amount / 2;
     let supply_before = state.total_supply;
-
-    let block = block_with_transactions(&state, vec![tx]);
+    let block = block(&state, tx);
     apply_block(&mut state, &block, 0).unwrap();
-    let after_block_supply = state.total_supply;
+    let after_block = state.total_supply;
+    let height = indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
     apply_epoch_transition(
         &mut state,
-        &EpochTransitionContext::new(
-            (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-            (1u64)
-                .saturating_mul(EPOCH_DURATION_BLOCKS)
-                .saturating_sub(1),
-        )
-        .unwrap(),
+        &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
     )
     .unwrap();
-
-    assert_eq!(after_block_supply, supply_before - expected_burn);
-    assert_eq!(
-        state.total_supply, after_block_supply,
-        "epoch rewards are preminted/accounted and must not mint supply"
-    );
+    assert_eq!(after_block, supply_before - fee / 2);
+    assert_eq!(state.total_supply, after_block);
 }

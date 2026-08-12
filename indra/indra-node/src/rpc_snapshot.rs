@@ -470,29 +470,15 @@ mod tests {
             let position_id = position.position_id;
             state.stake_positions.insert(position_id, position);
             let creation_op_id = numbered_id(number + 2_000_000);
-            let mut tranche = UnbondingTrancheV1::new(
+            let tranche = UnbondingTrancheV1::new(
                 position_id,
                 500_000 + number,
-                indra_crypto::commit(500_000 + number, &[0u8; 32]),
                 UnbondingTimingV1::height_precise(30_000).unwrap(),
                 custody,
                 creation_op_id,
                 0,
             )
             .unwrap();
-            let source_blinding = indra_crypto::derive_tranche_source_blinding_v1(
-                &indra_crypto::TrancheSourceBlindingInputsV1 {
-                    chain_id: state.chain_id.as_bytes(),
-                    position_id: position_id.0,
-                    tranche_id: tranche.tranche_id.0,
-                    principal_spark: tranche.principal_spark,
-                    start_height: tranche.timing.start_height(),
-                    creation_op_id: creation_op_id.0,
-                },
-            )
-            .unwrap();
-            tranche.source_commitment =
-                indra_crypto::commit(tranche.principal_spark, &source_blinding);
             state.unbonding_tranches.insert(tranche.tranche_id, tranche);
         }
         state.rebuild_position_tranche_index().unwrap();

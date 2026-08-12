@@ -169,6 +169,7 @@ pub struct ChainState {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl ChainState {
     /// Return every top-level state field whose value differs.
     ///
@@ -1383,7 +1384,7 @@ fn decode_unbonding_tranches(
 }
 
 fn validate_and_build_position_tranche_index(
-    chain_id: &str,
+    _chain_id: &str,
     positions: &PersistentOrdMap<Bytes32, StakePositionV1>,
     tranches: &PersistentOrdMap<Bytes32, UnbondingTrancheV1>,
 ) -> IndraResult<BTreeMap<Bytes32, Vec<Bytes32>>> {
@@ -1437,25 +1438,6 @@ fn validate_and_build_position_tranche_index(
         if tranche.custody != position.custody {
             return Err(IndraError::InvalidStakePosition(
                 "unbonding tranche custody differs from its position".to_string(),
-            ));
-        }
-        let start_height = tranche.timing.start_height();
-        let source_blinding = indra_crypto::derive_tranche_source_blinding_v1(
-            &indra_crypto::TrancheSourceBlindingInputsV1 {
-                chain_id: chain_id.as_bytes(),
-                position_id: tranche.position_id.0,
-                tranche_id: tranche.tranche_id.0,
-                principal_spark: tranche.principal_spark,
-                start_height,
-                creation_op_id: tranche.creation_op_id.0,
-            },
-        )
-        .map_err(|error| IndraError::InvalidStakePosition(error.to_string()))?;
-        if indra_crypto::commit(tranche.principal_spark, &source_blinding)
-            != tranche.source_commitment
-        {
-            return Err(IndraError::InvalidStakePosition(
-                "unbonding tranche source commitment does not match canonical KDF".to_string(),
             ));
         }
         let ids = index.entry(tranche.position_id).or_default();
@@ -1664,7 +1646,6 @@ fn decode_retired_cold_components(
     }
     Ok((classical, pq))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

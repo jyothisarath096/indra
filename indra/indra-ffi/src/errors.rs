@@ -16,8 +16,6 @@ pub enum IndraError {
     TxBuildFailed = -5,
     /// Signing failed.
     SignFailed = -6,
-    /// Range proof generation or verification failed.
-    RangeProofFailed = -7,
     /// Insufficient wallet balance.
     InsufficientBalance = -8,
     /// Invalid parameter value.
@@ -47,13 +45,7 @@ impl From<indra_cli::CliError> for IndraError {
             indra_cli::CliError::InvalidHex(_) => Self::InvalidHex,
             indra_cli::CliError::InsufficientBalance { .. } => Self::InsufficientBalance,
             indra_cli::CliError::Crypto(_) => Self::SignFailed,
-            indra_cli::CliError::Transaction(message) => {
-                if message.contains("range proof") {
-                    Self::RangeProofFailed
-                } else {
-                    Self::TxBuildFailed
-                }
-            }
+            indra_cli::CliError::Transaction(_) => Self::TxBuildFailed,
             indra_cli::CliError::Parse(_) | indra_cli::CliError::MissingArgument(_) => {
                 Self::InvalidParam
             }
@@ -72,7 +64,6 @@ pub const fn error_string(error_code: i32) -> &'static [u8] {
         -4 => b"key generation failed\0",
         -5 => b"transaction build failed\0",
         -6 => b"signing failed\0",
-        -7 => b"range proof failed\0",
         -8 => b"insufficient balance\0",
         -9 => b"invalid parameter\0",
         -10 => b"invalid json\0",

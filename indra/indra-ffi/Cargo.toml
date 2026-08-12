@@ -12,7 +12,6 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 indra-core         = { path = "../indra-core" }
 indra-crypto       = { path = "../indra-crypto" }
-indra-bulletproofs = { path = "../indra-bulletproofs" }
 indra-cli          = { path = "../indra-cli" }
 hex                = { version = "0.4", default-features = false, features = ["alloc"] }
 serde_json         = "1"

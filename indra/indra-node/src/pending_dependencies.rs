@@ -549,12 +549,10 @@ mod tests {
                 validator_id: validator,
                 deposit_utxo_id: deposit,
                 delegator_pubkey: pubkey(0x11),
-                deposit_proof: None,
             }),
             staking(StakingOpBody::SelfStake {
                 deposit_utxo_id: deposit,
                 validator_pubkey: pubkey(0x12),
-                deposit_proof: None,
                 cold_authorization: cold_auth,
             }),
             staking(StakingOpBody::ExitStakePosition {
@@ -575,7 +573,6 @@ mod tests {
                 deposit_utxo_id: deposit,
                 validator_pubkey: pubkey(0x13),
                 vrf_pk: [0x55; 32],
-                deposit_proof: None,
                 cold_pubkey: cold.clone(),
                 cold_signature: signature(),
             }),

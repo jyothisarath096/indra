@@ -164,33 +164,6 @@ impl ColdHybridPubKey {
     }
 }
 
-/// Pedersen commitment (compressed Ristretto255 point, 32 bytes).
-///
-/// Commitment = v·G + r·H
-/// The 32-byte compressed point reveals nothing about v or r.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CommitmentV1 {
-    /// Compressed Ristretto255 point.
-    pub compressed_point: Bytes32,
-}
-
-impl Encode for CommitmentV1 {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        self.compressed_point.encode(buf);
-    }
-    fn encoded_len(&self) -> usize {
-        32
-    }
-}
-
-impl Decode for CommitmentV1 {
-    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        Ok(Self {
-            compressed_point: Bytes32::decode(r)?,
-        })
-    }
-}
-
 /// A single validator's PQ signature in the Quorum Certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PQVoteSig {
@@ -251,16 +224,6 @@ mod tests {
         assert_eq!(encoded.len(), 32 + 4 + indra_crypto::PQ_PK_BYTES);
         assert_eq!(cold, ColdHybridPubKey::decode_exact(&encoded).unwrap());
         assert_eq!(cold.to_crypto_pubkey().unwrap(), public);
-    }
-
-    #[test]
-    fn commitment_round_trip() {
-        let c = CommitmentV1 {
-            compressed_point: Bytes32::from([0x55u8; 32]),
-        };
-        let enc = c.encode_to_vec();
-        assert_eq!(enc.len(), 32);
-        assert_eq!(c, CommitmentV1::decode_exact(&enc).unwrap());
     }
 
     #[test]

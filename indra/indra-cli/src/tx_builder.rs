@@ -5,28 +5,22 @@
 //! 1. Caller provides: recipient pubkey, amount, fee, wallet, signing keypair
 //! 2. Builder selects UTXOs (coin selection)
 //! 3. Builds outputs: recipient output + change output (if needed)
-//! 4. Generates Pedersen commitments + Bulletproof range proofs for each output
-//! 5. Signs the transaction with the hybrid keypair
-//! 6. Returns serialised hex ready for indra_sendTransaction RPC
+//! 4. Signs the transparent-value transaction with the hybrid keypair
+//! 5. Returns serialised hex ready for indra_sendTransaction RPC
 
-use curve25519_dalek::scalar::Scalar;
 use indra_core::{
     codec::Encode,
     types::{
-        crypto::{ColdHybridPubKey, CommitmentV1, HybridPubKey, HybridSignature},
-        primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, MAX_RANGE_PROOF_BYTES,
-            TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES,
-        },
+        crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
+        primitives::{Bytes32, ProtocolVersion, VariableBytes, TRANSACTION_PROTOCOL_VERSION},
         stake_position::PositionCustodyV1,
-        staking::{ColdStakingAuthorization, StakeDepositProof, StakingOp, StakingOpBody},
+        staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
 use indra_crypto::{
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
-    pedersen::commit,
-    sender_derive_payment_blinding_v1, sha256, PaymentAddress, PaymentPubKeyV1,
+    sha256, PaymentAddressV1,
 };
 
 use crate::{
@@ -35,7 +29,6 @@ use crate::{
 };
 
 /// Minimum fee in Spark.
-/// Transactions with Bulletproof range proofs are ~4-5 KB.
 /// At 8 decimal places this is 0.0005 INDRA = 50,000 Spark.
 pub const MIN_FEE_SPARK: u64 = 50_000;
 
@@ -60,8 +53,6 @@ pub struct TxParams<'a> {
     pub ml_dsa_seed_bytes: Vec<u8>,
     /// Sender's own pubkey (for change output).
     pub sender_pubkey: HybridPubKey,
-    /// Sender's canonical payment key for self-directed change.
-    pub sender_payment_pubkey: PaymentPubKeyV1,
 }
 
 /// The result of building a transaction.
@@ -72,10 +63,6 @@ pub struct BuiltTransaction {
     pub tx_id: String,
     /// Change amount returned to sender in Spark (0 if exact).
     pub change_spark: u64,
-    /// The blinding factor for the recipient output.
-    pub recipient_blinding: [u8; 32],
-    /// The blinding factor for the change output (if any).
-    pub change_blinding: Option<[u8; 32]>,
     /// The UTXO IDs that were spent.
     pub spent_utxo_ids: Vec<Bytes32>,
     /// Pending change output to persist until the transaction is mined.
@@ -128,7 +115,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
 
     // 2. Decode and authenticate the complete recipient descriptor.
     let recipient_address =
-        PaymentAddress::from_text(params.recipient_address, params.chain_id.as_bytes()).map_err(
+        PaymentAddressV1::from_text(params.recipient_address, params.chain_id.as_bytes()).map_err(
             |e| CliError::Transaction(format!("invalid recipient payment address: {e}")),
         )?;
     let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
@@ -137,10 +124,14 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let selected = params
         .wallet
         .select_utxos(params.amount_spark, params.fee_spark)?;
-    let total_in: u64 = selected.iter().map(|e| e.value_spark).sum();
+    let total_in = selected.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.value_spark)
+            .ok_or_else(|| CliError::Transaction("input value overflow".into()))
+    })?;
     let change_spark = total_in
-        .saturating_sub(params.amount_spark)
-        .saturating_sub(params.fee_spark);
+        .checked_sub(params.amount_spark)
+        .and_then(|value| value.checked_sub(params.fee_spark))
+        .ok_or_else(|| CliError::Transaction("inputs do not cover outputs and fee".into()))?;
 
     // 4. Build inputs
     let inputs: Vec<InputV1> = selected
@@ -158,107 +149,37 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         })
         .collect();
 
-    let mut rng = rand::rngs::OsRng;
-    // 5. Every ordinary output uses the same mandatory note-construction path.
-    let recipient_payment = sender_derive_payment_blinding_v1(
-        recipient_address.payment_pubkey(),
-        params.chain_id.as_bytes(),
-        recipient_address.owner_id(),
-        0,
-        params.amount_spark,
-        0,
-    )
-    .map_err(|e| CliError::Crypto(e.to_string()))?;
-    let recipient_blinding = recipient_payment.blinding;
-
-    let change_payment = if change_spark > DUST_LIMIT_SPARK {
-        Some(
-            sender_derive_payment_blinding_v1(
-                &params.sender_payment_pubkey,
-                params.chain_id.as_bytes(),
-                sha256(&params.sender_pubkey.classical_pk.0),
-                1,
-                change_spark,
-                0,
-            )
-            .map_err(|e| CliError::Crypto(e.to_string()))?,
-        )
-    } else {
-        None
-    };
-    let change_blinding = change_payment.as_ref().map(|payment| payment.blinding);
-
-    let input_blinding_sum = selected.iter().fold(Scalar::ZERO, |acc, entry| {
-        acc + Scalar::from_bytes_mod_order(entry.blinding)
-    });
-    let recipient_blinding_scalar = Scalar::from_bytes_mod_order(recipient_blinding);
-    let change_blinding_scalar = change_blinding
-        .map(Scalar::from_bytes_mod_order)
-        .unwrap_or(Scalar::ZERO);
-    let fee_blinding =
-        (input_blinding_sum - recipient_blinding_scalar - change_blinding_scalar).to_bytes();
-
-    // 6. Build outputs with Pedersen commitments + range proofs
+    // 5. Build transparent-value outputs.
     let mut outputs = Vec::new();
 
     // Recipient output
-    let recipient_commitment = commit(params.amount_spark, &recipient_blinding);
-    let recipient_proof =
-        indra_crypto::prove_range(params.amount_spark, &recipient_blinding, &mut rng)
-            .map_err(|e| CliError::Transaction(format!("range proof failed: {e}")))?;
-
     outputs.push(OutputV1 {
         value_spark: params.amount_spark,
-        commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(recipient_commitment.0),
-        },
         owner_pubkey: recipient_pubkey,
-        range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&recipient_proof)
-            .map_err(|_| CliError::Transaction("range proof too large".into()))?,
         lock_height: 0,
     });
 
     // Change output (if above dust)
     let mut pending_change = None;
-    if let Some(cb) = change_blinding {
-        let change_commitment = commit(change_spark, &cb);
-        let change_proof = indra_crypto::prove_range(change_spark, &cb, &mut rng)
-            .map_err(|e| CliError::Transaction(format!("change range proof failed: {e}")))?;
-
+    if change_spark > DUST_LIMIT_SPARK {
         let change_output = OutputV1 {
             value_spark: change_spark,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from(change_commitment.0),
-            },
             owner_pubkey: params.sender_pubkey.clone(),
-            range_proof: VariableBytes::<MAX_RANGE_PROOF_BYTES>::from_slice(&change_proof)
-                .map_err(|_| CliError::Transaction("change range proof too large".into()))?,
             lock_height: 0,
         };
         pending_change = Some(PendingChange {
             output: change_output.clone(),
-            blinding: cb,
         });
         outputs.push(change_output);
     }
 
-    // 7. Build fee commitment
-    let fee_commitment = commit(params.fee_spark, &fee_blinding);
-
-    // 8. Build unsigned transaction
+    // 6. Build unsigned transaction.
     let mut tx = TransactionV1 {
-        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION_PAYMENT_NOTES),
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs,
         outputs,
-        payment_notes: std::iter::once(recipient_payment.note)
-            .chain(change_payment.map(|payment| payment.note))
-            .collect(),
         fee_amount: params.fee_spark,
-        fee_blinding: Bytes32::from(fee_blinding),
-        fee_commitment: CommitmentV1 {
-            compressed_point: Bytes32::from(fee_commitment.0),
-        },
         signature: dummy_signature()?,
     };
 
@@ -297,8 +218,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         tx_hex,
         tx_id,
         change_spark,
-        recipient_blinding,
-        change_blinding,
         spent_utxo_ids: spent_ids,
         pending_change,
     })
@@ -307,7 +226,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
 /// Build and sign a validator self-stake operation.
 pub fn build_self_stake_op(
     deposit_utxo_id: Bytes32,
-    deposit_proof: StakeDepositProof,
     validator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
@@ -316,7 +234,6 @@ pub fn build_self_stake_op(
         StakingOpBody::SelfStake {
             deposit_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
-            deposit_proof: Some(deposit_proof),
             cold_authorization: None,
         },
         validator_keypair,
@@ -329,7 +246,6 @@ pub fn build_self_stake_op(
 pub fn build_register_validator_op_with_cold(
     commission_bps: u32,
     deposit_utxo_id: Bytes32,
-    deposit_proof: StakeDepositProof,
     keypair: &HybridKeypair,
     cold_keypair: &ColdHybridKeypair,
     vrf_pk: [u8; 32],
@@ -349,7 +265,6 @@ pub fn build_register_validator_op_with_cold(
             deposit_utxo_id,
             validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
             vrf_pk,
-            deposit_proof: Some(deposit_proof),
             cold_pubkey,
             cold_signature: dummy_signature()?,
         },
@@ -389,7 +304,6 @@ pub fn build_register_validator_op_with_cold(
 pub fn build_register_validator_op(
     _commission_bps: u32,
     _deposit_utxo_id: Bytes32,
-    _deposit_proof: StakeDepositProof,
     _keypair: &HybridKeypair,
     _vrf_pk: [u8; 32],
     _nonce: u64,
@@ -404,7 +318,6 @@ pub fn build_register_validator_op(
 pub fn build_delegate_op(
     validator_id: Bytes32,
     deposit_utxo_id: Bytes32,
-    deposit_proof: StakeDepositProof,
     delegator_keypair: &HybridKeypair,
     nonce: u64,
     chain_id: &str,
@@ -414,7 +327,6 @@ pub fn build_delegate_op(
             validator_id,
             deposit_utxo_id,
             delegator_pubkey: hybrid_pubkey_from_keypair(delegator_keypair)?,
-            deposit_proof: Some(deposit_proof),
         },
         delegator_keypair,
         nonce,
@@ -632,7 +544,6 @@ fn dummy_signature() -> CliResult<HybridSignature> {
             .map_err(|_| CliError::Transaction("dummy PQ signature exceeded max length".into()))?,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,15 +551,13 @@ mod tests {
     use indra_core::codec::Decode;
     use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
     use indra_core::types::transaction::TransactionV1;
-    use indra_crypto::{recipient_derive_payment_blinding_v1, PaymentKeypairV1};
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
         let seed = [0x42u8; 32];
         let mut w = Wallet::new();
 
-        let blinding = [0x01u8; 32];
         let utxo_id = Bytes32::from([0xAAu8; 32]);
-        w.add_utxo(utxo_id, 10_000_000, blinding, 1, 0, 0);
+        w.add_utxo(utxo_id, 10_000_000, 1, 0, 0);
 
         let pq = PqKeypair::generate();
         let pq_seed = pq.secret_key_bytes();
@@ -682,64 +591,17 @@ mod tests {
         TransactionV1::decode_exact(&bytes).unwrap()
     }
 
-    fn deposit_proof(byte: u8, value: u64) -> StakeDepositProof {
-        StakeDepositProof {
-            committed_value_spark: value,
-            blinding_factor: Bytes32::from([byte; 32]),
-        }
-    }
-
-    fn payment_address(keypair: &HybridKeypair, payment: &PaymentKeypairV1) -> String {
-        PaymentAddress::new(DEFAULT_CHAIN_ID.as_bytes(), keypair, payment.public_key())
+    fn payment_address(keypair: &HybridKeypair) -> String {
+        PaymentAddressV1::new(DEFAULT_CHAIN_ID.as_bytes(), keypair.public_key())
             .unwrap()
             .to_text()
     }
 
     #[test]
-    fn build_transaction_requires_valid_descriptor_and_mandatory_notes() {
+    fn build_transaction_requires_valid_address_and_sets_recipient_owner() {
         let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let recipient_keypair = test_keypair(0x61);
-        let recipient_payment = PaymentKeypairV1::generate();
-        let recipient_address = payment_address(&recipient_keypair, &recipient_payment);
-        let sender_payment = PaymentKeypairV1::generate();
-        let params = TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
-            recipient_address: &recipient_address,
-            amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
-            wallet: &wallet,
-            ed25519_seed: seed,
-            ml_dsa_seed_bytes: pq_seed,
-            sender_pubkey,
-            sender_payment_pubkey: sender_payment.public_key(),
-        };
-
-        let built = build_transaction(&params).unwrap();
-        let tx = decode_built_tx(&built);
-        assert_eq!(tx.payment_notes.len(), tx.outputs.len());
-        assert!(tx.validate_structure().is_ok());
-        let recipient_note = &tx.payment_notes[0];
-        let recipient_side = recipient_derive_payment_blinding_v1(
-            &recipient_payment,
-            recipient_note,
-            DEFAULT_CHAIN_ID.as_bytes(),
-            0,
-            1_000_000,
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            tx.outputs[0].commitment.compressed_point.0,
-            commit(1_000_000, &recipient_side.blinding).0
-        );
-    }
-
-    #[test]
-    fn self_directed_change_uses_sender_payment_key() {
-        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
-        let recipient_keypair = test_keypair(0x62);
-        let recipient_address = payment_address(&recipient_keypair, &PaymentKeypairV1::generate());
-        let sender_payment = PaymentKeypairV1::generate();
+        let recipient_address = payment_address(&recipient_keypair);
         let built = build_transaction(&TxParams {
             chain_id: DEFAULT_CHAIN_ID,
             recipient_address: &recipient_address,
@@ -749,34 +611,44 @@ mod tests {
             ed25519_seed: seed,
             ml_dsa_seed_bytes: pq_seed,
             sender_pubkey,
-            sender_payment_pubkey: sender_payment.public_key(),
+        })
+        .unwrap();
+        let tx = decode_built_tx(&built);
+        assert!(tx.validate_structure().is_ok());
+        assert_eq!(tx.outputs[0].value_spark, 1_000_000);
+        assert_eq!(
+            tx.outputs[0].owner_pubkey,
+            hybrid_pubkey_from_keypair(&recipient_keypair).unwrap()
+        );
+    }
+
+    #[test]
+    fn change_output_uses_sender_hybrid_pubkey() {
+        let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
+        let recipient_address = payment_address(&test_keypair(0x62));
+        let built = build_transaction(&TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_address: &recipient_address,
+            amount_spark: 1_000_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            ed25519_seed: seed,
+            ml_dsa_seed_bytes: pq_seed,
+            sender_pubkey: sender_pubkey.clone(),
         })
         .unwrap();
         let tx = decode_built_tx(&built);
         assert_eq!(tx.outputs.len(), 2);
-        let recovered = recipient_derive_payment_blinding_v1(
-            &sender_payment,
-            &tx.payment_notes[1],
-            DEFAULT_CHAIN_ID.as_bytes(),
-            1,
-            built.change_spark,
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            tx.outputs[1].commitment.compressed_point.0,
-            commit(built.change_spark, &recovered.blinding).0
-        );
+        assert_eq!(tx.outputs[1].value_spark, built.change_spark);
+        assert_eq!(tx.outputs[1].owner_pubkey, sender_pubkey);
     }
 
     #[test]
     fn malformed_or_wrong_chain_descriptor_is_rejected() {
         let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
-        let sender_payment = PaymentKeypairV1::generate();
         for recipient_address in [
             "not-an-address".to_string(),
-            payment_address(&test_keypair(0x63), &PaymentKeypairV1::generate())
-                .replace("indra:", "bad:"),
+            payment_address(&test_keypair(0x63)).replace("indra:", "bad:"),
         ] {
             assert!(build_transaction(&TxParams {
                 chain_id: DEFAULT_CHAIN_ID,
@@ -787,7 +659,6 @@ mod tests {
                 ed25519_seed: seed,
                 ml_dsa_seed_bytes: pq_seed.clone(),
                 sender_pubkey: sender_pubkey.clone(),
-                sender_payment_pubkey: sender_payment.public_key(),
             })
             .is_err());
         }
@@ -796,8 +667,7 @@ mod tests {
     #[test]
     fn insufficient_balance_and_dust_are_rejected() {
         let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
-        let recipient_address = payment_address(&test_keypair(0x64), &PaymentKeypairV1::generate());
-        let sender_payment = PaymentKeypairV1::generate().public_key();
+        let recipient_address = payment_address(&test_keypair(0x64));
         for amount_spark in [1, 100_000_000] {
             assert!(build_transaction(&TxParams {
                 chain_id: DEFAULT_CHAIN_ID,
@@ -808,7 +678,6 @@ mod tests {
                 ed25519_seed: seed,
                 ml_dsa_seed_bytes: pq_seed.clone(),
                 sender_pubkey: sender_pubkey.clone(),
-                sender_payment_pubkey: sender_payment.clone(),
             })
             .is_err());
         }
@@ -820,16 +689,7 @@ mod tests {
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
         let deposit_utxo_id = Bytes32::from([0xA5; 32]);
-
-        let proof = deposit_proof(0xA5, 1_000_000);
-        let built = build_self_stake_op(
-            deposit_utxo_id,
-            proof.clone(),
-            &keypair,
-            7,
-            DEFAULT_CHAIN_ID,
-        )
-        .unwrap();
+        let built = build_self_stake_op(deposit_utxo_id, &keypair, 7, DEFAULT_CHAIN_ID).unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
@@ -840,11 +700,9 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id: id,
                 validator_pubkey,
-                deposit_proof,
                 ..
             } if id == deposit_utxo_id
                 && validator_pubkey.classical_pk == spk.classical_pk
-                && deposit_proof == Some(proof)
         ));
     }
 
@@ -888,7 +746,6 @@ mod tests {
         let built = build_register_validator_op_with_cold(
             1_000,
             deposit_utxo_id,
-            deposit_proof(0xAB, 2_000_000),
             &keypair,
             &test_cold_keypair(0x91),
             [0xAA; 32],
@@ -917,7 +774,6 @@ mod tests {
         let built = build_delegate_op(
             validator_id,
             deposit_utxo_id,
-            deposit_proof(0x02, 500_000),
             &keypair,
             10,
             DEFAULT_CHAIN_ID,
@@ -1100,7 +956,6 @@ mod tests {
             build_register_validator_op_with_cold(
                 1_000,
                 deposit_utxo_id,
-                deposit_proof(0x11, 1_000),
                 &keypair,
                 &test_cold_keypair(0x92),
                 [0x11; 32],
@@ -1108,18 +963,10 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(
-                deposit_utxo_id,
-                deposit_proof(0x12, 1_000),
-                &keypair,
-                42,
-                DEFAULT_CHAIN_ID,
-            )
-            .unwrap(),
+            build_self_stake_op(deposit_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
             build_delegate_op(
                 validator_id,
                 deposit_utxo_id,
-                deposit_proof(0x13, 1_000),
                 &keypair,
                 42,
                 DEFAULT_CHAIN_ID,
@@ -1171,7 +1018,6 @@ mod tests {
             build_register_validator_op_with_cold(
                 1_000,
                 deposit_utxo_id,
-                deposit_proof(0x21, 1_000),
                 &keypair,
                 &test_cold_keypair(0x93),
                 [0x12; 32],
@@ -1179,23 +1025,9 @@ mod tests {
                 DEFAULT_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(
-                deposit_utxo_id,
-                deposit_proof(0x22, 1_000),
-                &keypair,
-                2,
-                DEFAULT_CHAIN_ID,
-            )
-            .unwrap(),
-            build_delegate_op(
-                validator_id,
-                deposit_utxo_id,
-                deposit_proof(0x23, 1_000),
-                &keypair,
-                4,
-                DEFAULT_CHAIN_ID,
-            )
-            .unwrap(),
+            build_self_stake_op(deposit_utxo_id, &keypair, 2, DEFAULT_CHAIN_ID).unwrap(),
+            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, DEFAULT_CHAIN_ID)
+                .unwrap(),
             build_exit_stake_position_op(
                 Bytes32::from([0x32; 32]),
                 1_000,

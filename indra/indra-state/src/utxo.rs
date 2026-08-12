@@ -405,7 +405,6 @@ fn validate_tranche_refund_entry(entry: &UtxoEntry) -> IndraResult<()> {
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,19 +418,15 @@ mod tests {
             indra_core::types::primitives::MAX_LIVE_UTXOS
         ));
     }
-    use indra_core::types::{crypto::CommitmentV1, stake_position::PositionCustodyV1};
+    use indra_core::types::stake_position::PositionCustodyV1;
 
     fn dummy_output(byte: u8) -> OutputV1 {
         OutputV1 {
             value_spark: 1_000,
-            commitment: CommitmentV1 {
-                compressed_point: Bytes32::from([byte.wrapping_add(1); 32]),
-            },
             owner_pubkey: indra_core::types::crypto::HybridPubKey {
                 classical_pk: Bytes32::from([byte; 32]),
                 pq_pk: indra_core::VariableBytes::from_slice(&[byte; 32]).unwrap(),
             },
-            range_proof: indra_core::VariableBytes::from_slice(&[byte]).unwrap(),
             lock_height: 0,
         }
     }
