@@ -13,9 +13,11 @@ The old unauthenticated address-indexed RPC methods have been replaced by:
 
 - `indra_getLegacyScanChallenge(address)`
 
-The authorized methods require a signed ownership proof from the legacy
-address's hybrid spend key before returning address-specific UTXO or balance
-data. A public RPC endpoint can still serve general chain data, but it should
+The authorized methods require a dual-verified hybrid signature and an exact
+full-hybrid-public-key match to the requested UTXO owner before returning
+address-specific UTXO or balance data. The legacy 32-byte address remains a
+lookup label only; its classical-key hash is not an authorization boundary.
+A public RPC endpoint can still serve general chain data, but it should
 not let arbitrary callers enumerate a specific owner's holdings by address.
 
 This is RPC-layer hardening only. The proof is not a view key and does not grant

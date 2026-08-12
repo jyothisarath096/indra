@@ -7,7 +7,8 @@ use indra_core::{
     codec::Encode,
     types::crypto::{HybridPubKey, HybridSignature},
     types::primitives::{
-        Bytes32 as CoreBytes32, EPOCH_DURATION_BLOCKS, MAX_TRANCHES_PER_POSITION, STAKING_TX_IDX,
+        Bytes32 as CoreBytes32, EPOCH_DURATION_BLOCKS, MAX_TRANCHES_PER_POSITION,
+        SLASH_REWARD_TX_IDX, STAKING_REWARD_TX_IDX, STAKING_TX_IDX,
     },
     types::{
         block::{BlockV1, NO_POLC_ROUND},
@@ -940,7 +941,7 @@ fn verify_legacy_scan_auth(
     address: [u8; 32],
     auth_json: &str,
     state: &NodeState<'_>,
-) -> RpcResult<()> {
+) -> RpcResult<HybridPubKey> {
     let version = parse_u8_field(auth_json, "version")?;
     if version != 1 {
         return Err(RpcError::Forbidden(format!(
@@ -986,10 +987,14 @@ fn verify_legacy_scan_auth(
         .map_err(|reason| RpcError::InvalidParams(format!("invalid auth signature: {reason}")))?;
     let msg = legacy_scan_signing_message(address, challenge);
     indra_crypto::verify_hybrid(&msg, &crypto_sig, &crypto_pk)
-        .map_err(|_| RpcError::Forbidden("legacy scan authorization signature invalid".into()))
+        .map_err(|_| RpcError::Forbidden("legacy scan authorization signature invalid".into()))?;
+    Ok(pk)
 }
 
-fn authorized_address(params: &[String], state: &NodeState<'_>) -> RpcResult<(String, [u8; 32])> {
+fn authorized_address(
+    params: &[String],
+    state: &NodeState<'_>,
+) -> RpcResult<(String, [u8; 32], HybridPubKey)> {
     if params.len() < 2 {
         return Err(RpcError::InvalidParams(
             "expected address and scan_auth_proof parameters".into(),
@@ -998,8 +1003,8 @@ fn authorized_address(params: &[String], state: &NodeState<'_>) -> RpcResult<(St
     let address_hex = unquote(&params[0]).to_string();
     let auth = unquote(&params[1]);
     let address = parse_address_hex(&address_hex)?;
-    verify_legacy_scan_auth(address, auth, state)?;
-    Ok((address_hex, address))
+    let owner_pubkey = verify_legacy_scan_auth(address, auth, state)?;
+    Ok((address_hex, address, owner_pubkey))
 }
 
 /// `indra_getLegacyScanChallenge` — returns a node-provided challenge for a
@@ -1026,14 +1031,13 @@ fn explain_utxo_provenance_authorized(
             "expected address, scan_auth_proof, and utxo_id parameters".into(),
         ));
     }
-    let (address_hex, address) = authorized_address(&params[..2], state)?;
+    let (address_hex, _address, authenticated_owner) = authorized_address(&params[..2], state)?;
     let utxo_id = parse_hex32_value(unquote(&params[2]), "utxo_id")?;
     let entry =
         state.chain.utxos.get(&utxo_id).ok_or_else(|| {
             RpcError::NotFound(format!("UTXO {} not found", hex::encode(utxo_id.0)))
         })?;
-    let owner_address = indra_crypto::sha256(&entry.output.owner_pubkey.classical_pk.0);
-    if owner_address != address {
+    if entry.output.owner_pubkey != authenticated_owner {
         return Err(RpcError::Forbidden(
             "scan authorization does not cover requested UTXO owner".into(),
         ));
@@ -1096,6 +1100,8 @@ fn classify_utxo_provenance(
 
     match entry.tx_index {
         STAKING_TX_IDX => classify_staking_provenance(entry, state),
+        STAKING_REWARD_TX_IDX => classify_staking_reward_provenance(entry, state),
+        SLASH_REWARD_TX_IDX => classify_slash_reward_provenance(entry, state),
         tx if tx == u32::MAX - 3 => classify_governance_change(entry, state),
         tx if tx == u32::MAX - 2 => classify_governance_refund(entry, state),
         _ => unrecoverable(
@@ -1133,68 +1139,89 @@ fn classify_staking_provenance(
         );
     }
 
-    let block = match retained_block(entry.created_height, state) {
-        Ok(Some(block)) => block,
-        Ok(None) => {
-            return unrecoverable(
-                "staking_protocol_output_unavailable",
-                retained_block_unavailable_reason(entry.created_height, state),
-            )
-        }
-        Err(reason) => return unrecoverable("staking_protocol_output_unavailable", reason),
-    };
-
-    let matching_claims = block.staking_ops.iter().filter(|op| {
-        matches!(
-            &op.body,
-            StakingOpBody::ClaimRewards { delegator_pubkey, .. }
-                if *delegator_pubkey == entry.output.owner_pubkey
-        )
-    });
-    let mut evidence = block.slashing_evidence.iter();
-    if let (Some(evidence), None, 0) = (evidence.next(), evidence.next(), matching_claims.count()) {
-        let evidence_hash = Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()));
-        return recoverable(
-            "slash_reporter_reward",
-            format!(
-                r#"{{"evidence_hash":"{}","block_height":{}}}"#,
-                hex::encode(evidence_hash.0),
-                entry.created_height
-            ),
-        );
-    }
-    if !block.slashing_evidence.is_empty() {
-        return unrecoverable(
-            "staking_protocol_output_ambiguous",
-            "retained block contains multiple possible slash events or a reward claim for this owner",
-        );
-    }
-
-    for op in &block.staking_ops {
-        if let StakingOpBody::ClaimRewards {
-            validator_id,
-            delegator_pubkey,
-            ..
-        } = &op.body
-        {
-            let delegator_id = staking_pubkey_to_id(delegator_pubkey);
-            if entry.output.owner_pubkey == *delegator_pubkey {
-                return recoverable(
-                    "staking_reward_claim",
-                    format!(
-                        r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
-                        hex::encode(validator_id.0),
-                        hex::encode(delegator_id.0),
-                        entry.created_height
-                    ),
-                );
-            }
-        }
-    }
-
     unrecoverable(
         "staking_protocol_output_unclassified",
-        "retained staking provenance did not identify this UTXO",
+        "staking namespace output has no retained tranche-refund provenance",
+    )
+}
+
+fn retained_protocol_block(
+    entry: &indra_state::utxo::UtxoEntry,
+    state: &NodeState<'_>,
+) -> Result<BlockV1, UtxoProvenanceExplanation> {
+    match retained_block(entry.created_height, state) {
+        Ok(Some(block)) => Ok(block),
+        Ok(None) => {
+            return Err(unrecoverable(
+                "staking_protocol_output_unavailable",
+                retained_block_unavailable_reason(entry.created_height, state),
+            ))
+        }
+        Err(reason) => return Err(unrecoverable("staking_protocol_output_unavailable", reason)),
+    }
+}
+
+fn classify_staking_reward_provenance(
+    entry: &indra_state::utxo::UtxoEntry,
+    state: &NodeState<'_>,
+) -> UtxoProvenanceExplanation {
+    let block = match retained_protocol_block(entry, state) {
+        Ok(block) => block,
+        Err(explanation) => return explanation,
+    };
+    let Some(op) = block.staking_ops.get(entry.output_index as usize) else {
+        return unrecoverable(
+            "staking_reward_claim_unclassified",
+            "reward coordinate does not reference a retained staking operation",
+        );
+    };
+    if let StakingOpBody::ClaimRewards {
+        validator_id,
+        delegator_pubkey,
+        ..
+    } = &op.body
+    {
+        if entry.output.owner_pubkey == *delegator_pubkey {
+            let delegator_id = staking_pubkey_to_id(delegator_pubkey);
+            return recoverable(
+                "staking_reward_claim",
+                format!(
+                    r#"{{"validator_id":"{}","delegator_id":"{}","claim_height":{}}}"#,
+                    hex::encode(validator_id.0),
+                    hex::encode(delegator_id.0),
+                    entry.created_height
+                ),
+            );
+        }
+    }
+    unrecoverable(
+        "staking_reward_claim_unclassified",
+        "retained staking operation does not match this reward output",
+    )
+}
+
+fn classify_slash_reward_provenance(
+    entry: &indra_state::utxo::UtxoEntry,
+    state: &NodeState<'_>,
+) -> UtxoProvenanceExplanation {
+    let block = match retained_protocol_block(entry, state) {
+        Ok(block) => block,
+        Err(explanation) => return explanation,
+    };
+    let Some(evidence) = block.slashing_evidence.get(entry.output_index as usize) else {
+        return unrecoverable(
+            "slash_reporter_reward_unclassified",
+            "reward coordinate does not reference retained slash evidence",
+        );
+    };
+    let evidence_hash = Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()));
+    recoverable(
+        "slash_reporter_reward",
+        format!(
+            r#"{{"evidence_hash":"{}","block_height":{}}}"#,
+            hex::encode(evidence_hash.0),
+            entry.created_height
+        ),
     )
 }
 
@@ -1255,6 +1282,26 @@ fn classify_governance_refund(
     entry: &indra_state::utxo::UtxoEntry,
     state: &NodeState<'_>,
 ) -> UtxoProvenanceExplanation {
+    let retained_terminal = state
+        .chain
+        .governance
+        .proposals
+        .values()
+        .filter(|proposal| {
+            matches!(
+                proposal.phase,
+                indra_state::governance::ProposalPhase::Executed
+                    | indra_state::governance::ProposalPhase::Failed
+                    | indra_state::governance::ProposalPhase::Cancelled
+            )
+        })
+        .count();
+    if retained_terminal >= indra_state::governance::MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS {
+        return unrecoverable(
+            "governance_deposit_refund_unavailable",
+            "terminal proposal history is at its consensus retention limit; a pruned proposal could be the true refund source, so attribution is ambiguous",
+        );
+    }
     let mut candidates = state
         .chain
         .governance
@@ -2833,8 +2880,15 @@ mod tests {
     }
 
     fn authorized_params(engine: &BlockBackedEngine, utxo_id: Bytes32) -> Vec<String> {
+        authorized_params_for_keypair(engine, utxo_id, &scan_keypair())
+    }
+
+    fn authorized_params_for_keypair(
+        engine: &BlockBackedEngine,
+        utxo_id: Bytes32,
+        keypair: &HybridKeypair,
+    ) -> Vec<String> {
         let state = NodeState::read_only(engine);
-        let keypair = scan_keypair();
         let public = keypair.public_key();
         let address = indra_crypto::sha256(&public.classical.0);
         let challenge = legacy_scan_challenge_bytes(address, &state);
@@ -2863,7 +2917,7 @@ mod tests {
         }
     }
 
-    fn owned_output(amount: u64, _blinding: [u8; 32]) -> OutputV1 {
+    fn owned_output(amount: u64, _fixture_tag: [u8; 32]) -> OutputV1 {
         OutputV1 {
             value_spark: amount,
             owner_pubkey: scan_owner_pubkey(),
@@ -2899,7 +2953,12 @@ mod tests {
         let utxo_id = engine
             .chain
             .utxos
-            .insert(owned_output(7_000, [0; 32]), height, STAKING_TX_IDX, 0)
+            .insert(
+                owned_output(7_000, [0; 32]),
+                height,
+                STAKING_REWARD_TX_IDX,
+                0,
+            )
             .unwrap();
         engine
             .blocks
@@ -3011,6 +3070,25 @@ mod tests {
         );
         assert!(refund.contains(r#""recoverable":true"#), "{refund}");
 
+        let retained_template = engine.chain.governance.proposals[&proposal_id].clone();
+        for ordinal in 1..indra_state::governance::MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS {
+            let mut retained = retained_template.clone();
+            retained.proposal_id =
+                Bytes32::from(indra_crypto::sha256(&(ordinal as u64).to_le_bytes()));
+            engine
+                .chain
+                .governance
+                .proposals
+                .insert(retained.proposal_id, retained);
+        }
+        let pruning_ambiguous_refund = explain(&engine, refund_utxo_id);
+        assert!(
+            pruning_ambiguous_refund.contains(r#""recoverable":false"#)
+                && pruning_ambiguous_refund
+                    .contains("pruned proposal could be the true refund source"),
+            "{pruning_ambiguous_refund}"
+        );
+
         let second_action = GovernableAction::SetMinDelegationSpark { value: 45 };
         let second_proposal_id = compute_proposal_id(
             proposer_id,
@@ -3081,6 +3159,27 @@ mod tests {
             "{result}"
         );
         assert!(result.contains(r#""recoverable":false"#), "{result}");
+    }
+
+    #[test]
+    fn legacy_scan_auth_rejects_same_classical_key_with_substituted_pq_key() {
+        let mut engine = block_backed_engine();
+        let utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(1_234, [0x92; 32]), 2, 0, 0)
+            .unwrap();
+        let attacker = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xA5; 32]),
+            PqKeypair::from_seed(&[0x6B; 32]).unwrap(),
+        );
+        let params = authorized_params_for_keypair(&engine, utxo_id, &attacker);
+        let state = NodeState::read_only(&engine);
+
+        let error = explain_utxo_provenance_authorized(&params, &state).unwrap_err();
+
+        assert!(matches!(error, RpcError::Forbidden(message)
+            if message.contains("does not cover requested UTXO owner")));
     }
 
     #[test]

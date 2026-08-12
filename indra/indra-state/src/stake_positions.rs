@@ -33,6 +33,7 @@ pub fn deposit_stake_position(
     validator_id: Bytes32,
     principal_owner_id: Bytes32,
     custody: PositionCustodyV1,
+    custody_pubkey: &HybridPubKey,
     utxo_id: Bytes32,
     current_height: u64,
 ) -> StateResult<Bytes32> {
@@ -57,9 +58,8 @@ pub fn deposit_stake_position(
     }
     let owner_matches_custody = match custody {
         PositionCustodyV1::DelegatorIdentity { delegator_id } => {
-            Bytes32::from(indra_crypto::sha256(
-                &utxo.output.owner_pubkey.classical_pk.0,
-            )) == delegator_id
+            Bytes32::from(indra_crypto::sha256(&custody_pubkey.classical_pk.0)) == delegator_id
+                && utxo.output.owner_pubkey == *custody_pubkey
         }
         PositionCustodyV1::ValidatorColdIdentity { validator_id } => {
             let cold_pubkey =
@@ -68,7 +68,7 @@ pub fn deposit_stake_position(
                         "validator cold custody key cannot be resolved".to_string(),
                     )
                 })?;
-            utxo.output.owner_pubkey == cold_pubkey
+            *custody_pubkey == cold_pubkey && utxo.output.owner_pubkey == *custody_pubkey
         }
     };
     if !owner_matches_custody {
@@ -678,7 +678,7 @@ mod tests {
         state: &mut ChainState,
         owner_keys: &HybridKeypair,
         amount: u64,
-        _blinding: [u8; 32],
+        _fixture_tag: [u8; 32],
         height: u64,
         ordinal: u32,
     ) -> Bytes32 {
@@ -734,18 +734,40 @@ mod tests {
         let first = add_deposit_utxo(&mut state, &keys, 600_000, [1; 32], 10, 0);
         let before_failed_deposit = state.clone();
         set_fail_after_mutation(Some(1));
-        assert!(
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, first, 11,)
-                .is_err()
-        );
+        assert!(deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            &wire_pubkey(&keys),
+            first,
+            11,
+        )
+        .is_err());
         set_fail_after_mutation(None);
         assert_eq!(state, before_failed_deposit);
-        let position_id =
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, first, 11).unwrap();
+        let position_id = deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            &wire_pubkey(&keys),
+            first,
+            11,
+        )
+        .unwrap();
         let second = add_deposit_utxo(&mut state, &keys, 400_000, [2; 32], 12, 0);
         assert_eq!(
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, second, 13,)
-                .unwrap(),
+            deposit_stake_position(
+                &mut state,
+                validator_id,
+                owner_id,
+                custody,
+                &wire_pubkey(&keys),
+                second,
+                13,
+            )
+            .unwrap(),
             position_id
         );
         let active = state
@@ -793,6 +815,7 @@ mod tests {
                 validator_id,
                 owner_id,
                 custody,
+                &wire_pubkey(&keys),
                 input,
                 100 + u64::from(ordinal),
             )
@@ -836,8 +859,16 @@ mod tests {
             delegator_id: owner_id,
         };
         let input = add_deposit_utxo(&mut state, &keys, 6_400_000, [0xA1; 32], 10, 0);
-        let position_id =
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 11).unwrap();
+        let position_id = deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            &wire_pubkey(&keys),
+            input,
+            11,
+        )
+        .unwrap();
         for nonce in 1..MAX_TRANCHES_PER_POSITION as u64 {
             let intent = signed_exit(&keys, &state, position_id, owner_id, 100_000, nonce);
             exit_stake_position(&mut state, &intent, 100 + nonce).unwrap();
@@ -895,8 +926,16 @@ mod tests {
         let input = add_deposit_utxo(&mut state, &keys, 1_000_000, [3; 32], 20, 0);
         state.total_supply = accounted_value(&state);
         let conserved = state.total_supply;
-        let position_id =
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 21).unwrap();
+        let position_id = deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            &wire_pubkey(&keys),
+            input,
+            21,
+        )
+        .unwrap();
         assert_eq!(accounted_value(&state), conserved);
         let first_intent = signed_exit(&keys, &state, position_id, owner_id, 400_000, 1);
         let first = exit_stake_position(&mut state, &first_intent, 100).unwrap();
@@ -970,8 +1009,16 @@ mod tests {
             delegator_id: owner_id,
         };
         let input = add_deposit_utxo(&mut state, &keys, 1_000_000, [4; 32], 30, 0);
-        let position_id =
-            deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 31).unwrap();
+        let position_id = deposit_stake_position(
+            &mut state,
+            validator_id,
+            owner_id,
+            custody,
+            &wire_pubkey(&keys),
+            input,
+            31,
+        )
+        .unwrap();
         let before = state.clone();
         let intent = signed_exit(&keys, &state, position_id, owner_id, 400_000, 1);
         set_fail_after_mutation(Some(2));
@@ -988,9 +1035,16 @@ mod tests {
                 delegator_id: owner_id,
             };
             let input = add_deposit_utxo(&mut state, &keys, 800_000, [5; 32], 40, 0);
-            let position_id =
-                deposit_stake_position(&mut state, validator_id, owner_id, custody, input, 41)
-                    .unwrap();
+            let position_id = deposit_stake_position(
+                &mut state,
+                validator_id,
+                owner_id,
+                custody,
+                &wire_pubkey(&keys),
+                input,
+                41,
+            )
+            .unwrap();
             let intent = signed_exit(&keys, &state, position_id, owner_id, 200_000, 1);
             exit_stake_position(&mut state, &intent, 42).unwrap();
             state

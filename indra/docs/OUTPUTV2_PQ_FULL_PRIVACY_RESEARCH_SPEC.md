@@ -31,7 +31,7 @@ It produces:
 2. a faithful specification of the Lattice RingCT v1.0 sender-privacy proposal;
 3. an exact mapping analysis against INDRA's current UTXO architecture; and
 4. a proof that the two requested constructions cannot presently be composed
-   faithfully with each other or with INDRA's existing confidential-value
+   faithfully with each other or with INDRA's current transparent-value UTXO
    system.
 
 Three blockers prevent a normative end-to-end OutputV2:
@@ -40,8 +40,10 @@ Three blockers prevent a normative end-to-end OutputV2:
   key relations, dimensions, moduli, distributions, and signing algorithms.
   Neither paper defines a bridge.
 - Lattice RingCT proves balance using its own lattice commitment
-  `Com_A(m, sk) = A*sk + m mod q`. Its proof does not cover INDRA's
-  Ristretto255 Pedersen commitments or Bulletproofs.
+  `Com_A(m, sk) = A*sk + m mod q`. INDRA's current baseline instead exposes
+  authoritative `u64` values and enforces checked public conservation, so an
+  OutputV2 composition would need a new, fully specified confidential-value
+  transition rather than compatibility with an existing proof system.
 - INDRA reveals and deletes the exact input UTXO. A ring spend must leave ring
   members in the anonymity pool and reject reuse through a linkability tag.
   This is a different state-transition model, not a signature-module swap.
@@ -765,14 +767,15 @@ one payment to Bob plus one change output.
 ### 14.2 Missing step that prevents a transaction
 
 LRCT Algorithm 6 requires the output address and coin commitment to be in
-LRCT's key/commitment system. SAP26 gives a different `P_B`; INDRA gives a
-the former Ristretto commitment and Bulletproof design.
+LRCT's key/commitment system. SAP26 gives a different `P_B`; INDRA's current
+transparent baseline supplies neither an LRCT ownership secret nor an LRCT
+coin commitment.
 
 There is no published operation in the selected sources that produces:
 
 ```text
 LRCT-compatible output ownership secret for Bob
-+ compatibility layer for the former Pedersen output commitment
++ a specified transition from INDRA's transparent-value baseline
 + one ring proof hiding Alice's real input
 + a binding to SAP announcement (R_B, tag_B)
 ```

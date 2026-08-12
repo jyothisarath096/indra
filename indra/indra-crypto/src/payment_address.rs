@@ -22,6 +22,9 @@ const PQ_LENGTH_BYTES: usize = 4;
 const FIXED_BYTES: usize = 1 + 2 + 32 + PQ_LENGTH_BYTES + PQ_PK_BYTES + CHECKSUM_BYTES;
 const MAX_BINARY_BYTES: usize = FIXED_BYTES + MAX_PAYMENT_CHAIN_ID_BYTES;
 const MAX_TEXT_PAYLOAD_BYTES: usize = (MAX_BINARY_BYTES * 4).div_ceil(3);
+/// Maximum complete textual payment-address length, including the `indra:` prefix.
+pub const MAX_PAYMENT_ADDRESS_TEXT_BYTES: usize =
+    PAYMENT_ADDRESS_TEXT_PREFIX.len() + MAX_TEXT_PAYLOAD_BYTES;
 
 /// A chain-bound raw hybrid-public-key payment address.
 ///

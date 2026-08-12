@@ -64,8 +64,8 @@ use indra_crypto::{
 };
 use indra_state::{
     apply::compute_slash_evidence_v2_hash, epoch::epoch_for_height, try_apply_governance_candidate,
-    try_apply_slash_candidate, try_apply_staking_candidate,
-    try_apply_transaction_candidate_with_dust, ChainState,
+    try_apply_slash_candidate, try_apply_slash_candidate_at_index,
+    try_apply_staking_candidate_at_index, try_apply_transaction_candidate_with_dust, ChainState,
 };
 use indra_storage::{
     load_chain_manifest, load_last_qc, save_chain_manifest, BlockStore, ChainManifest, EpochStore,
@@ -1006,7 +1006,12 @@ impl NodeEngine {
                 retained_staking.push(op);
                 continue;
             }
-            match try_apply_staking_candidate(&mut scratch, &op, height) {
+            match try_apply_staking_candidate_at_index(
+                &mut scratch,
+                &op,
+                height,
+                staking_ops.len() as u32,
+            ) {
                 Ok(()) => {
                     staking_ops.push(op.clone());
                     retained_staking.push(op);
@@ -1067,11 +1072,12 @@ impl NodeEngine {
                 retained_slashes.push(evidence);
                 continue;
             }
-            match try_apply_slash_candidate(
+            match try_apply_slash_candidate_at_index(
                 &mut scratch,
                 &evidence,
                 height,
                 reporter_pubkey.as_ref(),
+                slash_evidence.len() as u32,
             ) {
                 Ok(()) => {
                     slash_evidence.push(evidence.clone());
@@ -3029,7 +3035,7 @@ mod tests {
             .iter()
             .filter(|op| {
                 let mut scratch = engine.state.clone();
-                try_apply_staking_candidate(&mut scratch, op, height).is_ok()
+                indra_state::try_apply_staking_candidate(&mut scratch, op, height).is_ok()
             })
             .map(indra_state::pending::staking_op_id)
             .collect();
@@ -3229,7 +3235,7 @@ mod tests {
         let started = Instant::now();
         for _ in 0..5_000 {
             let mut scratch = engine.state.clone();
-            try_apply_staking_candidate(
+            indra_state::try_apply_staking_candidate(
                 &mut scratch,
                 &staking,
                 engine.state.height.saturating_add(1),

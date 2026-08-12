@@ -43,7 +43,7 @@ use indra_core::{
         primitives::{
             bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
-            SLASH_EVIDENCE_WINDOW_EPOCHS, STAKING_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
+            SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
         qc::QuorumCertificateV1,
         slash_membership::SlashMembershipRootRecord,
@@ -55,11 +55,11 @@ use indra_core::{
     },
     EpochRecord,
 };
-use indra_crypto::verify_hybrid;
+use indra_crypto::{validate_classical_public_key, validate_pq_public_key, verify_hybrid};
 
 use crate::{
     chain::ChainState,
-    delegation::apply_staking_op,
+    delegation::apply_staking_op_at_index,
     epoch::{epoch_for_height, is_epoch_boundary},
     error::{StateError, StateResult},
     fee::compute_next_base_fee,
@@ -98,6 +98,7 @@ fn apply_slash_v2_at_height_with_accounting_mode(
     chain_id: &str,
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
+    synthetic_output_index: u32,
     verify_vote_crypto: bool,
 ) -> StateResult<SlashAccounting> {
     if evidence.membership_proof.entry.validator_id != evidence.validator_id
@@ -130,10 +131,12 @@ fn apply_slash_v2_at_height_with_accounting_mode(
         chain_id,
         height,
         reporter_pubkey,
+        synthetic_output_index,
         verify_vote_crypto,
     )
 }
 
+#[cfg(test)]
 fn apply_slash_v2_at_height_with_accounting(
     state: &mut ChainState,
     evidence: &SlashEvidenceV2,
@@ -141,12 +144,31 @@ fn apply_slash_v2_at_height_with_accounting(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<SlashAccounting> {
+    apply_slash_v2_at_height_with_accounting_at_index(
+        state,
+        evidence,
+        chain_id,
+        height,
+        reporter_pubkey,
+        0,
+    )
+}
+
+fn apply_slash_v2_at_height_with_accounting_at_index(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    chain_id: &str,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+    synthetic_output_index: u32,
+) -> StateResult<SlashAccounting> {
     apply_slash_v2_at_height_with_accounting_mode(
         state,
         evidence,
         chain_id,
         height,
         reporter_pubkey,
+        synthetic_output_index,
         true,
     )
 }
@@ -167,6 +189,7 @@ pub fn try_apply_verified_slash_candidate(
         &chain_id,
         height,
         reporter_pubkey,
+        0,
         false,
     )?;
     txn.add_slash_accounting(accounting.slash_amount)?;
@@ -1275,6 +1298,34 @@ mod tests {
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
         state.finalize_genesis().unwrap();
         (state, utxo_id, keypair, [0x01; 32], TEST_INPUT_VALUE + 1)
+    }
+
+    #[test]
+    fn transaction_rejects_new_output_with_noncanonical_hybrid_owner_key() {
+        let (state, utxo_id, keypair, fixture_tag, value) = state_with_utxo();
+        let mut tx = make_tx(
+            &state,
+            &keypair,
+            utxo_id,
+            value,
+            fixture_tag,
+            Bytes32::from([0xD7; 32]),
+        );
+        tx.outputs[0].owner_pubkey.pq_pk =
+            VariableBytes::from_slice(&[0u8; indra_crypto::PQ_PK_BYTES]).unwrap();
+        tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
+
+        let error = validate_transaction(
+            &state,
+            &tx,
+            &state.chain_id,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StateError::InvalidOutputOwnerKey { .. }));
     }
 
     fn make_tx(
@@ -3220,6 +3271,55 @@ mod tests {
             "ambiguous candidate matches must preserve the prior uniqueness-required behavior"
         );
     }
+
+    #[test]
+    fn concurrent_identical_synthetic_rewards_have_distinct_utxo_coordinates() {
+        let mut state = ChainState::new_genesis();
+        let (owner, _) = make_test_keypair([0xD8; 32]);
+        let amount = indra_core::types::primitives::DUST_LIMIT_SPARK;
+        let height = 77;
+
+        let first = create_slash_reporter_reward_utxo(
+            &mut state,
+            &Bytes32::from([1; 32]),
+            height,
+            amount,
+            &owner,
+            0,
+        )
+        .unwrap();
+        let second = create_slash_reporter_reward_utxo(
+            &mut state,
+            &Bytes32::from([2; 32]),
+            height,
+            amount,
+            &owner,
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            first, second,
+            "distinct slash events must never share a UTXO ID"
+        );
+
+        let staking_id = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: amount,
+                    owner_pubkey: owner,
+                    lock_height: 0,
+                },
+                height,
+                indra_core::types::primitives::STAKING_REWARD_TX_IDX,
+                0,
+            )
+            .unwrap();
+        assert_ne!(
+            first, staking_id,
+            "staking and slash rewards need separate namespaces"
+        );
+    }
 }
 
 fn slash_membership_record_for_validation(
@@ -3242,6 +3342,7 @@ fn apply_slash_common(
     chain_id: &str,
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
+    synthetic_output_index: u32,
     verify_vote_crypto: bool,
 ) -> StateResult<SlashAccounting> {
     use crate::ValidatorStatus;
@@ -3579,6 +3680,7 @@ fn apply_slash_common(
                 height,
                 potential_reporter_reward,
                 pubkey,
+                synthetic_output_index,
             )?;
             potential_reporter_reward
         } else {
@@ -3617,6 +3719,7 @@ fn create_slash_reporter_reward_utxo(
     block_height: u64,
     reporter_reward: u64,
     reporter_pubkey: &HybridPubKey,
+    synthetic_output_index: u32,
 ) -> StateResult<Bytes32> {
     let output = OutputV1 {
         value_spark: reporter_reward,
@@ -3625,7 +3728,12 @@ fn create_slash_reporter_reward_utxo(
     };
     let reward_utxo_id = state
         .utxos
-        .insert(output, block_height, STAKING_TX_IDX, 0)
+        .insert(
+            output,
+            block_height,
+            SLASH_REWARD_TX_IDX,
+            synthetic_output_index,
+        )
         .map_err(|_| StateError::InvariantViolation {
             message: "UTXO ID collision in slash reporter reward output",
         })?;
@@ -3793,11 +3901,21 @@ pub fn try_apply_staking_candidate(
     op: &StakingOp,
     height: u64,
 ) -> StateResult<()> {
+    try_apply_staking_candidate_at_index(state, op, height, 0)
+}
+
+/// Atomically apply one staking operation at its candidate-block ordinal.
+pub fn try_apply_staking_candidate_at_index(
+    state: &mut ChainState,
+    op: &StakingOp,
+    height: u64,
+    operation_index: u32,
+) -> StateResult<()> {
     let chain_id = state.chain_id.clone();
     let mut txn = StateTxn::begin(state, height);
     txn.snapshot_staking_scope();
     txn.snapshot_delegator_identity_scope();
-    apply_staking_op(txn.state_mut(), op, &chain_id, height)?;
+    apply_staking_op_at_index(txn.state_mut(), op, &chain_id, height, operation_index)?;
     txn.after_mutation()?;
     txn.commit_scratch();
     Ok(())
@@ -3872,15 +3990,27 @@ pub fn try_apply_slash_candidate(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<()> {
+    try_apply_slash_candidate_at_index(state, evidence, height, reporter_pubkey, 0)
+}
+
+/// Atomically apply slash evidence at its candidate-block ordinal.
+pub fn try_apply_slash_candidate_at_index(
+    state: &mut ChainState,
+    evidence: &SlashEvidenceV2,
+    height: u64,
+    reporter_pubkey: Option<&HybridPubKey>,
+    evidence_index: u32,
+) -> StateResult<()> {
     let chain_id = state.chain_id.clone();
     let mut txn = StateTxn::begin(state, height);
     txn.snapshot_slashing_scope();
-    let accounting = apply_slash_v2_at_height_with_accounting(
+    let accounting = apply_slash_v2_at_height_with_accounting_at_index(
         txn.state_mut(),
         evidence,
         &chain_id,
         height,
         reporter_pubkey,
+        evidence_index,
     )?;
     txn.add_slash_accounting(accounting.slash_amount)?;
     txn.commit_scratch();
@@ -4031,10 +4161,20 @@ fn apply_block_inner(
     if !block.staking_ops.is_empty() {
         let mut shadow = state.clone();
         let chain_id = state.chain_id.clone();
-        for op in &block.staking_ops {
+        for (operation_index, op) in block.staking_ops.iter().enumerate() {
             op.validate_structure()
                 .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
-            apply_staking_op(&mut shadow, op, &chain_id, block.header.height)?;
+            let operation_index =
+                u32::try_from(operation_index).map_err(|_| StateError::InvariantViolation {
+                    message: "staking operation index overflow",
+                })?;
+            apply_staking_op_at_index(
+                &mut shadow,
+                op,
+                &chain_id,
+                block.header.height,
+                operation_index,
+            )?;
         }
     }
 
@@ -4058,13 +4198,18 @@ fn apply_block_inner(
         let mut shadow = state.clone();
         let chain_id_clone = state.chain_id.clone();
         let reporter_pubkey = slash_reporter_pubkey_for_block(&shadow, block)?;
-        for evidence in &block.slashing_evidence {
-            apply_slash_v2_at_height_with_accounting(
+        for (evidence_index, evidence) in block.slashing_evidence.iter().enumerate() {
+            let evidence_index =
+                u32::try_from(evidence_index).map_err(|_| StateError::InvariantViolation {
+                    message: "slash evidence index overflow",
+                })?;
+            apply_slash_v2_at_height_with_accounting_at_index(
                 &mut shadow,
                 evidence,
                 &chain_id_clone,
                 block.header.height,
                 reporter_pubkey.as_ref(),
+                evidence_index,
             )?;
         }
     }
@@ -4079,13 +4224,22 @@ fn apply_block_inner(
     }
 
     let chain_id = txn.state().chain_id.clone();
-    for op in &block.staking_ops {
+    for (operation_index, op) in block.staking_ops.iter().enumerate() {
         txn.snapshot_staking_scope();
         txn.snapshot_delegator_identity_scope();
-        apply_staking_op(txn.state_mut(), op, &chain_id, block.header.height).map_err(|_| {
-            StateError::InvariantViolation {
-                message: "staking op failed on real state after shadow validation",
-            }
+        let operation_index =
+            u32::try_from(operation_index).map_err(|_| StateError::InvariantViolation {
+                message: "staking operation index overflow",
+            })?;
+        apply_staking_op_at_index(
+            txn.state_mut(),
+            op,
+            &chain_id,
+            block.header.height,
+            operation_index,
+        )
+        .map_err(|_| StateError::InvariantViolation {
+            message: "staking op failed on real state after shadow validation",
         })?;
         txn.after_mutation()?;
     }
@@ -4111,14 +4265,19 @@ fn apply_block_inner(
 
     let chain_id_for_slash = txn.state().chain_id.clone();
     let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
-    for evidence in &block.slashing_evidence {
+    for (evidence_index, evidence) in block.slashing_evidence.iter().enumerate() {
         txn.snapshot_slashing_scope();
-        let accounting = apply_slash_v2_at_height_with_accounting(
+        let evidence_index =
+            u32::try_from(evidence_index).map_err(|_| StateError::InvariantViolation {
+                message: "slash evidence index overflow",
+            })?;
+        let accounting = apply_slash_v2_at_height_with_accounting_at_index(
             txn.state_mut(),
             evidence,
             &chain_id_for_slash,
             block.header.height,
             reporter_pubkey.as_ref(),
+            evidence_index,
         )
         .map_err(|_| StateError::InvariantViolation {
             message: "slash failed on real state after shadow validation",
@@ -4462,6 +4621,20 @@ pub fn validate_transaction_with_dust(
     }
 
     for output in &tx.outputs {
+        let crypto_owner = output
+            .owner_pubkey
+            .to_crypto_pubkey()
+            .map_err(|reason| StateError::InvalidOutputOwnerKey { reason })?;
+        validate_classical_public_key(&crypto_owner.classical).map_err(|error| {
+            StateError::InvalidOutputOwnerKey {
+                reason: error.to_string(),
+            }
+        })?;
+        validate_pq_public_key(&crypto_owner.pq).map_err(|error| {
+            StateError::InvalidOutputOwnerKey {
+                reason: error.to_string(),
+            }
+        })?;
         if output.value_spark < dust_limit_spark {
             return Err(StateError::InvariantViolation {
                 message: "transaction output below dust limit",

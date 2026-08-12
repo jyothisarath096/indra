@@ -345,7 +345,9 @@ Supply direction:  Decreasing over time (fee burn)
 | Block hashing | SHA-256 | Partial (Grover) |
 | Value conservation | Checked `u64` public arithmetic | Exact arithmetic invariant |
 
-Transaction ownership and consensus finality are fully post-quantum.
+Transaction ownership requires exact full-hybrid-key custody and dual
+Ed25519 + ML-DSA-87 verification; consensus finality uses ML-DSA-87. These
+authorization paths retain post-quantum security through their PQ components.
 Current OutputV1 owner/value metadata is public to raw-chain observers and
 amount correlation can deanonymize flows. See the
 [whitepaper](docs/WHITEPAPER.md) Section 4 and [privacy status](docs/PRIVACY_STATUS.md).

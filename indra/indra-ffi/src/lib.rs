@@ -370,7 +370,11 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
 
     match catch_unwind(|| {
         let params_ref = &*params;
-        if params_ref.utxo_count > MAX_UTXO_COUNT || params_ref.recipient_address_len == 0 {
+        if params_ref.utxo_count > MAX_UTXO_COUNT
+            || params_ref.recipient_address_len == 0
+            || params_ref.recipient_address_len
+                > indra_crypto::payment_address::MAX_PAYMENT_ADDRESS_TEXT_BYTES
+        {
             return Err(IndraError::InvalidParam);
         }
         if params_ref.recipient_address.is_null()
@@ -533,6 +537,7 @@ mod handle_tests {
         ffi::{CStr, CString},
         fs,
         path::Path,
+        process::Command,
         sync::{Mutex, OnceLock},
         thread,
     };
@@ -737,6 +742,29 @@ mod handle_tests {
     }
 
     #[test]
+    fn transaction_builder_rejects_oversized_address_before_dereferencing_slice() {
+        let _guard = test_lock();
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let params = IndraTxParams {
+            recipient_address: std::ptr::dangling(),
+            recipient_address_len: indra_crypto::payment_address::MAX_PAYMENT_ADDRESS_TEXT_BYTES
+                + 1,
+            amount_spark: 1_000_000,
+            fee_spark: 50_000,
+            utxos: std::ptr::null(),
+            utxo_count: 0,
+            sender_handle: INDRA_KEY_HANDLE_INVALID,
+            chain_id: chain.as_ptr(),
+        };
+        let mut result = IndraTxResult::zeroed();
+
+        assert_eq!(
+            unsafe { indra_build_tx_with_handle(&params, &mut result) },
+            IndraError::InvalidParam.code()
+        );
+    }
+
+    #[test]
     fn staking_handle_signature_is_byte_identical_to_direct_signing() {
         let _guard = test_lock();
         let (handle, public) = handle_from_seed([0x44; 32]);
@@ -931,5 +959,81 @@ mod handle_tests {
                 header.display()
             );
         }
+    }
+
+    #[test]
+    fn c_header_struct_layouts_match_rust_repr_c_exactly() {
+        let _guard = test_lock();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let temp = std::env::temp_dir().join(format!("indra-ffi-layout-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("layout.c");
+        let binary = temp.join("layout-probe");
+        fs::write(
+            &source,
+            r#"#include <stddef.h>
+#include <stdio.h>
+#include "indra.h"
+int main(void) {
+  printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu ",
+    sizeof(IndraUtxoEntry), _Alignof(IndraUtxoEntry),
+    offsetof(IndraUtxoEntry, utxo_id), offsetof(IndraUtxoEntry, value_spark),
+    offsetof(IndraUtxoEntry, created_height), offsetof(IndraUtxoEntry, tx_index),
+    offsetof(IndraUtxoEntry, out_index), offsetof(IndraUtxoEntry, spent),
+    sizeof(((IndraUtxoEntry*)0)->spent));
+  printf("%zu %zu %zu %zu %zu %zu %zu %zu\n",
+    sizeof(IndraTxResult), _Alignof(IndraTxResult),
+    offsetof(IndraTxResult, tx_id), offsetof(IndraTxResult, tx_bytes),
+    offsetof(IndraTxResult, tx_bytes_len), offsetof(IndraTxResult, change_spark),
+    offsetof(IndraTxResult, spent_indices), offsetof(IndraTxResult, spent_count));
+  return 0;
+}"#,
+        )
+        .unwrap();
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let compiled = Command::new(compiler)
+            .arg("-std=c11")
+            .arg("-I")
+            .arg(manifest.join("include"))
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "C layout probe failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(&binary).output().unwrap();
+        assert!(output.status.success());
+        let c: Vec<usize> = String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let rust = vec![
+            std::mem::size_of::<IndraUtxoEntry>(),
+            std::mem::align_of::<IndraUtxoEntry>(),
+            std::mem::offset_of!(IndraUtxoEntry, utxo_id),
+            std::mem::offset_of!(IndraUtxoEntry, value_spark),
+            std::mem::offset_of!(IndraUtxoEntry, created_height),
+            std::mem::offset_of!(IndraUtxoEntry, tx_index),
+            std::mem::offset_of!(IndraUtxoEntry, out_index),
+            std::mem::offset_of!(IndraUtxoEntry, spent),
+            std::mem::size_of::<u8>(),
+            std::mem::size_of::<IndraTxResult>(),
+            std::mem::align_of::<IndraTxResult>(),
+            std::mem::offset_of!(IndraTxResult, tx_id),
+            std::mem::offset_of!(IndraTxResult, tx_bytes),
+            std::mem::offset_of!(IndraTxResult, tx_bytes_len),
+            std::mem::offset_of!(IndraTxResult, change_spark),
+            std::mem::offset_of!(IndraTxResult, spent_indices),
+            std::mem::offset_of!(IndraTxResult, spent_count),
+        ];
+        eprintln!("C layout:    {c:?}");
+        eprintln!("Rust layout: {rust:?}");
+        assert_eq!(c, rust, "C header and Rust repr(C) layouts diverged");
+        let _ = fs::remove_dir_all(temp);
     }
 }

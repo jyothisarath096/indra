@@ -115,13 +115,6 @@ pub enum IndraError {
         limit: u64,
     },
 
-    /// Fee commitment does not match the revealed fee amount.
-    #[error("fee commitment does not match fee_amount {amount}")]
-    FeeCommitmentMismatch {
-        /// The revealed fee amount.
-        amount: u64,
-    },
-
     /// Fee is below the minimum required.
     #[error("fee {actual} Spark/KB is below minimum {minimum} Spark/KB")]
     FeeTooLow {
@@ -165,10 +158,6 @@ pub enum IndraError {
         /// Which scheme failed.
         scheme: &'static str,
     },
-
-    /// Commitment balance equation not satisfied.
-    #[error("commitment balance equation not satisfied")]
-    CommitmentImbalance,
 
     /// VRF proof failed.
     #[error("VRF proof verification failed")]

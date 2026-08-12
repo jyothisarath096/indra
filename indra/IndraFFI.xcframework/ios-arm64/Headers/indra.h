@@ -15,7 +15,6 @@ extern "C" {
 #define INDRA_ERR_KEYGEN         -4
 #define INDRA_ERR_TX_BUILD       -5
 #define INDRA_ERR_SIGN           -6
-#define INDRA_ERR_RANGE_PROOF    -7
 #define INDRA_ERR_BALANCE        -8
 #define INDRA_ERR_INVALID_PARAM  -9
 #define INDRA_ERR_INVALID_JSON  -10
@@ -34,9 +33,6 @@ extern "C" {
 #define INDRA_BYTES32_LEN         32
 #define INDRA_TX_ID_BYTES         32
 #define INDRA_MNEMONIC_MAX_BYTES 300
-#define INDRA_PAYMENT_KEYPAIR_V1_BYTES 97
-#define INDRA_PAYMENT_PUBKEY_V1_BYTES 1601
-#define INDRA_PAYMENT_NOTE_V1_BYTES 1665
 
 typedef uint64_t IndraKeyHandle;
 #define INDRA_KEY_HANDLE_INVALID ((IndraKeyHandle)0)
@@ -51,7 +47,6 @@ typedef struct {
 typedef struct {
     uint8_t  utxo_id[INDRA_BYTES32_LEN];
     uint64_t value_spark;
-    uint8_t  blinding[INDRA_BYTES32_LEN];
     uint64_t created_height;
     uint32_t tx_index;
     uint32_t out_index;
@@ -74,7 +69,6 @@ typedef struct {
     uint8_t* tx_bytes;
     size_t   tx_bytes_len;
     uint64_t change_spark;
-    uint8_t  change_blinding[INDRA_BYTES32_LEN];
     size_t*  spent_indices;
     size_t   spent_count;
 } IndraTxResult;

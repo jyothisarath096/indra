@@ -607,7 +607,7 @@ mod tests {
 
     fn output(
         value: u64,
-        _blinding: [u8; 32],
+        _fixture_tag: [u8; 32],
         owner_pubkey: HybridPubKey,
         _proof_seed: [u8; 32],
     ) -> OutputV1 {
@@ -630,17 +630,17 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let (owner_pubkey, owner_keypair) = keypair([0x42; 32]);
         let input_value = 10_000_000_000u64;
-        let input_blinding = [0x11; 32];
+        let input_fixture_tag = [0x11; 32];
         let original_output = output(
             input_value,
-            input_blinding,
+            input_fixture_tag,
             owner_pubkey.clone(),
             [0x51; 32],
         );
         let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
         let output_value = input_value - fee;
-        let output_blinding = [0x21; 32];
+        let output_fixture_tag = [0x21; 32];
         let mut tx = TransactionV1 {
             version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
@@ -650,7 +650,7 @@ mod tests {
             }],
             outputs: vec![output(
                 output_value,
-                output_blinding,
+                output_fixture_tag,
                 owner_pubkey.clone(),
                 [0x61; 32],
             )],

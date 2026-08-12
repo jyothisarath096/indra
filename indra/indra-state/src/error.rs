@@ -151,6 +151,13 @@ pub enum StateError {
         reason: String,
     },
 
+    /// A newly created output carries a malformed or non-canonical hybrid owner key.
+    #[error("transaction output owner key invalid: {reason}")]
+    InvalidOutputOwnerKey {
+        /// Canonical key-validation failure.
+        reason: String,
+    },
+
     /// Transaction version is not supported by this state machine.
     #[error("transaction version {version} not supported")]
     UnsupportedTxVersion {

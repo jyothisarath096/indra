@@ -152,9 +152,10 @@ pub const STAKING_OP_DOMAIN: &str = "indra-stake-v1";
 
 /// Special transaction index reserved for staking-created UTXOs.
 pub const STAKING_TX_IDX: u32 = u32::MAX;
-
-/// Domain for deterministic staking reward blinding factor derivation.
-pub const STAKING_REWARD_BLINDING_DOMAIN: &[u8] = b"indra-staking-reward-v1";
+/// Synthetic transaction namespace for staking reward-claim outputs.
+pub const STAKING_REWARD_TX_IDX: u32 = u32::MAX - 4;
+/// Synthetic transaction namespace for slash-reporter reward outputs.
+pub const SLASH_REWARD_TX_IDX: u32 = u32::MAX - 5;
 
 // ── Cryptographic Size Bounds ─────────────────────────────────────────────────
 

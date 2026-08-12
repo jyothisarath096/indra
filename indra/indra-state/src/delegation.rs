@@ -9,7 +9,7 @@ use indra_core::types::{
     primitives::{
         Bytes32, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
         MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-        MIN_COMMISSION_BPS, STAKING_TX_IDX,
+        MIN_COMMISSION_BPS, STAKING_REWARD_TX_IDX,
     },
     staking::{validate_network_addr_string, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -39,9 +39,26 @@ pub fn apply_staking_op(
     chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
+    apply_staking_op_at_index(state, op, chain_id, current_height, 0)
+}
+
+pub(crate) fn apply_staking_op_at_index(
+    state: &mut ChainState,
+    op: &StakingOp,
+    chain_id: &str,
+    current_height: u64,
+    synthetic_output_index: u32,
+) -> StateResult<()> {
     op.validate_structure()
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    apply_staking_op_mode(state, op, chain_id, current_height, true)
+    apply_staking_op_mode(
+        state,
+        op,
+        chain_id,
+        current_height,
+        synthetic_output_index,
+        true,
+    )
 }
 
 /// Apply an admission-verified staking operation without repeating intrinsic crypto.
@@ -62,7 +79,7 @@ pub fn apply_verified_staking_op(
     }
     op.validate_structure()
         .map_err(|err| StateError::InvalidStakingOp(err.to_string()))?;
-    apply_staking_op_mode(state, op, chain_id, current_height, false)
+    apply_staking_op_mode(state, op, chain_id, current_height, 0, false)
 }
 
 fn apply_staking_op_mode(
@@ -70,6 +87,7 @@ fn apply_staking_op_mode(
     op: &StakingOp,
     chain_id: &str,
     current_height: u64,
+    synthetic_output_index: u32,
     verify_crypto: bool,
 ) -> StateResult<()> {
     if matches!(op.body, StakingOpBody::RotateValidatorColdKey { .. }) {
@@ -312,7 +330,13 @@ fn apply_staking_op_mode(
             validator_id,
             delegator_pubkey,
             ..
-        } => apply_claim_rewards(state, validator_id, delegator_pubkey, current_height),
+        } => apply_claim_rewards(
+            state,
+            validator_id,
+            delegator_pubkey,
+            current_height,
+            synthetic_output_index,
+        ),
         StakingOpBody::RegisterValidator {
             commission_bps,
             deposit_utxo_id,
@@ -717,6 +741,7 @@ fn apply_register_validator(
         indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
             validator_id,
         },
+        &utxo_entry.output.owner_pubkey,
         deposit_utxo_id,
         current_height,
     )?;
@@ -947,8 +972,7 @@ fn apply_delegate(
         .clone();
 
     let delegator_id = pubkey_to_id(delegator_pubkey);
-    let utxo_owner_id = pubkey_to_id(&utxo_entry.output.owner_pubkey);
-    if utxo_owner_id != delegator_id {
+    if utxo_entry.output.owner_pubkey != *delegator_pubkey {
         return Err(StateError::InvalidStakingOp(
             "UTXO does not belong to the delegator".into(),
         ));
@@ -969,6 +993,7 @@ fn apply_delegate(
         *validator_id,
         delegator_id,
         indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity { delegator_id },
+        delegator_pubkey,
         deposit_utxo_id,
         current_height,
     )?;
@@ -1065,6 +1090,7 @@ fn apply_self_stake(
         indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
             validator_id,
         },
+        &cold_owner,
         deposit_utxo_id,
         current_height,
     )?;
@@ -1151,6 +1177,7 @@ fn apply_claim_rewards(
     validator_id: &Bytes32,
     delegator_pubkey: &HybridPubKey,
     current_height: u64,
+    synthetic_output_index: u32,
 ) -> StateResult<()> {
     let delegator_id = pubkey_to_id(delegator_pubkey);
     let claim_from_validator = *validator_id == delegator_id;
@@ -1225,7 +1252,12 @@ fn apply_claim_rewards(
 
     state
         .utxos
-        .insert(output, current_height, STAKING_TX_IDX, 0)
+        .insert(
+            output,
+            current_height,
+            STAKING_REWARD_TX_IDX,
+            synthetic_output_index,
+        )
         .map_err(|_| StateError::InvariantViolation {
             message: "UTXO ID collision in staking reward output",
         })?;
@@ -1903,6 +1935,28 @@ mod tests {
             apply_staking_op(&mut state, &op, &chain_id, 1),
             Err(StateError::InvalidStakingOp(_))
         ));
+    }
+
+    #[test]
+    fn delegate_rejects_same_classical_key_with_substituted_pq_key() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, _) = make_active_validator(&mut state, 0x21);
+        let legitimate_keypair = mixed_keypair(0x22, 0x23);
+        let attacker_keypair = mixed_keypair(0x22, 0x24);
+        let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        assert_eq!(legitimate_pubkey.classical_pk, attacker_pubkey.classical_pk);
+        assert_ne!(legitimate_pubkey, attacker_pubkey);
+        let deposit_utxo_id = insert_delegator_utxo(&mut state, legitimate_pubkey, 1_000_000, 0x25);
+        let op = delegate_op(&state, validator_id, deposit_utxo_id, &attacker_keypair, 1);
+        let chain_id = state.chain_id.clone();
+        let before = state.clone();
+
+        let error = apply_staking_op(&mut state, &op, &chain_id, 1).unwrap_err();
+
+        assert!(matches!(error, StateError::InvalidStakingOp(message)
+            if message.contains("does not belong to the delegator")));
+        assert_eq!(state, before);
     }
 
     #[test]

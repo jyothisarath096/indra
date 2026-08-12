@@ -24,8 +24,10 @@ key encapsulation. The current OutputV1 transaction format stores authoritative
 amounts and full hybrid owner keys publicly; checked-`u64` conservation and
 dust validation are the sole monetary-validity rules.
 
-**Important scope note:** INDRA transaction ownership and consensus
-finality are post-quantum secure. The current chain format does not
+**Important scope note:** INDRA transaction ownership requires exact
+full-hybrid-key custody plus dual Ed25519 + ML-DSA-87 verification, and
+consensus finality uses ML-DSA-87. These paths retain post-quantum security
+through their PQ components. The current chain format does not
 provide node-level owner or amount privacy: full nodes and raw block-data
 observers can see OutputV1 owner/value metadata. Future transaction
 privacy work is documented as planned, not implemented. This distinction

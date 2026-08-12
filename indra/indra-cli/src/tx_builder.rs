@@ -159,8 +159,10 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         lock_height: 0,
     });
 
-    // Change output (if above dust)
+    // Change output (if above dust). A non-zero sub-dust remainder is paid as
+    // additional fee so the transaction still satisfies exact conservation.
     let mut pending_change = None;
+    let mut effective_fee_spark = params.fee_spark;
     if change_spark > DUST_LIMIT_SPARK {
         let change_output = OutputV1 {
             value_spark: change_spark,
@@ -171,6 +173,12 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
             output: change_output.clone(),
         });
         outputs.push(change_output);
+    } else if change_spark > 0 {
+        effective_fee_spark = effective_fee_spark
+            .checked_add(change_spark)
+            .ok_or_else(|| {
+                CliError::Transaction("fee overflow while folding dust change".into())
+            })?;
     }
 
     // 6. Build unsigned transaction.
@@ -179,7 +187,7 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         signature_module_id: 1,
         inputs,
         outputs,
-        fee_amount: params.fee_spark,
+        fee_amount: effective_fee_spark,
         signature: dummy_signature()?,
     };
 
@@ -217,7 +225,10 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     Ok(BuiltTransaction {
         tx_hex,
         tx_id,
-        change_spark,
+        change_spark: pending_change
+            .as_ref()
+            .map(|change| change.output.value_spark)
+            .unwrap_or(0),
         spent_utxo_ids: spent_ids,
         pending_change,
     })
@@ -641,6 +652,32 @@ mod tests {
         assert_eq!(tx.outputs.len(), 2);
         assert_eq!(tx.outputs[1].value_spark, built.change_spark);
         assert_eq!(tx.outputs[1].owner_pubkey, sender_pubkey);
+    }
+
+    #[test]
+    fn sub_dust_change_is_folded_into_fee_and_conservation_remains_exact() {
+        for remainder in [1, DUST_LIMIT_SPARK] {
+            let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
+            let recipient_address = payment_address(&test_keypair(0x6A));
+            let amount = 10_000_000 - MIN_FEE_SPARK - remainder;
+            let built = build_transaction(&TxParams {
+                chain_id: DEFAULT_CHAIN_ID,
+                recipient_address: &recipient_address,
+                amount_spark: amount,
+                fee_spark: MIN_FEE_SPARK,
+                wallet: &wallet,
+                ed25519_seed: seed,
+                ml_dsa_seed_bytes: pq_seed,
+                sender_pubkey,
+            })
+            .unwrap();
+            let tx = decode_built_tx(&built);
+            assert_eq!(built.change_spark, 0);
+            assert!(built.pending_change.is_none());
+            assert_eq!(tx.outputs.len(), 1);
+            assert_eq!(tx.fee_amount, MIN_FEE_SPARK + remainder);
+            assert_eq!(tx.outputs[0].value_spark + tx.fee_amount, 10_000_000);
+        }
     }
 
     #[test]
