@@ -104,6 +104,7 @@ int32_t indra_validate_mnemonic(const char* phrase);
 
 int32_t indra_validator_id(
     const uint8_t* classical_pk,
+    const uint8_t* pq_pk,
     uint8_t* out_id
 );
 

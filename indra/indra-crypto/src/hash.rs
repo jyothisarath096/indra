@@ -27,20 +27,6 @@ pub fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Compute the spend nullifier for a UTXO.
-///
-/// nullifier = SHA-256(secret_key_bytes || utxo_id_bytes)
-///
-/// This reveals nothing about the secret key or UTXO value, but is
-/// deterministic: the same (key, utxo_id) pair always produces the
-/// same nullifier, enabling double-spend detection on-chain.
-pub fn compute_nullifier(secret_key_bytes: &[u8], utxo_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(secret_key_bytes);
-    h.update(utxo_id);
-    h.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,38 +66,6 @@ mod tests {
         let b = sha256(b"right node");
         assert_ne!(hash_pair(&a, &b), hash_pair(&b, &a));
     }
-
-    /// Nullifier is deterministic.
-    #[test]
-    fn nullifier_is_deterministic() {
-        let sk = [0x42u8; 32];
-        let utxo_id = sha256(b"test_utxo_0001");
-        assert_eq!(
-            compute_nullifier(&sk, &utxo_id),
-            compute_nullifier(&sk, &utxo_id),
-        );
-    }
-
-    /// Different secret keys produce different nullifiers for the same UTXO.
-    #[test]
-    fn nullifier_depends_on_key() {
-        let sk1 = [0x11u8; 32];
-        let sk2 = [0x22u8; 32];
-        let utxo_id = sha256(b"same_utxo");
-        assert_ne!(
-            compute_nullifier(&sk1, &utxo_id),
-            compute_nullifier(&sk2, &utxo_id),
-        );
-    }
-
-    /// Same key, different UTXOs → different nullifiers.
-    #[test]
-    fn nullifier_depends_on_utxo() {
-        let sk = [0x55u8; 32];
-        let id1 = sha256(b"utxo_A");
-        let id2 = sha256(b"utxo_B");
-        assert_ne!(compute_nullifier(&sk, &id1), compute_nullifier(&sk, &id2),);
-    }
 }
 
 /// Domain-separated hash: SHA-256(domain || data).
@@ -129,8 +83,6 @@ pub mod domains {
     pub const TX_SIGN: &[u8] = b"INDRA-TX-SIGN-v1";
     /// Hash domain for vote signing messages.
     pub const VOTE_SIGN: &[u8] = b"INDRA-VOTE-SIGN-v1";
-    /// Hash domain for nullifier derivation.
-    pub const NULLIFIER: &[u8] = b"INDRA-NULLIFIER-v1";
     /// Hash domain for VRF input derivation.
     pub const VRF_INPUT: &[u8] = b"INDRA-VRF-INPUT-v1";
 }

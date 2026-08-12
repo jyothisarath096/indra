@@ -232,7 +232,7 @@ impl StakingOp {
                 ..
             } => (
                 AUTH_TAG_COLD_CLAIM_REWARDS,
-                pubkey_to_id(delegator_pubkey),
+                delegator_pubkey.identity_id(),
                 authorization,
             ),
             StakingOpBody::SetCommission {
@@ -246,7 +246,7 @@ impl StakingOp {
                 ..
             } => (
                 AUTH_TAG_COLD_SELF_STAKE,
-                pubkey_to_id(validator_pubkey),
+                validator_pubkey.identity_id(),
                 authorization,
             ),
             StakingOpBody::ExitStakePosition {
@@ -341,7 +341,7 @@ impl StakingOp {
         cold_pubkey.encode(&mut payload);
         1u64.encode(&mut payload);
 
-        let identity_id = pubkey_to_id(validator_pubkey);
+        let identity_id = validator_pubkey.identity_id();
         let hot = AuthorizationEnvelope::new_hot(
             chain_id.as_bytes(),
             AUTH_TAG_REGISTER_VALIDATOR,
@@ -429,7 +429,7 @@ impl StakingOp {
             }
             | StakingOpBody::ClaimRewards {
                 delegator_pubkey, ..
-            } => pubkey_to_id(delegator_pubkey),
+            } => delegator_pubkey.identity_id(),
             StakingOpBody::ExitStakePosition { custody, .. } => match custody {
                 PositionCustodyV1::DelegatorIdentity { delegator_id } => *delegator_id,
                 PositionCustodyV1::ValidatorColdIdentity { validator_id } => *validator_id,
@@ -439,7 +439,7 @@ impl StakingOp {
             }
             | StakingOpBody::SelfStake {
                 validator_pubkey, ..
-            } => pubkey_to_id(validator_pubkey),
+            } => validator_pubkey.identity_id(),
             StakingOpBody::SetCommission { validator_id, .. }
             | StakingOpBody::SetAutoDelegate { validator_id, .. }
             | StakingOpBody::UpdateNetworkAddress { validator_id, .. }
@@ -978,10 +978,6 @@ pub fn validate_network_addr_string(addr: &str) -> IndraResult<()> {
     Ok(())
 }
 
-fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,7 +1391,7 @@ mod tests {
     #[test]
     fn staking_op_self_stake_signer_id_is_validator_id() {
         let pubkey = dummy_pubkey();
-        let expected = pubkey_to_id(&pubkey);
+        let expected = pubkey.identity_id();
         let op = op(StakingOpBody::SelfStake {
             deposit_utxo_id: Bytes32::from([0xA3; 32]),
             validator_pubkey: pubkey,
@@ -1414,7 +1410,7 @@ mod tests {
             cold_authorization: None,
         });
         let delegate = op(StakingOpBody::Delegate {
-            validator_id: pubkey_to_id(&pubkey),
+            validator_id: pubkey.identity_id(),
             deposit_utxo_id,
             delegator_pubkey: pubkey,
         });

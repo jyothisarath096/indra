@@ -211,7 +211,6 @@ mod tests {
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([nonce; 32]),
-                nullifier: Bytes32::from([nonce; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: 1_000,

@@ -15,10 +15,14 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, Key, KeyInit, Nonce,
 };
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{Bytes32, VariableBytes},
+};
 use indra_crypto::{
     derive_all_seeds, generate_mnemonic,
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
-    mnemonic_to_seed, sha256, PaymentAddressV1, VrfKeypair,
+    mnemonic_to_seed, PaymentAddressV1, VrfKeypair,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -88,7 +92,7 @@ pub type KeystoreResult<T> = Result<T, KeystoreError>;
 /// All public keys for a validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorKeys {
-    /// 32-byte validator identity (SHA-256 of hybrid classical public key).
+    /// Domain-separated 32-byte identity of the complete hybrid public key.
     pub validator_id: [u8; 32],
     /// Ed25519 public key (32 bytes).
     pub hybrid_classical_pk: [u8; 32],
@@ -268,7 +272,13 @@ fn build_keys_file(
     Ok(KeysFile {
         name,
         public: ValidatorKeys {
-            validator_id: sha256(&pk.classical.0),
+            validator_id: HybridPubKey {
+                classical_pk: Bytes32::from(pk.classical.0),
+                pq_pk: VariableBytes::from_slice(&pk.pq.0)
+                    .map_err(|_| KeystoreError::Crypto("ML-DSA-87 public key too large".into()))?,
+            }
+            .identity_id()
+            .0,
             hybrid_classical_pk: pk.classical.0,
             hybrid_pq_pk: pk.pq.0.to_vec(),
             vrf_pk: vrf.public_key(),
@@ -550,10 +560,16 @@ impl PublicJson {
     fn to_validator_keys(&self) -> KeystoreResult<ValidatorKeys> {
         let hybrid_classical_pk =
             decode_hex_fixed::<32>(&self.hybrid_classical_pk, "public.hybrid_classical_pk")?;
+        let hybrid_pq_pk = decode_hex(&self.hybrid_pq_pk, "public.hybrid_pq_pk")?;
+        let identity_key = HybridPubKey {
+            classical_pk: Bytes32::from(hybrid_classical_pk),
+            pq_pk: VariableBytes::from_slice(&hybrid_pq_pk)
+                .map_err(|_| KeystoreError::Crypto("ML-DSA-87 public key too large".into()))?,
+        };
         Ok(ValidatorKeys {
-            validator_id: sha256(&hybrid_classical_pk),
+            validator_id: identity_key.identity_id().0,
             hybrid_classical_pk,
-            hybrid_pq_pk: decode_hex(&self.hybrid_pq_pk, "public.hybrid_pq_pk")?,
+            hybrid_pq_pk,
             vrf_pk: decode_hex_fixed::<32>(&self.vrf_pk, "public.vrf_pk")?,
         })
     }

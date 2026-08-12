@@ -1182,7 +1182,7 @@ fn classify_staking_reward_provenance(
     } = &op.body
     {
         if entry.output.owner_pubkey == *delegator_pubkey {
-            let delegator_id = staking_pubkey_to_id(delegator_pubkey);
+            let delegator_id = staking_identity_id(delegator_pubkey);
             return recoverable(
                 "staking_reward_claim",
                 format!(
@@ -1347,8 +1347,8 @@ fn retained_block_unavailable_reason(height: u64, state: &NodeState<'_>) -> Stri
     }
 }
 
-fn staking_pubkey_to_id(pubkey: &HybridPubKey) -> CoreBytes32 {
-    CoreBytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
+fn staking_identity_id(pubkey: &HybridPubKey) -> CoreBytes32 {
+    pubkey.identity_id()
 }
 
 fn json_string_or_null(value: Option<&str>) -> String {
@@ -2989,7 +2989,7 @@ mod tests {
         let mut engine = block_backed_engine();
         let height = 2;
         let owner = scan_owner_pubkey();
-        let proposer_id = Bytes32::from(indra_crypto::sha256(&owner.classical_pk.0));
+        let proposer_id = owner.identity_id();
         let action = GovernableAction::SetMinDelegationSpark { value: 44 };
         let proposed_epoch = epoch_for_height(height);
         let proposal_id =

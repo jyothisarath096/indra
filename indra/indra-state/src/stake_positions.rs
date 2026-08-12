@@ -58,7 +58,7 @@ pub fn deposit_stake_position(
     }
     let owner_matches_custody = match custody {
         PositionCustodyV1::DelegatorIdentity { delegator_id } => {
-            Bytes32::from(indra_crypto::sha256(&custody_pubkey.classical_pk.0)) == delegator_id
+            custody_pubkey.identity_id() == delegator_id
                 && utxo.output.owner_pubkey == *custody_pubkey
         }
         PositionCustodyV1::ValidatorColdIdentity { validator_id } => {
@@ -660,7 +660,7 @@ mod tests {
     fn setup() -> (ChainState, HybridKeypair, Bytes32, Bytes32) {
         let owner_keys = keypair(9);
         let owner_pubkey = wire_pubkey(&owner_keys);
-        let owner_id = Bytes32::from(indra_crypto::sha256(&owner_pubkey.classical_pk.0));
+        let owner_id = owner_pubkey.identity_id();
         let validator_id = id(7);
         let mut state = ChainState::new_genesis();
         state

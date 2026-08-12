@@ -17,7 +17,6 @@ use indra_state::ChainState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DependencyKey {
     Utxo(Bytes32),
-    Nullifier(Bytes32),
     BaseFee,
     NextHeight,
     StakingNonce(Bytes32),
@@ -177,7 +176,7 @@ pub(crate) fn staking_footprint(
             validator_pubkey,
             ..
         } => {
-            let validator = Bytes32::from(indra_crypto::sha256(&validator_pubkey.classical_pk.0));
+            let validator = validator_pubkey.identity_id();
             let position = derive_position_id(
                 validator,
                 validator,
@@ -258,7 +257,7 @@ pub(crate) fn staking_footprint(
             cold_pubkey,
             ..
         } => {
-            let validator = Bytes32::from(indra_crypto::sha256(&validator_pubkey.classical_pk.0));
+            let validator = validator_pubkey.identity_id();
             keys.extend([
                 DependencyKey::GovernanceParam(6),
                 DependencyKey::Validator(validator),
@@ -502,18 +501,18 @@ mod tests {
             BTreeSet::from([a, b])
         );
 
-        index.insert(a, BTreeSet::from([DependencyKey::Nullifier(v)]));
+        index.insert(a, BTreeSet::from([DependencyKey::Utxo(v)]));
         assert_eq!(
             index.affected([DependencyKey::Utxo(u)]),
             BTreeSet::from([b])
         );
         assert_eq!(
-            index.affected([DependencyKey::Nullifier(v)]),
+            index.affected([DependencyKey::Utxo(v)]),
             BTreeSet::from([a])
         );
 
         index.remove(&b);
-        index.assert_reconstructed([(a, BTreeSet::from([DependencyKey::Nullifier(v)]))]);
+        index.assert_reconstructed([(a, BTreeSet::from([DependencyKey::Utxo(v)]))]);
     }
 
     #[test]

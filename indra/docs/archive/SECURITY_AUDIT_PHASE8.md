@@ -52,7 +52,7 @@ The RPC layer performs some important validation, but it was not uniform across 
 
 Transaction submission through the live node RPC path decodes `TransactionV1` and calls `mempool.submit_validated(tx.clone(), &state)` before gossiping (`indra-node/src/bin/node.rs:2765`). The trait implementation used by the generic RPC server also routes to `submit_validated` (`indra-node/src/lib.rs:140`).
 
-This verifies signatures, UTXO existence, value arithmetic, nullifiers, and other transaction state rules added in Phase 2 before mempool admission.
+This verifies signatures, UTXO existence, value arithmetic, removed spend tags, and other transaction state rules added in Phase 2 before mempool admission.
 
 **Residual note:** The RPC layer relies on the HTTP body cap for transaction size; API-08 covers the body-limit behavior.
 

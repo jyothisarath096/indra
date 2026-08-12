@@ -14,14 +14,13 @@
 //!
 //! Per-transaction checks (in order, for each tx):
 //!   7.  At least 1 input, at least 1 output
-//!   8.  No duplicate nullifiers within the transaction
-//!   9.  No duplicate nullifiers against the nullifier set
+//!   8.  No duplicate input UTXO references within the block
 //!   10. All input UTXOs exist in the UTXO set
 //!   11. All input UTXOs are past their lock_height
 //!   12. fee_amount ≥ base_fee × tx_weight_kb
 //!
 //! State updates (only after ALL checks pass):
-//!   - Spend inputs (remove from UTXO set, add nullifiers)
+//!   - Spend inputs by atomically removing them from the UTXO set
 //!   - Create outputs (insert into UTXO set)
 //!   - Update base_fee
 //!   - If epoch boundary: apply epoch transition
@@ -200,22 +199,6 @@ pub fn try_apply_verified_slash_candidate(
 mod tests {
     use super::*;
 
-    #[test]
-    fn block_wide_nullifier_ceiling_accepts_400_and_rejects_401() {
-        assert!(validate_block_nullifier_count(
-            indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK
-        )
-        .is_ok());
-        assert!(matches!(
-            validate_block_nullifier_count(
-                indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK + 1
-            ),
-            Err(StateError::TooManyNullifiers {
-                actual: 401,
-                max: 400
-            })
-        ));
-    }
     use crate::chain::ChainState;
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
@@ -283,7 +266,7 @@ mod tests {
     }
 
     fn staking_delegator_id_for_test(pubkey: &HybridPubKey) -> Bytes32 {
-        Bytes32::from(sha256(&pubkey.classical_pk.0))
+        pubkey.identity_id()
     }
 
     fn sign_staking_op(keypair: &HybridKeypair, chain_id: &str, op: &mut StakingOp) {
@@ -299,7 +282,7 @@ mod tests {
     }
 
     fn governance_validator_id(pubkey: &HybridPubKey) -> Bytes32 {
-        Bytes32::from(sha256(&pubkey.classical_pk.0))
+        pubkey.identity_id()
     }
 
     fn sign_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair, chain_id: &str) {
@@ -702,7 +685,8 @@ mod tests {
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let keypair = HybridKeypair::new(classical, pq);
         let public = keypair.public_key();
-        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
         let mut state = ChainState::new_genesis();
         state
             .validators
@@ -1303,27 +1287,13 @@ mod tests {
     #[test]
     fn transaction_rejects_new_output_with_noncanonical_hybrid_owner_key() {
         let (state, utxo_id, keypair, fixture_tag, value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            value,
-            fixture_tag,
-            Bytes32::from([0xD7; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, value, fixture_tag);
         tx.outputs[0].owner_pubkey.pq_pk =
             VariableBytes::from_slice(&[0u8; indra_crypto::PQ_PK_BYTES]).unwrap();
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
 
-        let error = validate_transaction(
-            &state,
-            &tx,
-            &state.chain_id,
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-            1,
-        )
-        .unwrap_err();
+        let error =
+            validate_transaction(&state, &tx, &state.chain_id, &mut HashSet::new(), 1).unwrap_err();
 
         assert!(matches!(error, StateError::InvalidOutputOwnerKey { .. }));
     }
@@ -1334,7 +1304,6 @@ mod tests {
         utxo_id: Bytes32,
         input_value: u64,
         _input_blinding: [u8; 32],
-        nullifier: Bytes32,
     ) -> TransactionV1 {
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
         let output_value = input_value - fee;
@@ -1342,7 +1311,7 @@ mod tests {
         let mut tx = TransactionV1 {
             version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
-            inputs: vec![InputV1 { utxo_id, nullifier }],
+            inputs: vec![InputV1 { utxo_id }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
                 owner_pubkey,
@@ -1372,13 +1341,13 @@ mod tests {
             let output = dummy_output(byte, owner_pubkey.clone());
             let value = TEST_INPUT_VALUE + u64::from(byte);
             let utxo_id = state.utxos.insert(output, 0, 0, index as u32).unwrap();
-            inputs.push((utxo_id, value, [byte; 32], Bytes32::from([byte; 32])));
+            inputs.push((utxo_id, value, [byte; 32]));
         }
         state.finalize_genesis().unwrap();
         let transactions = inputs
             .into_iter()
-            .map(|(utxo_id, value, blinding, nullifier)| {
-                make_tx(&state, &keypair, utxo_id, value, blinding, nullifier)
+            .map(|(utxo_id, value, fixture_tag)| {
+                make_tx(&state, &keypair, utxo_id, value, fixture_tag)
             })
             .collect();
         let block = make_block(&state, transactions);
@@ -1723,14 +1692,7 @@ mod tests {
     #[test]
     fn project_block_for_roots_failpoint_rollback_covers_each_mutation() {
         let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xC1; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, value, blinding);
         let block = make_block(&state, vec![tx]);
 
         crate::txn::set_fail_after_mutation(None);
@@ -1760,15 +1722,7 @@ mod tests {
     #[test]
     fn committed_effect_journal_covers_transaction_validity_state_diff() {
         let (mut state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xC2; 32]),
-        );
-        let nullifier = tx.inputs[0].nullifier;
+        let tx = make_tx(&state, &keypair, utxo_id, value, blinding);
         let block = make_block(&state, vec![tx]);
         let before = state.clone();
         let outcome = apply_block_with_effects(&mut state, &block, 0).unwrap();
@@ -1776,8 +1730,6 @@ mod tests {
         assert_ne!(before.utxos, state.utxos);
         assert!(outcome.effects.utxo_set_changed);
         assert!(outcome.effects.spent_utxos.contains(&utxo_id));
-        assert_ne!(before.nullifiers, state.nullifiers);
-        assert!(outcome.effects.inserted_nullifiers.contains(&nullifier));
         assert_eq!(
             before.base_fee != state.base_fee,
             outcome.effects.base_fee_changed
@@ -1803,14 +1755,7 @@ mod tests {
     #[test]
     fn state_txn_rolls_back_after_each_transaction_mutation_failpoint() {
         let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xA1; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, value, blinding);
         let block = make_block(&state, vec![tx]);
 
         let mutation_count = assert_all_failpoints_roll_back(&state, &block);
@@ -1823,14 +1768,7 @@ mod tests {
     #[test]
     fn transaction_candidate_adapter_rolls_back_partial_application() {
         let (state, utxo_id, keypair, blinding, value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            value,
-            blinding,
-            Bytes32::from([0xC1; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, value, blinding);
         let before = state.clone();
         let mut scratch = state;
         let dust_limit =
@@ -2320,15 +2258,7 @@ mod tests {
     #[test]
     fn apply_block_with_tx_spends_utxo() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let nullifier = Bytes32::from([0x99u8; 32]);
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            nullifier,
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block, 0).unwrap();
 
@@ -2336,21 +2266,12 @@ mod tests {
         assert!(!state.utxos.contains(&utxo_id));
         // Output UTXO must exist
         assert_eq!(state.utxos.len(), 1);
-        // Nullifier must be recorded
-        assert!(state.nullifiers.contains(&nullifier));
     }
 
     #[test]
     fn apply_transaction_fails_loudly_if_utxo_already_spent() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x9A; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         assert!(state.utxos.spend(&utxo_id).is_some());
 
         let mut txn = StateTxn::begin(&mut state, 1);
@@ -2363,40 +2284,19 @@ mod tests {
     }
 
     #[test]
-    fn double_spend_rejected() {
-        let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let nullifier = Bytes32::from([0xAAu8; 32]);
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            nullifier,
-        );
-        let block1 = make_block(&state, vec![tx.clone()]);
-        apply_block(&mut state, &block1, 0).unwrap();
+    fn replay_spend_rejected_after_atomic_utxo_removal() {
+        let (mut state, utxo_id, keypair, fixture_tag, input_value) = state_with_utxo();
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, fixture_tag);
+        let first = make_block(&state, vec![tx.clone()]);
+        apply_block(&mut state, &first, 0).unwrap();
+        assert!(!state.utxos.contains(&utxo_id));
 
-        // Re-insert the output so the utxo_id exists again
-        // but the nullifier is already spent
-        let output = dummy_output(0x01, make_test_keypair([0x11; 32]).0);
-        state.utxos.insert(output, 0, 0, 0).unwrap();
-
-        let block2 = make_block(
-            &state,
-            vec![make_tx(
-                &state,
-                &keypair,
-                utxo_id,
-                input_value,
-                input_blinding,
-                nullifier,
-            )],
-        );
+        let replay = make_block(&state, vec![tx]);
         assert_eq!(
-            apply_block(&mut state, &block2, 0),
-            Err(StateError::DoubleSpend)
+            apply_block(&mut state, &replay, 0),
+            Err(StateError::UnknownUtxo)
         );
+        assert_eq!(state.height, 1);
     }
 
     #[test]
@@ -2443,7 +2343,6 @@ mod tests {
     fn unknown_utxo_rejected() {
         let mut state = canonical_test_genesis();
         let fake_utxo = Bytes32::from([0xDEu8; 32]);
-        let nullifier = Bytes32::from([0xADu8; 32]);
         let (_, keypair) = make_test_keypair([0x22; 32]);
         let tx = make_tx(
             &state,
@@ -2451,7 +2350,6 @@ mod tests {
             fake_utxo,
             TEST_INPUT_VALUE + 1,
             [0x01; 32],
-            nullifier,
         );
         let block = make_block(&state, vec![tx]);
         assert_eq!(
@@ -2463,14 +2361,7 @@ mod tests {
     #[test]
     fn fee_too_low_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x01u8; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         tx.fee_amount = 0; // too low
         tx.signature = sign_transaction(&keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
@@ -2485,14 +2376,7 @@ mod tests {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let initial_supply = state.total_supply;
         let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x11u8; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.total_supply, initial_supply - (fee / 2));
@@ -2521,15 +2405,7 @@ mod tests {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
 
         // Block 1: spend the UTXO
-        let nullifier = Bytes32::from([0x55u8; 32]);
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            nullifier,
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let block1 = make_block(&state, vec![tx]);
         apply_block(&mut state, &block1, 0).unwrap();
         assert_eq!(state.height, 1);
@@ -2548,14 +2424,7 @@ mod tests {
         output.lock_height = 100; // locked until height 100
         let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
 
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            TEST_INPUT_VALUE + 1,
-            [0x01; 32],
-            Bytes32::from([0x01u8; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, TEST_INPUT_VALUE + 1, [0x01; 32]);
         let block = make_block(&state, vec![tx]); // height will be 1 < 100
         assert!(matches!(
             apply_block(&mut state, &block, 0),
@@ -2566,14 +2435,7 @@ mod tests {
     #[test]
     fn valid_signature_accepted() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x44; 32]),
-        );
+        let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block, 0).unwrap();
         assert_eq!(state.height, 1);
@@ -2582,14 +2444,7 @@ mod tests {
     #[test]
     fn wrong_signature_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x45; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let (_, wrong_keypair) = make_test_keypair([0x33; 32]);
         tx.signature = sign_transaction(&wrong_keypair, &state.chain_id, &tx);
         let block = make_block(&state, vec![tx]);
@@ -2602,14 +2457,7 @@ mod tests {
     #[test]
     fn zeroed_signature_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x46; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         tx.signature = dummy_sig();
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
@@ -2621,14 +2469,7 @@ mod tests {
     #[test]
     fn wrong_chain_id_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x47; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         tx.signature = sign_transaction(&keypair, "indra-mainnet-1", &tx);
         let block = make_block(&state, vec![tx]);
         assert!(matches!(
@@ -2640,14 +2481,7 @@ mod tests {
     #[test]
     fn wrong_version_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x48; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         tx.version = ProtocolVersion(99);
         let block = make_block(&state, vec![tx]);
         assert_eq!(
@@ -2659,14 +2493,7 @@ mod tests {
     #[test]
     fn wrong_module_id_rejected() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
-        let mut tx = make_tx(
-            &state,
-            &keypair,
-            utxo_id,
-            input_value,
-            input_blinding,
-            Bytes32::from([0x49; 32]),
-        );
+        let mut tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         tx.signature_module_id = 7;
         let block = make_block(&state, vec![tx]);
         assert_eq!(
@@ -3840,7 +3667,7 @@ fn verify_vote_sig_with_keys(
     verify_hybrid(&signing_bytes, &sig, &pk).map_err(|e| e.to_string())
 }
 
-/// Apply a block to the chain state, updating UTXOs, nullifiers, fees and validators.
+/// Apply a block to the chain state, updating UTXOs, fees and validators.
 pub fn apply_block(
     state: &mut ChainState,
     block: &BlockV1,
@@ -3878,13 +3705,11 @@ pub fn try_apply_transaction_candidate_with_dust(
     tx_index: u32,
     dust_limit_spark: u64,
 ) -> StateResult<()> {
-    let mut block_nullifiers = HashSet::new();
     let mut block_input_utxos = HashSet::new();
     validate_transaction_with_dust(
         state,
         tx,
         &state.chain_id,
-        &mut block_nullifiers,
         &mut block_input_utxos,
         height,
         dust_limit_spark,
@@ -4139,9 +3964,8 @@ fn apply_block_inner(
 
     // Validate each transaction against current state
     // We do a dry-run: check but don't mutate yet
-    // Track nullifiers and input UTXO IDs seen in THIS block to catch
-    // intra-block double spends before any mutation occurs.
-    let mut block_nullifiers: HashSet<Bytes32> = HashSet::new();
+    // Track input UTXO IDs seen in this block to catch intra-block double spends
+    // before any mutation occurs.
     let mut block_input_utxos: HashSet<Bytes32> = HashSet::new();
     let transaction_dust_limit =
         indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len());
@@ -4151,7 +3975,6 @@ fn apply_block_inner(
             state,
             tx,
             &state.chain_id,
-            &mut block_nullifiers,
             &mut block_input_utxos,
             block.header.height,
             transaction_dust_limit,
@@ -4444,13 +4267,6 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
             max: MAX_TX_PER_BLOCK,
         });
     }
-    let spent_inputs = block
-        .transactions
-        .iter()
-        .map(|tx| tx.inputs.len())
-        .sum::<usize>();
-    validate_block_nullifier_count(spent_inputs)?;
-
     // base_fee field must match what we computed for this height
     // (the block proposer must use the correct fee or be rejected)
     if block.header.base_fee != state.base_fee {
@@ -4463,28 +4279,14 @@ fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()>
     Ok(())
 }
 
-fn validate_block_nullifier_count(spent_inputs: usize) -> StateResult<()> {
-    if spent_inputs > indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK {
-        return Err(StateError::TooManyNullifiers {
-            actual: spent_inputs,
-            max: indra_core::types::primitives::MAX_NULLIFIERS_PER_BLOCK,
-        });
-    }
-    Ok(())
-}
-
 /// Validate one transaction against the current state.
 ///
-/// `block_nullifiers` accumulates nullifiers seen so far in THIS block,
-/// allowing detection of intra-block double spends.
 /// `block_input_utxos` accumulates input UTXO IDs seen so far in THIS block,
-/// preventing the same UTXO from being counted more than once with distinct
-/// nullifiers.
+/// preventing the same UTXO from being counted more than once.
 pub fn validate_transaction(
     state: &ChainState,
     tx: &TransactionV1,
     chain_id: &str,
-    block_nullifiers: &mut HashSet<Bytes32>,
     block_input_utxos: &mut HashSet<Bytes32>,
     current_height: u64,
 ) -> StateResult<()> {
@@ -4492,7 +4294,6 @@ pub fn validate_transaction(
         state,
         tx,
         chain_id,
-        block_nullifiers,
         block_input_utxos,
         current_height,
         indra_core::types::primitives::transaction_dust_limit_spark(state.utxos.len()),
@@ -4504,7 +4305,6 @@ pub fn validate_transaction_with_dust(
     state: &ChainState,
     tx: &TransactionV1,
     chain_id: &str,
-    block_nullifiers: &mut HashSet<Bytes32>,
     block_input_utxos: &mut HashSet<Bytes32>,
     current_height: u64,
     dust_limit_spark: u64,
@@ -4536,16 +4336,6 @@ pub fn validate_transaction_with_dust(
             });
         }
 
-        // Duplicate nullifier within this transaction
-        if block_nullifiers.contains(&input.nullifier) {
-            return Err(StateError::DuplicateNullifier);
-        }
-
-        // Already spent in a previous block
-        if state.nullifiers.contains(&input.nullifier) {
-            return Err(StateError::DoubleSpend);
-        }
-
         // Referenced UTXO must exist
         let entry = state
             .utxos
@@ -4571,8 +4361,6 @@ pub fn validate_transaction_with_dust(
                 current_height,
             });
         }
-
-        block_nullifiers.insert(input.nullifier);
     }
 
     let owner_pubkey = owner_pubkey.ok_or(StateError::UnknownUtxo)?;
@@ -4660,7 +4448,6 @@ fn apply_transaction(
                 message: "attempted to spend an already-spent UTXO during apply_transaction",
             });
         }
-        txn.insert_nullifier(input.nullifier)?;
     }
 
     // Create outputs: insert new UTXOs

@@ -180,16 +180,8 @@ pub fn verify_pending_transaction(
     tx_id: Bytes32,
     current_height: u64,
 ) -> StateResult<VerifiedPendingTransaction> {
-    let mut nullifiers = HashSet::new();
     let mut input_ids = HashSet::new();
-    validate_transaction(
-        state,
-        tx,
-        &state.chain_id,
-        &mut nullifiers,
-        &mut input_ids,
-        current_height,
-    )?;
+    validate_transaction(state, tx, &state.chain_id, &mut input_ids, current_height)?;
     let input_utxos = tx
         .inputs
         .iter()
@@ -225,9 +217,6 @@ pub fn validate_verified_pending_transaction(
             return Err(StateError::InvariantViolation {
                 message: "pending transaction input certificate order mismatch",
             });
-        }
-        if state.nullifiers.contains(&input.nullifier) {
-            return Err(StateError::DoubleSpend);
         }
         let current = state
             .utxos

@@ -11,6 +11,27 @@ use crate::{
     },
 };
 
+/// Domain separating validator and delegator identity IDs from every other
+/// protocol hash construction.
+pub const HYBRID_IDENTITY_DOMAIN: &[u8] = b"INDRA-HYBRID-IDENTITY-v1";
+
+/// Derive a protocol identity from the canonical components of a hybrid key.
+pub fn hybrid_identity_id(
+    classical_pk: &[u8; 32],
+    pq_pk: &[u8; indra_crypto::PQ_PK_BYTES],
+) -> Bytes32 {
+    hybrid_identity_id_bytes(classical_pk, pq_pk)
+}
+
+fn hybrid_identity_id_bytes(classical_pk: &[u8; 32], pq_pk: &[u8]) -> Bytes32 {
+    let mut bytes = Vec::with_capacity(HYBRID_IDENTITY_DOMAIN.len() + 32 + 4 + pq_pk.len());
+    bytes.extend_from_slice(HYBRID_IDENTITY_DOMAIN);
+    bytes.extend_from_slice(classical_pk);
+    bytes.extend_from_slice(&(pq_pk.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(pq_pk);
+    Bytes32::from(indra_crypto::sha256(&bytes))
+}
+
 /// Hybrid signature on the wire: Ed25519 + ML-DSA-87.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridSignature {
@@ -97,6 +118,14 @@ impl Decode for HybridPubKey {
 }
 
 impl HybridPubKey {
+    /// Derive the canonical protocol identity for this complete hybrid key.
+    ///
+    /// The canonical key encoding binds both the Ed25519 and ML-DSA-87 public
+    /// components, including the PQ component's canonical length prefix.
+    pub fn identity_id(&self) -> Bytes32 {
+        hybrid_identity_id_bytes(&self.classical_pk.0, self.pq_pk.as_slice())
+    }
+
     /// Convert the wire public key into the crypto-layer representation.
     pub fn to_crypto_pubkey(&self) -> Result<indra_crypto::HybridPublicKey, String> {
         use indra_crypto::{
@@ -115,6 +144,40 @@ impl HybridPubKey {
             classical: ClassicalPublicKey(self.classical_pk.0),
             pq: PqPublicKey(pq_arr),
         })
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::types::primitives::VariableBytes;
+
+    #[test]
+    fn hybrid_identity_is_domain_separated_and_binds_both_key_components() {
+        let classical = Bytes32::from([0x11; 32]);
+        let first = HybridPubKey {
+            classical_pk: classical,
+            pq_pk: VariableBytes::from_slice(&[0x22; indra_crypto::PQ_PK_BYTES]).unwrap(),
+        };
+        let second = HybridPubKey {
+            classical_pk: classical,
+            pq_pk: VariableBytes::from_slice(&[0x23; indra_crypto::PQ_PK_BYTES]).unwrap(),
+        };
+
+        assert_ne!(first.identity_id(), second.identity_id());
+        assert_ne!(
+            first.identity_id(),
+            Bytes32::from(indra_crypto::sha256(&classical.0)),
+            "the removed classical-only identity must never alias the canonical hybrid identity"
+        );
+
+        let mut oracle = Vec::new();
+        oracle.extend_from_slice(HYBRID_IDENTITY_DOMAIN);
+        first.encode(&mut oracle);
+        assert_eq!(
+            first.identity_id(),
+            Bytes32::from(indra_crypto::sha256(&oracle))
+        );
     }
 }
 

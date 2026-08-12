@@ -19,8 +19,6 @@ pub struct CanonicalStateEffects {
     pub spent_utxos: BTreeSet<Bytes32>,
     /// Whether the resident UTXO namespace changed in any way.
     pub utxo_set_changed: bool,
-    /// Nullifiers newly made permanent by the committed transition.
-    pub inserted_nullifiers: BTreeSet<Bytes32>,
     /// Whether the transaction fee floor changed.
     pub base_fee_changed: bool,
     /// Supply/reward accounting scalars changed.
@@ -90,7 +88,6 @@ pub(crate) enum CanonicalStateField {
     BurnBuffer,
     FeeRewardPool,
     Utxos,
-    Nullifiers,
     Validators,
     ConsensusSnapshots,
     RewardEconomicSnapshot,
@@ -154,7 +151,6 @@ impl CanonicalStateEffects {
                 self.economic_accounting_changed
             }
             F::Utxos => self.utxo_set_changed,
-            F::Nullifiers => !self.inserted_nullifiers.is_empty(),
             F::Validators => self.validator_registry_changed || !self.validators_changed.is_empty(),
             F::ConsensusSnapshots => self.consensus_snapshots_changed,
             F::RewardEconomicSnapshot => self.reward_economic_snapshot_changed,

@@ -169,6 +169,7 @@ fn apply_propose(
     ) {
         return invalid("proposer must be active or registered validator");
     }
+    require_registered_proposer_pubkey(state, &op.signer_id, proposer_pubkey)?;
     if state.governance.active_proposal_count() >= MAX_ACTIVE_GOVERNANCE_PROPOSALS {
         return invalid("global active proposal cap exceeded");
     }
@@ -640,9 +641,7 @@ fn verify_governance_sig(
             proposer_pubkey, ..
         } = &op.payload
         {
-            if proposer_pubkey != &pubkey {
-                return invalid("cold proposal deposit owner must equal registered cold key");
-            }
+            require_registered_proposer_pubkey(state, &op.signer_id, proposer_pubkey)?;
         }
         let signing_bytes = op
             .cold_authorization_signing_bytes(chain_id)
@@ -697,11 +696,7 @@ fn governance_signer_pubkey(state: &ChainState, op: &GovernanceOpV2) -> StateRes
         GovernancePayload::Propose {
             proposer_pubkey, ..
         } => {
-            if pubkey_to_id(proposer_pubkey) != op.signer_id {
-                return Err(StateError::GovernanceSignatureInvalid {
-                    reason: "proposer pubkey does not match signer_id".into(),
-                });
-            }
+            require_registered_proposer_pubkey(state, &op.signer_id, proposer_pubkey)?;
             Ok(proposer_pubkey.clone())
         }
         GovernancePayload::Commit { .. } | GovernancePayload::Reveal { .. } => {
@@ -749,6 +744,19 @@ fn validator_pubkey(state: &ChainState, validator_id: &Bytes32) -> StateResult<H
             }
         })?,
     })
+}
+
+fn require_registered_proposer_pubkey(
+    state: &ChainState,
+    signer_id: &Bytes32,
+    proposer_pubkey: &HybridPubKey,
+) -> StateResult<()> {
+    let registered = resolve_active_validator_cold_pubkey(state, signer_id)
+        .map_err(identity_error_to_governance_error)?;
+    if registered != *proposer_pubkey {
+        return invalid("proposal pubkey must equal the registered complete cold hybrid key");
+    }
+    Ok(())
 }
 
 fn identity_error_to_governance_error(err: IdentityError) -> StateError {
@@ -827,10 +835,6 @@ fn governance_change_output(
     })
 }
 
-fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(sha256(&pubkey.classical_pk.0))
-}
-
 fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
     Err(StateError::InvalidGovernanceOp {
         reason: reason.into(),
@@ -855,6 +859,10 @@ mod tests {
     use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
     use crate::delegation::apply_staking_op;
+
+    fn test_validator_id(pubkey: &HybridPubKey) -> Bytes32 {
+        pubkey.identity_id()
+    }
 
     fn keypair(seed: u8) -> (HybridPubKey, HybridKeypair) {
         let seed = [seed; 32];
@@ -1049,7 +1057,7 @@ mod tests {
     }
 
     fn install_governance_validator(state: &mut ChainState, pubkey: &HybridPubKey) -> Bytes32 {
-        let validator_id = pubkey_to_id(pubkey);
+        let validator_id = test_validator_id(pubkey);
         state
             .validators
             .upsert(crate::validator::ValidatorEntry {
@@ -1189,7 +1197,7 @@ mod tests {
     ) -> ProposalRecord {
         ProposalRecord {
             proposal_id,
-            proposer_id: pubkey_to_id(&proposer_pubkey),
+            proposer_id: test_validator_id(&proposer_pubkey),
             proposer_pubkey,
             tier: action.tier(),
             action,
@@ -1764,6 +1772,76 @@ mod tests {
             state.utxos.get(&victim_deposit).is_some(),
             "victim deposit UTXO must remain unspent"
         );
+    }
+
+    #[test]
+    fn governance_proposal_rejects_victim_classical_key_with_attacker_pq_key() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (victim_pubkey, _) = keypair(0x31);
+        let victim_id = install_governance_validator(&mut state, &victim_pubkey);
+        let (mixed_pubkey, mixed_keypair) = mixed_keypair(0x31, 0xA4);
+        assert_eq!(mixed_pubkey.classical_pk, victim_pubkey.classical_pk);
+        assert_ne!(mixed_pubkey.pq_pk, victim_pubkey.pq_pk);
+        let attacker_deposit = state
+            .utxos
+            .insert(deposit_output(mixed_pubkey.clone(), 1_000), 0, 0, 0)
+            .unwrap();
+        let op = propose_op(victim_id, &mixed_keypair, mixed_pubkey, attacker_deposit, 1);
+
+        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason })
+                if reason.contains("registered complete cold hybrid key")
+        ));
+        assert!(state.utxos.get(&attacker_deposit).is_some());
+        assert!(state.governance.proposals.is_empty());
+    }
+
+    #[test]
+    fn apply_propose_independently_rechecks_complete_registered_key() {
+        let mut state = ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        let (victim_pubkey, _) = keypair(0x32);
+        let victim_id = install_governance_validator(&mut state, &victim_pubkey);
+        let (mixed_pubkey, mixed_keypair) = mixed_keypair(0x32, 0xA5);
+        let attacker_deposit = state
+            .utxos
+            .insert(deposit_output(mixed_pubkey.clone(), 1_000), 0, 0, 0)
+            .unwrap();
+        let op = propose_op(
+            victim_id,
+            &mixed_keypair,
+            mixed_pubkey.clone(),
+            attacker_deposit,
+            1,
+        );
+        let action = GovernableAction::SetMinDelegationSpark {
+            value: DUST_LIMIT_SPARK,
+        };
+
+        let result = apply_propose(
+            &mut state,
+            &op,
+            0,
+            DEFAULT_CHAIN_ID,
+            &action,
+            &attacker_deposit,
+            &mixed_pubkey,
+            b"test",
+            b"test proposal",
+            0,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidGovernanceOp { reason })
+                if reason.contains("registered complete cold hybrid key")
+        ));
+        assert!(state.utxos.get(&attacker_deposit).is_some());
+        assert!(state.governance.proposals.is_empty());
     }
 
     #[test]
@@ -2343,9 +2421,7 @@ mod tests {
     fn governance_redelegation_uses_only_active_remainder_mid_unbonding() {
         let mut state = ChainState::new_genesis();
         let (delegator_pubkey, delegator_keys) = keypair(0xD8);
-        let delegator_id = Bytes32::from(indra_crypto::sha256(
-            &delegator_keys.public_key().classical.0,
-        ));
+        let delegator_id = delegator_pubkey.identity_id();
         let from_validator = Bytes32::from([0xD9; 32]);
         let to_validator = Bytes32::from([0xDA; 32]);
         let proposal_id = Bytes32::from([0xDB; 32]);

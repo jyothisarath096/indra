@@ -33,10 +33,9 @@ fn pubkey() -> HybridPubKey {
     }
 }
 
-fn input(utxo_byte: u8, null_byte: u8) -> InputV1 {
+fn input(utxo_byte: u8, _input_tag: u8) -> InputV1 {
     InputV1 {
         utxo_id: Bytes32::from([utxo_byte; 32]),
-        nullifier: Bytes32::from([null_byte; 32]),
     }
 }
 
@@ -200,13 +199,6 @@ fn zero_outputs_rejected() {
     let mut tx = minimal_tx();
     tx.outputs.clear();
     assert_eq!(tx.validate_structure(), Err(IndraError::ZeroOutputs));
-}
-
-#[test]
-fn duplicate_nullifier_within_tx_rejected() {
-    let mut tx = minimal_tx();
-    tx.inputs.push(tx.inputs[0].clone());
-    assert_eq!(tx.validate_structure(), Err(IndraError::DuplicateNullifier));
 }
 
 #[test]

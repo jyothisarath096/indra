@@ -254,8 +254,8 @@ range-proof system exists in the current protocol.
 
 INDRA uses an Unspent Transaction Output model. Each UTXO represents
 a unit of value owned by a specific public key. Spending a UTXO
-produces a nullifier recorded permanently on-chain. Double-spending
-is cryptographically impossible: once a nullifier exists, any
+atomically removes the referenced UTXO from the live set. Double-spending
+is rejected because an already-consumed UTXO no longer exists, and any
 transaction attempting to spend the same UTXO is rejected.
 
 UTXO entries use one canonical genesis-native encoding. Nodes reject unknown
@@ -798,7 +798,7 @@ before mainnet stake reaches significant value.
 
 **StateCommitmentV2 and compressed authenticated trees are not active.**
 Incremental validator/delegation/staking commitments and compressed
-authenticated UTXO/nullifier trees have been implemented behind hard-fork
+authenticated UTXO trees have been implemented behind hard-fork
 height gates, but both activation constants remain deliberately
 unscheduled (`u64::MAX`) pending further review. Live testnet state roots
 therefore still use the currently-active commitment rules.

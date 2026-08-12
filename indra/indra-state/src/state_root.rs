@@ -2,7 +2,6 @@
 //!
 //! The final state root commits to:
 //! - the full UTXO sparse Merkle tree
-//! - the full nullifier sparse Merkle tree
 //! - chain metadata required for deterministic replay
 //!
 //! `tip_hash` is intentionally excluded from the metadata hash to avoid a
@@ -19,8 +18,8 @@ use crate::ChainState;
 
 /// Root values computed from the same post-state snapshot.
 ///
-/// `state_root` commits to the UTXO root, nullifier root, validator/staking
-/// root, and chain metadata. `validator_set_root` is exposed alongside it so
+/// `state_root` commits to the UTXO root, validator/staking root, and chain
+/// metadata. `validator_set_root` is exposed alongside it so
 /// block-header callers do not need to recompute the expensive validator/
 /// delegation/staking commitment a second time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +39,6 @@ pub fn compute_state_root(state: &ChainState) -> Bytes32 {
 /// pass.
 pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     let utxo_root = state.utxos.root_at_height(state.height);
-    let nullifier_root = state.nullifiers.root_at_height(state.height);
     let validator_set_root = compute_validator_set_root(state);
 
     let chain_id = VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
@@ -56,9 +54,8 @@ pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     state.governance.encode(&mut metadata);
     let metadata_hash = sha256(&metadata);
 
-    let mut combined = Vec::with_capacity(128);
+    let mut combined = Vec::with_capacity(96);
     combined.extend_from_slice(&utxo_root);
-    combined.extend_from_slice(&nullifier_root);
     combined.extend_from_slice(&validator_set_root.0);
     combined.extend_from_slice(&metadata_hash);
     ComputedStateRoots {

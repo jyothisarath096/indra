@@ -18,7 +18,10 @@
 
 use std::{ffi::c_char, panic::catch_unwind};
 
-use indra_crypto::sha256;
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{Bytes32, VariableBytes},
+};
 
 pub mod errors;
 pub mod governance;
@@ -329,24 +332,45 @@ pub unsafe extern "C" fn indra_validate_mnemonic(phrase: *const c_char) -> i32 {
     }
 }
 
-/// Derive the validator id from a classical public key.
+/// Derive the validator ID from a complete Ed25519 + ML-DSA-87 public key.
 ///
 /// # Safety
 ///
-/// `classical_pk` must point to at least 32 readable bytes and `out_id` must
-/// point to a writable 32-byte output buffer.
+/// `classical_pk` and `pq_pk` must point to 32 and 2592 readable bytes,
+/// respectively, and `out_id` must point to a writable 32-byte output buffer.
 #[no_mangle]
-pub unsafe extern "C" fn indra_validator_id(classical_pk: *const u8, out_id: *mut u8) -> i32 {
-    if classical_pk.is_null() || out_id.is_null() {
+pub unsafe extern "C" fn indra_validator_id(
+    classical_pk: *const u8,
+    pq_pk: *const u8,
+    out_id: *mut u8,
+) -> i32 {
+    if classical_pk.is_null() || pq_pk.is_null() || out_id.is_null() {
         return IndraError::NullPointer.code();
     }
 
-    match catch_unwind(|| {
+    match catch_unwind(|| -> Result<(), IndraError> {
         let classical_pk_bytes = std::slice::from_raw_parts(classical_pk, CLASSICAL_PK_BYTES);
-        let validator_id = sha256(classical_pk_bytes);
-        std::slice::from_raw_parts_mut(out_id, BYTES32_LEN).copy_from_slice(&validator_id);
+        let pq_pk_bytes = std::slice::from_raw_parts(pq_pk, PQ_PK_BYTES);
+        let identity_key = HybridPubKey {
+            classical_pk: Bytes32::from(
+                <[u8; CLASSICAL_PK_BYTES]>::try_from(classical_pk_bytes)
+                    .map_err(|_| IndraError::InvalidParam)?,
+            ),
+            pq_pk: VariableBytes::from_slice(pq_pk_bytes).map_err(|_| IndraError::InvalidParam)?,
+        };
+        let crypto_key = identity_key
+            .to_crypto_pubkey()
+            .map_err(|_| IndraError::InvalidParam)?;
+        indra_crypto::validate_classical_public_key(&crypto_key.classical)
+            .map_err(|_| IndraError::InvalidParam)?;
+        indra_crypto::validate_pq_public_key(&crypto_key.pq)
+            .map_err(|_| IndraError::InvalidParam)?;
+        std::slice::from_raw_parts_mut(out_id, BYTES32_LEN)
+            .copy_from_slice(&identity_key.identity_id().0);
+        Ok(())
     }) {
-        Ok(()) => IndraError::Ok.code(),
+        Ok(Ok(())) => IndraError::Ok.code(),
+        Ok(Err(err)) => err.code(),
         Err(_) => IndraError::Internal.code(),
     }
 }
@@ -672,6 +696,42 @@ mod handle_tests {
     }
 
     #[test]
+    fn ffi_validator_id_binds_complete_hybrid_public_key() {
+        let _guard = test_lock();
+        let first = direct_keypair_from_master_seed([0x28; 32]).public_key();
+        let alternate_pq = PqKeypair::from_seed(&[0x29; 32]).unwrap().public_key();
+        let mut first_id = [0u8; BYTES32_LEN];
+        let mut mixed_id = [0u8; BYTES32_LEN];
+
+        assert_eq!(
+            unsafe {
+                indra_validator_id(
+                    first.classical.0.as_ptr(),
+                    first.pq.0.as_ptr(),
+                    first_id.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+        assert_eq!(
+            unsafe {
+                indra_validator_id(
+                    first.classical.0.as_ptr(),
+                    alternate_pq.0.as_ptr(),
+                    mixed_id.as_mut_ptr(),
+                )
+            },
+            OK
+        );
+
+        assert_eq!(
+            first_id,
+            indra_core::types::crypto::hybrid_identity_id(&first.classical.0, &first.pq.0).0
+        );
+        assert_ne!(first_id, mixed_id);
+    }
+
+    #[test]
     fn destroy_key_handle_zeroizes_and_invalidates_entry() {
         let _guard = test_lock();
         let (handle, _public) = handle_from_seed([0x11; 32]);
@@ -964,6 +1024,7 @@ mod handle_tests {
     #[test]
     fn c_header_struct_layouts_match_rust_repr_c_exactly() {
         let _guard = test_lock();
+        let _: unsafe extern "C" fn(*const u8, *const u8, *mut u8) -> i32 = indra_validator_id;
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let temp = std::env::temp_dir().join(format!("indra-ffi-layout-{}", std::process::id()));
         fs::create_dir_all(&temp).unwrap();
@@ -974,6 +1035,10 @@ mod handle_tests {
             r#"#include <stddef.h>
 #include <stdio.h>
 #include "indra.h"
+typedef int32_t (*IndraValidatorIdFn)(const uint8_t*, const uint8_t*, uint8_t*);
+_Static_assert(
+  __builtin_types_compatible_p(__typeof__(&indra_validator_id), IndraValidatorIdFn),
+  "indra_validator_id declaration must bind both hybrid public-key components");
 int main(void) {
   printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu ",
     sizeof(IndraUtxoEntry), _Alignof(IndraUtxoEntry),

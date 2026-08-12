@@ -49,7 +49,6 @@ enum UndoEntry {
     Scalars(ScalarSnapshot),
     UtxoSpent(UtxoEntry),
     UtxoInserted(Bytes32),
-    NullifierInserted(Bytes32),
     Validators(ValidatorSet),
     PositionState {
         positions: PersistentOrdMap<Bytes32, StakePositionV1>,
@@ -183,9 +182,6 @@ impl<'a> StateTxn<'a> {
                     effects.utxo_set_changed = true;
                 }
                 UndoEntry::UtxoInserted(_) => effects.utxo_set_changed = true,
-                UndoEntry::NullifierInserted(nullifier) => {
-                    effects.inserted_nullifiers.insert(*nullifier);
-                }
                 UndoEntry::Validators(before) => {
                     let old: BTreeMap<_, _> = before
                         .all_validators()
@@ -529,16 +525,6 @@ impl<'a> StateTxn<'a> {
         Ok(id)
     }
 
-    /// Insert a nullifier with precise rollback.
-    pub(crate) fn insert_nullifier(&mut self, nullifier: Bytes32) -> StateResult<()> {
-        self.state
-            .nullifiers
-            .insert_or_double_spend_at_height(nullifier, self.height)?;
-        measure_undo_recording(|| self.undo.push(UndoEntry::NullifierInserted(nullifier)));
-        self.effects.inserted_nullifiers.insert(nullifier);
-        self.after_mutation()
-    }
-
     /// Insert or replace one canonical staking position.
     pub(crate) fn put_stake_position(&mut self, position: StakePositionV1) -> StateResult<()> {
         self.snapshot_position_state();
@@ -800,12 +786,6 @@ impl<'a> StateTxn<'a> {
                         .utxos
                         .remove_for_rollback_at_height(&id, self.height);
                 }
-                UndoEntry::NullifierInserted(nullifier) => {
-                    let _ = self
-                        .state
-                        .nullifiers
-                        .remove_for_rollback_at_height(&nullifier, self.height);
-                }
                 UndoEntry::Validators(validators) => self.state.validators = validators,
                 UndoEntry::PositionState {
                     positions,
@@ -1060,7 +1040,6 @@ mod tests {
         let signer = Bytes32::from([0x31; 32]);
         let validator = Bytes32::from([0x32; 32]);
         let governance_signer = Bytes32::from([0x33; 32]);
-        let nullifier = Bytes32::from([0x34; 32]);
         let position = StakePositionV1::new(
             validator,
             signer,
@@ -1081,7 +1060,6 @@ mod tests {
         );
         let utxo = txn.insert_utxo(test_output(0x35), 0, 0, 0).unwrap();
         txn.spend_utxo(&utxo).unwrap();
-        txn.insert_nullifier(nullifier).unwrap();
         txn.set_base_fee(old_base_fee.saturating_add(1)).unwrap();
         txn.snapshot_staking_scope();
         txn.state_mut().staking_nonces.insert(signer, 1);
@@ -1113,7 +1091,6 @@ mod tests {
 
         assert!(effects.spent_utxos.contains(&utxo));
         assert!(effects.utxo_set_changed);
-        assert!(effects.inserted_nullifiers.contains(&nullifier));
         assert!(effects.base_fee_changed);
         assert!(effects.staking_nonces_changed.contains(&signer));
         assert!(effects

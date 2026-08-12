@@ -418,7 +418,7 @@ mod tests {
         let pq = PqKeypair::generate();
         let hybrid_kp = HybridKeypair::new(classical, pq);
         let pk = hybrid_kp.public_key();
-        let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
+        let id = indra_core::types::crypto::hybrid_identity_id(&pk.classical.0, &pk.pq.0);
         let v = QcValidator {
             validator_id: id,
             position,

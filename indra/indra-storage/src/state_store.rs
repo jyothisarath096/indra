@@ -826,10 +826,6 @@ mod tests {
             original.utxos.root_at_height(original.height)
         );
         assert_eq!(
-            decoded.nullifiers.root_at_height(decoded.height),
-            original.nullifiers.root_at_height(original.height)
-        );
-        assert_eq!(
             compute_validator_set_root(&decoded),
             compute_validator_set_root(&original)
         );

@@ -181,7 +181,8 @@ fn install_active_validator(
     let hybrid = HybridKeypair::new(classical, pq);
     let public = hybrid.public_key();
     let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
-    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+    let validator_id =
+        indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
     driver
         .engine
@@ -229,7 +230,8 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
     .unwrap();
     let cold_public = cold.public_key();
     let cold_public = cold_public.as_complete_hybrid();
-    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+    let validator_id =
+        indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
     if state.height == 0 {
         state.validators = Default::default();
@@ -284,7 +286,11 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     .unwrap();
     let cold_public = cold.public_key();
     let cold_public = cold_public.as_complete_hybrid();
-    let validator_id = indra_crypto::sha256(&classical.public_key().0);
+    let validator_id = indra_core::types::crypto::hybrid_identity_id(
+        &classical.public_key().0,
+        &pq.public_key().0,
+    )
+    .0;
     let genesis_path = dir.join("genesis.toml");
     let genesis = format!(
         "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
@@ -310,7 +316,8 @@ fn build_single_validator_qc_bytes(
     let pq = PqKeypair::from_seed(&seed).unwrap();
     let hybrid = HybridKeypair::new(classical, pq);
     let public = hybrid.public_key();
-    let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+    let validator_id =
+        indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
     let vote = produce_vote(
         height,
         round,
@@ -847,7 +854,10 @@ fn node_syncs_before_joining_consensus() {
     );
     assert!(!driver.sync().is_caught_up());
 
-    let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+    let remote_id = indra_core::types::crypto::hybrid_identity_id(
+        &remote.public_key().classical.0,
+        &remote.public_key().pq.0,
+    );
     let vote = indra_consensus::vote::produce_vote(
         1,
         0,

@@ -149,9 +149,14 @@ fn validate_genesis_manifest_with_minimum(
             indra_crypto::PQ_PK_BYTES,
             "cold_hybrid_pq_pk",
         )?;
-        if validator_id != indra_crypto::sha256(&classical) {
+        let identity_key = HybridPubKey {
+            classical_pk: Bytes32::from(classical),
+            pq_pk: VariableBytes::from_slice(&pq)
+                .map_err(|_| format!("genesis validator {} PQ key too large", validator.name))?,
+        };
+        if validator_id != identity_key.identity_id().0 {
             return Err(format!(
-                "genesis validator {} validator_id does not match its classical hot key",
+                "genesis validator {} validator_id does not match its complete hybrid hot key",
                 validator.name
             ));
         }
@@ -259,7 +264,12 @@ pub fn build_genesis_state() -> ChainState {
     let cold_public = cold.public_key();
     let cold_public = cold_public.as_complete_hybrid();
     let vrf_pk = VrfKeypair::from_seed(&[0xD5; 32]).public_key();
-    let validator_id = Bytes32::from(sha256(&hot_public.classical.0));
+    let validator_id = HybridPubKey {
+        classical_pk: Bytes32::from(hot_public.classical.0),
+        pq_pk: VariableBytes::from_slice(&hot_public.pq.0)
+            .expect("fixed-size ML-DSA-87 public key fits protocol maximum"),
+    }
+    .identity_id();
     state
         .validators
         .upsert(ValidatorEntry {
@@ -483,7 +493,13 @@ mod tests {
                 let cold_public = cold_public.as_complete_hybrid();
                 GenesisValidator {
                     name: format!("validator-{index}"),
-                    validator_id: hex::encode(sha256(&hot_public.classical.0)),
+                    validator_id: hex::encode(
+                        indra_core::types::crypto::hybrid_identity_id(
+                            &hot_public.classical.0,
+                            &hot_public.pq.0,
+                        )
+                        .0,
+                    ),
                     hybrid_classical_pk: hex::encode(hot_public.classical.0),
                     hybrid_pq_pk: hex::encode(hot_public.pq.0),
                     vrf_pk: hex::encode(
@@ -605,8 +621,12 @@ mod tests {
     #[test]
     fn genesis_utxo_uses_authoritative_public_value() {
         let classical_pk = [0x42u8; 32];
-        let validator_id = Bytes32::from(sha256(&classical_pk));
         let pq_pk = vec![0x24u8; 2592];
+        let identity_key = HybridPubKey {
+            classical_pk: Bytes32::from(classical_pk),
+            pq_pk: VariableBytes::from_slice(&pq_pk).unwrap(),
+        };
+        let validator_id = identity_key.identity_id();
         let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds([0x51; 32], [0x52; 32])
             .unwrap();
         let cold_public = cold.public_key();
@@ -640,7 +660,13 @@ mod tests {
             let extra_cold_public = extra_cold_public.as_complete_hybrid();
             contents.push_str(&format!(
                 "\n[[validators]]\nname = \"extra-{i}\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
-                hex::encode(sha256(&hot_public.classical.0)),
+                hex::encode(
+                    indra_core::types::crypto::hybrid_identity_id(
+                        &hot_public.classical.0,
+                        &hot_public.pq.0,
+                    )
+                    .0,
+                ),
                 hex::encode(hot_public.classical.0),
                 hex::encode(hot_public.pq.0),
                 hex::encode([0xA0 + i; 32]),

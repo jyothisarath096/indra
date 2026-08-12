@@ -174,7 +174,13 @@ impl NodeConfig {
             let cold_public = cold.public_key();
             let cold_public = cold_public.as_complete_hybrid();
             let vrf_public = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]).public_key();
-            let validator_id = indra_crypto::sha256(&hot_public.classical.0);
+            let validator_id = indra_core::types::crypto::HybridPubKey {
+                classical_pk: indra_core::Bytes32::from(hot_public.classical.0),
+                pq_pk: indra_core::VariableBytes::from_slice(&hot_public.pq.0)
+                    .expect("fixed-size ML-DSA-87 public key fits protocol maximum"),
+            }
+            .identity_id()
+            .0;
             let contents = format!(
                 "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
                 hex::encode(validator_id), hex::encode(hot_public.classical.0),
@@ -190,8 +196,14 @@ impl NodeConfig {
             genesis_validator_minimum: 1,
             validator_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
-            pq_seed: None,
-            pq_pk: None,
+            pq_seed: Some(vec![0x43; indra_crypto::PQ_SK_BYTES]),
+            pq_pk: Some(
+                indra_crypto::PqKeypair::from_seed(&[0x43; 32])
+                    .expect("fixed local-test ML-DSA seed is valid")
+                    .public_key()
+                    .0
+                    .to_vec(),
+            ),
             p2p_addr: "127.0.0.1:30303".to_string(),
             bootstrap_peers: vec![],
             dns_seed_host: indra_core::types::primitives::DNS_SEED_HOSTS.join(","),

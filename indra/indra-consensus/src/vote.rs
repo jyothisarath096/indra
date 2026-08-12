@@ -358,14 +358,14 @@ pub fn vote_signing_bytes(
 mod tests {
     use super::*;
     use indra_core::types::{primitives::DEFAULT_CHAIN_ID, vote::VoteStep};
-    use indra_crypto::{hybrid::HybridKeypair, sha256};
+    use indra_crypto::hybrid::HybridKeypair;
 
     fn voter(seed: u8, stake: u64) -> (RegisteredVoter, HybridKeypair) {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[seed; 32]);
         let pq = indra_crypto::hybrid::PqKeypair::generate();
         let kp = HybridKeypair::new(classical, pq);
         let pk = kp.public_key();
-        let id = Bytes32::from(sha256(&pk.classical.0));
+        let id = indra_core::types::crypto::hybrid_identity_id(&pk.classical.0, &pk.pq.0);
         let voter = RegisteredVoter {
             validator_id: id,
             classical_pk: pk.classical.0,

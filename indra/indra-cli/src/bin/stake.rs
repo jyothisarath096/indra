@@ -8,7 +8,7 @@ use indra_cli::{
 use indra_core::types::{primitives::Bytes32, stake_position::PositionCustodyV1};
 #[cfg(test)]
 use indra_core::{
-    codec::{Decode, Encode},
+    codec::Decode,
     types::{crypto::HybridPubKey, primitives::VariableBytes},
 };
 
@@ -727,21 +727,14 @@ mod tests {
     fn validator_owned_address_update_uses_keys_json_validator_id() {
         let keys = generate_from_master_seed("validator".to_string(), [0xA1; 32]).unwrap();
         let canonical = Bytes32::from(keys.public.validator_id);
-        let old_hybrid_encoding_hash = {
+        let canonical_full_hybrid_hash = {
             let pubkey = hybrid_pubkey_from_keys(&keys).unwrap();
-            Bytes32::from(indra_crypto::sha256(&pubkey.encode_to_vec()))
+            pubkey.identity_id()
         };
 
         assert_eq!(validator_id_from_keys(&keys), canonical);
         assert_eq!(staking_signer_id(&keys).unwrap(), canonical);
-        assert_eq!(
-            canonical,
-            Bytes32::from(indra_crypto::sha256(&keys.public.hybrid_classical_pk))
-        );
-        assert_ne!(
-            canonical, old_hybrid_encoding_hash,
-            "the old CLI derivation hashed the encoded hybrid pubkey and does not match live validator_id"
-        );
+        assert_eq!(canonical, canonical_full_hybrid_hash);
     }
 
     #[test]

@@ -109,7 +109,7 @@ before any implementation.
 
 INDRA currently has:
 
-- `InputV1 { utxo_id, nullifier }`; the exact spent output is public
+- `InputV1 { utxo_id }`; the exact spent output is public
   ([transaction.rs lines 28-44](../indra-core/src/types/transaction.rs));
 - `OutputV1 { value_spark, owner_pubkey, lock_height }`, with a visible
   amount and hybrid Ed25519 + ML-DSA-87 owner

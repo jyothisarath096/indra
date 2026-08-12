@@ -3386,7 +3386,10 @@ mod tests {
         height: u64,
         block_hash: Bytes32,
     ) -> Vec<u8> {
-        let validator_id = Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &signer.public_key().classical.0,
+            &signer.public_key().pq.0,
+        );
         let vote = indra_consensus::vote::produce_vote(
             height,
             0,
@@ -3420,8 +3423,10 @@ mod tests {
         let votes: Vec<_> = signers
             .iter()
             .map(|signer| {
-                let validator_id =
-                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                    &signer.public_key().classical.0,
+                    &signer.public_key().pq.0,
+                );
                 indra_consensus::vote::produce_vote_with_election_result(
                     height,
                     round,
@@ -3465,7 +3470,8 @@ mod tests {
         .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
         driver
             .engine
@@ -3504,7 +3510,10 @@ mod tests {
     }
 
     fn validator_id_for(signer: &HybridKeypair) -> Bytes32 {
-        Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0))
+        indra_core::types::crypto::hybrid_identity_id(
+            &signer.public_key().classical.0,
+            &signer.public_key().pq.0,
+        )
     }
 
     fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
@@ -3520,7 +3529,11 @@ mod tests {
         .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        )
+        .0;
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
@@ -4677,7 +4690,11 @@ mod tests {
             .unwrap();
             let cold_public = cold.public_key();
             let cold_public = cold_public.as_complete_hybrid();
-            let validator_id = indra_crypto::sha256(&classical.public_key().0);
+            let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                &classical.public_key().0,
+                &pq.public_key().0,
+            )
+            .0;
             genesis.push_str(&format!(
                 "\n[[validators]]\nname = \"v{i}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
                 hex::encode(validator_id),
@@ -4844,9 +4861,10 @@ mod tests {
             let targets: Vec<usize> = (1..self.validators).collect();
             let height = self.start_height.saturating_add(1);
             let round = 0u32;
-            let attacker_id = Bytes32::from(indra_crypto::sha256(
+            let attacker_id = indra_core::types::crypto::hybrid_identity_id(
                 &self.signers[attacker].public_key().classical.0,
-            ));
+                &self.signers[attacker].public_key().pq.0,
+            );
             let mut scheduled = 0usize;
 
             for second in 0..duration_secs {
@@ -7685,7 +7703,10 @@ mod tests {
             ClassicalKeypair::from_seed(&seed),
             PqKeypair::from_seed(&seed).unwrap(),
         );
-        Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0))
+        indra_core::types::crypto::hybrid_identity_id(
+            &keypair.public_key().classical.0,
+            &keypair.public_key().pq.0,
+        )
     }
 
     fn pick_tip_hash_for_verified_round_winners(
@@ -7860,10 +7881,22 @@ mod tests {
             voters,
         );
         let signer_ids = [
-            Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0)),
-            Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0)),
-            Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0)),
-            Bytes32::from(indra_crypto::sha256(&d.public_key().classical.0)),
+            indra_core::types::crypto::hybrid_identity_id(
+                &a.public_key().classical.0,
+                &a.public_key().pq.0,
+            ),
+            indra_core::types::crypto::hybrid_identity_id(
+                &b.public_key().classical.0,
+                &b.public_key().pq.0,
+            ),
+            indra_core::types::crypto::hybrid_identity_id(
+                &c.public_key().classical.0,
+                &c.public_key().pq.0,
+            ),
+            indra_core::types::crypto::hybrid_identity_id(
+                &d.public_key().classical.0,
+                &d.public_key().pq.0,
+            ),
         ];
         let signers = [&a, &b, &c, &d];
 
@@ -7930,8 +7963,14 @@ mod tests {
         let block = make_strict_block(&driver, [0x42u8; 32], 0, vec![]);
         let block_hash = block.header.block_hash();
 
-        let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
-        let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
+        let remote_a_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote_a.public_key().classical.0,
+            &remote_a.public_key().pq.0,
+        );
+        let remote_b_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote_b.public_key().classical.0,
+            &remote_b.public_key().pq.0,
+        );
 
         let prevote_a = indra_consensus::vote::produce_vote(
             1,
@@ -8788,7 +8827,10 @@ mod tests {
         let block = make_strict_block(&driver, [0x77u8; 32], 0, vec![]);
         let block_hash = block.header.block_hash();
         driver.pending_blocks.insert(block_hash, block);
-        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let remote_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote.public_key().classical.0,
+            &remote.public_key().pq.0,
+        );
         let vote = indra_consensus::vote::produce_vote(
             1,
             0,
@@ -8822,7 +8864,10 @@ mod tests {
         let remote = install_active_validator(&mut driver, [0x7Au8; 32], "remote");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
-        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let remote_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote.public_key().classical.0,
+            &remote.public_key().pq.0,
+        );
         let vote = indra_consensus::vote::produce_vote(
             1,
             0,
@@ -8851,7 +8896,10 @@ mod tests {
         let remote = install_active_validator(&mut driver, [0x49u8; 32], "remote");
         driver.refresh_registered_voters();
 
-        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let remote_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote.public_key().classical.0,
+            &remote.public_key().pq.0,
+        );
         let vote_a = indra_consensus::vote::produce_vote_with_election_result(
             1,
             0,
@@ -8898,7 +8946,10 @@ mod tests {
         let attacker = install_active_validator(&mut driver, [0x4Du8; 32], "attacker");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
-        let real_id = Bytes32::from(indra_crypto::sha256(&real.public_key().classical.0));
+        let real_id = indra_core::types::crypto::hybrid_identity_id(
+            &real.public_key().classical.0,
+            &real.public_key().pq.0,
+        );
         let slot = (real_id, driver.next_height(), 0, VoteStep::Prevote);
         let forged = indra_consensus::vote::produce_vote(
             driver.next_height(),
@@ -8945,7 +8996,10 @@ mod tests {
         let (mut driver, dir) = local_driver([0x4Eu8; 32], "future_vote_bound");
         let remote = install_active_validator(&mut driver, [0x4Fu8; 32], "remote");
         driver.refresh_registered_voters();
-        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let remote_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote.public_key().classical.0,
+            &remote.public_key().pq.0,
+        );
         let vote = indra_consensus::vote::produce_vote(
             driver.next_height().saturating_add(100),
             driver
@@ -8972,7 +9026,10 @@ mod tests {
         let real = install_active_validator(&mut driver, [0x51u8; 32], "real");
         let attacker = install_active_validator(&mut driver, [0x52u8; 32], "attacker");
         driver.refresh_registered_voters();
-        let real_id = Bytes32::from(indra_crypto::sha256(&real.public_key().classical.0));
+        let real_id = indra_core::types::crypto::hybrid_identity_id(
+            &real.public_key().classical.0,
+            &real.public_key().pq.0,
+        );
         for hash in [Bytes32::from([0xAA; 32]), Bytes32::from([0xBB; 32])] {
             let forged = indra_consensus::vote::produce_vote_with_election_result(
                 driver.next_height(),
@@ -9653,7 +9710,10 @@ mod tests {
         driver.engine.state.tip_hash = Bytes32::from([0x31; 32]);
         driver.refresh_registered_voters();
 
-        let validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &local.public_key().classical.0,
+            &local.public_key().pq.0,
+        );
         let value_hash = Bytes32::from([0x44u8; 32]);
         let vote = indra_consensus::vote::produce_vote(
             7,
@@ -9695,7 +9755,10 @@ mod tests {
         driver.engine.state.height = 7;
         driver.refresh_registered_voters();
 
-        let validator_id = Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &local.public_key().classical.0,
+            &local.public_key().pq.0,
+        );
         let value_hash = Bytes32::from([0x45u8; 32]);
         let vote = indra_consensus::vote::produce_vote(
             7,
@@ -9832,8 +9895,14 @@ mod tests {
             |a| matches!(a, DriverAction::BroadcastVote(vote) if vote.step == VoteStep::Prevote)
         ));
 
-        let remote_a_id = Bytes32::from(indra_crypto::sha256(&remote_a.public_key().classical.0));
-        let remote_b_id = Bytes32::from(indra_crypto::sha256(&remote_b.public_key().classical.0));
+        let remote_a_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote_a.public_key().classical.0,
+            &remote_a.public_key().pq.0,
+        );
+        let remote_b_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote_b.public_key().classical.0,
+            &remote_b.public_key().pq.0,
+        );
         let prevote_a = indra_consensus::vote::produce_vote(
             height,
             0,
@@ -9959,8 +10028,10 @@ mod tests {
         };
         let (result_round_one, evidence_round_one) =
             authoritative_result_for_seed(&election_round_one, [0x77u8; 32]);
-        let local_validator_id =
-            Bytes32::from(indra_crypto::sha256(&local.public_key().classical.0));
+        let local_validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &local.public_key().classical.0,
+            &local.public_key().pq.0,
+        );
         assert_eq!(
             indra_consensus::proposer::elect_proposer(
                 &election_round_zero,
@@ -10076,10 +10147,22 @@ mod tests {
         driver_a.refresh_registered_voters();
         driver_b.refresh_registered_voters();
 
-        let a_id = Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0));
-        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
-        let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
-        let d_id = Bytes32::from(indra_crypto::sha256(&d.public_key().classical.0));
+        let a_id = indra_core::types::crypto::hybrid_identity_id(
+            &a.public_key().classical.0,
+            &a.public_key().pq.0,
+        );
+        let b_id = indra_core::types::crypto::hybrid_identity_id(
+            &b.public_key().classical.0,
+            &b.public_key().pq.0,
+        );
+        let c_id = indra_core::types::crypto::hybrid_identity_id(
+            &c.public_key().classical.0,
+            &c.public_key().pq.0,
+        );
+        let d_id = indra_core::types::crypto::hybrid_identity_id(
+            &d.public_key().classical.0,
+            &d.public_key().pq.0,
+        );
 
         let chosen_tip =
             pick_tip_hash_for_verified_round_winners(&driver_a, 1, [0x81u8; 32], [0x82u8; 32]);
@@ -10291,7 +10374,10 @@ mod tests {
         );
         assert!(!driver.sync.is_caught_up());
 
-        let remote_id = Bytes32::from(indra_crypto::sha256(&remote.public_key().classical.0));
+        let remote_id = indra_core::types::crypto::hybrid_identity_id(
+            &remote.public_key().classical.0,
+            &remote.public_key().pq.0,
+        );
         let vote = indra_consensus::vote::produce_vote(
             1,
             0,

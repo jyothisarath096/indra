@@ -14,6 +14,10 @@ use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
 };
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{Bytes32, VariableBytes},
+};
 use indra_crypto::{
     hybrid::{
         ClassicalKeypair, ClassicalPublicKey, ClassicalSignature, ColdHybridKeypair, HybridKeypair,
@@ -214,15 +218,20 @@ fn validate_manifest_structure(manifest: &ColdShareManifest) -> KeystoreResult<(
     validate_threshold(manifest.threshold, manifest.share_count)?;
     let validator_id = decode_fixed::<32>(&manifest.validator_id, "validator_id")?;
     let hot_classical = decode_fixed::<32>(&manifest.hot_classical_pk, "hot_classical_pk")?;
-    decode_public_hex(&manifest.hot_pq_pk, PQ_PK_BYTES, "hot_pq_pk")?;
+    let hot_pq = decode_public_hex(&manifest.hot_pq_pk, PQ_PK_BYTES, "hot_pq_pk")?;
     decode_fixed::<32>(&manifest.cold_classical_pk, "cold_classical_pk")?;
     decode_public_hex(&manifest.cold_pq_pk, PQ_PK_BYTES, "cold_pq_pk")?;
     decode_fixed::<32>(&manifest.ceremony_id, "ceremony_id")?;
     manifest_signature(manifest)?;
     parse_commitments(manifest)?;
-    if validator_id != sha256(&hot_classical) {
+    let hot_identity = HybridPubKey {
+        classical_pk: Bytes32::from(hot_classical),
+        pq_pk: VariableBytes::from_slice(&hot_pq)
+            .map_err(|_| share_error("hot ML-DSA-87 public key too large"))?,
+    };
+    if validator_id != hot_identity.identity_id().0 {
         return Err(share_error(
-            "validator_id does not match hot Ed25519 identity",
+            "validator_id does not match complete hot hybrid identity",
         ));
     }
     Ok(())

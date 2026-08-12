@@ -219,13 +219,6 @@ impl NodeEngine {
 
         let mut common = vec![DependencyKey::NextHeight];
         common.extend(effects.spent_utxos.iter().copied().map(DependencyKey::Utxo));
-        common.extend(
-            effects
-                .inserted_nullifiers
-                .iter()
-                .copied()
-                .map(DependencyKey::Nullifier),
-        );
         if effects.base_fee_changed {
             common.push(DependencyKey::BaseFee);
         }
@@ -564,7 +557,15 @@ impl NodeEngine {
                     let hybrid = HybridKeypair::new(classical, pq);
                     let vrf = VrfKeypair::from_seed(&vrfs);
                     let pk = hybrid.public_key();
-                    let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
+                    let id = HybridPubKey {
+                        classical_pk: Bytes32::from(pk.classical.0),
+                        pq_pk: VariableBytes::from_slice(&pk.pq.0).map_err(|_| {
+                            NodeError::ValidatorConfigIncomplete {
+                                detail: "configured ML-DSA-87 public key is too large".to_string(),
+                            }
+                        })?,
+                    }
+                    .identity_id();
                     (Some(hybrid), Some(vrf), Some(id))
                 }
                 (Some(_), None) => {
@@ -1900,7 +1901,17 @@ mod tests {
             engine.state.slash_membership_roots.clear();
         }
         let classical = ClassicalKeypair::from_seed(&seed);
-        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let pq_seed = if engine.config.validator_seed == Some(seed) {
+            engine
+                .config
+                .pq_seed
+                .as_deref()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .unwrap_or(seed)
+        } else {
+            seed
+        };
+        let pq = PqKeypair::from_seed(&pq_seed).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
         let public = hybrid.public_key();
         let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
@@ -1911,7 +1922,8 @@ mod tests {
         .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
         engine
             .state
@@ -1970,7 +1982,11 @@ mod tests {
         .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        )
+        .0;
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
             "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
@@ -2061,7 +2077,7 @@ mod tests {
         utxo_id: Bytes32,
         owner: &HybridKeypair,
         _input_blinding: [u8; 32],
-        seed: u8,
+        _input_tag: u8,
     ) -> TransactionV1 {
         let input = engine.state.utxos.get(&utxo_id).unwrap().output.clone();
         let owner_pubkey = governance_pubkey_from_keypair(owner);
@@ -2070,10 +2086,7 @@ mod tests {
         let mut tx = TransactionV1 {
             version: indra_core::ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
-            inputs: vec![InputV1 {
-                utxo_id,
-                nullifier: Bytes32::from([seed ^ 0xA5; 32]),
-            }],
+            inputs: vec![InputV1 { utxo_id }],
             outputs: vec![OutputV1 {
                 value_spark: output_value,
                 owner_pubkey: owner_pubkey.clone(),
@@ -2118,7 +2131,10 @@ mod tests {
         nonce: u64,
         new_commission_bps: u32,
     ) -> StakingOp {
-        let validator_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &keypair.public_key().classical.0,
+            &keypair.public_key().pq.0,
+        );
         let mut op = StakingOp {
             body: StakingOpBody::SetCommission {
                 validator_id,
@@ -2185,7 +2201,10 @@ mod tests {
         nonce: u64,
     ) -> GovernanceOpV2 {
         let proposer_pubkey = governance_pubkey_from_keypair(keypair);
-        let signer_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let signer_id = indra_core::types::crypto::hybrid_identity_id(
+            &keypair.public_key().classical.0,
+            &keypair.public_key().pq.0,
+        );
         let deposit_utxo_id = engine
             .state
             .utxos
@@ -2226,7 +2245,10 @@ mod tests {
         cold_keypair: &HybridKeypair,
         cold_nonce: u64,
     ) -> GovernanceOpV2 {
-        let signer_id = Bytes32::from(indra_crypto::sha256(&hot_keypair.public_key().classical.0));
+        let signer_id = indra_core::types::crypto::hybrid_identity_id(
+            &hot_keypair.public_key().classical.0,
+            &hot_keypair.public_key().pq.0,
+        );
         let cold_public = cold_keypair.public_key();
         let cold_pubkey = HybridPubKey {
             classical_pk: Bytes32::from(cold_public.classical.0),
@@ -2283,7 +2305,10 @@ mod tests {
         hash_1: Bytes32,
         hash_2: Bytes32,
     ) -> SlashEvidenceV1 {
-        let validator_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &keypair.public_key().classical.0,
+            &keypair.public_key().pq.0,
+        );
         SlashEvidenceV1 {
             validator_id,
             vote_1: produce_vote_with_election_result(
@@ -2409,13 +2434,15 @@ mod tests {
         height: u64,
         round: u32,
         value_hash: Bytes32,
-        seed: [u8; 32],
+        classical_seed: [u8; 32],
+        pq_seed: [u8; 32],
     ) -> Vec<u8> {
-        let classical = ClassicalKeypair::from_seed(&seed);
-        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let classical = ClassicalKeypair::from_seed(&classical_seed);
+        let pq = PqKeypair::from_seed(&pq_seed).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
         let public = hybrid.public_key();
-        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
         let vote = produce_vote(
             height,
             round,
@@ -2592,8 +2619,10 @@ mod tests {
         let votes: Vec<_> = signers
             .iter()
             .map(|signer| {
-                let validator_id =
-                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                    &signer.public_key().classical.0,
+                    &signer.public_key().pq.0,
+                );
                 produce_vote(
                     height,
                     0,
@@ -2625,9 +2654,18 @@ mod tests {
         let a = install_active_validator(&mut engine, [0x51; 32], "a");
         let b = install_active_validator(&mut engine, [0x52; 32], "b");
         let c = install_active_validator(&mut engine, [0x53; 32], "c");
-        let a_id = Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0));
-        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
-        let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
+        let a_id = indra_core::types::crypto::hybrid_identity_id(
+            &a.public_key().classical.0,
+            &a.public_key().pq.0,
+        );
+        let b_id = indra_core::types::crypto::hybrid_identity_id(
+            &b.public_key().classical.0,
+            &b.public_key().pq.0,
+        );
+        let c_id = indra_core::types::crypto::hybrid_identity_id(
+            &c.public_key().classical.0,
+            &c.public_key().pq.0,
+        );
         engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 40;
         engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 30;
         engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 30;
@@ -2656,9 +2694,18 @@ mod tests {
         let a = install_active_validator(&mut engine, [0x61; 32], "a");
         let b = install_active_validator(&mut engine, [0x62; 32], "b");
         let c = install_active_validator(&mut engine, [0x63; 32], "c");
-        let a_id = Bytes32::from(indra_crypto::sha256(&a.public_key().classical.0));
-        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
-        let c_id = Bytes32::from(indra_crypto::sha256(&c.public_key().classical.0));
+        let a_id = indra_core::types::crypto::hybrid_identity_id(
+            &a.public_key().classical.0,
+            &a.public_key().pq.0,
+        );
+        let b_id = indra_core::types::crypto::hybrid_identity_id(
+            &b.public_key().classical.0,
+            &b.public_key().pq.0,
+        );
+        let c_id = indra_core::types::crypto::hybrid_identity_id(
+            &c.public_key().classical.0,
+            &c.public_key().pq.0,
+        );
         engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 20;
         engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 40;
         engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 40;
@@ -2999,7 +3046,10 @@ mod tests {
         engine.add_governance_op(governance).unwrap();
 
         let slash_key = install_active_validator(&mut engine, [0xB3; 32], "diff-slash");
-        let slash_id = Bytes32::from(indra_crypto::sha256(&slash_key.public_key().classical.0));
+        let slash_id = indra_core::types::crypto::hybrid_identity_id(
+            &slash_key.public_key().classical.0,
+            &slash_key.public_key().pq.0,
+        );
         let slash = signed_slash_evidence(
             &engine,
             &slash_key,
@@ -3013,7 +3063,10 @@ mod tests {
         );
         engine.add_slash_evidence(slash).unwrap();
 
-        let staking_id = Bytes32::from(indra_crypto::sha256(&staking_hot.public_key().classical.0));
+        let staking_id = indra_core::types::crypto::hybrid_identity_id(
+            &staking_hot.public_key().classical.0,
+            &staking_hot.public_key().pq.0,
+        );
         engine
             .state
             .validators
@@ -3171,10 +3224,6 @@ mod tests {
                 .unwrap();
             let mut pending = transaction.clone();
             pending.inputs[0].utxo_id = utxo_id;
-            let mut nullifier = [0u8; 32];
-            nullifier[..4].copy_from_slice(&index.to_le_bytes());
-            nullifier[31] = 0xC1;
-            pending.inputs[0].nullifier = Bytes32::from(nullifier);
             let signature = transaction_owner
                 .sign(&pending.signing_bytes(&engine.state.chain_id))
                 .unwrap();
@@ -3338,8 +3387,14 @@ mod tests {
             install_active_validator(&mut governance_engine, [0xC6; 32], "bench-governance-from");
         let to =
             install_active_validator(&mut governance_engine, [0xC7; 32], "bench-governance-to");
-        let from_id = Bytes32::from(indra_crypto::sha256(&from.public_key().classical.0));
-        let to_id = Bytes32::from(indra_crypto::sha256(&to.public_key().classical.0));
+        let from_id = indra_core::types::crypto::hybrid_identity_id(
+            &from.public_key().classical.0,
+            &from.public_key().pq.0,
+        );
+        let to_id = indra_core::types::crypto::hybrid_identity_id(
+            &to.public_key().classical.0,
+            &to.public_key().pq.0,
+        );
         let record = governance_engine
             .state
             .governance
@@ -3371,7 +3426,7 @@ mod tests {
                 PqKeypair::from_seed(&seed).unwrap(),
             );
             let pubkey = governance_pubkey_from_keypair(&keypair);
-            let signer_id = Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0));
+            let signer_id = pubkey.identity_id();
             governance_engine
                 .state
                 .delegator_identities
@@ -3448,8 +3503,10 @@ mod tests {
             seed[..4].copy_from_slice(&index.to_le_bytes());
             let keypair =
                 install_active_validator(&mut slash_engine, seed, &format!("bench-slash-{index}"));
-            let validator_id =
-                Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+            let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                &keypair.public_key().classical.0,
+                &keypair.public_key().pq.0,
+            );
             slash_engine
                 .state
                 .validators
@@ -3611,8 +3668,13 @@ mod tests {
         for height in 1..=3u64 {
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
             engine.commit_block(&block).unwrap();
-            last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
+            last_qc = build_single_validator_qc_bytes(
+                height,
+                0,
+                block.header.block_hash(),
+                [0x42u8; 32],
+                [0x42u8; 32],
+            );
             assert_eq!(engine.state.height, height);
         }
 
@@ -3787,6 +3849,7 @@ mod tests {
                     0,
                     block.header.block_hash(),
                     [0x42u8; 32],
+                    [0x43u8; 32],
                 );
                 assert_eq!(engine.state.height, height);
             }
@@ -3819,6 +3882,7 @@ mod tests {
                     0,
                     block.header.block_hash(),
                     [0x42u8; 32],
+                    [0x43u8; 32],
                 );
                 assert_eq!(engine.state.height, height);
             }
@@ -3890,6 +3954,7 @@ mod tests {
                     0,
                     block.header.block_hash(),
                     [0x42u8; 32],
+                    [0x43u8; 32],
                 );
             }
             make_strict_block(&engine.state, [0x42u8; 32], last_qc)
@@ -3972,7 +4037,11 @@ mod tests {
         let vrf = VrfKeypair::from_seed(&[0x22u8; 32]);
         let cold = cold_keypair_for_seed([0x11; 32]);
         let cold_public = cold.public_key();
-        let validator_id = indra_crypto::sha256(&classical.public_key().0);
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        )
+        .0;
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
             "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
@@ -4134,6 +4203,9 @@ mod tests {
             let mut config = NodeConfig::local_test(dir.clone());
             config.validator_seed = Some(*seed);
             config.vrf_seed = Some(*seed);
+            let pq = PqKeypair::from_seed(seed).unwrap();
+            config.pq_seed = Some(pq.secret_key_bytes());
+            config.pq_pk = Some(pq.public_key().0.to_vec());
             let mut engine = NodeEngine::init(config).unwrap();
             for validator_seed in seeds {
                 install_active_validator(&mut engine, validator_seed, "validator");
@@ -4306,7 +4378,10 @@ mod tests {
         let dir = temp_dir("staking_last_position_slot");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let validator = install_active_validator(&mut engine, [0x81; 32], "position-target");
-        let validator_id = Bytes32::from(indra_crypto::sha256(&validator.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &validator.public_key().classical.0,
+            &validator.public_key().pq.0,
+        );
         // Genesis already contains the validator's self position.
         for ordinal in 0..(indra_core::types::primitives::MAX_STAKE_POSITIONS_PER_VALIDATOR - 2) {
             let owner = Bytes32::from(indra_crypto::sha256(&(ordinal as u64).to_le_bytes()));
@@ -4377,7 +4452,10 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0x52; 32], "gov");
-        let signer_id = Bytes32::from(indra_crypto::sha256(&keypair.public_key().classical.0));
+        let signer_id = indra_core::types::crypto::hybrid_identity_id(
+            &keypair.public_key().classical.0,
+            &keypair.public_key().pq.0,
+        );
         let mut op = GovernanceOpV2 {
             action_type: GovernanceActionType::CommitVote,
             signer_id,
@@ -4511,7 +4589,10 @@ mod tests {
         let dir = temp_dir("governance_staking_deposit_conflict");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let validator = install_active_validator(&mut engine, [0x57; 32], "gov-stake-target");
-        let validator_id = Bytes32::from(indra_crypto::sha256(&validator.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &validator.public_key().classical.0,
+            &validator.public_key().pq.0,
+        );
         let hot = install_active_validator(&mut engine, [0x58; 32], "gov-stake-signer");
         let cold = cold_keypair_for_seed([0x58; 32]);
         let governance = valid_cold_governance_propose_op(&mut engine, &hot, &cold, 1);
@@ -4548,7 +4629,10 @@ mod tests {
         let dir = temp_dir("transaction_cross_pool_conflicts");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let target = install_active_validator(&mut engine, [0x59; 32], "tx-conflict-target");
-        let target_id = Bytes32::from(indra_crypto::sha256(&target.public_key().classical.0));
+        let target_id = indra_core::types::crypto::hybrid_identity_id(
+            &target.public_key().classical.0,
+            &target.public_key().pq.0,
+        );
 
         let delegator = HybridKeypair::new(
             ClassicalKeypair::from_seed(&[0x5A; 32]),
@@ -4600,7 +4684,10 @@ mod tests {
         let dir = temp_dir("combined_four_pool_conflicts");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let proposer = install_active_validator(&mut engine, [0x42; 32], "combined-proposer");
-        let proposer_id = Bytes32::from(indra_crypto::sha256(&proposer.public_key().classical.0));
+        let proposer_id = indra_core::types::crypto::hybrid_identity_id(
+            &proposer.public_key().classical.0,
+            &proposer.public_key().pq.0,
+        );
 
         // Two transactions spend the same UTXO; deterministic mempool order wins.
         let tx_owner = HybridKeypair::new(

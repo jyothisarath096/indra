@@ -5593,7 +5593,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
                 "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
-                hex::encode(indra_crypto::sha256(&classical.public_key().0)),
+                hex::encode(
+                    indra_core::types::crypto::hybrid_identity_id(
+                        &classical.public_key().0,
+                        &pq.public_key().0,
+                    )
+                    .0,
+                ),
                 hex::encode(classical.public_key().0),
                 hex::encode(pq.public_key().0),
                 hex::encode(vrf.public_key()),
@@ -5618,7 +5624,8 @@ mod tests {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&seed);
         let pq = indra_crypto::hybrid::PqKeypair::from_seed(&seed).unwrap();
         let public = indra_crypto::HybridKeypair::new(classical, pq).public_key();
-        let validator_id = indra_core::Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
         driver
             .engine
             .state
@@ -7000,7 +7007,6 @@ mod tests {
             signature_module_id: 1,
             inputs: vec![indra_core::types::transaction::InputV1 {
                 utxo_id: indra_core::Bytes32::from([byte; 32]),
-                nullifier: indra_core::Bytes32::from([byte.wrapping_add(1); 32]),
             }],
             outputs: vec![snapshot_test_output(byte.wrapping_add(2))],
             fee_amount: 500,

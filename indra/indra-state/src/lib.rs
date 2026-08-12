@@ -45,7 +45,6 @@ pub mod fee;
 pub mod governance;
 pub mod governance_apply;
 pub mod identity;
-pub mod nullifier;
 pub mod pending;
 pub mod persistent;
 pub mod smt;
@@ -76,7 +75,6 @@ pub use identity::{
     resolve_and_check_identity, resolve_delegator_identity_for_redelegation, IdentityCheckOutcome,
     IdentityError,
 };
-pub use nullifier::NullifierSet;
 pub use persistent::{
     PersistentAuthTree, PersistentOrdMap, PersistentOrdSet, PersistentSparseMerkleTree,
 };

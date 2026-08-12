@@ -16,7 +16,7 @@ use indra_core::types::{
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
-use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
@@ -37,7 +37,7 @@ fn finalized_genesis() -> ChainState {
     let mut state = ChainState::new_genesis();
     let seed = [0xF0; 32];
     let (public, _) = keypair(seed);
-    let validator_id = Bytes32::from(sha256(&public.classical_pk.0));
+    let validator_id = public.identity_id();
     state
         .validators
         .upsert(ValidatorEntry {
@@ -93,7 +93,6 @@ fn output(
 
 fn tx_spending(
     utxo_id: Bytes32,
-    nullifier: Bytes32,
     value_in: u64,
     _input_blinding: [u8; 32],
     owner_pubkey: HybridPubKey,
@@ -107,7 +106,7 @@ fn tx_spending(
     let mut tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![InputV1 { utxo_id, nullifier }],
+        inputs: vec![InputV1 { utxo_id }],
         outputs: vec![output(
             value_out,
             output_blinding,
@@ -126,8 +125,6 @@ fn tx_spending(
 
 fn tx_spending_same_utxo_twice(
     utxo_id: Bytes32,
-    nullifier_a: Bytes32,
-    nullifier_b: Bytes32,
     value_in: u64,
     _input_blinding: [u8; 32],
     owner_pubkey: HybridPubKey,
@@ -143,16 +140,7 @@ fn tx_spending_same_utxo_twice(
     let mut tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![
-            InputV1 {
-                utxo_id,
-                nullifier: nullifier_a,
-            },
-            InputV1 {
-                utxo_id,
-                nullifier: nullifier_b,
-            },
-        ],
+        inputs: vec![InputV1 { utxo_id }, InputV1 { utxo_id }],
         outputs: vec![output(
             value_out,
             output_blinding,
@@ -217,16 +205,7 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
     let tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![
-            InputV1 {
-                utxo_id: utxo_a,
-                nullifier: Bytes32::from([0xE1; 32]),
-            },
-            InputV1 {
-                utxo_id: utxo_b,
-                nullifier: Bytes32::from([0xE2; 32]),
-            },
-        ],
+        inputs: vec![InputV1 { utxo_id: utxo_a }, InputV1 { utxo_id: utxo_b }],
         outputs: vec![OutputV1 {
             value_spark: INITIAL_BASE_FEE_SPARK_PER_KB,
             owner_pubkey: overflow_owner.clone(),
@@ -265,7 +244,6 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
 
     let tx_a = tx_spending(
         utxo_id,
-        Bytes32::from([0xA1; 32]),
         input_value,
         input_blinding,
         owner_pubkey.clone(),
@@ -273,9 +251,8 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
         [0x21; 32],
         [0x61; 32],
     );
-    let tx_b = tx_spending(
+    let mut tx_b = tx_spending(
         utxo_id,
-        Bytes32::from([0xB2; 32]),
         input_value,
         input_blinding,
         owner_pubkey,
@@ -283,6 +260,8 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
         [0x22; 32],
         [0x62; 32],
     );
+    tx_b.outputs[0].lock_height = 1;
+    tx_b.signature = sign_tx(&tx_b, &owner_keypair, DEFAULT_CHAIN_ID);
 
     let block = block_with_transactions(&state, vec![tx_a, tx_b]);
 
@@ -292,7 +271,6 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
     );
     assert!(state.utxos.contains(&utxo_id));
     assert_eq!(state.utxos.len(), 1);
-    assert_eq!(state.nullifiers.len(), 0);
     assert_eq!(state.height, 0);
 }
 
@@ -311,8 +289,6 @@ fn t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected() {
     let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
     let tx = tx_spending_same_utxo_twice(
         utxo_id,
-        Bytes32::from([0xC1; 32]),
-        Bytes32::from([0xC2; 32]),
         input_value,
         input_blinding,
         owner_pubkey,
@@ -326,7 +302,6 @@ fn t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected() {
     );
     assert!(state.utxos.contains(&utxo_id));
     assert_eq!(state.utxos.len(), 1);
-    assert_eq!(state.nullifiers.len(), 0);
     assert_eq!(state.height, 0);
 }
 
@@ -343,10 +318,8 @@ fn legitimate_single_spend_still_works_after_duplicate_utxo_fix() {
         [0x53; 32],
     );
     let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
-    let nullifier = Bytes32::from([0xD1; 32]);
     let tx = tx_spending(
         utxo_id,
-        nullifier,
         input_value,
         input_blinding,
         owner_pubkey,
@@ -360,6 +333,5 @@ fn legitimate_single_spend_still_works_after_duplicate_utxo_fix() {
 
     assert!(!state.utxos.contains(&utxo_id));
     assert_eq!(state.utxos.len(), 1);
-    assert!(state.nullifiers.contains(&nullifier));
     assert_eq!(state.height, 1);
 }

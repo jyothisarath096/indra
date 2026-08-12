@@ -1,10 +1,8 @@
 //! Transaction types: InputV1, OutputV1, TransactionV1.
 //!
 //! Transparent-value UTXO model. Values and ownership keys are public;
-//! checked integer conservation, dust validation, signatures, and nullifiers
+//! checked integer conservation, dust validation, signatures, and atomic UTXO consumption
 //! provide the monetary and ownership invariants.
-
-use std::collections::BTreeSet;
 
 use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
@@ -27,17 +25,14 @@ pub type TxId = Bytes32;
 pub struct InputV1 {
     /// ID of the UTXO being spent.
     pub utxo_id: Bytes32,
-    /// Spend nullifier: SHA-256(secret_key || utxo_id).
-    pub nullifier: Bytes32,
 }
 
 impl Encode for InputV1 {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.utxo_id.encode(buf);
-        self.nullifier.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        64
+        32
     }
 }
 
@@ -45,7 +40,6 @@ impl Decode for InputV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             utxo_id: Bytes32::decode(r)?,
-            nullifier: Bytes32::decode(r)?,
         })
     }
 }
@@ -142,13 +136,6 @@ impl TransactionV1 {
             return Err(IndraError::UnsupportedVersion {
                 version: self.version.0,
             });
-        }
-        // No duplicate nullifiers within this transaction
-        let mut seen: BTreeSet<Bytes32> = BTreeSet::new();
-        for input in &self.inputs {
-            if !seen.insert(input.nullifier) {
-                return Err(IndraError::DuplicateNullifier);
-            }
         }
         Ok(())
     }
@@ -260,7 +247,6 @@ mod transparent_transaction_tests {
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([1; 32]),
-                nullifier: Bytes32::from([2; 32]),
             }],
             outputs: vec![output],
             fee_amount: 7,
@@ -278,7 +264,6 @@ mod transparent_transaction_tests {
             signature_module_id: 1,
             inputs: vec![InputV1 {
                 utxo_id: Bytes32::from([0x01; 32]),
-                nullifier: Bytes32::from([0x02; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: 100_000,
@@ -314,13 +299,6 @@ mod transparent_transaction_tests {
         let mut tx = minimal_tx();
         tx.outputs.clear();
         assert_eq!(tx.validate_structure(), Err(IndraError::ZeroOutputs));
-    }
-
-    #[test]
-    fn duplicate_nullifier_rejected() {
-        let mut tx = minimal_tx();
-        tx.inputs.push(tx.inputs[0].clone());
-        assert_eq!(tx.validate_structure(), Err(IndraError::DuplicateNullifier));
     }
 
     #[test]

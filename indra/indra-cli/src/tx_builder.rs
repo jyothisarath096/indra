@@ -136,16 +136,8 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     // 4. Build inputs
     let inputs: Vec<InputV1> = selected
         .iter()
-        .map(|e| {
-            // nullifier = SHA-256(ed25519_seed || utxo_id)
-            let mut data = Vec::with_capacity(64);
-            data.extend_from_slice(&params.ed25519_seed);
-            data.extend_from_slice(&e.utxo_id.0);
-            let nullifier = Bytes32::from(sha256(&data));
-            InputV1 {
-                utxo_id: e.utxo_id,
-                nullifier,
-            }
+        .map(|entry| InputV1 {
+            utxo_id: entry.utxo_id,
         })
         .collect();
 

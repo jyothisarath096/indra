@@ -94,7 +94,6 @@ pub struct Mempool {
     total_encoded_bytes: usize,
     max_encoded_bytes: usize,
     by_utxo: BTreeMap<Bytes32, BTreeSet<Bytes32>>,
-    by_nullifier: BTreeMap<Bytes32, BTreeSet<Bytes32>>,
 }
 
 impl Mempool {
@@ -106,7 +105,6 @@ impl Mempool {
             total_encoded_bytes: 0,
             max_encoded_bytes: MAX_MEMPOOL_ENCODED_BYTES,
             by_utxo: BTreeMap::new(),
-            by_nullifier: BTreeMap::new(),
         }
     }
 
@@ -118,7 +116,6 @@ impl Mempool {
             total_encoded_bytes: 0,
             max_encoded_bytes,
             by_utxo: BTreeMap::new(),
-            by_nullifier: BTreeMap::new(),
         }
     }
 
@@ -154,7 +151,7 @@ impl Mempool {
     /// - Has at least one input and one output
     /// - Fee meets the minimum ratio against `current_base_fee`
     ///
-    /// Does NOT validate: signatures, UTXO existence, nullifier set.
+    /// Does NOT validate signatures or UTXO existence.
     /// Those checks happen in apply_block when the tx is included.
     pub fn submit(
         &mut self,
@@ -193,18 +190,19 @@ impl Mempool {
         }
 
         // Admission conflict check. A higher-fee transaction atomically replaces
-        // every lower-fee entry that claims one of the same UTXOs or nullifiers.
+        // every lower-fee entry that claims one of the same UTXOs.
         // Equal/lower-fee conflicts are rejected so pool contents are independent
         // of hash-map iteration order.
         let input_utxos: HashSet<_> = tx.inputs.iter().map(|input| input.utxo_id).collect();
-        let nullifiers: HashSet<_> = tx.inputs.iter().map(|input| input.nullifier).collect();
         let mut conflicts: Vec<(Bytes32, u64)> = self
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.tx.inputs.iter().any(|input| {
-                    input_utxos.contains(&input.utxo_id) || nullifiers.contains(&input.nullifier)
-                })
+                entry
+                    .tx
+                    .inputs
+                    .iter()
+                    .any(|input| input_utxos.contains(&input.utxo_id))
             })
             .map(|(id, entry)| (*id, entry.fee_rate))
             .collect();
@@ -356,9 +354,6 @@ impl Mempool {
         for id in &effects.spent_utxos {
             affected.extend(self.by_utxo.get(id).into_iter().flatten().copied());
         }
-        for id in &effects.inserted_nullifiers {
-            affected.extend(self.by_nullifier.get(id).into_iter().flatten().copied());
-        }
         if effects.base_fee_changed {
             affected.extend(self.entries.keys().copied());
         }
@@ -388,7 +383,6 @@ impl Mempool {
         self.entries.clear();
         self.total_encoded_bytes = 0;
         self.by_utxo.clear();
-        self.by_nullifier.clear();
         self.debug_assert_byte_accounting();
     }
 
@@ -399,11 +393,6 @@ impl Mempool {
                 &mut self.by_utxo,
                 *tx_id,
                 entry.tx.inputs.iter().map(|i| i.utxo_id),
-            );
-            Self::remove_index_memberships(
-                &mut self.by_nullifier,
-                *tx_id,
-                entry.tx.inputs.iter().map(|i| i.nullifier),
             );
             self.total_encoded_bytes = self
                 .total_encoded_bytes
@@ -419,10 +408,6 @@ impl Mempool {
         };
         for input in &entry.tx.inputs {
             self.by_utxo.entry(input.utxo_id).or_default().insert(tx_id);
-            self.by_nullifier
-                .entry(input.nullifier)
-                .or_default()
-                .insert(tx_id);
         }
         self.debug_assert_indexes();
     }
@@ -446,15 +431,12 @@ impl Mempool {
         #[cfg(debug_assertions)]
         {
             let mut utxos = BTreeMap::<Bytes32, BTreeSet<Bytes32>>::new();
-            let mut nullifiers = BTreeMap::<Bytes32, BTreeSet<Bytes32>>::new();
             for (id, entry) in &self.entries {
                 for input in &entry.tx.inputs {
                     utxos.entry(input.utxo_id).or_default().insert(*id);
-                    nullifiers.entry(input.nullifier).or_default().insert(*id);
                 }
             }
             debug_assert_eq!(self.by_utxo, utxos);
-            debug_assert_eq!(self.by_nullifier, nullifiers);
         }
     }
 
@@ -566,7 +548,7 @@ mod tests {
     use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
     use indra_state::ChainState;
 
-    fn dummy_tx(fee: u64, nullifier_byte: u8) -> TransactionV1 {
+    fn dummy_tx(fee: u64, input_byte: u8) -> TransactionV1 {
         let owner_pubkey = HybridPubKey {
             classical_pk: Bytes32::ZERO,
             pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
@@ -575,8 +557,7 @@ mod tests {
             version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
             inputs: vec![InputV1 {
-                utxo_id: Bytes32::from([nullifier_byte; 32]),
-                nullifier: Bytes32::from([nullifier_byte; 32]),
+                utxo_id: Bytes32::from([input_byte; 32]),
             }],
             outputs: vec![OutputV1 {
                 value_spark: DUST_LIMIT_SPARK,
@@ -644,10 +625,7 @@ mod tests {
         let mut tx = TransactionV1 {
             version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
-            inputs: vec![InputV1 {
-                utxo_id,
-                nullifier: Bytes32::from([0xA1; 32]),
-            }],
+            inputs: vec![InputV1 { utxo_id }],
             outputs: vec![output(
                 output_value,
                 output_fixture_tag,
@@ -875,9 +853,7 @@ mod tests {
         assert_byte_accounting(&mempool);
 
         let mut effects = indra_state::CanonicalStateEffects::default();
-        effects
-            .inserted_nullifiers
-            .insert(spent.inputs[0].nullifier);
+        effects.spent_utxos.insert(spent.inputs[0].utxo_id);
         mempool.apply_canonical_effects(&ChainState::new_genesis(), &effects);
         assert_eq!(mempool.len(), 1);
         assert_byte_accounting(&mempool);
@@ -1072,13 +1048,11 @@ mod tests {
         };
         targeted.apply_canonical_effects(&state, &unrelated);
         assert!(targeted.contains(&tx_id));
-        let mut nullifiers = HashSet::new();
         let mut inputs = HashSet::new();
         assert!(indra_state::apply::validate_transaction(
             &state,
             &tx,
             &state.chain_id,
-            &mut nullifiers,
             &mut inputs,
             state.height.saturating_add(1),
         )
@@ -1086,19 +1060,15 @@ mod tests {
 
         let input = &tx.inputs[0];
         state.utxos.spend_at_height(&input.utxo_id, 1).unwrap();
-        assert!(state.nullifiers.insert(input.nullifier));
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(input.utxo_id);
-        effects.inserted_nullifiers.insert(input.nullifier);
         targeted.apply_canonical_effects(&state, &effects);
 
-        let mut nullifiers = HashSet::new();
         let mut inputs = HashSet::new();
         assert!(indra_state::apply::validate_transaction(
             &state,
             &tx,
             &state.chain_id,
-            &mut nullifiers,
             &mut inputs,
             state.height.saturating_add(1),
         )

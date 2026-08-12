@@ -606,7 +606,7 @@ fn apply_register_validator(
         ));
     }
 
-    let validator_id = pubkey_to_id(validator_pubkey);
+    let validator_id = validator_pubkey.identity_id();
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
     }
@@ -971,7 +971,7 @@ fn apply_delegate(
         .ok_or(StateError::UnknownUtxo)?
         .clone();
 
-    let delegator_id = pubkey_to_id(delegator_pubkey);
+    let delegator_id = delegator_pubkey.identity_id();
     if utxo_entry.output.owner_pubkey != *delegator_pubkey {
         return Err(StateError::InvalidStakingOp(
             "UTXO does not belong to the delegator".into(),
@@ -1048,7 +1048,7 @@ fn apply_self_stake(
     current_height: u64,
     bond_count_cap: Option<usize>,
 ) -> StateResult<()> {
-    let validator_id = pubkey_to_id(validator_pubkey);
+    let validator_id = validator_pubkey.identity_id();
     let validator = state
         .validators
         .get(&validator_id)
@@ -1179,7 +1179,7 @@ fn apply_claim_rewards(
     current_height: u64,
     synthetic_output_index: u32,
 ) -> StateResult<()> {
-    let delegator_id = pubkey_to_id(delegator_pubkey);
+    let delegator_id = delegator_pubkey.identity_id();
     let claim_from_validator = *validator_id == delegator_id;
     let custody = if claim_from_validator {
         indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
@@ -1444,17 +1444,6 @@ fn apply_update_network_address(
     Ok(())
 }
 
-/// Derive a stable staking identity from a hybrid public key.
-///
-/// This must match `keys.json`'s canonical `validator_id`/account ID:
-/// SHA-256 of the classical public key bytes. Do not hash the encoded
-/// hybrid-pubkey object here; that produces a different identity from
-/// live genesis validators and makes validator-owned reward claims
-/// unreachable for real keys.
-fn pubkey_to_id(pubkey: &indra_core::types::crypto::HybridPubKey) -> Bytes32 {
-    let hash = indra_crypto::sha256(&pubkey.classical_pk.0);
-    Bytes32::from(hash)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1760,7 +1749,7 @@ mod tests {
     fn make_active_validator(state: &mut ChainState, seed: u8) -> (Bytes32, HybridKeypair) {
         let keypair = keypair(seed);
         let pubkey = pubkey_from_keypair(&keypair);
-        let validator_id = pubkey_to_id(&pubkey);
+        let validator_id = pubkey.identity_id();
         insert_active_validator_with_pubkey(state, validator_id, &pubkey, seed);
         let cold = derived_test_cold_keypair(&keypair).public_key();
         let entry = state.validators.get_mut(&validator_id).unwrap();
@@ -1981,14 +1970,14 @@ mod tests {
     }
 
     #[test]
-    fn validator_self_stake_post_identity_gate_rejects_same_classical_different_pq_pubkey() {
+    fn substituted_pq_key_cannot_resolve_victim_validator_identity() {
         let mut state = ChainState::new_genesis();
         let legitimate_keypair = mixed_keypair(0x54, 0x55);
         let attacker_keypair = mixed_keypair(0x54, 0x56);
         let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
         let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
-        let validator_id = pubkey_to_id(&legitimate_pubkey);
-        assert_eq!(pubkey_to_id(&attacker_pubkey), validator_id);
+        let validator_id = legitimate_pubkey.identity_id();
+        assert_ne!(attacker_pubkey.identity_id(), validator_id);
         insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x54);
         state
             .delegator_identities
@@ -2012,9 +2001,46 @@ mod tests {
         assert!(matches!(
             err,
             StateError::InvalidStakingOp(message)
-                if message.contains("validator identity stored pubkey mismatch")
+                if message.contains("cold authorization is valid only for an Active validator")
         ));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn first_registration_with_compromised_classical_key_cannot_squat_victim_identity_id() {
+        let mut state = ChainState::new_genesis();
+        let victim_keypair = mixed_keypair(0x5B, 0x5C);
+        let attacker_keypair = mixed_keypair(0x5B, 0x5D);
+        let victim_pubkey = pubkey_from_keypair(&victim_keypair);
+        let attacker_pubkey = pubkey_from_keypair(&attacker_keypair);
+        let victim_id = victim_pubkey.identity_id();
+        let attacker_id = attacker_pubkey.identity_id();
+        assert_eq!(victim_pubkey.classical_pk, attacker_pubkey.classical_pk);
+        assert_ne!(victim_pubkey.pq_pk, attacker_pubkey.pq_pk);
+        assert_ne!(victim_id, attacker_id);
+
+        let attacker_cold = derived_test_cold_keypair(&attacker_keypair);
+        let deposit_utxo_id = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&attacker_cold),
+            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            0x5E,
+        );
+        let op = dual_signed_register_op(
+            deposit_utxo_id,
+            &attacker_keypair,
+            &attacker_cold,
+            1,
+            &state.chain_id,
+            [0x5F; 32],
+            0x5D,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+
+        assert!(state.validators.get(&attacker_id).is_some());
+        assert!(state.validators.get(&victim_id).is_none());
     }
 
     #[test]
@@ -2024,8 +2050,8 @@ mod tests {
         let conflicting_keypair = mixed_keypair(0x58, 0x5A);
         let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
         let conflicting_pubkey = pubkey_from_keypair(&conflicting_keypair);
-        let validator_id = pubkey_to_id(&legitimate_pubkey);
-        assert_eq!(pubkey_to_id(&conflicting_pubkey), validator_id);
+        let validator_id = legitimate_pubkey.identity_id();
+        assert_ne!(conflicting_pubkey.identity_id(), validator_id);
         insert_active_validator_with_pubkey(&mut state, validator_id, &legitimate_pubkey, 0x58);
         state
             .delegator_identities
@@ -2202,8 +2228,8 @@ mod tests {
         let conflicting_keypair = mixed_keypair(0xB2, 0xB4);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
         let conflicting_pubkey = pubkey_from_keypair(&conflicting_keypair);
-        let validator_id = pubkey_to_id(&validator_pubkey);
-        assert_eq!(pubkey_to_id(&conflicting_pubkey), validator_id);
+        let validator_id = validator_pubkey.identity_id();
+        assert_ne!(conflicting_pubkey.identity_id(), validator_id);
         state
             .delegator_identities
             .insert(validator_id, conflicting_pubkey);
@@ -2242,15 +2268,15 @@ mod tests {
     }
 
     #[test]
-    fn validator_and_delegator_registry_keys_are_classical_pubkey_identity_hashes() {
+    fn validator_and_delegator_registry_keys_bind_complete_hybrid_pubkeys() {
         let validator_pubkey = pubkey_from_keypair(&keypair(0xB5));
         let delegator_pubkey = pubkey_from_keypair(&keypair(0xB6));
-        let validator_id = pubkey_to_id(&validator_pubkey);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let validator_id = validator_pubkey.identity_id();
+        let delegator_id = delegator_pubkey.identity_id();
 
         assert_ne!(validator_id, delegator_id);
-        assert_eq!(pubkey_to_id(&validator_pubkey), validator_id);
-        assert_eq!(pubkey_to_id(&delegator_pubkey), delegator_id);
+        assert_eq!(validator_pubkey.identity_id(), validator_id);
+        assert_eq!(delegator_pubkey.identity_id(), delegator_id);
     }
 
     #[test]
@@ -2579,7 +2605,7 @@ mod tests {
             MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             bond_seed,
         );
-        let validator_id = pubkey_to_id(&pubkey_from_keypair(&hot));
+        let validator_id = pubkey_from_keypair(&hot).identity_id();
         let op = dual_signed_register_op(
             deposit_utxo_id,
             &hot,
@@ -2599,7 +2625,7 @@ mod tests {
         cold: &HybridKeypair,
         cold_nonce: u64,
     ) -> StakingOp {
-        let validator_id = pubkey_to_id(&pubkey_from_keypair(hot));
+        let validator_id = pubkey_from_keypair(hot).identity_id();
         let cold_key_version = state
             .validators
             .get(&validator_id)
@@ -2836,7 +2862,7 @@ mod tests {
         let (validator_id, _) = make_active_validator(&mut state, 0xD1);
         let delegator_keypair = keypair(0xD2);
         let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
-        let delegator_id = pubkey_to_id(&delegator_pubkey);
+        let delegator_id = delegator_pubkey.identity_id();
         let deposit_id =
             insert_delegator_utxo(&mut state, delegator_pubkey.clone(), 1_000_000, 0xD3);
         let chain_id = state.chain_id.clone();

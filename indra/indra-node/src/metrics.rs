@@ -341,9 +341,7 @@ struct MetricsSnapshot {
     sync_target: u64,
     active_validators: usize,
     live_utxos: usize,
-    live_nullifiers: usize,
     utxo_occupancy_bps: u64,
-    nullifier_occupancy_bps: u64,
     transaction_dust_tier: u64,
     blocks_retained: usize,
     lowest_block: u64,
@@ -405,11 +403,8 @@ impl MetricsSnapshot {
             sync_target,
             active_validators: s.validators.active_count(),
             live_utxos: s.utxos.len(),
-            live_nullifiers: s.nullifiers.len(),
             utxo_occupancy_bps: (s.utxos.len() as u64).saturating_mul(10_000)
                 / indra_core::types::primitives::MAX_LIVE_UTXOS as u64,
-            nullifier_occupancy_bps: (s.nullifiers.len() as u64).saturating_mul(10_000)
-                / indra_core::types::primitives::MAX_LIVE_NULLIFIERS as u64,
             transaction_dust_tier: indra_core::types::primitives::transaction_dust_tier(
                 s.utxos.len(),
             ),
@@ -517,21 +512,9 @@ fn render_snapshot(
     );
     gauge(
         &mut buf,
-        "indra_live_nullifiers",
-        "Current permanent nullifier count",
-        snapshot.live_nullifiers,
-    );
-    gauge(
-        &mut buf,
         "indra_utxo_occupancy_basis_points",
         "Live UTXO occupancy in basis points of its cap",
         snapshot.utxo_occupancy_bps,
-    );
-    gauge(
-        &mut buf,
-        "indra_nullifier_occupancy_basis_points",
-        "Nullifier occupancy in basis points of its cap",
-        snapshot.nullifier_occupancy_bps,
     );
     gauge(
         &mut buf,

@@ -100,16 +100,12 @@ fn signed_staking_op(
     op
 }
 
-fn pubkey_to_id(pubkey: &HybridPubKey) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&pubkey.classical_pk.0))
-}
-
 fn install_validator(
     state: &mut ChainState,
     seed: [u8; 32],
 ) -> (Bytes32, HybridPubKey, HybridKeypair) {
     let (pubkey, keypair) = make_test_keypair(seed);
-    let validator_id = pubkey_to_id(&pubkey);
+    let validator_id = pubkey.identity_id();
     state
         .validators
         .upsert(ValidatorEntry {
@@ -178,7 +174,7 @@ fn make_tx(
     utxo_id: Bytes32,
     input_value: u64,
     _input_blinding: [u8; 32],
-    nullifier_byte: u8,
+    _input_tag: u8,
     _out_byte: u8,
 ) -> TransactionV1 {
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
@@ -186,10 +182,7 @@ fn make_tx(
     let mut tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![InputV1 {
-            utxo_id,
-            nullifier: Bytes32::from([nullifier_byte; 32]),
-        }],
+        inputs: vec![InputV1 { utxo_id }],
         outputs: vec![OutputV1 {
             value_spark: output_value,
             owner_pubkey: owner_pubkey.clone(),
@@ -245,7 +238,7 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
         .map(|index| {
             let seed = [0xA0 + index; 32];
             let (pubkey, _) = make_test_keypair(seed);
-            let validator_id = pubkey_to_id(&pubkey);
+            let validator_id = pubkey.identity_id();
             state
                 .validators
                 .upsert(ValidatorEntry {
@@ -523,7 +516,6 @@ fn utxo_lifecycle_across_blocks() {
 
     assert!(!state.utxos.contains(&utxo_id), "old UTXO should be spent");
     assert_eq!(state.utxos.len(), 1, "one new UTXO created");
-    assert!(state.nullifiers.contains(&Bytes32::from([0xAAu8; 32])));
 
     // Block 2: spend the new UTXO
     // Find the new UTXO id — it was inserted at height 1, tx 0, output 0
@@ -552,7 +544,6 @@ fn utxo_lifecycle_across_blocks() {
 
     assert_eq!(state.height, 2);
     assert_eq!(state.utxos.len(), 1);
-    assert!(state.nullifiers.contains(&Bytes32::from([0xBBu8; 32])));
 }
 
 #[test]

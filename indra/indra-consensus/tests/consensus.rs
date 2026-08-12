@@ -59,10 +59,7 @@ fn dummy_tx(
     let mut tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
-        inputs: vec![InputV1 {
-            utxo_id,
-            nullifier: Bytes32::from([nonce; 32]),
-        }],
+        inputs: vec![InputV1 { utxo_id }],
         outputs: vec![dummy_output(nonce, output_value, owner_pubkey.clone())],
         fee_amount: fee,
         signature: HybridSignature {
@@ -90,7 +87,7 @@ impl TestValidator {
         let pq = indra_crypto::hybrid::PqKeypair::generate();
         let hybrid_kp = HybridKeypair::new(classical, pq);
         let pk = hybrid_kp.public_key();
-        let id = Bytes32::from(indra_crypto::sha256(&pk.classical.0));
+        let id = indra_core::types::crypto::hybrid_identity_id(&pk.classical.0, &pk.pq.0);
         Self {
             hybrid_kp,
             id,

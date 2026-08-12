@@ -9,8 +9,8 @@
 | ID | Component | Finding | Severity | Status |
 |----|-----------|---------|----------|--------|
 | T-01 | UTXO ownership | Spend authorization requires the owner hybrid signature for all inputs | SAFE | Checked |
-| T-02 | Nullifier | Same-block duplicate-UTXO spends with distinct nullifiers are rejected | CRITICAL | FIXED — regression tests added |
-| T-03 | Nullifier | Cross-block replay protection works for normal spends because UTXOs are removed and nullifiers persist | SAFE | Checked |
+| T-02 | removed spend tags | Same-block duplicate-UTXO spends with distinct removed spend tags are rejected | CRITICAL | FIXED — regression tests added |
+| T-03 | removed spend tags | Cross-block replay protection works for normal spends because UTXOs are removed and removed spend tags persist | SAFE | Checked |
 | T-04 | apply.rs | `verify_balance` is called after duplicate input UTXO IDs are rejected | CRITICAL | FIXED via T-02 |
 | T-05 | apply.rs / fee.rs | Transaction value sums and required-fee multiplication fail closed on overflow | LOW | FIXED — checked arithmetic regression test added |
 | T-06 | apply.rs | Zero-value / dust outputs are rejected in structure and state validation | SAFE | Checked |
@@ -39,45 +39,45 @@ Severity key: CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE.
 
 **Status:** SAFE.
 
-### T-02 — Same-block duplicate-UTXO spends with distinct nullifiers are rejected
+### T-02 — Same-block duplicate-UTXO spends with distinct removed spend tags are rejected
 
-**Description:** The transaction pre-validation pass previously tracked `block_nullifiers`, but did not track input UTXO IDs. A block could contain two transactions that both referenced the same UTXO with different arbitrary nullifiers. Both validated against the same start-of-block UTXO. During mutation, `apply_transaction` called `state.utxos.spend(&input.utxo_id)` but ignored `None`; the second transaction still inserted its nullifier and created outputs.
+**Description:** The transaction pre-validation pass previously tracked `block_removed spend tags`, but did not track input UTXO IDs. A block could contain two transactions that both referenced the same UTXO with different arbitrary removed spend tags. Both validated against the same start-of-block UTXO. During mutation, `apply_transaction` called `state.utxos.spend(&input.utxo_id)` but ignored `None`; the second transaction still inserted its removed spend tags and created outputs.
 
-This is exploitable by a legitimate UTXO owner. They can create two valid signed transactions spending the same UTXO, choose two distinct nullifiers, and create two sets of outputs whose commitments each balance against the same input commitment. The result is two unspent outputs from one original UTXO.
+This is exploitable by a legitimate UTXO owner. They can create two valid signed transactions spending the same UTXO, choose two distinct removed spend tags, and create two sets of outputs whose commitments each balance against the same input commitment. The result is two unspent outputs from one original UTXO.
 
 **Attack scenario:**
 
 1. Attacker owns one UTXO with value `V` and knows its blinding.
-2. They construct `tx_a` spending `utxo_id` with nullifier `N_a`, output value `V - fee`, and a valid fee/output commitment balance.
-3. They construct `tx_b` spending the same `utxo_id` with nullifier `N_b != N_a`, again outputting `V - fee`.
+2. They construct `tx_a` spending `utxo_id` with removed spend tags `N_a`, output value `V - fee`, and a valid fee/output commitment balance.
+3. They construct `tx_b` spending the same `utxo_id` with removed spend tags `N_b != N_a`, again outputting `V - fee`.
 4. `apply_block` pre-validates both transactions before mutating state.
-5. `block_nullifiers` sees `N_a` and `N_b` as distinct, so no duplicate is detected.
+5. `block_removed spend tags` sees `N_a` and `N_b` as distinct, so no duplicate is detected.
 6. Both transactions load the same still-unspent UTXO during validation and pass signature, fee, range-proof, and balance checks.
 7. Mutation spends the UTXO for `tx_a`; mutation for `tx_b` ignores that the UTXO is already gone and still creates `tx_b`'s output.
 
 **Code location:** `indra-state/src/apply.rs:316-329`, `indra-state/src/apply.rs:542-582`, `indra-state/src/apply.rs:665-675`.
 
-**Proof-of-concept:** Added `indra-state/tests/audit_phase2.rs::audit_t01_same_utxo_can_be_spent_twice_in_one_block_with_distinct_nullifiers`. It is ignored by default and can be run explicitly:
+**Proof-of-concept:** Added `indra-state/tests/audit_phase2.rs::audit_t01_same_utxo_can_be_spent_twice_in_one_block_with_distinct_removed spend tags`. It is ignored by default and can be run explicitly:
 
 ```bash
 cargo test -p indra-state --test audit_phase2 -- --ignored --nocapture
 ```
 
-The PoC builds real range-proved, hybrid-signed transactions and confirms the vulnerable behavior: one starting UTXO becomes two unspent outputs and two nullifiers.
+The PoC builds real range-proved, hybrid-signed transactions and confirms the vulnerable behavior: one starting UTXO becomes two unspent outputs and two removed spend tags.
 
-**Fix:** `apply_block` now tracks `block_input_utxos: HashSet<Bytes32>` alongside `block_nullifiers` during pre-validation and rejects repeated `input.utxo_id` values both within one transaction and across multiple transactions in the same block. `apply_transaction` now treats `state.utxos.spend(&input.utxo_id) == None` as an invariant violation instead of silently continuing. Longer term, consider binding nullifiers to `(owner secret, utxo_id)` with a verifiable spend proof if the protocol intends nullifiers to be more than replay tags.
+**Fix:** `apply_block` now tracks `block_input_utxos: HashSet<Bytes32>` alongside `block_removed spend tags` during pre-validation and rejects repeated `input.utxo_id` values both within one transaction and across multiple transactions in the same block. `apply_transaction` now treats `state.utxos.spend(&input.utxo_id) == None` as an invariant violation instead of silently continuing. Longer term, consider binding removed spend tags to `(owner secret, utxo_id)` with a verifiable spend proof if the protocol intends removed spend tags to be more than replay tags.
 
 **Status:** FIXED. This remediation does not change cryptographic derivation, key material, genesis data, wire encoding, or transaction format. It is a state-validation hardening fix.
 
 ### T-03 — Cross-block replay protection works for normal spends
 
-**Description:** `NullifierSet` is append-only, encoded deterministically, and restored from snapshots. `apply_transaction` inserts each input nullifier, and `validate_transaction` rejects nullifiers already in state. UTXOs are removed from `UtxoSet` on spend.
+**Description:** `removed spend tagsSet` is append-only, encoded deterministically, and restored from snapshots. `apply_transaction` inserts each input removed spend tags, and `validate_transaction` rejects removed spend tags already in state. UTXOs are removed from `UtxoSet` on spend.
 
-**Attack scenario checked:** Replay the same transaction in a later block, or construct a second transaction reusing the same nullifier.
+**Attack scenario checked:** Replay the same transaction in a later block, or construct a second transaction reusing the same removed spend tags.
 
-**Code location:** `indra-state/src/nullifier.rs:44-122`; `indra-state/src/apply.rs:548-550`, `indra-state/src/apply.rs:665-668`.
+**Code location:** `indra-state/src/removed spend tags.rs:44-122`; `indra-state/src/apply.rs:548-550`, `indra-state/src/apply.rs:665-668`.
 
-**Proof-of-concept / reasoning:** A later replay finds either the nullifier already present or the UTXO missing. Existing tests cover `double_spend_same_block_rejected` for duplicate nullifiers and `replay_tx_rejected_by_nullifier`.
+**Proof-of-concept / reasoning:** A later replay finds either the removed spend tags already present or the UTXO missing. Existing tests cover `double_spend_same_block_rejected` for duplicate removed spend tags and `replay_tx_rejected_by_removed spend tags`.
 
 **Recommended fix:** Fix T-02. After that, cross-block replay protection remains sound.
 
@@ -85,7 +85,7 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 
 ### T-04 — `verify_balance` is called after duplicate input commitments are rejected
 
-**Description:** `verify_balance` is called for every transaction, using the exact input commitments from referenced UTXOs, output commitments from transaction outputs, and the fee commitment. This re-verifies the Phase 1 C-15 finding. The former T-02 bug allowed the same input commitment to appear twice in one block, either across two transactions or twice in one transaction with distinct nullifiers. That duplicate input path is now rejected before `verify_balance` is trusted.
+**Description:** `verify_balance` is called for every transaction, using the exact input commitments from referenced UTXOs, output commitments from transaction outputs, and the fee commitment. This re-verifies the Phase 1 C-15 finding. The former T-02 bug allowed the same input commitment to appear twice in one block, either across two transactions or twice in one transaction with distinct removed spend tags. That duplicate input path is now rejected before `verify_balance` is trusted.
 
 **Attack scenario:** The T-02 exploit passes `verify_balance` because each transaction independently balances against the same input commitment observed during start-of-block validation.
 
@@ -190,7 +190,7 @@ The PoC builds real range-proved, hybrid-signed transactions and confirms the vu
 **Attack scenario:**
 
 1. Attacker submits many structurally valid but signature-invalid or UTXO-invalid transactions with sufficient fee fields.
-2. Admission calls `validate_transaction` against current state with fresh per-admission duplicate-nullifier and duplicate-UTXO tracking.
+2. Admission calls `validate_transaction` against current state with fresh per-admission duplicate-removed spend tags and duplicate-UTXO tracking.
 3. Signature-invalid, unknown-UTXO, locked-output, double-spend, or balance-invalid transactions are rejected before mempool insertion and before gossip.
 4. Final `apply_block` validation remains authoritative in case state changes between admission and inclusion.
 
@@ -230,7 +230,7 @@ Added/updated:
 - `indra-consensus/src/mempool.rs::mempool_rejects_transaction_spending_nonexistent_utxo`
 - `indra-consensus/src/mempool.rs::mempool_accepts_valid_transaction`
 
-The original exploit PoC was inverted: the duplicate-UTXO block now fails with `StateError::DuplicateUtxoSpend`, the original UTXO remains unspent, nullifiers are unchanged, and height does not advance.
+The original exploit PoC was inverted: the duplicate-UTXO block now fails with `StateError::DuplicateUtxoSpend`, the original UTXO remains unspent, removed spend tags are unchanged, and height does not advance.
 
 ## Findings NOT Present
 
@@ -244,7 +244,7 @@ The original exploit PoC was inverted: the duplicate-UTXO block now fails with `
 
 ## Recommended Fix Order
 
-1. **Strengthen nullifier semantics:** if nullifiers are intended to prove ownership-secret derivation, add a verifiable spend/nullifier proof or redesign the input authorization model so arbitrary nullifiers cannot be chosen freely.
+1. **Strengthen removed spend tags semantics:** if removed spend tags are intended to prove ownership-secret derivation, add a verifiable spend/removed spend tags proof or redesign the input authorization model so arbitrary removed spend tags cannot be chosen freely.
 2. **Fix CLI dust-change construction:** when positive change is below or equal to dust and omitted, either add it to `fee_amount` and fee commitment or reject construction before signing.
 
 ## Phase 2 Hardening Change Scope

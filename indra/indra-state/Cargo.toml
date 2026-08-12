@@ -1,6 +1,6 @@
 [package]
 name        = "indra-state"
-description = "INDRA state machine — UTXO set, nullifier set, block application, epoch transitions"
+description = "INDRA state machine — UTXO set, block application, epoch transitions"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

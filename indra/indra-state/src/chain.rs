@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 
 use crate::{
     governance::GovernanceState,
-    nullifier::NullifierSet,
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
@@ -93,9 +92,6 @@ pub struct ChainState {
 
     /// All unspent transaction outputs.
     pub utxos: UtxoSet,
-
-    /// All spent nullifiers (double-spend guard).
-    pub nullifiers: NullifierSet,
 
     /// Current validator set.
     pub validators: ValidatorSet,
@@ -190,7 +186,6 @@ impl ChainState {
             burn_buffer: _,
             fee_reward_pool: _,
             utxos: _,
-            nullifiers: _,
             validators: _,
             consensus_snapshots: _,
             reward_economic_snapshot: _,
@@ -227,7 +222,6 @@ impl ChainState {
         changed!(burn_buffer, F::BurnBuffer);
         changed!(fee_reward_pool, F::FeeRewardPool);
         changed!(utxos, F::Utxos);
-        changed!(nullifiers, F::Nullifiers);
         changed!(validators, F::Validators);
         changed!(consensus_snapshots, F::ConsensusSnapshots);
         changed!(reward_economic_snapshot, F::RewardEconomicSnapshot);
@@ -275,8 +269,6 @@ impl Encode for ChainState {
         self.fee_reward_pool.encode(buf);
         // Included: the full UTXO set is required to validate spends after restart.
         self.utxos.encode(buf);
-        // Included: nullifiers are the double-spend guard and cannot be reconstructed from summaries.
-        self.nullifiers.encode(buf);
         // Included: validator metadata is needed for proposer election and signature/QC verification.
         self.validators.encode(buf);
         encode_nonce_map(&self.staking_nonces, buf);
@@ -313,7 +305,6 @@ impl Encode for ChainState {
             + self.burn_buffer.encoded_len()
             + self.fee_reward_pool.encoded_len()
             + self.utxos.encoded_len()
-            + self.nullifiers.encoded_len()
             + self.validators.encoded_len()
             + nonce_map_encoded_len(&self.staking_nonces)
             + hash_set_encoded_len(&self.applied_slash_hashes)
@@ -350,7 +341,6 @@ impl Decode for ChainState {
         let burn_buffer = u64::decode(r)?;
         let fee_reward_pool = u64::decode(r)?;
         let utxos = UtxoSet::decode_at_height(r, height)?;
-        let nullifiers = NullifierSet::decode_at_height(r, height)?;
         let validators = ValidatorSet::decode(r)?;
         let staking_nonces = decode_nonce_map(r)?;
         let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
@@ -421,7 +411,6 @@ impl Decode for ChainState {
             burn_buffer,
             fee_reward_pool,
             utxos,
-            nullifiers,
             validators,
             consensus_snapshots,
             reward_economic_snapshot,
@@ -470,7 +459,6 @@ impl ChainState {
             burn_buffer: 0,
             fee_reward_pool: 0,
             utxos: UtxoSet::new(),
-            nullifiers: NullifierSet::new(),
             validators: ValidatorSet::new(),
             consensus_snapshots: Vec::new(),
             reward_economic_snapshot: None,
@@ -1744,7 +1732,6 @@ mod tests {
         assert_eq!(state.treasury_balance, 0);
         assert_eq!(state.fee_reward_pool, 0);
         assert!(state.utxos.is_empty());
-        assert!(state.nullifiers.is_empty());
         assert!(state.validators.is_empty());
         assert!(state.consensus_snapshots.is_empty());
     }

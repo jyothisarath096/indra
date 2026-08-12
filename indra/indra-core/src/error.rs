@@ -124,10 +124,6 @@ pub enum IndraError {
         minimum: u64,
     },
 
-    /// Duplicate nullifier within a single transaction.
-    #[error("duplicate nullifier in transaction")]
-    DuplicateNullifier,
-
     /// Transaction failed structural validation.
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
@@ -173,10 +169,6 @@ pub enum IndraError {
     /// A referenced UTXO does not exist.
     #[error("UTXO not found")]
     UtxoNotFound,
-
-    /// A nullifier has already been spent.
-    #[error("nullifier already spent (double-spend)")]
-    DoubleSpend,
 
     /// A UTXO is time-locked.
     #[error("UTXO locked until height {lock_height}, current height is {current_height}")]

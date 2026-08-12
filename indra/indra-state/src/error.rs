@@ -78,15 +78,6 @@ pub enum StateError {
         max: usize,
     },
 
-    /// A block exceeds the permanent-nullifier insertion budget.
-    #[error("block contains {actual} spent inputs, maximum is {max}")]
-    TooManyNullifiers {
-        /// Actual number of spent inputs.
-        actual: usize,
-        /// Consensus maximum.
-        max: usize,
-    },
-
     /// A canonical collection has reached its live consensus capacity.
     #[error("live {collection} capacity reached: {current} entries (maximum {max})")]
     LiveStateCapacityExceeded {
@@ -112,10 +103,6 @@ pub enum StateError {
     #[error("transaction references unknown UTXO")]
     UnknownUtxo,
 
-    /// A transaction attempts to spend an already-spent nullifier.
-    #[error("double-spend detected: nullifier already in nullifier set")]
-    DoubleSpend,
-
     /// A transaction's fee is below the required base fee.
     #[error("transaction fee {actual} Spark/KB below required {required} Spark/KB")]
     FeeTooLow {
@@ -132,10 +119,6 @@ pub enum StateError {
     /// A transaction has zero outputs.
     #[error("transaction has zero outputs")]
     ZeroOutputs,
-
-    /// A transaction contains duplicate nullifiers.
-    #[error("transaction contains duplicate nullifiers")]
-    DuplicateNullifier,
 
     /// A block or transaction attempts to spend the same UTXO more than once.
     #[error("duplicate UTXO spend in block: {utxo_id}")]
@@ -191,10 +174,6 @@ pub enum StateError {
         /// Current height.
         current_height: u64,
     },
-
-    /// The transaction nullifier does not match the expected derivation.
-    #[error("nullifier derivation invalid")]
-    NullifierInvalid,
 
     /// Transaction value arithmetic overflowed.
     #[error("transaction value arithmetic overflow")]

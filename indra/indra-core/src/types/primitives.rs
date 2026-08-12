@@ -119,10 +119,6 @@ pub const MAX_BLOCK_SIZE_BYTES: usize = 12_582_912; // 12 MB
 /// Maximum transactions per block.
 pub const MAX_TX_PER_BLOCK: usize = 200;
 
-/// Provisional consensus ceiling on spent inputs inserted as nullifiers per block.
-/// This requires a follow-up mainnet workload-sizing pass.
-pub const MAX_NULLIFIERS_PER_BLOCK: usize = 400;
-
 /// Maximum inputs per transaction.
 pub const MAX_INPUTS: usize = 16;
 
@@ -131,9 +127,6 @@ pub const MAX_OUTPUTS: usize = 16;
 
 /// Consensus maximum number of simultaneously-live UTXOs.
 pub const MAX_LIVE_UTXOS: usize = 500_000;
-
-/// Consensus maximum number of permanent nullifiers.
-pub const MAX_LIVE_NULLIFIERS: usize = 1_000_000;
 
 /// Maximum quorum certificate size in bytes.
 pub const MAX_QC_SIZE_BYTES: usize = 10_485_760; // 10 MB
@@ -520,7 +513,7 @@ pub const MAX_VALIDATOR_NETWORK_ADDR_LEN: usize = 255;
 // PRIMITIVE TYPES
 // =============================================================================
 
-/// A fixed 32-byte value (block hash, state root, nullifier, UTXO ID, etc.).
+/// A fixed 32-byte value (block hash, state root, UTXO ID, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Bytes32(pub [u8; 32]);
 impl Bytes32 {

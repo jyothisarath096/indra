@@ -27,11 +27,11 @@ Residual risk: this remains safe only because recompute never folds hashes in ma
 `indra-state/src/state_root.rs` commits to:
 
 - UTXO SMT root (`state.utxos.root()`) at line 22.
-- Nullifier SMT root (`state.nullifiers.root()`) at line 23.
+- removed spend tags SMT root (`state.removed spend tags.root()`) at line 23.
 - Validator/delegation root (`compute_validator_set_root(state)`) at line 24.
 - Metadata hash containing chain ID, height, total supply, base fee, treasury balance, burn buffer, fee reward pool, and governance state at lines 26-37.
 
-The top-level combination order is fixed: UTXO root, nullifier root, validator root, metadata hash at lines 39-44.
+The top-level combination order is fixed: UTXO root, removed spend tags root, validator root, metadata hash at lines 39-44.
 
 The validator/delegation commitment collects leaves from validators, delegators, staking nonces, staked bonds, and applied slash hashes. It sorts all leaves by key before hashing at line 146, so mixed sources are canonicalized before Merkle reduction.
 
@@ -123,7 +123,7 @@ The snapshot format is a complete `ChainState` encoding in `indra-storage/src/st
 | `burn_buffer` | yes | yes, metadata | governance accounting |
 | `fee_reward_pool` | yes | yes, metadata | epoch fee distribution |
 | `utxos` | yes | yes, UTXO SMT | spend validation |
-| `nullifiers` | yes | yes, nullifier SMT | double-spend guard |
+| `removed spend tags` | yes | yes, removed spend tags SMT | double-spend guard |
 | `validators` | yes | yes, validator root | proposer/QC/rewards/liveness |
 | `delegations` | yes | yes, validator root | active power/rewards |
 | `staked_bonds` | yes | yes, validator root | delegation/unbonding |
@@ -173,15 +173,15 @@ Operational caveat: if future consensus or state-root logic reads `EpochStore` o
 | `indra-state/src/smt.rs` | 124 | `Vec<HashMap<NodeLoc,[u8;32]>>` levels | SAFE | Intermediate maps keyed by deterministic node locations; iteration order does not alter parent hash values. |
 | `indra-state/src/smt.rs` | 144 | `HashMap<NodeLoc,(Option<[u8;32]>,Option<[u8;32]>)>` grouped | SAFE | Parent entries are keyed by `NodeLoc`; left/right chosen by key bit, not encounter order. |
 | `indra-state/src/utxo.rs` | 123 | `HashMap<Bytes32,UtxoEntry>` | SAFE | Snapshot encoding sorts by `utxo_id`; SMT root is order-insensitive; raw `all_entries()` should not be used in consensus. |
-| `indra-state/src/nullifier.rs` | 32 | `HashSet<Bytes32>` | SAFE | Snapshot encoding sorts; SMT root is order-insensitive; membership only in apply path. |
+| `indra-state/src/removed spend tags.rs` | 32 | `HashSet<Bytes32>` | SAFE | Snapshot encoding sorts; SMT root is order-insensitive; membership only in apply path. |
 | `indra-state/src/chain.rs` | 76 | `HashSet<Bytes32>` applied slash hashes | SAFE | Encoded by collecting and sorting at lines 278-284; state-root leaves sorted in `state_root.rs`. |
 | `indra-state/src/epoch.rs` | 84 | `HashSet<Bytes32>` active_before | SAFE | Used for set difference only; resulting vectors are sorted before inclusion in `EpochRecord`. |
 | `indra-state/src/epoch.rs` | 139 | `HashSet<Bytes32>` active_after_set | SAFE | Used for set difference only; `validators_joined` and `validators_left` are sorted at lines 144 and 149. |
 | `indra-state/src/apply.rs` | 287 | `HashSet<Bytes32>` seen slash hashes | SAFE | Duplicate detection only; not iterated to produce state. |
 | `indra-state/src/apply.rs` | 297 | `HashSet<Vec<u8>>` seen tx hashes | SAFE | Duplicate detection only; not iterated to produce state. |
-| `indra-state/src/apply.rs` | 308 | `HashSet<Bytes32>` block nullifiers | SAFE | Duplicate detection during transaction validation; not iterated to produce state. |
+| `indra-state/src/apply.rs` | 308 | `HashSet<Bytes32>` block removed spend tags | SAFE | Duplicate detection during transaction validation; not iterated to produce state. |
 | `indra-consensus/src/mempool.rs` | 83 | `HashMap<Bytes32,MempoolEntry>` | FIXED HIGH | `select_for_block` and capacity eviction previously sorted only by fee rate; equal-fee ties now use deterministic `tx_id` tiebreakers. |
-| `indra-consensus/src/mempool.rs` | 209 | `HashSet<Bytes32>` block_nullifiers in `evict_invalid` | SAFE | Per-entry validation scratch set; not iterated for output. |
+| `indra-consensus/src/mempool.rs` | 209 | `HashSet<Bytes32>` block_removed spend tags in `evict_invalid` | SAFE | Per-entry validation scratch set; not iterated for output. |
 | `indra-consensus/src/qc.rs` | 154 | `HashMap<Bytes32,&QcValidator>` | SAFE | Lookup by validator ID while iterating canonical votes; not iterated for QC output. |
 | `indra-consensus/src/qc.rs` | 202 | `HashMap<usize,&QcValidator>` | SAFE | Lookup by fixed bitfield positions; output order follows bitfield order. |
 | `indra-consensus/src/qc.rs` | 250 | `HashSet<Bytes32>` seen signatures | SAFE | Duplicate detection only. |

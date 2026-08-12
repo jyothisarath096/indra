@@ -1429,7 +1429,8 @@ mod tests {
         .unwrap();
         let cold_public = cold.public_key();
         let cold_public = cold_public.as_complete_hybrid();
-        let validator_id = Bytes32::from(indra_crypto::sha256(&public.classical.0));
+        let validator_id =
+            indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
         state
             .validators
@@ -1727,8 +1728,10 @@ mod tests {
         let votes: Vec<_> = signers
             .iter()
             .map(|signer| {
-                let validator_id =
-                    Bytes32::from(indra_crypto::sha256(&signer.public_key().classical.0));
+                let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                    &signer.public_key().classical.0,
+                    &signer.public_key().pq.0,
+                );
                 produce_vote(
                     height,
                     0,
@@ -2125,7 +2128,10 @@ mod tests {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[0x41; 32]);
         let pq = indra_crypto::hybrid::PqKeypair::from_seed(&[0x41; 32]).unwrap();
         let hybrid = indra_crypto::hybrid::HybridKeypair::new(classical, pq);
-        let validator_id = Bytes32::from(indra_crypto::sha256(&hybrid.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &hybrid.public_key().classical.0,
+            &hybrid.public_key().pq.0,
+        );
         let pq_pk = hybrid.public_key().pq.0.to_vec();
         let mut prev_qc = Vec::new();
         for i in 1..=10u64 {
@@ -2498,7 +2504,10 @@ mod tests {
         let classical = ClassicalKeypair::from_seed(&[0x42; 32]);
         let pq = PqKeypair::from_seed(&[0x43; 32]).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
-        let validator_id = Bytes32::from(indra_crypto::sha256(&hybrid.public_key().classical.0));
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &hybrid.public_key().classical.0,
+            &hybrid.public_key().pq.0,
+        );
         let stake = source.state.validators.total_active_stake();
 
         let block1 = make_strict_block(&source.state, 0x42, 0, vec![]);
@@ -3005,7 +3014,10 @@ mod tests {
             &a,
         )
         .unwrap();
-        let b_id = Bytes32::from(indra_crypto::sha256(&b.public_key().classical.0));
+        let b_id = indra_core::types::crypto::hybrid_identity_id(
+            &b.public_key().classical.0,
+            &b.public_key().pq.0,
+        );
         let b_vote = produce_vote(
             u64::MAX,
             0,

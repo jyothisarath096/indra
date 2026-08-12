@@ -45,7 +45,7 @@ fn output(value_spark: u64, owner_pubkey: HybridPubKey) -> OutputV1 {
 
 fn validator(owner: &HybridPubKey) -> ValidatorEntry {
     ValidatorEntry {
-        validator_id: Bytes32::from(indra_crypto::sha256(&owner.classical_pk.0)),
+        validator_id: owner.identity_id(),
         name: "money".into(),
         hybrid_classical_pk: Some(owner.classical_pk.0),
         hybrid_pq_pk: Some(owner.pq_pk.as_slice().to_vec()),
@@ -94,10 +94,7 @@ fn signed_tx(
         inputs: inputs
             .into_iter()
             .enumerate()
-            .map(|(i, utxo_id)| InputV1 {
-                utxo_id,
-                nullifier: Bytes32::from([i as u8 + 1; 32]),
-            })
+            .map(|(_, utxo_id)| InputV1 { utxo_id })
             .collect(),
         outputs,
         fee_amount,
