@@ -57,15 +57,10 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-/// Maximum round jump accepted from a single peer Status message in one step.
+/// Maximum round jump accepted from one quorum-backed round certificate.
 ///
-/// A single faulty/runaway peer must not be able to teleport the whole
-/// network's round counter to an arbitrary value. Larger legitimate gaps can
-/// still be caught up gradually across repeated Status messages.
-///
-/// Multi-peer corroboration is intentionally deferred: on the 4-validator
-/// testnet, requiring multiple matching statuses before any jump could stall
-/// a partially connected but otherwise recoverable node.
+/// This is defense in depth only. The primary authorization boundary is a
+/// strict >2/3 stake union of hybrid-signed votes at the target height/round.
 const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
 
 /// Maximum entries retained per stalled-height consensus collection.
@@ -344,6 +339,9 @@ pub struct ConsensusDriver {
     slash_detector: SlashDetector,
     /// Vote collectors keyed by (height, round, step).
     vote_collectors: HashMap<(u64, u32, VoteStep), VoteCollector>,
+    /// Independently verified signed votes proving validators reached a round.
+    /// One entry per validator is counted across both vote steps.
+    round_advance_evidence: HashMap<(u64, u32), BTreeMap<Bytes32, VoteV1>>,
     /// Pending blocks by block hash.
     pending_blocks: HashMap<Bytes32, BlockV1>,
     /// Proposals buffered because they arrived before their parent tip was committed locally.
@@ -420,6 +418,7 @@ impl ConsensusDriver {
             engine,
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
+            round_advance_evidence: HashMap::new(),
             pending_blocks: HashMap::new(),
             future_proposals: HashMap::new(),
             buffered_votes: HashMap::new(),
@@ -469,6 +468,7 @@ impl ConsensusDriver {
     /// Replace the registered voter set for the current epoch.
     pub fn set_voters(&mut self, voters: Vec<RegisteredVoter>) {
         self.vote_collectors.clear();
+        self.round_advance_evidence.clear();
         self.registered_voters = voters;
     }
 
@@ -883,6 +883,7 @@ impl ConsensusDriver {
         self.pending_precommit_quorum.clear();
         self.requested_vrf_reveals.clear();
         self.vote_collectors.clear();
+        self.round_advance_evidence.clear();
         self.seen_round_votes.clear();
         self.vrf_states = [None, None];
         self.local_vrf_rounds.clear();
@@ -1819,12 +1820,28 @@ impl ConsensusDriver {
 
     fn prune_stalled_collections(&mut self) {
         self.prune_vote_collectors();
+        self.prune_round_advance_evidence();
         self.prune_pending_blocks();
         self.prune_future_proposals_bounded();
         self.prune_buffered_votes();
         self.prune_requested_proposals();
         self.prune_seen_round_votes();
         self.prune_pending_precommit_quorum();
+    }
+
+    fn prune_round_advance_evidence(&mut self) {
+        let height = self.next_height();
+        let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
+        let max_round = self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP);
+        self.round_advance_evidence
+            .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
+        if self.round_advance_evidence.len() > MAX_STALLED_HEIGHT_ENTRIES {
+            let mut keys: Vec<_> = self.round_advance_evidence.keys().copied().collect();
+            keys.sort_by_key(|(_, round)| round.abs_diff(self.current_round));
+            let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
+            self.round_advance_evidence
+                .retain(|key, _| keep.contains(key));
+        }
     }
 
     fn prune_vote_collectors(&mut self) {
@@ -2346,17 +2363,10 @@ impl ConsensusDriver {
 
         let proposal_round = block.header.proposer_round;
         let proposal_height = block.header.height;
-        if proposal_height == self.next_height()
-            && proposal_round > self.current_round
-            && self.sync.is_caught_up()
-        {
-            eprintln!(
-                "[consensus] proposal-driven round jump: {} → {} at height={}",
-                self.current_round, proposal_round, proposal_height
-            );
-            self.start_round(proposal_round);
-            self.apply_vote_safety();
-        }
+        // A valid proposal proves only that its proposer signed one candidate;
+        // it does not prove sufficient stake reached that round. Higher-round
+        // proposals remain staged until independently verified vote evidence
+        // crosses strict >2/3 stake.
 
         let mut actions = vec![DriverAction::BroadcastBlock(block.clone())];
         if let Some(from) = from {
@@ -2479,8 +2489,21 @@ impl ConsensusDriver {
         self.seen_round_votes.insert(slot_key, vote.block_hash);
         self.prune_seen_round_votes();
 
+        // VoteV1 signatures bind chain ID, height, round, full validator ID,
+        // step and value. A one-per-validator union across the two steps is a
+        // compact round-change certificate proving strict >2/3 stake reached
+        // the target round; no Status or proposal assertion contributes.
+        self.round_advance_evidence
+            .entry((vote.height, vote.round))
+            .or_default()
+            .entry(vote.validator_id)
+            .or_insert_with(|| vote.clone());
+        let mut round_advance_actions =
+            self.maybe_advance_to_certified_round(vote.height, vote.round);
+
         if !self.sync.is_caught_up() {
             actions.extend(self.record_vote_passive(from, vote, true));
+            actions.append(&mut round_advance_actions);
             return actions;
         }
 
@@ -2504,11 +2527,59 @@ impl ConsensusDriver {
                 .or_default()
                 .push((from, vote));
             self.prune_buffered_votes();
+            actions.append(&mut round_advance_actions);
             return actions;
         }
 
+        actions.append(&mut round_advance_actions);
         actions.extend(self.record_vote_and_actions(from, vote, true));
         actions
+    }
+
+    fn maybe_advance_to_certified_round(
+        &mut self,
+        height: u64,
+        target_round: u32,
+    ) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up()
+            || height != self.next_height()
+            || target_round <= self.current_round
+            || target_round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+        {
+            return Vec::new();
+        }
+        let Some(evidence) = self.round_advance_evidence.get(&(height, target_round)) else {
+            return Vec::new();
+        };
+        let stake_by_id: BTreeMap<Bytes32, u64> = self
+            .registered_voters
+            .iter()
+            .map(|voter| (voter.validator_id, voter.stake))
+            .collect();
+        let Some(signed_stake) = evidence.keys().try_fold(0u64, |total, validator_id| {
+            total.checked_add(stake_by_id.get(validator_id).copied().unwrap_or(0))
+        }) else {
+            return Vec::new();
+        };
+        let Some(total_stake) = self
+            .registered_voters
+            .iter()
+            .try_fold(0u64, |total, voter| total.checked_add(voter.stake))
+        else {
+            return Vec::new();
+        };
+        if !has_strict_two_thirds_quorum(signed_stake, total_stake) {
+            return Vec::new();
+        }
+
+        eprintln!(
+            "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
+            self.current_round, target_round, height, signed_stake, total_stake
+        );
+        self.start_round(target_round);
+        self.apply_vote_safety();
+        self.prune_stalled_collections();
+        self.maybe_prevote_current_round_proposal()
     }
 
     fn validate_precommit_election_result_hash(&self, vote: &VoteV1) -> Result<(), String> {
@@ -3027,6 +3098,8 @@ impl ConsensusDriver {
 
                 self.vote_collectors
                     .retain(|(vote_height, _, _), _| *vote_height > height);
+                self.round_advance_evidence
+                    .retain(|(vote_height, _), _| *vote_height > height);
                 self.pending_blocks
                     .retain(|_, pending| pending.header.height > height);
                 let next_height = self.next_height();
@@ -3156,33 +3229,12 @@ impl ConsensusDriver {
         validator_id: Bytes32,
         height: u64,
         tip_hash: Bytes32,
-        peer_round: u32,
+        _peer_round: u32,
     ) -> Vec<DriverAction> {
         let our_height = self.engine.height();
-        if height == our_height.saturating_add(1)
-            && peer_round > self.current_round
-            && self.sync.is_caught_up()
-        {
-            let current_round = self.current_round;
-            let capped_round = current_round
-                .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
-                .min(peer_round);
-            if capped_round > current_round {
-                if peer_round > capped_round {
-                    eprintln!(
-                        "[consensus] WARNING: peer {} claimed round {} (capping jump from {} to {})",
-                        from, peer_round, current_round, capped_round
-                    );
-                } else {
-                    eprintln!(
-                        "[consensus] round sync: advancing from round {} to {} (peer at round {})",
-                        current_round, capped_round, peer_round
-                    );
-                }
-                self.start_round(capped_round);
-                self.prune_stalled_collections();
-            }
-        }
+        // Status is intentionally informational only. Neither an authenticated
+        // transport peer nor a validator identity proves quorum reached its
+        // asserted round; only hybrid-signed vote evidence may advance rounds.
         let peer_stake = self
             .registered_voters
             .iter()
@@ -8255,15 +8307,38 @@ mod tests {
     }
 
     #[test]
-    fn proposal_drives_round_advancement() {
+    fn proposal_requires_quorum_evidence_before_round_advancement() {
         let (mut driver, dir) = local_driver([0x4Fu8; 32], "proposal_round_advance");
-        install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
+        let signer = install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
         driver.refresh_registered_voters();
 
         let block = make_strict_block(&driver, [0x4Fu8; 32], 5, vec![]);
         let block_hash = block.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
+        assert_eq!(driver.current_round(), 0);
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+        )));
+
+        let vote = indra_consensus::vote::produce_vote(
+            1,
+            5,
+            VoteStep::Prevote,
+            Bytes32::ZERO,
+            validator_id_for(&signer),
+            DEFAULT_CHAIN_ID,
+            &signer,
+        )
+        .unwrap();
+        let actions = driver.process(DriverEvent::InboundVote {
+            from: "127.0.0.1:9202".parse().unwrap(),
+            vote,
+        });
+        // With the single-validator test snapshot, the certified advance also
+        // lets the staged proposal immediately reach vote quorum and commit.
         assert_eq!(driver.height(), 1);
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -8288,7 +8363,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_round_jump_skips_past_voted_rounds() {
+    fn proposal_round_jump_cannot_bypass_vote_safety_without_evidence() {
         let (mut driver, dir) = local_driver([0x51u8; 32], "proposal_round_vote_safety");
         let _local = install_active_validator(&mut driver, [0x51u8; 32], "local");
         driver.refresh_registered_voters();
@@ -8297,7 +8372,7 @@ mod tests {
         let block = make_strict_block(&driver, [0x51u8; 32], 5, vec![]);
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
 
-        assert_eq!(driver.current_round(), 6);
+        assert_eq!(driver.current_round(), 0);
         assert!(!actions.iter().any(|action| matches!(
             action,
             DriverAction::BroadcastVote(vote) if vote.round == 5
@@ -8336,7 +8411,7 @@ mod tests {
     }
 
     #[test]
-    fn process_status_advances_round_when_peer_is_ahead() {
+    fn process_status_cannot_advance_round_without_quorum_evidence() {
         let (mut driver, dir) = local_driver([0x4Au8; 32], "status_round_advance");
         let peer: SocketAddr = "127.0.0.1:9301".parse().unwrap();
 
@@ -8348,13 +8423,70 @@ mod tests {
             round: 8,
         });
 
-        assert_eq!(driver.current_round(), 8);
+        assert_eq!(driver.current_round(), 0);
         assert_eq!(driver.current_phase(), RoundPhase::Propose);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn peer_status_round_jump_is_capped() {
+    fn legitimate_hybrid_signed_quorum_advances_round_and_preserves_liveness() {
+        let (mut driver, dir) = local_driver([0x93u8; 32], "round_evidence_quorum");
+        let signers: Vec<HybridKeypair> = (0u8..4)
+            .map(|i| {
+                let seed = [0xA0u8.saturating_add(i); 32];
+                HybridKeypair::new(
+                    ClassicalKeypair::from_seed(&seed),
+                    PqKeypair::from_seed(&seed).unwrap(),
+                )
+            })
+            .collect();
+        driver.set_voters(
+            signers
+                .iter()
+                .map(|signer| {
+                    let public = signer.public_key();
+                    RegisteredVoter {
+                        validator_id: validator_id_for(signer),
+                        classical_pk: public.classical.0,
+                        pq_pk: public.pq.0.to_vec(),
+                        stake: 1,
+                    }
+                })
+                .collect(),
+        );
+
+        for (index, signer) in signers.iter().enumerate() {
+            let vote = indra_consensus::vote::produce_vote(
+                1,
+                4,
+                if index == 1 {
+                    VoteStep::Precommit
+                } else {
+                    VoteStep::Prevote
+                },
+                Bytes32::ZERO,
+                validator_id_for(signer),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            driver.process(DriverEvent::InboundVote {
+                from: format!("127.0.0.1:{}", 9500 + index).parse().unwrap(),
+                vote,
+            });
+            if index < 2 {
+                assert_eq!(driver.current_round(), 0, "<=2/3 must not advance");
+            } else {
+                assert_eq!(driver.current_round(), 4, "strict >2/3 must advance");
+                break;
+            }
+        }
+        assert_eq!(driver.current_phase(), RoundPhase::Propose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_status_large_round_claim_is_informational_only() {
         let (mut driver, dir) = local_driver([0x8Au8; 32], "status_round_cap");
         driver.current_round = 5;
         let peer: SocketAddr = "127.0.0.1:9401".parse().unwrap();
@@ -8367,13 +8499,13 @@ mod tests {
             round: 1_358,
         });
 
-        assert_eq!(driver.current_round(), 5 + MAX_ACCEPTED_ROUND_JUMP);
+        assert_eq!(driver.current_round(), 5);
         assert_eq!(driver.current_phase(), RoundPhase::Propose);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn peer_status_normal_round_advance_still_works() {
+    fn peer_status_normal_round_claim_is_informational_only() {
         let (mut driver, dir) = local_driver([0x8Bu8; 32], "status_round_normal");
         driver.current_round = 5;
         let peer: SocketAddr = "127.0.0.1:9402".parse().unwrap();
@@ -8386,17 +8518,17 @@ mod tests {
             round: 6,
         });
 
-        assert_eq!(driver.current_round(), 6);
+        assert_eq!(driver.current_round(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn peer_status_repeated_messages_can_eventually_catch_up() {
+    fn peer_status_repeated_messages_cannot_force_round_advance() {
         let (mut driver, dir) = local_driver([0x8Cu8; 32], "status_round_repeated");
         driver.current_round = 5;
         let peer: SocketAddr = "127.0.0.1:9403".parse().unwrap();
 
-        while driver.current_round() < 29 {
+        for _ in 0..100 {
             driver.sync.mark_caught_up(driver.height());
             driver.process(DriverEvent::PeerStatus {
                 from: peer,
@@ -8407,7 +8539,7 @@ mod tests {
             });
         }
 
-        assert_eq!(driver.current_round(), 29);
+        assert_eq!(driver.current_round(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
