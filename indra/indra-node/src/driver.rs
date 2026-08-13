@@ -4556,7 +4556,12 @@ mod tests {
                 preferred.clone()
             } else {
                 (0u8..=u8::MAX)
-                    .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
+                    .flat_map(|seed| {
+                        [
+                            VrfKeypair::from_seed(&[seed; 32]),
+                            VrfKeypair::from_seed(&real_sim_seed(seed as usize)),
+                        ]
+                    })
                     .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
                     .expect("test validator VRF seed must be recoverable")
             };
@@ -4864,6 +4869,7 @@ mod tests {
         vrf_reveal_started_ms: HashMap<(u64, u32), u64>,
     }
 
+    #[derive(Debug)]
     struct RealDriverRestartOutcome {
         name: &'static str,
         validators: usize,
@@ -4943,11 +4949,22 @@ mod tests {
 
     impl RealDriverSimHarness {
         fn new(suffix: &str) -> Self {
-            Self::new_with_start_height(suffix, FINAL_REVEAL_SET_HEIGHT)
+            // Restart tests must build their history through the real block
+            // pipeline.  Fabricating an activated height by saving a state
+            // snapshot without the corresponding block log and chain
+            // manifest creates a store which production correctly rejects.
+            Self::new_with_start_height(suffix, 0)
         }
 
         fn new_with_start_height(suffix: &str, start_height: u64) -> Self {
-            let validators = real_driver_sim_n();
+            Self::new_with_start_height_and_validators(suffix, start_height, real_driver_sim_n())
+        }
+
+        fn new_with_start_height_and_validators(
+            suffix: &str,
+            start_height: u64,
+            validators: usize,
+        ) -> Self {
             let quorum = real_driver_sim_quorum(validators);
             let root = temp_dir(&format!("{suffix}_n{validators}"));
             let _ = std::fs::remove_dir_all(&root);
@@ -4985,15 +5002,21 @@ mod tests {
                 tip_hash
             };
             template_driver.refresh_registered_voters();
-            let quorum_signers: Vec<_> = signers.iter().take(quorum).collect();
-            let qc = qc_bytes_from_signers(
-                &template_driver,
-                &quorum_signers,
-                start_height,
-                0,
-                tip_hash,
-                None,
-            );
+            let qc = if start_height == 0 {
+                // Height one is the genesis-height block and must not carry a
+                // synthetic predecessor QC.
+                Vec::new()
+            } else {
+                let quorum_signers: Vec<_> = signers.iter().take(quorum).collect();
+                qc_bytes_from_signers(
+                    &template_driver,
+                    &quorum_signers,
+                    start_height,
+                    0,
+                    tip_hash,
+                    None,
+                )
+            };
             drop(template_driver);
 
             for i in 0..validators {
@@ -5190,8 +5213,22 @@ mod tests {
             driver.last_qc_bytes = initial_qc_bytes.to_vec();
             driver.sync.mark_caught_up(driver.height());
             driver.refresh_registered_voters();
-            driver.start_round(0);
             driver
+        }
+
+        fn restart_nodes_now(&mut self, nodes: &[usize]) {
+            for &node in nodes {
+                self.nodes[node].driver = None;
+                self.nodes[node].online = false;
+            }
+            for &node in nodes {
+                let driver = Self::restart_driver_from_config(
+                    self.nodes[node].config.clone(),
+                    &self.initial_qc_bytes,
+                );
+                self.nodes[node].driver = Some(driver);
+                self.nodes[node].online = true;
+            }
         }
 
         fn schedule(&mut self, at_ms: u64, kind: RealSimEventKind) {
@@ -6059,6 +6096,192 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn persisted_lock_survives_full_staggered_and_overlapping_restarts() {
+        let mut harness =
+            RealDriverSimHarness::new_with_start_height_and_validators("restart_lock_safety", 0, 4);
+
+        // Exercise restart in propose and prevote before establishing a lock.
+        harness.nodes[0].driver.as_mut().unwrap().current_phase = RoundPhase::Propose;
+        harness.restart_nodes_now(&[0]);
+        assert_eq!(harness.nodes[0].driver.as_ref().unwrap().locked_round, None);
+
+        let block_a = make_strict_block(
+            harness.nodes[0].driver.as_ref().unwrap(),
+            real_sim_seed(0),
+            0,
+            vec![],
+        );
+        let hash_a = block_a.header.block_hash();
+        let value_a = block_a.header.value_hash;
+        let mut vote_history = HashMap::<(usize, u64, u32, u8), Bytes32>::new();
+        for node in &mut harness.nodes {
+            let driver = node.driver.as_mut().unwrap();
+            driver.pending_blocks.insert(hash_a, block_a.clone());
+            driver.current_phase = RoundPhase::Prevote;
+        }
+        harness.restart_nodes_now(&[1]);
+        assert_eq!(harness.nodes[1].driver.as_ref().unwrap().locked_round, None);
+        {
+            let driver = harness.nodes[1].driver.as_mut().unwrap();
+            driver.pending_blocks.insert(hash_a, block_a.clone());
+            driver.current_phase = RoundPhase::Prevote;
+        }
+
+        // Deliver a genuine strict quorum of signed prevotes to every real
+        // driver. Each must persist the resulting lock before returning its
+        // non-nil precommit; no precommits are delivered yet, modelling a
+        // crash after lock/precommit but before commit observation.
+        for target in 0..harness.validators {
+            let mut emitted_precommit = false;
+            for signer_index in 0..harness.quorum {
+                let vote = indra_consensus::vote::produce_vote(
+                    1,
+                    0,
+                    VoteStep::Prevote,
+                    hash_a,
+                    validator_id_for(&harness.signers[signer_index]),
+                    DEFAULT_CHAIN_ID,
+                    &harness.signers[signer_index],
+                )
+                .unwrap();
+                let actions = harness.nodes[target].driver.as_mut().unwrap().process(
+                    DriverEvent::InboundVote {
+                        from: SocketAddr::from(([127, 0, 0, 1], 31_000 + signer_index as u16)),
+                        vote,
+                    },
+                );
+                emitted_precommit |= actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        DriverAction::BroadcastVote(vote)
+                            if vote.step == VoteStep::Precommit && vote.block_hash == hash_a
+                    )
+                });
+                for action in &actions {
+                    if let DriverAction::BroadcastVote(vote) = action {
+                        let step = match vote.step {
+                            VoteStep::Prevote => 0,
+                            VoteStep::Precommit => 1,
+                        };
+                        let key = (target, vote.height, vote.round, step);
+                        if let Some(previous) = vote_history.insert(key, vote.block_hash) {
+                            assert_eq!(
+                                previous, vote.block_hash,
+                                "node {target} emitted conflicting votes for {key:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(emitted_precommit, "node {target} did not precommit A");
+            assert_eq!(
+                harness.nodes[target].driver.as_ref().unwrap().current_phase,
+                RoundPhase::Precommit,
+                "node {target} was not restarted from the requested precommit phase"
+            );
+            let VoteSafetyLoadResult::Record(record) = harness.nodes[target]
+                .driver
+                .as_ref()
+                .unwrap()
+                .vote_safety
+                .load()
+            else {
+                panic!("node {target} did not durably record its lock")
+            };
+            let lock = record.consensus_lock.expect("durable lock is required");
+            assert_eq!(lock.block_hash, hash_a);
+            assert_eq!(lock.value_hash, value_a);
+            assert!(lock.polc_votes.len() >= harness.quorum);
+        }
+
+        // Simultaneous full-set restart, then staggered one-at-a-time and
+        // overlapping partial-group restarts. Every reconstruction goes
+        // through NodeEngine::init and VoteSafetyStore from disk.
+        harness.restart_nodes_now(&[0, 1, 2, 3]);
+        for node in 0..4 {
+            harness.restart_nodes_now(&[node]);
+        }
+        harness.restart_nodes_now(&[0, 1]);
+        harness.restart_nodes_now(&[1, 2]);
+
+        // The exact T7-01 exploit remains closed for every validator: after
+        // restart, a conflicting later-round proposal without a later PoLC
+        // can only receive a nil prevote.
+        for (node_index, node) in harness.nodes.iter_mut().enumerate() {
+            let driver = node.driver.as_mut().unwrap();
+            assert_eq!(driver.locked_round, Some(0));
+            assert_eq!(driver.locked_value, Some(hash_a));
+            assert_eq!(driver.locked_value_hash, Some(value_a));
+            assert_eq!(driver.current_round(), 1);
+
+            let mut block_b = make_block(&driver.engine.state);
+            block_b.header.proposer_round = 1;
+            block_b.header.polc_round = NO_POLC_ROUND;
+            block_b.header.timestamp = block_b.header.timestamp.saturating_add(1);
+            block_b.header.value_hash =
+                block_b.compute_value_hash(driver.engine.state.total_supply);
+            let hash_b = block_b.header.block_hash();
+            assert_ne!(hash_b, hash_a);
+            driver.pending_blocks.insert(hash_b, block_b);
+
+            driver.current_phase = RoundPhase::Propose;
+            let actions = driver.maybe_prevote_current_round_proposal();
+            for action in &actions {
+                if let DriverAction::BroadcastVote(vote) = action {
+                    let step = match vote.step {
+                        VoteStep::Prevote => 0,
+                        VoteStep::Precommit => 1,
+                    };
+                    let key = (node_index, vote.height, vote.round, step);
+                    if let Some(previous) = vote_history.insert(key, vote.block_hash) {
+                        assert_eq!(
+                            previous, vote.block_hash,
+                            "node {node_index} emitted conflicting cross-restart votes for {key:?}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                actions.iter().any(|action| matches!(
+                    action,
+                    DriverAction::BroadcastVote(vote)
+                        if vote.step == VoteStep::Prevote && vote.block_hash == Bytes32::ZERO
+                )),
+                "node {node_index} did not emit the required nil prevote"
+            );
+            assert!(
+                !actions.iter().any(|action| matches!(
+                    action,
+                    DriverAction::BroadcastVote(vote) if vote.block_hash == hash_b
+                )),
+                "node {node_index} emitted a conflicting cross-restart vote"
+            );
+        }
+
+        let heights = harness
+            .nodes
+            .iter()
+            .map(|node| node.driver.as_ref().unwrap().height())
+            .collect::<HashSet<_>>();
+        let rounds = harness
+            .nodes
+            .iter()
+            .map(|node| node.driver.as_ref().unwrap().current_round())
+            .collect::<HashSet<_>>();
+        assert_eq!(heights, HashSet::from([0]));
+        assert_eq!(rounds, HashSet::from([1]));
+    }
+
+    #[test]
+    fn real_driver_full_set_restart_reconverges_and_finalizes() {
+        let mut harness =
+            RealDriverSimHarness::new_with_start_height_and_validators("restart_full_set_ci", 0, 4);
+        let outcome = harness.run("restart_full_set_ci", 4, 2_000);
+        assert!(outcome.finalized_nodes >= outcome.quorum, "{outcome:?}");
+        assert!(outcome.finalized_round.is_some(), "{outcome:?}");
     }
 
     #[test]
