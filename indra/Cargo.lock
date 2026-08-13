@@ -910,6 +910,7 @@ dependencies = [
  "indra-cli",
  "indra-core",
  "indra-crypto",
+ "indra-state",
  "rand 0.8.6",
  "serde_json",
  "zeroize",

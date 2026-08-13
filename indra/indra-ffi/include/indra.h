@@ -24,6 +24,7 @@ extern "C" {
 #define INDRA_ERR_INVALID_SESSION -14
 #define INDRA_ERR_HANDLE_REVOKED -15
 #define INDRA_ERR_INVALID_RESULT -16
+#define INDRA_ERR_WRONG_KEY_ROLE -17
 #define INDRA_ERR_INTERNAL      -99
 
 #define INDRA_OP_HEX_MAX_BYTES 32768
@@ -50,6 +51,11 @@ typedef struct {
     uint8_t pq_pk[INDRA_PQ_PK_BYTES];
     uint8_t vrf_pk[INDRA_VRF_PK_BYTES];
 } IndraPublicKeyInfo;
+
+typedef struct {
+    uint8_t classical_pk[INDRA_CLASSICAL_PK_BYTES];
+    uint8_t pq_pk[INDRA_PQ_PK_BYTES];
+} IndraColdPublicKeyInfo;
 
 typedef struct {
     uint8_t  utxo_id[INDRA_BYTES32_LEN];
@@ -89,6 +95,14 @@ int32_t indra_keygen_handle(
     IndraPublicKeyInfo* out_public
 );
 
+int32_t indra_cold_key_handle_from_seeds(
+    IndraSessionHandle session,
+    const uint8_t* classical_seed,
+    const uint8_t* pq_seed,
+    IndraKeyHandle* out_handle,
+    IndraColdPublicKeyInfo* out_public
+);
+
 int32_t indra_generate_mnemonic(
     char* out_phrase,
     size_t out_len
@@ -106,6 +120,12 @@ int32_t indra_key_handle_public(
     IndraSessionHandle session,
     IndraKeyHandle handle,
     IndraPublicKeyInfo* out_public
+);
+
+int32_t indra_cold_key_handle_public(
+    IndraSessionHandle session,
+    IndraKeyHandle handle,
+    IndraColdPublicKeyInfo* out_public
 );
 
 int32_t indra_destroy_key_handle(IndraSessionHandle session, IndraKeyHandle handle);
@@ -136,7 +156,8 @@ int32_t indra_build_register_validator_with_handle(
     IndraSessionHandle session,
     uint32_t commission_bps,
     const uint8_t* deposit_utxo_id,
-    IndraKeyHandle handle,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
     uint64_t nonce,
     const char* chain_id,
     size_t chain_id_len,
@@ -147,8 +168,10 @@ int32_t indra_build_register_validator_with_handle(
 int32_t indra_build_self_stake_with_handle(
     IndraSessionHandle session,
     const uint8_t* deposit_utxo_id,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -167,10 +190,23 @@ int32_t indra_build_delegate_with_handle(
     size_t out_len
 );
 
-int32_t indra_build_claim_rewards_with_handle(
+int32_t indra_build_delegator_claim_rewards_with_handle(
     IndraSessionHandle session,
+    const uint8_t* validator_id,
     IndraKeyHandle handle,
     uint64_t nonce,
+    const char* chain_id,
+    size_t chain_id_len,
+    char* out_hex,
+    size_t out_len
+);
+
+int32_t indra_build_validator_claim_rewards_with_handle(
+    IndraSessionHandle session,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -180,8 +216,10 @@ int32_t indra_build_claim_rewards_with_handle(
 int32_t indra_build_set_commission_with_handle(
     IndraSessionHandle session,
     uint32_t new_commission_bps,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -191,8 +229,10 @@ int32_t indra_build_set_commission_with_handle(
 int32_t indra_build_set_auto_delegate_with_handle(
     IndraSessionHandle session,
     const uint8_t* target_validator_id,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -208,8 +248,10 @@ int32_t indra_build_governance_propose_with_handle(
     const char* action_json,
     size_t action_json_len,
     const uint8_t* deposit_utxo_id,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -222,8 +264,10 @@ int32_t indra_build_governance_commit_with_handle(
     uint8_t vote,
     const uint8_t* reveal_nonce,
     uint8_t* out_commitment,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -235,8 +279,10 @@ int32_t indra_build_governance_reveal_with_handle(
     const uint8_t* proposal_id,
     uint8_t vote,
     const uint8_t* reveal_nonce,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -271,8 +317,10 @@ int32_t indra_build_governance_execute_with_handle(
 int32_t indra_build_governance_cancel_with_handle(
     IndraSessionHandle session,
     const uint8_t* proposal_id,
-    IndraKeyHandle handle,
-    uint64_t nonce,
+    IndraKeyHandle hot_handle,
+    IndraKeyHandle cold_handle,
+    uint64_t cold_key_version,
+    uint64_t cold_nonce,
     const char* chain_id,
     size_t chain_id_len,
     char* out_hex,
@@ -280,6 +328,8 @@ int32_t indra_build_governance_cancel_with_handle(
 );
 
 int32_t indra_compute_vote_commitment(
+    const uint8_t* proposal_id,
+    const uint8_t* validator_id,
     uint8_t vote,
     const uint8_t* reveal_nonce,
     uint8_t* out_commitment

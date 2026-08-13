@@ -6,13 +6,16 @@ use std::{
 };
 
 use indra_cli::KeysFile;
-use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+use indra_crypto::{
+    hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
+    ColdHybridKeypair,
+};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::{
-    errors::IndraError, tx::BuiltTxOwned, IndraPublicKeyInfo, BYTES32_LEN, CLASSICAL_SK_BYTES,
-    PQ_PK_BYTES, PQ_SK_BYTES,
+    errors::IndraError, tx::BuiltTxOwned, IndraColdPublicKeyInfo, IndraPublicKeyInfo, BYTES32_LEN,
+    CLASSICAL_SK_BYTES, PQ_PK_BYTES, PQ_SK_BYTES,
 };
 
 const TOKEN_BYTES: usize = 16;
@@ -75,11 +78,18 @@ struct KeyState {
     material: Option<StoredKeyMaterial>,
 }
 
-struct StoredKeyMaterial {
-    public: IndraPublicKeyInfo,
-    classical_seed: [u8; CLASSICAL_SK_BYTES],
-    ml_dsa_seed: [u8; PQ_SK_BYTES],
-    vrf_seed: [u8; BYTES32_LEN],
+enum StoredKeyMaterial {
+    Hot {
+        public: IndraPublicKeyInfo,
+        classical_seed: [u8; CLASSICAL_SK_BYTES],
+        ml_dsa_seed: [u8; PQ_SK_BYTES],
+        vrf_seed: [u8; BYTES32_LEN],
+    },
+    Cold {
+        public: IndraColdPublicKeyInfo,
+        classical_seed: [u8; CLASSICAL_SK_BYTES],
+        pq_seed: [u8; PQ_SK_BYTES],
+    },
 }
 
 impl StoredKeyMaterial {
@@ -89,7 +99,7 @@ impl StoredKeyMaterial {
         }
         let mut pq_pk = [0u8; PQ_PK_BYTES];
         pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
-        Ok(Self {
+        Ok(Self::Hot {
             public: IndraPublicKeyInfo {
                 validator_id: keys.public.validator_id,
                 classical_pk: keys.public.hybrid_classical_pk,
@@ -102,50 +112,165 @@ impl StoredKeyMaterial {
         })
     }
 
-    fn signing_material(&self) -> SigningMaterial {
-        SigningMaterial {
-            public: self.public,
-            classical_seed: self.classical_seed,
-            ml_dsa_seed: self.ml_dsa_seed,
+    fn from_cold_seeds(
+        classical_seed: [u8; CLASSICAL_SK_BYTES],
+        pq_seed: [u8; PQ_SK_BYTES],
+    ) -> Result<Self, IndraError> {
+        let keypair = ColdHybridKeypair::from_independent_seeds(classical_seed, pq_seed)
+            .map_err(|_| IndraError::KeygenFailed)?;
+        let public = keypair.public_key();
+        let public = public.as_complete_hybrid();
+        let mut pq_pk = [0; PQ_PK_BYTES];
+        pq_pk.copy_from_slice(&public.pq.0);
+        Ok(Self::Cold {
+            public: IndraColdPublicKeyInfo {
+                classical_pk: public.classical.0,
+                pq_pk,
+            },
+            classical_seed,
+            pq_seed,
+        })
+    }
+
+    fn hot_signing_material(&self) -> Result<SigningMaterial, IndraError> {
+        match self {
+            Self::Hot {
+                public,
+                classical_seed,
+                ml_dsa_seed,
+                ..
+            } => Ok(SigningMaterial::Hot {
+                public: *public,
+                classical_seed: *classical_seed,
+                ml_dsa_seed: *ml_dsa_seed,
+            }),
+            Self::Cold { .. } => Err(IndraError::WrongKeyRole),
+        }
+    }
+
+    fn cold_signing_material(&self) -> Result<SigningMaterial, IndraError> {
+        match self {
+            Self::Cold {
+                classical_seed,
+                pq_seed,
+                ..
+            } => Ok(SigningMaterial::Cold {
+                classical_seed: *classical_seed,
+                pq_seed: *pq_seed,
+            }),
+            Self::Hot { .. } => Err(IndraError::WrongKeyRole),
         }
     }
 }
 
 impl Drop for StoredKeyMaterial {
     fn drop(&mut self) {
-        self.classical_seed.zeroize();
-        self.ml_dsa_seed.zeroize();
-        self.vrf_seed.zeroize();
+        match self {
+            Self::Hot {
+                classical_seed,
+                ml_dsa_seed,
+                vrf_seed,
+                ..
+            } => {
+                classical_seed.zeroize();
+                ml_dsa_seed.zeroize();
+                vrf_seed.zeroize();
+            }
+            Self::Cold {
+                classical_seed,
+                pq_seed,
+                ..
+            } => {
+                classical_seed.zeroize();
+                pq_seed.zeroize();
+            }
+        }
     }
 }
 
-pub(crate) struct SigningMaterial {
-    pub public: IndraPublicKeyInfo,
-    classical_seed: [u8; CLASSICAL_SK_BYTES],
-    ml_dsa_seed: [u8; PQ_SK_BYTES],
+pub(crate) enum SigningMaterial {
+    Hot {
+        public: IndraPublicKeyInfo,
+        classical_seed: [u8; CLASSICAL_SK_BYTES],
+        ml_dsa_seed: [u8; PQ_SK_BYTES],
+    },
+    Cold {
+        classical_seed: [u8; CLASSICAL_SK_BYTES],
+        pq_seed: [u8; PQ_SK_BYTES],
+    },
 }
 
 impl SigningMaterial {
     pub(crate) fn keypair(&self) -> Result<HybridKeypair, IndraError> {
-        let classical = ClassicalKeypair::from_seed(&self.classical_seed);
-        let pq = PqKeypair::from_bytes(&self.public.pq_pk, &self.ml_dsa_seed)
+        let Self::Hot {
+            public,
+            classical_seed,
+            ml_dsa_seed,
+        } = self
+        else {
+            return Err(IndraError::WrongKeyRole);
+        };
+        let classical = ClassicalKeypair::from_seed(classical_seed);
+        let pq = PqKeypair::from_bytes(&public.pq_pk, ml_dsa_seed)
             .map_err(|_| IndraError::KeygenFailed)?;
         Ok(HybridKeypair::new(classical, pq))
     }
 
+    pub(crate) fn cold_keypair(&self) -> Result<ColdHybridKeypair, IndraError> {
+        let Self::Cold {
+            classical_seed,
+            pq_seed,
+            ..
+        } = self
+        else {
+            return Err(IndraError::WrongKeyRole);
+        };
+        ColdHybridKeypair::from_independent_seeds(*classical_seed, *pq_seed)
+            .map_err(|_| IndraError::KeygenFailed)
+    }
+
+    pub(crate) fn hot_public(&self) -> Result<IndraPublicKeyInfo, IndraError> {
+        match self {
+            Self::Hot { public, .. } => Ok(*public),
+            Self::Cold { .. } => Err(IndraError::WrongKeyRole),
+        }
+    }
+
     pub(crate) fn classical_seed(&self) -> [u8; CLASSICAL_SK_BYTES] {
-        self.classical_seed
+        match self {
+            Self::Hot { classical_seed, .. } => *classical_seed,
+            Self::Cold { classical_seed, .. } => *classical_seed,
+        }
     }
 
     pub(crate) fn ml_dsa_seed(&self) -> [u8; PQ_SK_BYTES] {
-        self.ml_dsa_seed
+        match self {
+            Self::Hot { ml_dsa_seed, .. } => *ml_dsa_seed,
+            Self::Cold { pq_seed, .. } => *pq_seed,
+        }
     }
 }
 
 impl Drop for SigningMaterial {
     fn drop(&mut self) {
-        self.classical_seed.zeroize();
-        self.ml_dsa_seed.zeroize();
+        match self {
+            Self::Hot {
+                classical_seed,
+                ml_dsa_seed,
+                ..
+            } => {
+                classical_seed.zeroize();
+                ml_dsa_seed.zeroize();
+            }
+            Self::Cold {
+                classical_seed,
+                pq_seed,
+                ..
+            } => {
+                classical_seed.zeroize();
+                pq_seed.zeroize();
+            }
+        }
     }
 }
 
@@ -221,7 +346,30 @@ pub(crate) fn store_hot_keys(
     keys: &KeysFile,
 ) -> Result<(IndraKeyHandle, IndraPublicKeyInfo), IndraError> {
     let material = StoredKeyMaterial::from_hot_keys(keys)?;
-    let public = material.public;
+    let StoredKeyMaterial::Hot { public, .. } = &material else {
+        return Err(IndraError::WrongKeyRole);
+    };
+    let public = *public;
+    store_key_material(session, material).map(|handle| (handle, public))
+}
+
+pub(crate) fn store_cold_seeds(
+    session: IndraSessionHandle,
+    classical_seed: [u8; CLASSICAL_SK_BYTES],
+    pq_seed: [u8; PQ_SK_BYTES],
+) -> Result<(IndraKeyHandle, IndraColdPublicKeyInfo), IndraError> {
+    let material = StoredKeyMaterial::from_cold_seeds(classical_seed, pq_seed)?;
+    let StoredKeyMaterial::Cold { public, .. } = &material else {
+        return Err(IndraError::WrongKeyRole);
+    };
+    let public = *public;
+    store_key_material(session, material).map(|handle| (handle, public))
+}
+
+fn store_key_material(
+    session: IndraSessionHandle,
+    material: StoredKeyMaterial,
+) -> Result<IndraKeyHandle, IndraError> {
     let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
     let session_entry = guard
         .sessions
@@ -238,7 +386,7 @@ pub(crate) fn store_hot_keys(
                 }),
                 drained: Condvar::new(),
             }));
-            return Ok((handle, public));
+            return Ok(handle);
         }
     }
 }
@@ -273,16 +421,28 @@ pub(crate) fn public_info(
     if state.revoked {
         return Err(IndraError::HandleRevoked);
     }
-    state
-        .material
-        .as_ref()
-        .map(|material| material.public)
-        .ok_or(IndraError::HandleRevoked)
+    match state.material.as_ref().ok_or(IndraError::HandleRevoked)? {
+        StoredKeyMaterial::Hot { public, .. } => Ok(*public),
+        StoredKeyMaterial::Cold { .. } => Err(IndraError::WrongKeyRole),
+    }
 }
 
-pub(crate) fn acquire_signing_lease(
+pub(crate) fn cold_public_info(
     session: IndraSessionHandle,
     handle: IndraKeyHandle,
+) -> Result<IndraColdPublicKeyInfo, IndraError> {
+    let entry = key_entry(session, handle)?;
+    let state = entry.state.lock().map_err(|_| IndraError::Internal)?;
+    match state.material.as_ref().ok_or(IndraError::HandleRevoked)? {
+        StoredKeyMaterial::Cold { public, .. } => Ok(*public),
+        StoredKeyMaterial::Hot { .. } => Err(IndraError::WrongKeyRole),
+    }
+}
+
+fn acquire_role_signing_lease(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+    material_for_role: impl FnOnce(&StoredKeyMaterial) -> Result<SigningMaterial, IndraError>,
 ) -> Result<SigningLease, IndraError> {
     let entry = key_entry(session, handle)?;
     let material = {
@@ -290,11 +450,8 @@ pub(crate) fn acquire_signing_lease(
         if state.revoked {
             return Err(IndraError::HandleRevoked);
         }
-        let material = state
-            .material
-            .as_ref()
-            .ok_or(IndraError::HandleRevoked)?
-            .signing_material();
+        let material = state.material.as_ref().ok_or(IndraError::HandleRevoked)?;
+        let material = material_for_role(material)?;
         state.active_leases = state
             .active_leases
             .checked_add(1)
@@ -302,6 +459,20 @@ pub(crate) fn acquire_signing_lease(
         material
     };
     Ok(SigningLease { entry, material })
+}
+
+pub(crate) fn acquire_hot_signing_lease(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<SigningLease, IndraError> {
+    acquire_role_signing_lease(session, handle, StoredKeyMaterial::hot_signing_material)
+}
+
+pub(crate) fn acquire_cold_signing_lease(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<SigningLease, IndraError> {
+    acquire_role_signing_lease(session, handle, StoredKeyMaterial::cold_signing_material)
 }
 
 fn request_revocation(entry: &Arc<KeyEntry>) -> Result<(), IndraError> {

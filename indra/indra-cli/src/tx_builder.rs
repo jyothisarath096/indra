@@ -253,6 +253,102 @@ pub fn build_self_stake_op(
     )
 }
 
+/// Payload fields for an active-validator cold-authorized staking operation.
+pub enum ColdAuthorizedStakingAction {
+    /// Bond another validator-cold-owned UTXO.
+    SelfStake {
+        /// UTXO atomically consumed into self-stake.
+        deposit_utxo_id: Bytes32,
+        /// Complete registered hot validator identity.
+        validator_pubkey: HybridPubKey,
+    },
+    /// Claim the validator's own position rewards.
+    ClaimRewards {
+        /// Registered validator identity.
+        validator_id: Bytes32,
+        /// Complete registered hot validator identity.
+        validator_pubkey: HybridPubKey,
+    },
+    /// Stage a validator commission change.
+    SetCommission {
+        /// Registered validator identity.
+        validator_id: Bytes32,
+        /// New commission in basis points.
+        new_commission_bps: u32,
+    },
+    /// Set or clear a validator auto-delegation target.
+    SetAutoDelegate {
+        /// Registered validator identity.
+        validator_id: Bytes32,
+        /// Target validator, or zero to clear.
+        target_validator_id: Bytes32,
+    },
+}
+
+/// Build an active-validator staking operation authorized by its cold key.
+pub fn build_cold_authorized_staking_op(
+    action: ColdAuthorizedStakingAction,
+    cold_keypair: &ColdHybridKeypair,
+    cold_key_version: u64,
+    cold_nonce: u64,
+    chain_id: &str,
+) -> CliResult<BuiltStakingOp> {
+    let authorization = Some(ColdStakingAuthorization {
+        cold_key_version,
+        cold_nonce,
+    });
+    let body = match action {
+        ColdAuthorizedStakingAction::SelfStake {
+            deposit_utxo_id,
+            validator_pubkey,
+        } => StakingOpBody::SelfStake {
+            deposit_utxo_id,
+            validator_pubkey,
+            cold_authorization: authorization,
+        },
+        ColdAuthorizedStakingAction::ClaimRewards {
+            validator_id,
+            validator_pubkey,
+        } => StakingOpBody::ClaimRewards {
+            validator_id,
+            delegator_pubkey: validator_pubkey,
+            cold_authorization: authorization,
+        },
+        ColdAuthorizedStakingAction::SetCommission {
+            validator_id,
+            new_commission_bps,
+        } => StakingOpBody::SetCommission {
+            validator_id,
+            new_commission_bps,
+            cold_authorization: authorization,
+        },
+        ColdAuthorizedStakingAction::SetAutoDelegate {
+            validator_id,
+            target_validator_id,
+        } => StakingOpBody::SetAutoDelegate {
+            validator_id,
+            target_validator_id,
+            cold_authorization: authorization,
+        },
+    };
+    let mut op = StakingOp {
+        body,
+        nonce: 0,
+        signature: dummy_signature()?,
+    };
+    op.validate_structure()
+        .map_err(|error| CliError::Transaction(error.to_string()))?;
+    let message = op
+        .cold_authorization_signing_bytes(chain_id)
+        .map_err(|error| CliError::Transaction(error.to_string()))?
+        .ok_or_else(|| CliError::Transaction("missing cold authorization message".into()))?;
+    let signature = cold_keypair
+        .sign(&message)
+        .map_err(|error| CliError::Crypto(error.to_string()))?;
+    op.signature = wire_hybrid_signature(&signature)?;
+    encode_built_staking_op(op)
+}
+
 /// Build and sign a validator registration staking operation.
 pub fn build_register_validator_op_with_cold(
     commission_bps: u32,
@@ -309,20 +405,6 @@ pub fn build_register_validator_op_with_cold(
         op_hex: hex::encode(&op_bytes),
         op_id: hex::encode(sha256(&op_bytes)),
     })
-}
-
-/// Registration without an independently persisted cold key is unsupported.
-pub fn build_register_validator_op(
-    _commission_bps: u32,
-    _deposit_utxo_id: Bytes32,
-    _keypair: &HybridKeypair,
-    _vrf_pk: [u8; 32],
-    _nonce: u64,
-    _chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    Err(CliError::Transaction(
-        "validator registration requires an independent cold keypair".into(),
-    ))
 }
 
 /// Build and sign a delegate staking operation.

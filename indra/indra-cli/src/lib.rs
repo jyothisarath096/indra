@@ -69,8 +69,8 @@ pub use legacy_scan_auth::{
 pub use query::{rpc_call, QueryResult};
 pub use staking::{
     build_claim_rewards_op, build_delegate_op, build_exit_stake_position_op,
-    build_register_validator_op, build_register_validator_op_with_cold, build_set_auto_delegate_op,
-    build_set_commission_op, build_update_network_address_op, fetch_chain_id, fetch_staking_nonce,
+    build_register_validator_op_with_cold, build_set_auto_delegate_op, build_set_commission_op,
+    build_update_network_address_op, fetch_chain_id, fetch_staking_nonce,
     fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op, StakePositionExitSigner,
 };
 pub use tx_builder::{build_transaction, BuiltStakingOp, BuiltTransaction, TxParams};

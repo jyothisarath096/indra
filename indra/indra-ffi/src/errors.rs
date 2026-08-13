@@ -34,6 +34,8 @@ pub enum IndraError {
     HandleRevoked = -15,
     /// Unknown or already-destroyed result capability.
     InvalidResult = -16,
+    /// A key capability has the wrong hot/cold authorization role.
+    WrongKeyRole = -17,
     /// Internal error.
     Internal = -99,
 }
@@ -79,6 +81,7 @@ pub const fn error_string(error_code: i32) -> &'static [u8] {
         -14 => b"invalid session handle\0",
         -15 => b"key handle revoked\0",
         -16 => b"invalid result handle\0",
+        -17 => b"wrong key handle role\0",
         _ => b"internal error\0",
     }
 }

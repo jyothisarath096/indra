@@ -87,6 +87,23 @@ pub struct IndraPublicKeyInfo {
     pub vrf_pk: [u8; INDRA_VRF_PK_BYTES],
 }
 
+/// Public metadata for an independently-derived validator cold key.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IndraColdPublicKeyInfo {
+    pub classical_pk: [u8; CLASSICAL_PK_BYTES],
+    pub pq_pk: [u8; PQ_PK_BYTES],
+}
+
+impl IndraColdPublicKeyInfo {
+    pub const fn zeroed() -> Self {
+        Self {
+            classical_pk: [0; CLASSICAL_PK_BYTES],
+            pq_pk: [0; PQ_PK_BYTES],
+        }
+    }
+}
+
 impl IndraPublicKeyInfo {
     /// Zero-initialised value for tests and error paths.
     pub const fn zeroed() -> Self {
@@ -215,6 +232,44 @@ pub unsafe extern "C" fn indra_keygen_handle(
     }
 }
 
+/// Import an independently-derived validator cold key into a session.
+///
+/// Both seed inputs remain caller-owned and must each reference exactly 32
+/// readable bytes. Rust zeroizes its copies on every return path.
+#[no_mangle]
+pub unsafe extern "C" fn indra_cold_key_handle_from_seeds(
+    session: IndraSessionHandle,
+    classical_seed: *const u8,
+    pq_seed: *const u8,
+    out_handle: *mut IndraKeyHandle,
+    out_public: *mut IndraColdPublicKeyInfo,
+) -> i32 {
+    if classical_seed.is_null() || pq_seed.is_null() || out_handle.is_null() || out_public.is_null()
+    {
+        return IndraError::NullPointer.code();
+    }
+    *out_handle = INDRA_KEY_HANDLE_INVALID;
+    *out_public = IndraColdPublicKeyInfo::zeroed();
+    match catch_unwind(|| {
+        let mut classical = Zeroizing::new([0; CLASSICAL_SK_BYTES]);
+        let mut pq = Zeroizing::new([0; PQ_SK_BYTES]);
+        classical.copy_from_slice(std::slice::from_raw_parts(
+            classical_seed,
+            CLASSICAL_SK_BYTES,
+        ));
+        pq.copy_from_slice(std::slice::from_raw_parts(pq_seed, PQ_SK_BYTES));
+        handles::store_cold_seeds(session, *classical, *pq)
+    }) {
+        Ok(Ok((handle, public))) => {
+            *out_handle = handle;
+            *out_public = public;
+            IndraError::Ok.code()
+        }
+        Ok(Err(error)) => error.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
 /// Generate a new random 24-word BIP-39 mnemonic phrase.
 ///
 /// # Safety
@@ -304,6 +359,26 @@ pub unsafe extern "C" fn indra_key_handle_public(
             IndraError::Ok.code()
         }
         Ok(Err(err)) => err.code(),
+        Err(_) => IndraError::Internal.code(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indra_cold_key_handle_public(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+    out_public: *mut IndraColdPublicKeyInfo,
+) -> i32 {
+    if out_public.is_null() {
+        return IndraError::NullPointer.code();
+    }
+    *out_public = IndraColdPublicKeyInfo::zeroed();
+    match catch_unwind(|| handles::cold_public_info(session, handle)) {
+        Ok(Ok(public)) => {
+            *out_public = public;
+            IndraError::Ok.code()
+        }
+        Ok(Err(error)) => error.code(),
         Err(_) => IndraError::Internal.code(),
     }
 }
@@ -442,13 +517,13 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
         } else {
             std::slice::from_raw_parts(params_ref.utxos, params_ref.utxo_count)
         };
-        let lease = handles::acquire_signing_lease(session, params_ref.sender_handle)?;
+        let lease = handles::acquire_hot_signing_lease(session, params_ref.sender_handle)?;
         lease.checkpoint()?;
         let sender_classical_seed = Zeroizing::new(lease.material().classical_seed());
         let sender_ml_dsa_seed = Zeroizing::new(lease.material().ml_dsa_seed());
         let wallet_context = wallet::build_wallet_context(
             *sender_classical_seed,
-            &lease.material().public.pq_pk,
+            &lease.material().hot_public()?.pq_pk,
             utxos,
         )?;
         let built = tx::build_with_address(
@@ -594,10 +669,13 @@ mod handle_tests {
     use indra_core::{
         codec::Decode,
         types::{
+            crypto::HybridPubKey,
             governance::{GovernanceOpV2, GovernancePayload},
-            primitives::DEFAULT_CHAIN_ID,
+            primitives::{
+                Bytes32, VariableBytes, DEFAULT_CHAIN_ID, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            },
             staking::{StakingOp, StakingOpBody},
-            transaction::TransactionV1,
+            transaction::{OutputV1, TransactionV1},
         },
     };
     use indra_crypto::{mnemonic_to_seed, ClassicalKeypair, HybridKeypair, PqKeypair};
@@ -637,6 +715,28 @@ mod handle_tests {
         (handle, public)
     }
 
+    fn cold_handle_from_seeds(
+        session: IndraSessionHandle,
+        classical_seed: [u8; 32],
+        pq_seed: [u8; 32],
+    ) -> (IndraKeyHandle, IndraColdPublicKeyInfo) {
+        let mut handle = INDRA_KEY_HANDLE_INVALID;
+        let mut public = IndraColdPublicKeyInfo::zeroed();
+        assert_eq!(
+            unsafe {
+                indra_cold_key_handle_from_seeds(
+                    session,
+                    classical_seed.as_ptr(),
+                    pq_seed.as_ptr(),
+                    &mut handle,
+                    &mut public,
+                )
+            },
+            OK
+        );
+        (handle, public)
+    }
+
     fn direct_keypair_from_master_seed(seed: [u8; 32]) -> HybridKeypair {
         let keys = keygen::generate_keys(seed).unwrap();
         HybridKeypair::new(
@@ -665,6 +765,20 @@ mod handle_tests {
     unsafe fn decode_governance(out: &[c_char]) -> GovernanceOpV2 {
         let hex = CStr::from_ptr(out.as_ptr()).to_str().unwrap();
         GovernanceOpV2::decode_exact(&hex::decode(hex).unwrap()).unwrap()
+    }
+
+    fn hot_wire_public(public: &IndraPublicKeyInfo) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical_pk),
+            pq_pk: VariableBytes::from_slice(&public.pq_pk).unwrap(),
+        }
+    }
+
+    fn cold_wire_public(public: &IndraColdPublicKeyInfo) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from(public.classical_pk),
+            pq_pk: VariableBytes::from_slice(&public.pq_pk).unwrap(),
+        }
     }
 
     unsafe fn decode_tx_result(
@@ -733,6 +847,32 @@ mod handle_tests {
         assert_eq!(fetched.classical_pk, public.classical_pk);
         assert_eq!(fetched.pq_pk, public.pq_pk);
         assert_eq!(fetched.vrf_pk, public.vrf_pk);
+    }
+
+    #[test]
+    fn hot_and_cold_handle_roles_fail_closed_when_substituted() {
+        let _guard = test_lock();
+        let session = create_session();
+        let (hot, _) = handle_from_seed(session, [0x25; 32]);
+        let (cold, _) = cold_handle_from_seeds(session, [0x26; 32], [0x27; 32]);
+        assert!(matches!(
+            handles::acquire_cold_signing_lease(session, hot),
+            Err(IndraError::WrongKeyRole)
+        ));
+        assert!(matches!(
+            handles::acquire_hot_signing_lease(session, cold),
+            Err(IndraError::WrongKeyRole)
+        ));
+        let mut hot_public = IndraPublicKeyInfo::zeroed();
+        let mut cold_public = IndraColdPublicKeyInfo::zeroed();
+        assert_eq!(
+            unsafe { indra_key_handle_public(session, cold, &mut hot_public) },
+            IndraError::WrongKeyRole.code()
+        );
+        assert_eq!(
+            unsafe { indra_cold_key_handle_public(session, hot, &mut cold_public) },
+            IndraError::WrongKeyRole.code()
+        );
     }
 
     #[test]
@@ -842,7 +982,8 @@ mod handle_tests {
         let session = create_session();
         let (sender_handle, _sender_public) = handle_from_seed(session, [0x76; 32]);
         let (recipient_handle, _) = handle_from_seed(session, [0x77; 32]);
-        let recipient_lease = handles::acquire_signing_lease(session, recipient_handle).unwrap();
+        let recipient_lease =
+            handles::acquire_hot_signing_lease(session, recipient_handle).unwrap();
         let recipient_keypair = recipient_lease.material().keypair().unwrap();
         let recipient_address = indra_crypto::PaymentAddressV1::new(
             DEFAULT_CHAIN_ID.as_bytes(),
@@ -920,8 +1061,9 @@ mod handle_tests {
         let chain = CString::new("indra-testnet-1").unwrap();
         let mut out = out();
         let code = unsafe {
-            crate::staking::indra_build_claim_rewards_with_handle(
+            crate::staking::indra_build_delegator_claim_rewards_with_handle(
                 session,
+                public.validator_id.as_ptr(),
                 handle,
                 7,
                 chain.as_ptr(),
@@ -951,10 +1093,252 @@ mod handle_tests {
     }
 
     #[test]
+    fn ffi_registration_and_active_validator_staking_builders_apply_to_consensus_state() {
+        let _guard = test_lock();
+        let session = create_session();
+        let (hot, hot_public) = handle_from_seed(session, [0x81; 32]);
+        let (cold, cold_public) = cold_handle_from_seeds(session, [0x82; 32], [0x83; 32]);
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let mut state = indra_state::ChainState::new_genesis();
+        let deposit_id = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                    owner_pubkey: cold_wire_public(&cold_public),
+                    lock_height: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let mut output = out();
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_register_validator_with_handle(
+                    session,
+                    1_000,
+                    deposit_id.0.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        let registration = unsafe { decode_staking(&output) };
+        indra_state::delegation::apply_staking_op(&mut state, &registration, DEFAULT_CHAIN_ID, 1)
+            .unwrap();
+        let validator_id = Bytes32::from(hot_public.validator_id);
+        state.validators.get_mut(&validator_id).unwrap().status =
+            indra_state::validator::ValidatorStatus::Active;
+
+        let self_stake_id = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                    owner_pubkey: cold_wire_public(&cold_public),
+                    lock_height: 0,
+                },
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_self_stake_with_handle(
+                    session,
+                    self_stake_id.0.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    1,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            2,
+        )
+        .unwrap();
+
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_set_commission_with_handle(
+                    session,
+                    1_100,
+                    hot,
+                    cold,
+                    1,
+                    2,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            3,
+        )
+        .unwrap();
+
+        output.fill(0);
+        let clear_target = [0; 32];
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_set_auto_delegate_with_handle(
+                    session,
+                    clear_target.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    3,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            4,
+        )
+        .unwrap();
+
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_validator_claim_rewards_with_handle(
+                    session,
+                    hot,
+                    cold,
+                    1,
+                    4,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            5,
+        )
+        .unwrap();
+
+        let (delegator, delegator_public) = handle_from_seed(session, [0x84; 32]);
+        let delegator_pubkey = hot_wire_public(&delegator_public);
+        let delegation_id = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: 1_000_000,
+                    owner_pubkey: delegator_pubkey.clone(),
+                    lock_height: 0,
+                },
+                5,
+                0,
+                0,
+            )
+            .unwrap();
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_delegate_with_handle(
+                    session,
+                    validator_id.0.as_ptr(),
+                    delegation_id.0.as_ptr(),
+                    delegator,
+                    1,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            6,
+        )
+        .unwrap();
+        let delegator_id = delegator_pubkey.identity_id();
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            delegator_id,
+            indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                delegator_id,
+            },
+        );
+        let mut position = state.stake_positions.get(&position_id).unwrap().clone();
+        position.pending_rewards_spark = 100_000;
+        state.stake_positions.insert(position_id, position);
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_delegator_claim_rewards_with_handle(
+                    session,
+                    validator_id.0.as_ptr(),
+                    delegator,
+                    2,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 4);
+        assert_eq!(hot_wire_public(&hot_public).identity_id(), validator_id);
+    }
+
+    #[test]
     fn governance_handle_signature_is_byte_identical_to_direct_signing() {
         let _guard = test_lock();
         let session = create_session();
-        let (handle, public) = handle_from_seed(session, [0x55; 32]);
+        let (hot_handle, public) = handle_from_seed(session, [0x55; 32]);
+        let (cold_handle, _) = cold_handle_from_seeds(session, [0x56; 32], [0x57; 32]);
         let chain = CString::new("indra-testnet-1").unwrap();
         let proposal_id = [0x99; 32];
         let mut out = out();
@@ -962,7 +1346,9 @@ mod handle_tests {
             crate::governance::indra_build_governance_cancel_with_handle(
                 session,
                 proposal_id.as_ptr(),
-                handle,
+                hot_handle,
+                cold_handle,
+                1,
                 9,
                 chain.as_ptr(),
                 chain.as_bytes().len(),
@@ -972,20 +1358,228 @@ mod handle_tests {
         };
         assert_eq!(code, OK);
         let op = unsafe { decode_governance(&out) };
-        let domain = indra_core::types::governance::governance_signing_domain(
-            op.action_type,
-            op.signer_id,
-            op.nonce,
-            &op.payload,
-            "indra-testnet-1",
-        );
-        let direct = direct_keypair_from_master_seed([0x55; 32])
-            .sign(&indra_crypto::sha256(&domain))
+        let message = op
+            .cold_authorization_signing_bytes("indra-testnet-1")
+            .unwrap()
             .unwrap();
+        let direct =
+            indra_crypto::ColdHybridKeypair::from_independent_seeds([0x56; 32], [0x57; 32])
+                .unwrap()
+                .sign(&message)
+                .unwrap();
         assert_wire_signature_matches_direct(&op.signature, &direct);
         assert_eq!(op.signer_id.0, public.validator_id);
-        assert_eq!(op.nonce, 9);
+        assert_eq!(op.nonce, 0);
         assert!(matches!(op.payload, GovernancePayload::Cancel { .. }));
+    }
+
+    #[test]
+    fn ffi_cold_governance_builders_apply_to_consensus_state() {
+        use indra_core::types::governance::{compute_proposal_id, GovernableAction};
+        use indra_state::governance::{GovernanceSnapshot, ProposalPhase};
+
+        let _guard = test_lock();
+        let session = create_session();
+        let (hot, hot_public) = handle_from_seed(session, [0x91; 32]);
+        let (cold, cold_public) = cold_handle_from_seeds(session, [0x92; 32], [0x93; 32]);
+        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let mut state = indra_state::ChainState::new_genesis();
+        let registration_deposit = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                    owner_pubkey: cold_wire_public(&cold_public),
+                    lock_height: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let mut output = out();
+        assert_eq!(
+            unsafe {
+                crate::staking::indra_build_register_validator_with_handle(
+                    session,
+                    1_000,
+                    registration_deposit.0.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::delegation::apply_staking_op(
+            &mut state,
+            &unsafe { decode_staking(&output) },
+            DEFAULT_CHAIN_ID,
+            1,
+        )
+        .unwrap();
+        let validator_id = Bytes32::from(hot_public.validator_id);
+        state.validators.get_mut(&validator_id).unwrap().status =
+            indra_state::validator::ValidatorStatus::Active;
+
+        let proposal_deposit = state.governance.params.proposal_deposit_spark;
+        let deposit_id = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: proposal_deposit,
+                    owner_pubkey: cold_wire_public(&cold_public),
+                    lock_height: 0,
+                },
+                1,
+                1,
+                0,
+            )
+            .unwrap();
+        let title = CString::new("FFI proposal").unwrap();
+        let description = CString::new("consensus application proof").unwrap();
+        let action = GovernableAction::SetMinDelegationSpark { value: 200_000 };
+        let action_json =
+            CString::new(r#"{"type":"SetMinDelegationSpark","value":200000}"#).unwrap();
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_propose_with_handle(
+                    session,
+                    title.as_ptr(),
+                    title.as_bytes().len(),
+                    description.as_ptr(),
+                    description.as_bytes().len(),
+                    action_json.as_ptr(),
+                    action_json.as_bytes().len(),
+                    deposit_id.0.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    1,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        let propose = unsafe { decode_governance(&output) };
+        indra_state::governance_apply::apply_governance_op(
+            &mut state,
+            &propose,
+            0,
+            2,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        let proposal_id = compute_proposal_id(validator_id, &action, 0, DEFAULT_CHAIN_ID);
+
+        let mut cancel_state = state.clone();
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_cancel_with_handle(
+                    session,
+                    proposal_id.0.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    2,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::governance_apply::apply_governance_op(
+            &mut cancel_state,
+            &unsafe { decode_governance(&output) },
+            0,
+            3,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+
+        let proposal = state.governance.proposals.get_mut(&proposal_id).unwrap();
+        proposal.phase = ProposalPhase::Commit;
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights: [(validator_id, MINIMUM_VALIDATOR_SELF_STAKE_SPARK)].into(),
+            total_stake: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+        });
+        let reveal_nonce = [0xA5; 32];
+        let mut commitment = [0; 32];
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_commit_with_handle(
+                    session,
+                    proposal_id.0.as_ptr(),
+                    1,
+                    reveal_nonce.as_ptr(),
+                    commitment.as_mut_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    2,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::governance_apply::apply_governance_op(
+            &mut state,
+            &unsafe { decode_governance(&output) },
+            1,
+            3,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .phase = ProposalPhase::Reveal;
+        output.fill(0);
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_reveal_with_handle(
+                    session,
+                    proposal_id.0.as_ptr(),
+                    1,
+                    reveal_nonce.as_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    3,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            OK
+        );
+        indra_state::governance_apply::apply_governance_op(
+            &mut state,
+            &unsafe { decode_governance(&output) },
+            2,
+            4,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 3);
     }
 
     #[test]
@@ -1019,10 +1613,12 @@ mod handle_tests {
             unsafe { indra_build_tx_with_handle(session, &tx_params, &mut result, &mut metadata) },
             INVALID_HANDLE
         );
+        let id = [0x02; 32];
         assert_eq!(
             unsafe {
-                crate::staking::indra_build_claim_rewards_with_handle(
+                crate::staking::indra_build_delegator_claim_rewards_with_handle(
                     session,
+                    id.as_ptr(),
                     INDRA_KEY_HANDLE_INVALID,
                     1,
                     chain.as_ptr(),
@@ -1033,7 +1629,6 @@ mod handle_tests {
             },
             INVALID_HANDLE
         );
-        let id = [0x02; 32];
         macro_rules! assert_invalid {
             ($call:expr) => {{
                 out_hex.fill(0x5A as c_char);
@@ -1046,6 +1641,7 @@ mod handle_tests {
             100,
             id.as_ptr(),
             INDRA_KEY_HANDLE_INVALID,
+            INDRA_KEY_HANDLE_INVALID,
             1,
             chain.as_ptr(),
             chain.as_bytes().len(),
@@ -1056,6 +1652,8 @@ mod handle_tests {
             session,
             id.as_ptr(),
             INDRA_KEY_HANDLE_INVALID,
+            INDRA_KEY_HANDLE_INVALID,
+            1,
             1,
             chain.as_ptr(),
             chain.as_bytes().len(),
@@ -1077,6 +1675,8 @@ mod handle_tests {
             session,
             100,
             INDRA_KEY_HANDLE_INVALID,
+            INDRA_KEY_HANDLE_INVALID,
+            1,
             1,
             chain.as_ptr(),
             chain.as_bytes().len(),
@@ -1087,6 +1687,8 @@ mod handle_tests {
             session,
             id.as_ptr(),
             INDRA_KEY_HANDLE_INVALID,
+            INDRA_KEY_HANDLE_INVALID,
+            1,
             1,
             chain.as_ptr(),
             chain.as_bytes().len(),
@@ -1110,6 +1712,8 @@ mod handle_tests {
                 action.as_bytes().len(),
                 id.as_ptr(),
                 INDRA_KEY_HANDLE_INVALID,
+                INDRA_KEY_HANDLE_INVALID,
+                1,
                 1,
                 chain.as_ptr(),
                 chain.as_bytes().len(),
@@ -1125,6 +1729,8 @@ mod handle_tests {
                 nonce.as_ptr(),
                 commitment.as_mut_ptr(),
                 INDRA_KEY_HANDLE_INVALID,
+                INDRA_KEY_HANDLE_INVALID,
+                1,
                 1,
                 chain.as_ptr(),
                 chain.as_bytes().len(),
@@ -1139,6 +1745,8 @@ mod handle_tests {
                 1,
                 nonce.as_ptr(),
                 INDRA_KEY_HANDLE_INVALID,
+                INDRA_KEY_HANDLE_INVALID,
+                1,
                 1,
                 chain.as_ptr(),
                 chain.as_bytes().len(),
@@ -1179,6 +1787,8 @@ mod handle_tests {
                     session,
                     id.as_ptr(),
                     INDRA_KEY_HANDLE_INVALID,
+                    INDRA_KEY_HANDLE_INVALID,
+                    1,
                     1,
                     chain.as_ptr(),
                     chain.as_bytes().len(),
@@ -1219,8 +1829,9 @@ mod handle_tests {
                 let chain = CString::new("indra-testnet-1").unwrap();
                 let mut out = out();
                 let code = unsafe {
-                    crate::staking::indra_build_claim_rewards_with_handle(
+                    crate::staking::indra_build_delegator_claim_rewards_with_handle(
                         session,
+                        public.validator_id.as_ptr(),
                         handle,
                         u64::from(i) + 1,
                         chain.as_ptr(),
@@ -1255,8 +1866,9 @@ mod handle_tests {
                 let chain = CString::new("indra-testnet-1").unwrap();
                 let mut output = out();
                 let code = unsafe {
-                    crate::staking::indra_build_claim_rewards_with_handle(
+                    crate::staking::indra_build_delegator_claim_rewards_with_handle(
                         session,
+                        public.validator_id.as_ptr(),
                         handle,
                         nonce,
                         chain.as_ptr(),
@@ -1281,7 +1893,7 @@ mod handle_tests {
         use std::sync::{mpsc, Arc, Barrier};
         let _guard = test_lock();
         let session = create_session();
-        let (handle, _) = handle_from_seed(session, [0x72; 32]);
+        let (handle, public) = handle_from_seed(session, [0x72; 32]);
         let reached = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let revoked = Arc::new(Barrier::new(2));
@@ -1292,8 +1904,9 @@ mod handle_tests {
             let chain = CString::new("indra-testnet-1").unwrap();
             let mut output = vec![0x5A as c_char; INDRA_OP_HEX_MAX_BYTES];
             let code = unsafe {
-                crate::staking::indra_build_claim_rewards_with_handle(
+                crate::staking::indra_build_delegator_claim_rewards_with_handle(
                     session,
+                    public.validator_id.as_ptr(),
                     handle,
                     1,
                     chain.as_ptr(),
@@ -1331,8 +1944,8 @@ mod handle_tests {
         let session = create_session();
         let (first_handle, _) = handle_from_seed(session, [0x7A; 32]);
         let (second_handle, _) = handle_from_seed(session, [0x7B; 32]);
-        let first_lease = handles::acquire_signing_lease(session, first_handle).unwrap();
-        let second_lease = handles::acquire_signing_lease(session, second_handle).unwrap();
+        let first_lease = handles::acquire_hot_signing_lease(session, first_handle).unwrap();
+        let second_lease = handles::acquire_hot_signing_lease(session, second_handle).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         let teardown = thread::spawn(move || {
             done_tx.send(indra_destroy_session(session)).unwrap();
@@ -1527,22 +2140,25 @@ _Static_assert(
 CHECK(indra_create_session, int32_t (*)(IndraSessionHandle*));
 CHECK(indra_destroy_session, int32_t (*)(IndraSessionHandle));
 CHECK(indra_keygen_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle*, IndraPublicKeyInfo*));
+CHECK(indra_cold_key_handle_from_seeds, int32_t (*)(IndraSessionHandle, const uint8_t*, const uint8_t*, IndraKeyHandle*, IndraColdPublicKeyInfo*));
 CHECK(indra_keygen_from_mnemonic_handle, int32_t (*)(IndraSessionHandle, const char*, size_t, IndraKeyHandle*, IndraPublicKeyInfo*));
 CHECK(indra_key_handle_public, int32_t (*)(IndraSessionHandle, IndraKeyHandle, IndraPublicKeyInfo*));
+CHECK(indra_cold_key_handle_public, int32_t (*)(IndraSessionHandle, IndraKeyHandle, IndraColdPublicKeyInfo*));
 CHECK(indra_destroy_key_handle, int32_t (*)(IndraSessionHandle, IndraKeyHandle));
 CHECK(indra_build_tx_with_handle, int32_t (*)(IndraSessionHandle, const IndraTxParams*, IndraResultHandle*, IndraTxResultMetadata*));
-CHECK(indra_build_register_validator_with_handle, int32_t (*)(IndraSessionHandle, uint32_t, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_self_stake_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_delegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_claim_rewards_with_handle, int32_t (*)(IndraSessionHandle, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_set_commission_with_handle, int32_t (*)(IndraSessionHandle, uint32_t, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_set_auto_delegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_governance_propose_with_handle, int32_t (*)(IndraSessionHandle, const char*, size_t, const char*, size_t, const char*, size_t, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_governance_commit_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_governance_reveal_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_register_validator_with_handle, int32_t (*)(IndraSessionHandle, uint32_t, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_self_stake_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_delegator_claim_rewards_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_validator_claim_rewards_with_handle, int32_t (*)(IndraSessionHandle, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_set_commission_with_handle, int32_t (*)(IndraSessionHandle, uint32_t, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_set_auto_delegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_governance_propose_with_handle, int32_t (*)(IndraSessionHandle, const char*, size_t, const char*, size_t, const char*, size_t, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_governance_commit_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_governance_reveal_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_redelegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, const uint8_t*, const uint8_t*, uint64_t, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_execute_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_governance_cancel_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_governance_cancel_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_compute_vote_commitment, int32_t (*)(const uint8_t*, const uint8_t*, uint8_t, const uint8_t*, uint8_t*));
 CHECK(indra_result_copy_tx_bytes, int32_t (*)(IndraSessionHandle, IndraResultHandle, uint8_t*, size_t));
 CHECK(indra_result_copy_spent_indices, int32_t (*)(IndraSessionHandle, IndraResultHandle, size_t*, size_t));
 CHECK(indra_destroy_result, int32_t (*)(IndraSessionHandle, IndraResultHandle));
@@ -1555,6 +2171,8 @@ int main(void) {
     sizeof(IndraPublicKeyInfo), _Alignof(IndraPublicKeyInfo),
     offsetof(IndraPublicKeyInfo, validator_id), offsetof(IndraPublicKeyInfo, classical_pk),
     offsetof(IndraPublicKeyInfo, pq_pk), offsetof(IndraPublicKeyInfo, vrf_pk));
+  printf("%zu %zu %zu %zu ", sizeof(IndraColdPublicKeyInfo), _Alignof(IndraColdPublicKeyInfo),
+    offsetof(IndraColdPublicKeyInfo, classical_pk), offsetof(IndraColdPublicKeyInfo, pq_pk));
   printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu ",
     sizeof(IndraUtxoEntry), _Alignof(IndraUtxoEntry),
     offsetof(IndraUtxoEntry, utxo_id), offsetof(IndraUtxoEntry, value_spark),
@@ -1610,6 +2228,10 @@ int main(void) {
             std::mem::offset_of!(IndraPublicKeyInfo, classical_pk),
             std::mem::offset_of!(IndraPublicKeyInfo, pq_pk),
             std::mem::offset_of!(IndraPublicKeyInfo, vrf_pk),
+            std::mem::size_of::<IndraColdPublicKeyInfo>(),
+            std::mem::align_of::<IndraColdPublicKeyInfo>(),
+            std::mem::offset_of!(IndraColdPublicKeyInfo, classical_pk),
+            std::mem::offset_of!(IndraColdPublicKeyInfo, pq_pk),
             std::mem::size_of::<IndraUtxoEntry>(),
             std::mem::align_of::<IndraUtxoEntry>(),
             std::mem::offset_of!(IndraUtxoEntry, utxo_id),

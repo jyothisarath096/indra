@@ -426,6 +426,14 @@ key and result handles as 16-byte opaque values, and replace direct Rust-buffer
 freeing with the result copy/destroy API. No legacy sequential-handle or raw
 result-buffer entry points remain.
 
+Validator consumers import the independently-derived cold Ed25519 and
+ML-DSA-87 seeds with `indra_cold_key_handle_from_seeds`. Registration accepts
+one hot and one cold capability; active-validator staking and discretionary
+governance builders require both capabilities plus the current cold-key version
+and next cold nonce. Delegator reward claims use the separately named ordinary
+hot-authorized API. Passing a hot capability in a cold slot, or vice versa,
+fails with `INDRA_ERR_WRONG_KEY_ROLE`; there is no hot fallback.
+
 ---
 
 ## Security
