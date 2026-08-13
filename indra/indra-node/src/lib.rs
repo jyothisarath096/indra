@@ -40,6 +40,7 @@ pub mod hardened_read_rpc;
 pub mod metrics;
 pub mod net_driver;
 mod pending_dependencies;
+pub mod qc_verification;
 pub mod recovery;
 pub mod rpc_snapshot;
 pub mod slash;

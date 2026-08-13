@@ -23,7 +23,7 @@ use indra_consensus::{
     qc::{verify_qc, QcValidator},
     vote::{produce_vote_with_election_result, RegisteredVoter},
 };
-use indra_core::codec::{ByteReader, Decode};
+use indra_core::codec::Decode;
 use indra_core::types::{
     block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
     crypto::HybridPubKey,
@@ -81,6 +81,7 @@ use crate::{
     pending_dependencies::{
         governance_footprint, slash_footprint, staking_footprint, DependencyIndex, DependencyKey,
     },
+    qc_verification::NetworkQcVerifier,
     sync::{
         commit_prepared_with_durable_hook, project_and_verify_block_state_root,
         verify_sync_candidate, PreparedSyncBlock,
@@ -117,6 +118,8 @@ pub struct NodeEngine {
     pub epoch_store: EpochStore,
     /// State snapshot store.
     pub state_store: StateStore,
+    /// Dedicated bounded verifier used only for peer-sourced QC candidates.
+    pub(crate) network_qc_verifier: NetworkQcVerifier,
     /// The validator's hybrid keypair (if this is a validator node).
     hybrid_keypair: Option<HybridKeypair>,
     /// The validator's VRF keypair.
@@ -608,6 +611,7 @@ impl NodeEngine {
             block_store,
             epoch_store,
             state_store,
+            network_qc_verifier: NetworkQcVerifier::new(),
             hybrid_keypair,
             vrf_keypair,
             validator_id,
@@ -622,6 +626,11 @@ impl NodeEngine {
     /// This node's validator ID, if it is a validator.
     pub fn validator_id(&self) -> Option<Bytes32> {
         self.validator_id
+    }
+
+    /// Bounded verifier for peer-sourced QC candidates.
+    pub fn network_qc_verifier(&self) -> &NetworkQcVerifier {
+        &self.network_qc_verifier
     }
 
     /// Load the last committed QC bytes persisted on disk, if any.
@@ -1529,6 +1538,20 @@ impl NodeEngine {
         verify_qc(qc, &validators, total_weight, &self.state.chain_id).map_err(NodeError::Consensus)
     }
 
+    /// Verify an attacker-controlled network QC through the bounded worker.
+    pub fn verify_network_qc_for_height(
+        &self,
+        qc: &indra_core::types::qc::QuorumCertificateV1,
+    ) -> NodeResult<()> {
+        let snapshot = self.state.snapshot_for_consensus_height(qc.height)?;
+        self.network_qc_verifier
+            .verify(qc, snapshot, &self.state.chain_id)
+            .map_err(|err| NodeError::BlockInvalid {
+                height: qc.height,
+                reason: format!("network QC verification failed: {err}"),
+            })
+    }
+
     /// Strictly verify a QC using one already-resolved immutable snapshot.
     pub(crate) fn verify_qc_with_snapshot(
         qc: &indra_core::types::qc::QuorumCertificateV1,
@@ -1600,8 +1623,7 @@ impl NodeEngine {
             .ok()
             .flatten()
             .and_then(|bytes| {
-                let mut reader = ByteReader::new(&bytes);
-                indra_core::types::qc::QuorumCertificateV1::decode(&mut reader)
+                indra_core::types::qc::QuorumCertificateV1::decode_exact(&bytes)
                     .ok()
                     .map(|qc| qc.height)
             })
@@ -1655,8 +1677,7 @@ impl NodeEngine {
             .ok()
             .flatten()
             .and_then(|bytes| {
-                let mut reader = ByteReader::new(&bytes);
-                indra_core::types::qc::QuorumCertificateV1::decode(&mut reader)
+                indra_core::types::qc::QuorumCertificateV1::decode_exact(&bytes)
                     .ok()
                     .map(|qc| qc.height)
             })

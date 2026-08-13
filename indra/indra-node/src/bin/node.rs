@@ -43,10 +43,7 @@ use indra_node::{
     genesis::load_genesis_seed_peers,
     metrics::{record_block_commit, DEFAULT_METRICS_ADDR},
     net_driver::{action_to_message, message_to_event},
-    sync::{
-        verify_direct_provisional_qc, verify_provisional_certificate, verify_sync_candidate,
-        PairVerificationError, SYNC_BATCH_SIZE,
-    },
+    sync::{PairVerificationError, SYNC_BATCH_SIZE},
     KeysData, MetricsState, NodeConfig, NodeConfigFile, NodeEngine, RpcLimiterTelemetry,
 };
 use indra_rpc::handlers::RpcEngineView;
@@ -2490,10 +2487,11 @@ fn main() {
                                     }
                                     let verified = {
                                         let d = driver.lock().unwrap();
-                                        verify_direct_provisional_qc(
+                                        indra_node::sync::verify_network_direct_provisional_qc(
                                             &pending.block,
                                             qc_bytes,
                                             &d.engine.state,
+                                            d.engine.network_qc_verifier(),
                                         )
                                     };
                                     match verified {
@@ -2846,10 +2844,11 @@ fn main() {
                                         }
 
                                         if let Some(pending) = d.sync().provisional().cloned() {
-                                            match verify_provisional_certificate(
+                                            match indra_node::sync::verify_network_provisional_certificate(
                                                 &pending.block,
                                                 &block,
                                                 &d.engine.state,
+                                                d.engine.network_qc_verifier(),
                                             ) {
                                                 Ok(()) => {
                                                     let finalized = d
@@ -2970,10 +2969,11 @@ fn main() {
                                             );
                                             break;
                                         }
-                                        match verify_sync_candidate(
+                                        match indra_node::sync::verify_network_sync_candidate(
                                             &block,
                                             &d.engine.state,
                                             unix_timestamp_secs(),
+                                            d.engine.network_qc_verifier(),
                                         ) {
                                             Ok(prepared) => {
                                                 let staged_height = block.header.height;

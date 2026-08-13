@@ -289,11 +289,10 @@ impl Decode for QuorumCertificateV1 {
         let height = u64::decode(r)?;
         let round = u32::decode(r)?;
         let block_hash = Bytes32::decode(r)?;
-        let election_result_hash = match u8::decode(r) {
-            Ok(0) => None,
-            Ok(1) => Some(Bytes32::decode(r)?),
-            Ok(byte) => return Err(IndraError::InvalidBool { byte }),
-            Err(_) => None,
+        let election_result_hash = match u8::decode(r)? {
+            0 => None,
+            1 => Some(Bytes32::decode(r)?),
+            byte => return Err(IndraError::InvalidBool { byte }),
         };
         let bf_bytes = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
@@ -367,6 +366,23 @@ mod tests {
         0xFFu8.encode(&mut buf);
         buf.extend_from_slice(&[0u8; 44]);
         assert!(QuorumCertificateV1::decode_exact(&buf).is_err());
+    }
+
+    #[test]
+    fn truncated_election_result_presence_flag_is_rejected() {
+        let mut bytes = Vec::new();
+        QC_FORMAT_HYBRID.encode(&mut bytes);
+        7u64.encode(&mut bytes);
+        2u32.encode(&mut bytes);
+        Bytes32::from([0x44; 32]).encode(&mut bytes);
+        assert!(QuorumCertificateV1::decode_exact(&bytes).is_err());
+    }
+
+    #[test]
+    fn trailing_qc_bytes_are_rejected() {
+        let mut encoded = dummy_qc().encode_to_vec();
+        encoded.push(0xA5);
+        assert!(QuorumCertificateV1::decode_exact(&encoded).is_err());
     }
 
     #[test]

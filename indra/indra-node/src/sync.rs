@@ -1124,6 +1124,23 @@ pub(crate) fn verify_reveal_set_evidence(
 }
 
 pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+    verify_block_qc_with(block, state, None)
+}
+
+/// Verify a peer-sourced embedded QC through the node's bounded worker.
+pub(crate) fn verify_network_block_qc(
+    block: &BlockV1,
+    state: &ChainState,
+    verifier: &crate::qc_verification::NetworkQcVerifier,
+) -> NodeResult<()> {
+    verify_block_qc_with(block, state, Some(verifier))
+}
+
+fn verify_block_qc_with(
+    block: &BlockV1,
+    state: &ChainState,
+    verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
+) -> NodeResult<()> {
     if block.header.height <= 1 {
         return Ok(());
     }
@@ -1139,8 +1156,7 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
         });
     }
 
-    let mut reader = indra_core::codec::ByteReader::new(qc_bytes);
-    let qc = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader).map_err(|e| {
+    let qc = indra_core::types::qc::QuorumCertificateV1::decode_exact(qc_bytes).map_err(|e| {
         NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!("invalid QC encoding: {e}"),
@@ -1168,7 +1184,7 @@ pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult
         });
     }
 
-    verify_sync_qc(&qc, state, block.header.height)
+    verify_sync_qc_with(&qc, state, block.header.height, verifier)
 }
 
 /// Fully validate a next-height candidate without publishing any state.
@@ -1184,6 +1200,20 @@ pub fn verify_sync_candidate(
     project_and_verify_block_state_root(block, state, timestamp_secs)
 }
 
+/// Fully validate a peer-sourced candidate using bounded QC verification.
+pub fn verify_network_sync_candidate(
+    block: &BlockV1,
+    state: &ChainState,
+    timestamp_secs: u64,
+    verifier: &crate::qc_verification::NetworkQcVerifier,
+) -> NodeResult<PreparedSyncBlock> {
+    verify_imported_block_proposer(block, state)?;
+    if block.header.height > 1 {
+        verify_network_block_qc(block, state, verifier)?;
+    }
+    project_and_verify_block_state_root(block, state, timestamp_secs)
+}
+
 /// Verify the certificate carried by H+1 against a provisional H and
 /// attribute a mismatch cryptographically rather than blaming H blindly.
 pub fn verify_provisional_certificate(
@@ -1191,9 +1221,29 @@ pub fn verify_provisional_certificate(
     carrier: &BlockV1,
     canonical_state: &ChainState,
 ) -> Result<(), PairVerificationError> {
-    let mut reader =
-        indra_core::codec::ByteReader::new(carrier.header.quorum_certificate.as_slice());
-    let qc = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader).map_err(|error| {
+    verify_provisional_certificate_with(provisional, carrier, canonical_state, None)
+}
+
+/// Verify a peer-sourced provisional carrier through bounded QC verification.
+pub fn verify_network_provisional_certificate(
+    provisional: &BlockV1,
+    carrier: &BlockV1,
+    canonical_state: &ChainState,
+    verifier: &crate::qc_verification::NetworkQcVerifier,
+) -> Result<(), PairVerificationError> {
+    verify_provisional_certificate_with(provisional, carrier, canonical_state, Some(verifier))
+}
+
+fn verify_provisional_certificate_with(
+    provisional: &BlockV1,
+    carrier: &BlockV1,
+    canonical_state: &ChainState,
+    verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
+) -> Result<(), PairVerificationError> {
+    let qc = indra_core::types::qc::QuorumCertificateV1::decode_exact(
+        carrier.header.quorum_certificate.as_slice(),
+    )
+    .map_err(|error| {
         PairVerificationError::CertificateCarrierWrong(NodeError::BlockInvalid {
             height: carrier.header.height,
             reason: format!("invalid QC encoding: {error}"),
@@ -1213,7 +1263,7 @@ pub fn verify_provisional_certificate(
     // Verify the certificate before comparing its hash. A valid quorum for a
     // different hash proves H was the wrong provisional branch; an invalid
     // quorum proves only that the later carrier is bad.
-    verify_sync_qc(&qc, canonical_state, carrier.header.height)
+    verify_sync_qc_with(&qc, canonical_state, carrier.header.height, verifier)
         .map_err(PairVerificationError::CertificateCarrierWrong)?;
     let provisional_hash = provisional.header.block_hash();
     if qc.block_hash != provisional_hash {
@@ -1238,33 +1288,72 @@ pub fn verify_direct_provisional_qc(
     qc_bytes: &[u8],
     canonical_state: &ChainState,
 ) -> NodeResult<()> {
-    let mut reader = indra_core::codec::ByteReader::new(qc_bytes);
-    let qc = indra_core::types::qc::QuorumCertificateV1::decode(&mut reader).map_err(|error| {
-        NodeError::BlockInvalid {
-            height: provisional.header.height,
-            reason: format!("invalid requested QC encoding: {error}"),
-        }
-    })?;
+    verify_direct_provisional_qc_with(provisional, qc_bytes, canonical_state, None)
+}
+
+/// Verify a directly requested peer QC through bounded QC verification.
+pub fn verify_network_direct_provisional_qc(
+    provisional: &BlockV1,
+    qc_bytes: &[u8],
+    canonical_state: &ChainState,
+    verifier: &crate::qc_verification::NetworkQcVerifier,
+) -> NodeResult<()> {
+    verify_direct_provisional_qc_with(provisional, qc_bytes, canonical_state, Some(verifier))
+}
+
+fn verify_direct_provisional_qc_with(
+    provisional: &BlockV1,
+    qc_bytes: &[u8],
+    canonical_state: &ChainState,
+    verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
+) -> NodeResult<()> {
+    let qc =
+        indra_core::types::qc::QuorumCertificateV1::decode_exact(qc_bytes).map_err(|error| {
+            NodeError::BlockInvalid {
+                height: provisional.header.height,
+                reason: format!("invalid requested QC encoding: {error}"),
+            }
+        })?;
     if qc.height != provisional.header.height || qc.block_hash != provisional.header.block_hash() {
         return Err(NodeError::BlockInvalid {
             height: provisional.header.height,
             reason: "requested QC does not certify the provisional block".to_string(),
         });
     }
-    verify_sync_qc(
+    verify_sync_qc_with(
         &qc,
         canonical_state,
         provisional.header.height.saturating_add(1),
+        verifier,
     )
 }
 
-fn verify_sync_qc(
+fn verify_sync_qc_with(
     qc: &indra_core::types::qc::QuorumCertificateV1,
     state: &ChainState,
     _importing_height: u64,
+    verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
 ) -> NodeResult<()> {
     let snapshot = state.snapshot_for_consensus_height(qc.height)?;
-    crate::engine::NodeEngine::verify_qc_with_snapshot(qc, snapshot, &state.chain_id)
+    if let Some(verifier) = verifier {
+        verifier
+            .verify(qc, snapshot, &state.chain_id)
+            .map_err(|err| NodeError::BlockInvalid {
+                height: qc.height,
+                reason: format!("network QC verification failed: {err}"),
+            })
+    } else {
+        crate::engine::NodeEngine::verify_qc_with_snapshot(qc, snapshot, &state.chain_id)
+    }
+}
+
+#[cfg(test)]
+fn verify_sync_qc(
+    qc: &indra_core::types::qc::QuorumCertificateV1,
+    state: &ChainState,
+    importing_height: u64,
+) -> NodeResult<()> {
+    verify_sync_qc_with(qc, state, importing_height, None)
 }
 
 /// Opaque detached result of authoritative sync-candidate validation.
@@ -2671,6 +2760,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "real-hardware 200-validator aggregate invalid-QC benchmark"]
+    fn aggregate_network_qc_budget_real_hardware_benchmark() {
+        const VALIDATORS: usize = 200;
+        const SIGNERS: usize = 134;
+        const BYZANTINE_SOURCES: usize = 67;
+
+        let mut state = ChainState::new_genesis();
+        let mut keypairs = Vec::with_capacity(VALIDATORS);
+        for seed in 1..=VALIDATORS {
+            let (_, keypair) =
+                install_active_validator(&mut state, u8::try_from(seed).unwrap(), 1, true, true);
+            keypairs.push(keypair);
+        }
+        install_test_snapshot_at_inert_gate(&mut state);
+        let snapshot = state.snapshot_for_consensus_height(u64::MAX).unwrap();
+        let signers: Vec<_> = keypairs.iter().take(SIGNERS).collect();
+        let valid = qc_from_test_signers(u64::MAX, Bytes32::from([0xD4; 32]), snapshot, &signers);
+        let invalid: Vec<_> = (0..BYZANTINE_SOURCES)
+            .map(|mutation| {
+                let mut qc = valid.clone();
+                qc.classical_signatures.last_mut().unwrap().classical_sig =
+                    VariableBytes::from_slice(&[u8::try_from(mutation + 1).unwrap(); 64]).unwrap();
+                qc
+            })
+            .collect();
+
+        let direct_started = Instant::now();
+        for qc in &invalid {
+            assert!(crate::engine::NodeEngine::verify_qc_with_snapshot(
+                qc,
+                snapshot,
+                &state.chain_id,
+            )
+            .is_err());
+        }
+        let direct_elapsed = direct_started.elapsed();
+
+        let verifier = crate::qc_verification::NetworkQcVerifier::new();
+        let governed_started = Instant::now();
+        for qc in &invalid {
+            assert!(verifier.verify(qc, snapshot, &state.chain_id).is_err());
+        }
+        let governed_elapsed = governed_started.elapsed();
+        let minimum_budgeted = crate::qc_verification::NETWORK_QC_MIN_START_INTERVAL
+            * u32::try_from(BYZANTINE_SOURCES - 1).unwrap();
+        assert!(governed_elapsed >= minimum_budgeted);
+        eprintln!(
+            "NETWORK_QC_AGGREGATE_BENCH validators={VALIDATORS} signers={SIGNERS} sources={BYZANTINE_SOURCES} direct_ms={:.3} governed_ms={:.3} direct_qc_per_sec={:.3} governed_qc_per_sec={:.3}",
+            direct_elapsed.as_secs_f64() * 1_000.0,
+            governed_elapsed.as_secs_f64() * 1_000.0,
+            BYZANTINE_SOURCES as f64 / direct_elapsed.as_secs_f64(),
+            BYZANTINE_SOURCES as f64 / governed_elapsed.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn follower_waits_for_first_peer_status() {
         let peer: SocketAddr = "127.0.0.1:30004".parse().unwrap();
         let mut sync = SyncState::follower(10);
@@ -2871,6 +3016,82 @@ mod tests {
         let block2 = make_strict_block(&state, 0x16, 0, qc_bytes);
 
         assert!(verify_block_qc(&block2, &state).is_ok());
+    }
+
+    #[test]
+    fn all_sync_qc_surfaces_reject_trailing_bytes() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x17, 10_000, true, true);
+        let block1 = make_strict_block(&state, 0x17, 0, vec![]);
+        let mut qc_bytes = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        qc_bytes.push(0xA5);
+
+        let mut after_block = state.clone();
+        apply_block(&mut after_block, &block1, 0).unwrap();
+        let carrier = make_strict_block(&after_block, 0x17, 0, qc_bytes.clone());
+
+        assert!(verify_block_qc(&carrier, &after_block).is_err());
+        assert!(matches!(
+            verify_provisional_certificate(&block1, &carrier, &state),
+            Err(PairVerificationError::CertificateCarrierWrong(_))
+        ));
+        assert!(verify_direct_provisional_qc(&block1, &qc_bytes, &state).is_err());
+        assert!(verify_sync_candidate(&carrier, &after_block, 0).is_err());
+    }
+
+    #[test]
+    fn bounded_network_qc_queue_returns_every_admitted_outcome() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x18, 10_000, true, true);
+        install_test_snapshot_at_inert_gate(&mut state);
+        let snapshot = state
+            .snapshot_for_consensus_height(u64::MAX)
+            .unwrap()
+            .clone();
+        let mut qc = QuorumCertificateV1::decode_exact(&build_qc_bytes(
+            u64::MAX,
+            0,
+            Bytes32::from([0x18; 32]),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        ))
+        .unwrap();
+        qc.classical_signatures[0].classical_sig = VariableBytes::from_slice(&[0xEE; 64]).unwrap();
+        let verifier = crate::qc_verification::NetworkQcVerifier::new();
+        let mut threads = Vec::new();
+        for _ in 0..(crate::qc_verification::NETWORK_QC_QUEUE_CAPACITY + 4) {
+            let verifier = verifier.clone();
+            let snapshot = snapshot.clone();
+            let qc = qc.clone();
+            let chain_id = state.chain_id.clone();
+            threads.push(std::thread::spawn(move || {
+                verifier.verify(&qc, &snapshot, &chain_id)
+            }));
+        }
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            crate::qc_verification::NETWORK_QC_QUEUE_CAPACITY + 4
+        );
+        assert!(outcomes.iter().all(Result::is_err));
+        assert_eq!(
+            verifier.expensive_verification_count(),
+            1,
+            "the first rejection must be cached for every exact replay"
+        );
     }
 
     #[test]

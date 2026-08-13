@@ -18,7 +18,7 @@ use indra_consensus::{
     verify_qc,
     vote::{verify_vote_authority, RegisteredVoter, VoteCollector, VoteDecision},
 };
-use indra_core::codec::{ByteReader, Decode, Encode};
+use indra_core::codec::{Decode, Encode};
 use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     crypto::HybridSignature,
@@ -46,8 +46,7 @@ use crate::{
     error::{NodeError, NodeResult},
     slash::{SlashDetector, SlashEvidence},
     sync::{
-        proposer_verification_required, verify_block_qc, verify_proposer_vrf,
-        verify_reveal_set_evidence, SyncState,
+        proposer_verification_required, verify_proposer_vrf, verify_reveal_set_evidence, SyncState,
     },
 };
 
@@ -2209,7 +2208,11 @@ impl ConsensusDriver {
         }
 
         if block.header.height > 1 {
-            if let Err(err) = verify_block_qc(&block, &self.engine.state) {
+            if let Err(err) = crate::sync::verify_network_block_qc(
+                &block,
+                &self.engine.state,
+                &self.engine.network_qc_verifier,
+            ) {
                 eprintln!(
                     "[vote] rejecting proposal at height={} round={}: embedded QC invalid: {}",
                     block.header.height, block.header.proposer_round, err,
@@ -3145,8 +3148,7 @@ impl ConsensusDriver {
             return vec![];
         }
 
-        let mut reader = ByteReader::new(&qc_bytes);
-        let qc = match QuorumCertificateV1::decode(&mut reader) {
+        let qc = match QuorumCertificateV1::decode_exact(&qc_bytes) {
             Ok(qc) => qc,
             Err(err) => {
                 eprintln!(
@@ -3167,7 +3169,7 @@ impl ConsensusDriver {
             }];
         }
 
-        if let Err(err) = self.engine.verify_qc_for_height(&qc) {
+        if let Err(err) = self.engine.verify_network_qc_for_height(&qc) {
             eprintln!(
                 "[driver] WARNING: received invalid QC from {} at height {}: {}",
                 from, height, err,
@@ -9882,6 +9884,50 @@ mod tests {
             }
         )));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_qc_response_rejects_trailing_bytes_before_verification() {
+        let (mut driver, dir) = local_driver([0x68u8; 32], "qc_response_trailing");
+        let local = install_active_validator(&mut driver, [0x68u8; 32], "local");
+        driver.engine.state.height = 7;
+        driver.refresh_registered_voters();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &local.public_key().classical.0,
+            &local.public_key().pq.0,
+        );
+        let value_hash = Bytes32::from([0x46u8; 32]);
+        let vote = indra_consensus::vote::produce_vote(
+            7,
+            0,
+            VoteStep::Precommit,
+            value_hash,
+            validator_id,
+            DEFAULT_CHAIN_ID,
+            &local,
+        )
+        .unwrap();
+        let validators = driver.engine.qc_validators();
+        let mut qc_bytes =
+            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+                .unwrap()
+                .encode_to_vec();
+        qc_bytes.push(0xA5);
+
+        let actions = driver.process(DriverEvent::QcResponse {
+            from: "127.0.0.1:9503".parse().unwrap(),
+            height: 7,
+            qc_bytes,
+        });
+        assert!(driver.last_qc_bytes().is_empty());
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::ScorePeer {
+                event: indra_network::peer::ScoreEvent::InvalidMessage,
+                ..
+            }
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
