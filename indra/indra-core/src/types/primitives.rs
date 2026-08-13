@@ -423,9 +423,26 @@ pub const TARGET_UTILISATION_DENOMINATOR: u64 = 100;
 
 // ── Governance ────────────────────────────────────────────────────────────────
 
-/// Consensus quorum threshold — strictly more than 2/3 of stake must agree
-/// for a block to be finalised.
-pub const CONSENSUS_QUORUM_BPS: u32 = 6_667;
+/// Return whether `signed_stake` is strictly greater than two thirds of
+/// `total_stake`.
+///
+/// The cross-products use `u128` so every `u64` stake distribution is compared
+/// exactly. A rounded basis-point threshold is not equivalent at integer
+/// boundaries and must not be used for consensus quorum decisions.
+pub fn has_strict_two_thirds_quorum(signed_stake: u64, total_stake: u64) -> bool {
+    total_stake != 0 && (signed_stake as u128) * 3 > (total_stake as u128) * 2
+}
+
+/// Smallest integer stake that satisfies [`has_strict_two_thirds_quorum`].
+///
+/// This is for diagnostics only; consensus decisions must call the exact
+/// cross-product predicate directly.
+pub fn strict_two_thirds_minimum(total_stake: u64) -> u64 {
+    if total_stake == 0 {
+        return 0;
+    }
+    (((total_stake as u128) * 2) / 3 + 1) as u64
+}
 
 /// Minimum validator commission rate in basis points (500 = 5%).
 /// Validators cannot undercut this — prevents race-to-zero on delegator fees.

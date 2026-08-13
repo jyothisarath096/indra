@@ -23,7 +23,7 @@ use indra_core::types::{
     block::{BlockV1, NO_POLC_ROUND},
     crypto::HybridSignature,
     primitives::{
-        bps_of, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES,
+        has_strict_two_thirds_quorum, Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES,
         MAX_PQ_SIG_BYTES, MAX_VRF_EMPTY_REVEAL_ROUNDS, MAX_VRF_ROUND_ENTRIES, VRF_COMMIT_WINDOW_MS,
         VRF_REVEAL_WINDOW_MS,
     },
@@ -1020,7 +1020,7 @@ impl ConsensusDriver {
     }
 
     fn quorum_stake_reached(authority: &VrfConsensusAuthority, stake: u64) -> bool {
-        authority.total_weight > 0 && stake >= bps_of(authority.total_weight, CONSENSUS_QUORUM_BPS)
+        has_strict_two_thirds_quorum(stake, authority.total_weight)
     }
 
     fn missing_reveal_validator_ids(
@@ -1464,12 +1464,11 @@ impl ConsensusDriver {
                     self.last_insufficient_reveal_round_counted = Some(counted_key);
                 }
                 eprintln!(
-                    "[vrf] election pending for height={} round={}: reveal set below quorum (revealed_stake={} total_stake={} quorum_bps={} insufficient rounds {}/{})",
+                    "[vrf] election pending for height={} round={}: reveal set below quorum, which requires strict two-thirds (revealed_stake={} total_stake={} insufficient rounds {}/{})",
                     state_height,
                     state_round,
                     revealed_stake,
                     authority.total_weight,
-                    CONSENSUS_QUORUM_BPS,
                     self.consecutive_empty_reveal_rounds,
                     MAX_VRF_EMPTY_REVEAL_ROUNDS,
                 );
@@ -2464,7 +2463,6 @@ impl ConsensusDriver {
                 return None;
             }
         }
-        let threshold = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
         let matching: Vec<VoteV1> = votes
             .into_iter()
             .filter(|vote| vote.election_result_hash == Some(target_hash))
@@ -2479,7 +2477,7 @@ impl ConsensusDriver {
             )
         });
 
-        if matching_stake >= threshold {
+        if has_strict_two_thirds_quorum(matching_stake, total_stake) {
             Some(matching)
         } else {
             eprintln!(
@@ -3722,7 +3720,7 @@ mod tests {
         let revealed = authority.weights[&local_id] + authority.weights[&b_id];
         assert_eq!(authority.total_weight, 100);
         assert!(ConsensusDriver::quorum_stake_reached(&authority, revealed));
-        assert!(revealed < bps_of(370, CONSENSUS_QUORUM_BPS));
+        assert!(!has_strict_two_thirds_quorum(revealed, 370));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

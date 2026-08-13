@@ -24,7 +24,7 @@ use indra_consensus::proposer::{
 use indra_core::codec::Decode;
 use indra_core::types::block::BlockV1;
 use indra_core::types::primitives::{
-    bps_of, Bytes32, CONSENSUS_QUORUM_BPS, MAX_VRF_EMPTY_REVEAL_ROUNDS,
+    has_strict_two_thirds_quorum, Bytes32, MAX_VRF_EMPTY_REVEAL_ROUNDS,
 };
 use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
 use indra_core::EpochRecord;
@@ -1076,7 +1076,7 @@ pub(crate) fn verify_reveal_set_evidence(
             state.validators.total_active_stake(),
         )
     };
-    if total_stake == 0 || revealed_stake < bps_of(total_stake, CONSENSUS_QUORUM_BPS) {
+    if !has_strict_two_thirds_quorum(revealed_stake, total_stake) {
         if block.vrf_reveals.is_empty() {
             let mut fallback =
                 compute_fallback_election_result(&election).map_err(NodeError::Consensus)?;
@@ -1099,8 +1099,8 @@ pub(crate) fn verify_reveal_set_evidence(
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
-                "vrf reveal set below quorum: revealed_stake={} total_stake={} quorum_bps={}",
-                revealed_stake, total_stake, CONSENSUS_QUORUM_BPS,
+                "vrf reveal set below quorum (requires strict two-thirds): revealed_stake={} total_stake={}",
+                revealed_stake, total_stake,
             ),
         });
     }

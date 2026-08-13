@@ -79,12 +79,10 @@ pub enum ConsensusError {
     DuplicateVote,
 
     /// QC construction attempted before quorum was reached.
-    #[error("quorum not yet reached: have {have_bps} bps, need {need_bps} bps")]
+    #[error("quorum not yet reached: have {have_bps} bps, need strictly more than two thirds")]
     QuorumNotReached {
         /// Current stake in basis points.
         have_bps: u64,
-        /// Required threshold.
-        need_bps: u64,
     },
 
     /// Signer stake does not meet the QC threshold.

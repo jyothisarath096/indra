@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        bps_of, muldiv, Bytes32, VariableBytes, CONSENSUS_QUORUM_BPS, MAX_CLASSICAL_SIG_BYTES,
-        MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
+        has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, Bytes32, VariableBytes,
+        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
@@ -105,11 +105,9 @@ impl QcBuilder {
             .fold(0u64, |total, validator| {
                 total.saturating_add(validator.stake)
             });
-        let quorum_stake = bps_of(self.total_stake, CONSENSUS_QUORUM_BPS);
-        if voted_stake < quorum_stake {
+        if !has_strict_two_thirds_quorum(voted_stake, self.total_stake) {
             return Err(ConsensusError::QuorumNotReached {
                 have_bps: stake_bps,
-                need_bps: CONSENSUS_QUORUM_BPS as u64,
             });
         }
         build_qc_from_votes(
@@ -191,10 +189,7 @@ fn build_qc_from_votes(
     }
 
     if pq_sigs.is_empty() {
-        return Err(ConsensusError::QuorumNotReached {
-            have_bps: 0,
-            need_bps: CONSENSUS_QUORUM_BPS as u64,
-        });
+        return Err(ConsensusError::QuorumNotReached { have_bps: 0 });
     }
 
     Ok(QuorumCertificateV1 {
@@ -240,16 +235,14 @@ fn signer_validators<'a>(
 /// Verify a QC using hybrid Ed25519 + ML-DSA-87 signatures when active.
 /// # Why two disagreeing valid QCs for the same (height, round) cannot both exist
 ///
-/// A QC is accepted only if `signed_stake >= bps_of(total_stake,
-/// CONSENSUS_QUORUM_BPS)`, where `CONSENSUS_QUORUM_BPS = 6_667` — i.e.,
-/// the signing set represents strictly more than 66.67% (> 2/3) of total
-/// stake.
+/// A QC is accepted only if `signed_stake * 3 > total_stake * 2`, using
+/// `u128` cross-products. The signing set therefore represents strictly more
+/// than 2/3 of total stake without any integer-rounding exception.
 ///
 /// Suppose two disagreeing QCs, A and B, both satisfy this bound for the
 /// same (height, round). Two subsets of a fixed total stake, each
-/// exceeding 2/3, cannot be disjoint: their intersection exceeds
-/// `2 * (6_667/10_000) - 1 ≈ 0.3334`, i.e., strictly more than 1/3 of
-/// total stake.
+/// exceeding 2/3, cannot be disjoint: their intersection is strictly more
+/// than 1/3 of total stake.
 ///
 /// Under the standard BFT assumption that Byzantine stake is strictly
 /// below 1/3 of total, that intersection cannot consist entirely of
@@ -283,12 +276,10 @@ pub fn verify_qc(
     let signed_stake = signers
         .iter()
         .fold(0u64, |acc, validator| acc.saturating_add(validator.stake));
-    let quorum_stake = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
-
-    if signed_stake < quorum_stake {
+    if !has_strict_two_thirds_quorum(signed_stake, total_stake) {
         return Err(ConsensusError::InsufficientStake {
             have: signed_stake,
-            need: quorum_stake,
+            need: strict_two_thirds_minimum(total_stake),
         });
     }
 
@@ -410,7 +401,7 @@ pub fn verify_qc_strict(
 mod tests {
     use super::*;
     use crate::vote::{produce_vote, produce_vote_with_election_result};
-    use indra_core::types::primitives::{CONSENSUS_QUORUM_BPS, DEFAULT_CHAIN_ID};
+    use indra_core::types::primitives::DEFAULT_CHAIN_ID;
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
     fn make_validator(seed: u8, position: usize, stake: u64) -> (QcValidator, HybridKeypair) {
@@ -876,7 +867,113 @@ mod tests {
 
     #[test]
     fn strict_consensus_quorum_is_above_two_thirds() {
-        assert!(CONSENSUS_QUORUM_BPS > 6_666);
+        assert!(!has_strict_two_thirds_quorum(2, 3));
+        assert!(has_strict_two_thirds_quorum(3, 4));
+    }
+
+    #[test]
+    fn floor_rounded_conflicting_qc_exploit_is_rejected() {
+        let (byzantine, byzantine_key) = make_validator(0x71, 0, 3_333);
+        let (honest_a, honest_a_key) = make_validator(0x72, 1, 3_334);
+        let (honest_b, honest_b_key) = make_validator(0x73, 2, 3_334);
+        let validators = vec![byzantine.clone(), honest_a.clone(), honest_b.clone()];
+        let total_stake = 10_001;
+        let height = 91;
+        let round = 7;
+        let hash_a = Bytes32::from([0xA1; 32]);
+        let hash_b = Bytes32::from([0xB2; 32]);
+
+        let byzantine_a = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            hash_a,
+            byzantine.validator_id,
+            DEFAULT_CHAIN_ID,
+            &byzantine_key,
+        )
+        .unwrap();
+        let honest_a_vote = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            hash_a,
+            honest_a.validator_id,
+            DEFAULT_CHAIN_ID,
+            &honest_a_key,
+        )
+        .unwrap();
+        let byzantine_b = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            hash_b,
+            byzantine.validator_id,
+            DEFAULT_CHAIN_ID,
+            &byzantine_key,
+        )
+        .unwrap();
+        let honest_b_vote = produce_vote(
+            height,
+            round,
+            VoteStep::Precommit,
+            hash_b,
+            honest_b.validator_id,
+            DEFAULT_CHAIN_ID,
+            &honest_b_key,
+        )
+        .unwrap();
+
+        let qc_a = build_qc(
+            height,
+            round,
+            hash_a,
+            DEFAULT_CHAIN_ID,
+            &validators,
+            vec![&byzantine_a, &honest_a_vote],
+        )
+        .unwrap();
+        let qc_b = build_qc(
+            height,
+            round,
+            hash_b,
+            DEFAULT_CHAIN_ID,
+            &validators,
+            vec![&byzantine_b, &honest_b_vote],
+        )
+        .unwrap();
+
+        assert!(3_333u128 * 3 < total_stake as u128);
+        assert!(!has_strict_two_thirds_quorum(6_667, total_stake));
+        assert!(matches!(
+            verify_qc(&qc_a, &validators, total_stake, DEFAULT_CHAIN_ID),
+            Err(ConsensusError::InsufficientStake { .. })
+        ));
+        assert!(matches!(
+            verify_qc(&qc_b, &validators, total_stake, DEFAULT_CHAIN_ID),
+            Err(ConsensusError::InsufficientStake { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_quorum_property_forces_more_than_one_third_intersection() {
+        for total_stake in 1u64..=100_000 {
+            let minimum = strict_two_thirds_minimum(total_stake);
+            assert!(has_strict_two_thirds_quorum(minimum, total_stake));
+            assert!(!has_strict_two_thirds_quorum(
+                minimum.saturating_sub(1),
+                total_stake
+            ));
+
+            // Two minimum-size quorums have the smallest possible overlap when
+            // each otherwise contains disjoint stake. Their overlap must still
+            // be strictly greater than one third of the total.
+            let minimum_overlap = (minimum as u128) * 2 - total_stake as u128;
+            assert!(
+                minimum_overlap * 3 > total_stake as u128,
+                "total={total_stake} minimum={minimum} overlap={minimum_overlap}"
+            );
+        }
     }
 
     #[test]
@@ -884,13 +981,13 @@ mod tests {
         let validator_count = 4usize;
         let stake_per_validator = 2_500u64;
         let total_stake = stake_per_validator * validator_count as u64;
-        let quorum = bps_of(total_stake, CONSENSUS_QUORUM_BPS);
-
         // Any two signer sets which each satisfy the strict >2/3 quorum
         // overlap in strictly more than 1/3 of total stake. With four equal
         // validators, every quorum has three signers and two conflicting
         // quorums share two signers (50% stake). Those shared validators
-        // would have to sign both block hashes.
+        // would have to sign both block hashes. This equal-weight example did
+        // not exercise integer rounding, so the uneven-stake regression above
+        // is also required.
         let first = [true, true, true, false];
         let second = [true, true, false, true];
         let signed_stake = |set: &[bool; 4]| {
@@ -903,8 +1000,14 @@ mod tests {
             .count() as u64
             * stake_per_validator;
 
-        assert!(signed_stake(&first) >= quorum);
-        assert!(signed_stake(&second) >= quorum);
+        assert!(has_strict_two_thirds_quorum(
+            signed_stake(&first),
+            total_stake
+        ));
+        assert!(has_strict_two_thirds_quorum(
+            signed_stake(&second),
+            total_stake
+        ));
         assert!(overlap_stake > total_stake / 3);
         assert_eq!(overlap_stake, 5_000);
     }

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{bps_of, muldiv, Bytes32},
+    primitives::{has_strict_two_thirds_quorum, muldiv, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
@@ -159,8 +159,6 @@ impl VoteCollector {
 
     /// Return the current decision without adding a vote.
     pub fn current_decision(&self) -> VoteDecision {
-        use indra_core::types::primitives::CONSENSUS_QUORUM_BPS;
-
         if self.total_stake == 0 {
             return VoteDecision::Waiting;
         }
@@ -174,10 +172,9 @@ impl VoteCollector {
         }
 
         // Check if any hash crossed the quorum threshold
-        let threshold = bps_of(self.total_stake, CONSENSUS_QUORUM_BPS);
         for (block_hash, stake) in &stake_by_hash {
             let bps = muldiv(*stake, 10_000, self.total_stake);
-            if *stake >= threshold {
+            if has_strict_two_thirds_quorum(*stake, self.total_stake) {
                 return VoteDecision::QuorumReached {
                     block_hash: *block_hash,
                     stake_bps: bps,
