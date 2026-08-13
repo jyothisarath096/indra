@@ -10,7 +10,7 @@ use crate::{
     errors::IndraError,
     handles,
     staking::{read_bytes32, read_chain_id, write_hex_to_buf},
-    IndraKeyHandle,
+    IndraKeyHandle, IndraSessionHandle,
 };
 use indra_core::{
     codec::Encode,
@@ -143,15 +143,19 @@ where
     if args.chain_id.is_null() || args.out_hex.is_null() {
         return IndraError::NullPointer.code();
     }
+    if args.out_len != 0 {
+        *args.out_hex = 0;
+    }
 
     match catch_unwind(|| {
-        let signing = handles::signing_material(args.handle)?;
-        let keypair = signing.keypair()?;
+        let lease = handles::acquire_signing_lease(args.session, args.handle)?;
+        lease.checkpoint()?;
+        let keypair = lease.material().keypair()?;
         let chain = read_chain_id(args.chain_id, args.chain_id_len)?;
         let payload = make_payload(&keypair)?;
-        let signer_id = Bytes32::from(signing.public.validator_id);
+        let signer_id = Bytes32::from(lease.material().public.validator_id);
         let hex = build_governance_op(signer_id, args.nonce, payload, &keypair, &chain)?;
-        write_hex_to_buf(&hex, args.out_hex, args.out_len)
+        lease.publish(|| write_hex_to_buf(&hex, args.out_hex, args.out_len))
     }) {
         Ok(Ok(())) => IndraError::Ok.code(),
         Ok(Err(err)) => err.code(),
@@ -161,6 +165,7 @@ where
 
 #[derive(Clone, Copy)]
 struct GovernanceHandleArgs {
+    session: IndraSessionHandle,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
@@ -171,6 +176,7 @@ struct GovernanceHandleArgs {
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
+    session: IndraSessionHandle,
     title: *const c_char,
     title_len: usize,
     description: *const c_char,
@@ -194,6 +200,7 @@ pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -248,6 +255,7 @@ pub unsafe extern "C" fn indra_compute_vote_commitment(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
+    session: IndraSessionHandle,
     proposal_id: *const u8,
     vote: u8,
     reveal_nonce: *const u8,
@@ -264,6 +272,7 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -287,6 +296,7 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
+    session: IndraSessionHandle,
     proposal_id: *const u8,
     vote: u8,
     reveal_nonce: *const u8,
@@ -302,6 +312,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -322,6 +333,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
+    session: IndraSessionHandle,
     proposal_id: *const u8,
     from_validator_id: *const u8,
     to_validator_id: *const u8,
@@ -338,6 +350,7 @@ pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -358,6 +371,7 @@ pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
+    session: IndraSessionHandle,
     proposal_id: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
@@ -371,6 +385,7 @@ pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -388,6 +403,7 @@ pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
+    session: IndraSessionHandle,
     proposal_id: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
@@ -401,6 +417,7 @@ pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
     }
     build_with_payload_handle(
         GovernanceHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,

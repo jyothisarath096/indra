@@ -28,6 +28,12 @@ pub enum IndraError {
     InvalidVote = -12,
     /// Unknown, destroyed, or otherwise invalid opaque key handle.
     InvalidHandle = -13,
+    /// Unknown or destroyed session capability.
+    InvalidSession = -14,
+    /// A signing operation was actively revoked before publication.
+    HandleRevoked = -15,
+    /// Unknown or already-destroyed result capability.
+    InvalidResult = -16,
     /// Internal error.
     Internal = -99,
 }
@@ -70,6 +76,9 @@ pub const fn error_string(error_code: i32) -> &'static [u8] {
         -11 => b"unknown governance action\0",
         -12 => b"invalid vote\0",
         -13 => b"invalid key handle\0",
+        -14 => b"invalid session handle\0",
+        -15 => b"key handle revoked\0",
+        -16 => b"invalid result handle\0",
         _ => b"internal error\0",
     }
 }

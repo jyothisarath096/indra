@@ -13,8 +13,8 @@ use indra_core::types::primitives::Bytes32;
 use indra_crypto::hybrid::HybridKeypair;
 
 use crate::{
-    bounded_utf8, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES,
-    MAX_FFI_STRING_BYTES,
+    bounded_utf8, errors::IndraError, handles, IndraKeyHandle, IndraSessionHandle,
+    INDRA_OP_HEX_MAX_BYTES, MAX_FFI_STRING_BYTES,
 };
 
 pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
@@ -55,13 +55,22 @@ where
     if args.chain_id.is_null() || args.out_hex.is_null() {
         return IndraError::NullPointer.code();
     }
+    if args.out_len != 0 {
+        *args.out_hex = 0;
+    }
 
     match catch_unwind(|| {
-        let signing = handles::signing_material(args.handle)?;
-        let keypair = signing.keypair()?;
+        let lease = handles::acquire_signing_lease(args.session, args.handle)?;
+        lease.checkpoint()?;
+        let keypair = lease.material().keypair()?;
         let chain = read_chain_id(args.chain_id, args.chain_id_len)?;
-        let hex = build(&keypair, &signing.public.validator_id, args.nonce, &chain)?;
-        write_hex_to_buf(&hex, args.out_hex, args.out_len)
+        let hex = build(
+            &keypair,
+            &lease.material().public.validator_id,
+            args.nonce,
+            &chain,
+        )?;
+        lease.publish(|| write_hex_to_buf(&hex, args.out_hex, args.out_len))
     }) {
         Ok(Ok(())) => IndraError::Ok.code(),
         Ok(Err(err)) => err.code(),
@@ -71,6 +80,7 @@ where
 
 #[derive(Clone, Copy)]
 struct StakingHandleArgs {
+    session: IndraSessionHandle,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
@@ -83,6 +93,7 @@ struct StakingHandleArgs {
 /// The VRF public key is derived from the handle's stored public metadata.
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_register_validator_with_handle(
+    session: IndraSessionHandle,
     commission_bps: u32,
     deposit_utxo_id: *const u8,
     handle: IndraKeyHandle,
@@ -100,6 +111,7 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
     }
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -109,7 +121,7 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
         },
         |keypair, _validator_id, nonce, chain| {
             let bond = Bytes32::from(read_bytes32(deposit_utxo_id));
-            let vrf = handles::public_info(handle)?.vrf_pk;
+            let vrf = handles::public_info(session, handle)?.vrf_pk;
             build_register_validator_op(commission_bps, bond, keypair, vrf, nonce, chain)
                 .map(|built| built.op_hex)
                 .map_err(IndraError::from)
@@ -119,6 +131,7 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_self_stake_with_handle(
+    session: IndraSessionHandle,
     deposit_utxo_id: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
@@ -132,6 +145,7 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
     }
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -154,6 +168,7 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_delegate_with_handle(
+    session: IndraSessionHandle,
     validator_id: *const u8,
     deposit_utxo_id: *const u8,
     handle: IndraKeyHandle,
@@ -168,6 +183,7 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
     }
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -191,6 +207,7 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
+    session: IndraSessionHandle,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
@@ -200,6 +217,7 @@ pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
 ) -> i32 {
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -217,6 +235,7 @@ pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_set_commission_with_handle(
+    session: IndraSessionHandle,
     new_commission_bps: u32,
     handle: IndraKeyHandle,
     nonce: u64,
@@ -230,6 +249,7 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
     }
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,
@@ -253,6 +273,7 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
 
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
+    session: IndraSessionHandle,
     target_validator_id: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
@@ -266,6 +287,7 @@ pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
     }
     build_with_handle(
         StakingHandleArgs {
+            session,
             handle,
             nonce,
             chain_id,

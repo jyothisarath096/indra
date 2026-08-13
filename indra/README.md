@@ -411,11 +411,20 @@ remains a fallback during rollout.
 
 Native iOS wallet at [github.com/jyothisarath096/indra-ios](https://github.com/jyothisarath096/indra-ios).
 Built with SwiftUI. Uses `indra-ffi` via XCFramework. Production FFI builds use
-opaque in-process key handles (`IndraKeyHandle`) and public metadata structs so
-raw private keys do not cross the FFI boundary. The opaque-handle API is the
-only supported signing surface.
+128-bit high-entropy, session-scoped key capabilities (`IndraKeyHandle`) and
+public metadata structs so raw private keys do not cross the FFI boundary. The
+opaque-handle API is the only supported signing surface. Session teardown is a
+blocking revocation boundary: admitted signers abort before publishing output.
+Transaction results are also Rust-owned opaque capabilities and are copied out
+through bounded accessors before one checked destroy call.
 Long-term persistence remains the consuming app's platform secure storage
 (iOS Keychain today; Android Keystore for a future Android app).
+
+The Topic 5 lifecycle redesign is a breaking mobile ABI. Existing iOS/macOS
+consumers must create a session, pass it with every key/result operation, treat
+key and result handles as 16-byte opaque values, and replace direct Rust-buffer
+freeing with the result copy/destroy API. No legacy sequential-handle or raw
+result-buffer entry points remain.
 
 ---
 

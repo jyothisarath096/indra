@@ -21,6 +21,9 @@ extern "C" {
 #define INDRA_ERR_UNKNOWN_ACTION -11
 #define INDRA_ERR_INVALID_VOTE  -12
 #define INDRA_ERR_INVALID_HANDLE -13
+#define INDRA_ERR_INVALID_SESSION -14
+#define INDRA_ERR_HANDLE_REVOKED -15
+#define INDRA_ERR_INVALID_RESULT -16
 #define INDRA_ERR_INTERNAL      -99
 
 #define INDRA_OP_HEX_MAX_BYTES 32768
@@ -34,8 +37,9 @@ extern "C" {
 #define INDRA_TX_ID_BYTES         32
 #define INDRA_MNEMONIC_MAX_BYTES 300
 
-typedef uint64_t IndraKeyHandle;
-#define INDRA_KEY_HANDLE_INVALID ((IndraKeyHandle)0)
+typedef struct { uint8_t bytes[16]; } IndraSessionHandle;
+typedef struct { uint8_t bytes[16]; } IndraKeyHandle;
+typedef struct { uint8_t bytes[16]; } IndraResultHandle;
 
 /* Secret inputs remain caller-owned. Rust zeroizes its private copies, but
  * callers must securely erase their original seed and mnemonic buffers. */
@@ -70,14 +74,16 @@ typedef struct {
 
 typedef struct {
     uint8_t  tx_id[INDRA_TX_ID_BYTES];
-    uint8_t* tx_bytes;
     size_t   tx_bytes_len;
     uint64_t change_spark;
-    size_t*  spent_indices;
     size_t   spent_count;
-} IndraTxResult;
+} IndraTxResultMetadata;
+
+int32_t indra_create_session(IndraSessionHandle* out_session);
+int32_t indra_destroy_session(IndraSessionHandle session);
 
 int32_t indra_keygen_handle(
+    IndraSessionHandle session,
     const uint8_t* seed,
     IndraKeyHandle* out_handle,
     IndraPublicKeyInfo* out_public
@@ -89,6 +95,7 @@ int32_t indra_generate_mnemonic(
 );
 
 int32_t indra_keygen_from_mnemonic_handle(
+    IndraSessionHandle session,
     const char* phrase,
     size_t phrase_len,
     IndraKeyHandle* out_handle,
@@ -96,14 +103,12 @@ int32_t indra_keygen_from_mnemonic_handle(
 );
 
 int32_t indra_key_handle_public(
+    IndraSessionHandle session,
     IndraKeyHandle handle,
     IndraPublicKeyInfo* out_public
 );
 
-int32_t indra_destroy_key_handle(IndraKeyHandle handle);
-int32_t indra_destroy_all_key_handles(void);
-
-void indra_zeroize_tx_result(IndraTxResult* result);
+int32_t indra_destroy_key_handle(IndraSessionHandle session, IndraKeyHandle handle);
 
 int32_t indra_validate_mnemonic(const char* phrase, size_t phrase_len);
 
@@ -114,8 +119,10 @@ int32_t indra_validator_id(
 );
 
 int32_t indra_build_tx_with_handle(
+    IndraSessionHandle session,
     const IndraTxParams* params,
-    IndraTxResult* out
+    IndraResultHandle* out_result,
+    IndraTxResultMetadata* out_metadata
 );
 
 int32_t indra_tx_to_hex(
@@ -126,6 +133,7 @@ int32_t indra_tx_to_hex(
 );
 
 int32_t indra_build_register_validator_with_handle(
+    IndraSessionHandle session,
     uint32_t commission_bps,
     const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
@@ -137,6 +145,7 @@ int32_t indra_build_register_validator_with_handle(
 );
 
 int32_t indra_build_self_stake_with_handle(
+    IndraSessionHandle session,
     const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
     uint64_t nonce,
@@ -147,6 +156,7 @@ int32_t indra_build_self_stake_with_handle(
 );
 
 int32_t indra_build_delegate_with_handle(
+    IndraSessionHandle session,
     const uint8_t* validator_id,
     const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
@@ -158,6 +168,7 @@ int32_t indra_build_delegate_with_handle(
 );
 
 int32_t indra_build_claim_rewards_with_handle(
+    IndraSessionHandle session,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
@@ -167,6 +178,7 @@ int32_t indra_build_claim_rewards_with_handle(
 );
 
 int32_t indra_build_set_commission_with_handle(
+    IndraSessionHandle session,
     uint32_t new_commission_bps,
     IndraKeyHandle handle,
     uint64_t nonce,
@@ -177,6 +189,7 @@ int32_t indra_build_set_commission_with_handle(
 );
 
 int32_t indra_build_set_auto_delegate_with_handle(
+    IndraSessionHandle session,
     const uint8_t* target_validator_id,
     IndraKeyHandle handle,
     uint64_t nonce,
@@ -187,6 +200,7 @@ int32_t indra_build_set_auto_delegate_with_handle(
 );
 
 int32_t indra_build_governance_propose_with_handle(
+    IndraSessionHandle session,
     const char* title,
     size_t title_len,
     const char* description,
@@ -203,6 +217,7 @@ int32_t indra_build_governance_propose_with_handle(
 );
 
 int32_t indra_build_governance_commit_with_handle(
+    IndraSessionHandle session,
     const uint8_t* proposal_id,
     uint8_t vote,
     const uint8_t* reveal_nonce,
@@ -216,6 +231,7 @@ int32_t indra_build_governance_commit_with_handle(
 );
 
 int32_t indra_build_governance_reveal_with_handle(
+    IndraSessionHandle session,
     const uint8_t* proposal_id,
     uint8_t vote,
     const uint8_t* reveal_nonce,
@@ -228,6 +244,7 @@ int32_t indra_build_governance_reveal_with_handle(
 );
 
 int32_t indra_build_governance_redelegate_with_handle(
+    IndraSessionHandle session,
     const uint8_t* proposal_id,
     const uint8_t* from_validator_id,
     const uint8_t* to_validator_id,
@@ -241,6 +258,7 @@ int32_t indra_build_governance_redelegate_with_handle(
 );
 
 int32_t indra_build_governance_execute_with_handle(
+    IndraSessionHandle session,
     const uint8_t* proposal_id,
     IndraKeyHandle handle,
     uint64_t nonce,
@@ -251,6 +269,7 @@ int32_t indra_build_governance_execute_with_handle(
 );
 
 int32_t indra_build_governance_cancel_with_handle(
+    IndraSessionHandle session,
     const uint8_t* proposal_id,
     IndraKeyHandle handle,
     uint64_t nonce,
@@ -266,8 +285,19 @@ int32_t indra_compute_vote_commitment(
     uint8_t* out_commitment
 );
 
-void indra_free_bytes(uint8_t* ptr, size_t len);
-void indra_free_usize(size_t* ptr, size_t len);
+int32_t indra_result_copy_tx_bytes(
+    IndraSessionHandle session,
+    IndraResultHandle result,
+    uint8_t* out,
+    size_t out_len
+);
+int32_t indra_result_copy_spent_indices(
+    IndraSessionHandle session,
+    IndraResultHandle result,
+    size_t* out,
+    size_t out_len
+);
+int32_t indra_destroy_result(IndraSessionHandle session, IndraResultHandle result);
 const char* indra_error_string(int32_t error_code);
 
 #ifdef __cplusplus

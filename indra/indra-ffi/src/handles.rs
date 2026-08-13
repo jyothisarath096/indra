@@ -1,62 +1,78 @@
-//! Opaque in-process key handles for FFI wallet integrations.
-//!
-//! Handles are process-local capabilities. They are not persistent storage and
-//! they deliberately avoid platform-specific assumptions such as iOS Keychain
-//! or Android Keystore. The consuming app is responsible for storing recovery
-//! material in its platform secure storage, recreating a handle on unlock, and
-//! destroying it on wallet lock/logout.
+//! Session-scoped opaque capabilities for FFI wallet integrations.
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
 };
 
 use indra_cli::KeysFile;
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::{
-    errors::IndraError, IndraPublicKeyInfo, BYTES32_LEN, CLASSICAL_SK_BYTES, PQ_PK_BYTES,
-    PQ_SK_BYTES,
+    errors::IndraError, tx::BuiltTxOwned, IndraPublicKeyInfo, BYTES32_LEN, CLASSICAL_SK_BYTES,
+    PQ_PK_BYTES, PQ_SK_BYTES,
 };
 
-pub type IndraKeyHandle = u64;
-pub const INDRA_KEY_HANDLE_INVALID: IndraKeyHandle = 0;
+const TOKEN_BYTES: usize = 16;
 
-static KEY_REGISTRY: OnceLock<Mutex<KeyRegistry>> = OnceLock::new();
+macro_rules! opaque_token {
+    ($name:ident, $invalid:ident) => {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub struct $name {
+            pub bytes: [u8; TOKEN_BYTES],
+        }
 
-fn registry() -> &'static Mutex<KeyRegistry> {
-    KEY_REGISTRY.get_or_init(|| Mutex::new(KeyRegistry::new()))
+        pub const $invalid: $name = $name {
+            bytes: [0u8; TOKEN_BYTES],
+        };
+    };
 }
 
-struct KeyRegistry {
-    next_handle: IndraKeyHandle,
-    entries: HashMap<IndraKeyHandle, StoredKeyMaterial>,
+opaque_token!(IndraSessionHandle, INDRA_SESSION_HANDLE_INVALID);
+opaque_token!(IndraKeyHandle, INDRA_KEY_HANDLE_INVALID);
+opaque_token!(IndraResultHandle, INDRA_RESULT_HANDLE_INVALID);
+
+impl IndraSessionHandle {
+    fn is_invalid(self) -> bool {
+        self.bytes == [0u8; TOKEN_BYTES]
+    }
 }
 
-impl KeyRegistry {
-    fn new() -> Self {
-        Self {
-            next_handle: 1,
-            entries: HashMap::new(),
-        }
+impl IndraKeyHandle {
+    fn is_invalid(self) -> bool {
+        self.bytes == [0u8; TOKEN_BYTES]
     }
+}
 
-    fn insert(&mut self, material: StoredKeyMaterial) -> Result<IndraKeyHandle, IndraError> {
-        let start = self.next_handle.max(1);
-        let mut candidate = start;
-        loop {
-            if candidate != INDRA_KEY_HANDLE_INVALID && !self.entries.contains_key(&candidate) {
-                self.entries.insert(candidate, material);
-                self.next_handle = candidate.wrapping_add(1).max(1);
-                return Ok(candidate);
-            }
-            candidate = candidate.wrapping_add(1).max(1);
-            if candidate == start {
-                return Err(IndraError::Internal);
-            }
-        }
-    }
+static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<Registry> {
+    REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
+}
+
+#[derive(Default)]
+struct Registry {
+    sessions: HashMap<IndraSessionHandle, SessionEntry>,
+}
+
+#[derive(Default)]
+struct SessionEntry {
+    keys: HashMap<IndraKeyHandle, Arc<KeyEntry>>,
+    results: HashMap<IndraResultHandle, Arc<BuiltTxOwned>>,
+}
+
+struct KeyEntry {
+    state: Mutex<KeyState>,
+    drained: Condvar,
+}
+
+struct KeyState {
+    revoked: bool,
+    active_leases: usize,
+    material: Option<StoredKeyMaterial>,
 }
 
 struct StoredKeyMaterial {
@@ -67,14 +83,12 @@ struct StoredKeyMaterial {
 }
 
 impl StoredKeyMaterial {
-    fn from_keys(keys: &KeysFile) -> Result<Self, IndraError> {
+    fn from_hot_keys(keys: &KeysFile) -> Result<Self, IndraError> {
         if keys.public.hybrid_pq_pk.len() != PQ_PK_BYTES {
             return Err(IndraError::KeygenFailed);
         }
         let mut pq_pk = [0u8; PQ_PK_BYTES];
         pq_pk.copy_from_slice(&keys.public.hybrid_pq_pk);
-        let mut ml_dsa_seed = [0u8; PQ_SK_BYTES];
-        ml_dsa_seed.copy_from_slice(&keys.ml_dsa_seed);
         Ok(Self {
             public: IndraPublicKeyInfo {
                 validator_id: keys.public.validator_id,
@@ -83,7 +97,7 @@ impl StoredKeyMaterial {
                 vrf_pk: keys.public.vrf_pk,
             },
             classical_seed: keys.ed25519_seed,
-            ml_dsa_seed,
+            ml_dsa_seed: keys.ml_dsa_seed,
             vrf_seed: keys.vrf_seed,
         })
     }
@@ -135,54 +149,326 @@ impl Drop for SigningMaterial {
     }
 }
 
-pub(crate) fn store_keys(
+pub(crate) struct SigningLease {
+    entry: Arc<KeyEntry>,
+    material: SigningMaterial,
+}
+
+impl SigningLease {
+    pub(crate) fn material(&self) -> &SigningMaterial {
+        &self.material
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(), IndraError> {
+        let state = self.entry.state.lock().map_err(|_| IndraError::Internal)?;
+        if state.revoked {
+            Err(IndraError::HandleRevoked)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn publish<R>(
+        &self,
+        publish: impl FnOnce() -> Result<R, IndraError>,
+    ) -> Result<R, IndraError> {
+        #[cfg(test)]
+        checkpoint_hook();
+        let state = self.entry.state.lock().map_err(|_| IndraError::Internal)?;
+        if state.revoked {
+            return Err(IndraError::HandleRevoked);
+        }
+        let result = publish();
+        drop(state);
+        result
+    }
+}
+
+impl Drop for SigningLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.entry.state.lock() {
+            state.active_leases = state.active_leases.saturating_sub(1);
+            if state.active_leases == 0 {
+                self.entry.drained.notify_all();
+            }
+        }
+    }
+}
+
+fn random_token<T>(wrap: impl Fn([u8; TOKEN_BYTES]) -> T) -> Result<T, IndraError> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    while bytes == [0u8; TOKEN_BYTES] {
+        OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| IndraError::Internal)?;
+    }
+    Ok(wrap(bytes))
+}
+
+pub(crate) fn create_session() -> Result<IndraSessionHandle, IndraError> {
+    let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
+    loop {
+        let handle = random_token(|bytes| IndraSessionHandle { bytes })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guard.sessions.entry(handle) {
+            entry.insert(SessionEntry::default());
+            return Ok(handle);
+        }
+    }
+}
+
+pub(crate) fn store_hot_keys(
+    session: IndraSessionHandle,
     keys: &KeysFile,
 ) -> Result<(IndraKeyHandle, IndraPublicKeyInfo), IndraError> {
-    let material = StoredKeyMaterial::from_keys(keys)?;
+    let material = StoredKeyMaterial::from_hot_keys(keys)?;
     let public = material.public;
     let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
-    let handle = guard.insert(material)?;
-    Ok((handle, public))
+    let session_entry = guard
+        .sessions
+        .get_mut(&session)
+        .ok_or(IndraError::InvalidSession)?;
+    loop {
+        let handle = random_token(|bytes| IndraKeyHandle { bytes })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = session_entry.keys.entry(handle) {
+            entry.insert(Arc::new(KeyEntry {
+                state: Mutex::new(KeyState {
+                    revoked: false,
+                    active_leases: 0,
+                    material: Some(material),
+                }),
+                drained: Condvar::new(),
+            }));
+            return Ok((handle, public));
+        }
+    }
 }
 
-pub(crate) fn public_info(handle: IndraKeyHandle) -> Result<IndraPublicKeyInfo, IndraError> {
-    if handle == INDRA_KEY_HANDLE_INVALID {
+fn key_entry(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<Arc<KeyEntry>, IndraError> {
+    if session.is_invalid() {
+        return Err(IndraError::InvalidSession);
+    }
+    if handle.is_invalid() {
         return Err(IndraError::InvalidHandle);
     }
     let guard = registry().lock().map_err(|_| IndraError::Internal)?;
     guard
-        .entries
+        .sessions
+        .get(&session)
+        .ok_or(IndraError::InvalidSession)?
+        .keys
         .get(&handle)
-        .map(|entry| entry.public)
+        .cloned()
         .ok_or(IndraError::InvalidHandle)
 }
 
-pub(crate) fn signing_material(handle: IndraKeyHandle) -> Result<SigningMaterial, IndraError> {
-    if handle == INDRA_KEY_HANDLE_INVALID {
-        return Err(IndraError::InvalidHandle);
+pub(crate) fn public_info(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<IndraPublicKeyInfo, IndraError> {
+    let entry = key_entry(session, handle)?;
+    let state = entry.state.lock().map_err(|_| IndraError::Internal)?;
+    if state.revoked {
+        return Err(IndraError::HandleRevoked);
     }
-    let guard = registry().lock().map_err(|_| IndraError::Internal)?;
-    guard
-        .entries
-        .get(&handle)
-        .map(StoredKeyMaterial::signing_material)
-        .ok_or(IndraError::InvalidHandle)
+    state
+        .material
+        .as_ref()
+        .map(|material| material.public)
+        .ok_or(IndraError::HandleRevoked)
 }
 
-pub(crate) fn destroy(handle: IndraKeyHandle) -> Result<(), IndraError> {
-    if handle == INDRA_KEY_HANDLE_INVALID {
-        return Err(IndraError::InvalidHandle);
+pub(crate) fn acquire_signing_lease(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<SigningLease, IndraError> {
+    let entry = key_entry(session, handle)?;
+    let material = {
+        let mut state = entry.state.lock().map_err(|_| IndraError::Internal)?;
+        if state.revoked {
+            return Err(IndraError::HandleRevoked);
+        }
+        let material = state
+            .material
+            .as_ref()
+            .ok_or(IndraError::HandleRevoked)?
+            .signing_material();
+        state.active_leases = state
+            .active_leases
+            .checked_add(1)
+            .ok_or(IndraError::Internal)?;
+        material
+    };
+    Ok(SigningLease { entry, material })
+}
+
+fn request_revocation(entry: &Arc<KeyEntry>) -> Result<(), IndraError> {
+    let mut state = entry.state.lock().map_err(|_| IndraError::Internal)?;
+    state.revoked = true;
+    #[cfg(test)]
+    revocation_hook();
+    Ok(())
+}
+
+fn drain_and_zeroize(entry: Arc<KeyEntry>) -> Result<(), IndraError> {
+    let mut state = entry.state.lock().map_err(|_| IndraError::Internal)?;
+    while state.active_leases != 0 {
+        state = entry
+            .drained
+            .wait(state)
+            .map_err(|_| IndraError::Internal)?;
     }
+    state.material.take();
+    Ok(())
+}
+
+pub(crate) fn destroy_key(
+    session: IndraSessionHandle,
+    handle: IndraKeyHandle,
+) -> Result<(), IndraError> {
+    let entry = {
+        let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
+        let session_entry = guard
+            .sessions
+            .get_mut(&session)
+            .ok_or(IndraError::InvalidSession)?;
+        let entry = session_entry
+            .keys
+            .get(&handle)
+            .cloned()
+            .ok_or(IndraError::InvalidHandle)?;
+        request_revocation(&entry)?;
+        session_entry.keys.remove(&handle);
+        entry
+    };
+    drain_and_zeroize(entry)
+}
+
+pub(crate) fn destroy_session(session: IndraSessionHandle) -> Result<(), IndraError> {
+    let entries = {
+        let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
+        let session_entry = guard
+            .sessions
+            .get(&session)
+            .ok_or(IndraError::InvalidSession)?;
+        let entries: Vec<_> = session_entry.keys.values().cloned().collect();
+        for entry in &entries {
+            request_revocation(entry)?;
+        }
+        guard.sessions.remove(&session);
+        entries
+    };
+    for entry in entries {
+        drain_and_zeroize(entry)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn store_result(
+    session: IndraSessionHandle,
+    result: BuiltTxOwned,
+) -> Result<IndraResultHandle, IndraError> {
     let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
-    guard
-        .entries
+    let session_entry = guard
+        .sessions
+        .get_mut(&session)
+        .ok_or(IndraError::InvalidSession)?;
+    loop {
+        let handle = random_token(|bytes| IndraResultHandle { bytes })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            session_entry.results.entry(handle)
+        {
+            entry.insert(Arc::new(result));
+            return Ok(handle);
+        }
+    }
+}
+
+pub(crate) fn with_result<R>(
+    session: IndraSessionHandle,
+    handle: IndraResultHandle,
+    read: impl FnOnce(&BuiltTxOwned) -> R,
+) -> Result<R, IndraError> {
+    let result = {
+        let guard = registry().lock().map_err(|_| IndraError::Internal)?;
+        guard
+            .sessions
+            .get(&session)
+            .ok_or(IndraError::InvalidSession)?
+            .results
+            .get(&handle)
+            .cloned()
+            .ok_or(IndraError::InvalidResult)?
+    };
+    Ok(read(&result))
+}
+
+pub(crate) fn destroy_result(
+    session: IndraSessionHandle,
+    handle: IndraResultHandle,
+) -> Result<(), IndraError> {
+    registry()
+        .lock()
+        .map_err(|_| IndraError::Internal)?
+        .sessions
+        .get_mut(&session)
+        .ok_or(IndraError::InvalidSession)?
+        .results
         .remove(&handle)
         .map(|_| ())
-        .ok_or(IndraError::InvalidHandle)
+        .ok_or(IndraError::InvalidResult)
 }
 
-pub(crate) fn destroy_all() -> Result<(), IndraError> {
-    let mut guard = registry().lock().map_err(|_| IndraError::Internal)?;
-    guard.entries.clear();
-    Ok(())
+#[cfg(test)]
+static CHECKPOINT_HOOK: OnceLock<
+    Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static REVOCATION_HOOK: OnceLock<Mutex<Option<Arc<std::sync::Barrier>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_checkpoint_hook(
+    reached: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+) {
+    *CHECKPOINT_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some((reached, release));
+}
+
+#[cfg(test)]
+pub(crate) fn install_revocation_hook(revoked: Arc<std::sync::Barrier>) {
+    *REVOCATION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(revoked);
+}
+
+#[cfg(test)]
+fn checkpoint_hook() {
+    let hook = CHECKPOINT_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take();
+    if let Some((reached, release)) = hook {
+        reached.wait();
+        release.wait();
+    }
+}
+
+#[cfg(test)]
+fn revocation_hook() {
+    let hook = REVOCATION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take();
+    if let Some(revoked) = hook {
+        revoked.wait();
+    }
 }
