@@ -102,6 +102,7 @@ fn main() {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
+    drop(params);
 
     println!("\nTransaction built:");
     println!("  TX ID:    {}", built.tx_id);

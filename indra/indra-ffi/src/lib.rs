@@ -33,6 +33,7 @@ pub mod wallet;
 
 use errors::{error_string, IndraError};
 pub use handles::{IndraKeyHandle, INDRA_KEY_HANDLE_INVALID};
+use zeroize::Zeroizing;
 
 pub const CLASSICAL_PK_BYTES: usize = 32;
 pub const CLASSICAL_SK_BYTES: usize = 32;
@@ -54,19 +55,22 @@ pub const MAX_TX_BYTES: usize = 1_048_576;
 pub const MAX_TX_HEX_BYTES: usize = MAX_TX_BYTES * 2 + 1;
 /// Maximum byte length for a generated mnemonic output buffer.
 pub const MAX_MNEMONIC_BYTES: usize = 512;
-/// Maximum number of bytes scanned while reading a C string over FFI.
-pub const MAX_CSTR_LEN: usize = 4096;
+/// Maximum byte length accepted for an FFI UTF-8 input.
+pub const MAX_FFI_STRING_BYTES: usize = 4096;
 
-pub(crate) unsafe fn bounded_cstr(ptr: *const c_char) -> Result<String, IndraError> {
+pub(crate) unsafe fn bounded_utf8(
+    ptr: *const c_char,
+    len: usize,
+    max_len: usize,
+) -> Result<String, IndraError> {
     if ptr.is_null() {
         return Err(IndraError::NullPointer);
     }
-    let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), MAX_CSTR_LEN);
-    let nul_pos = slice
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(IndraError::InvalidParam)?;
-    std::str::from_utf8(&slice[..nul_pos])
+    if len > max_len {
+        return Err(IndraError::InvalidParam);
+    }
+    let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
+    std::str::from_utf8(slice)
         .map(str::to_owned)
         .map_err(|_| IndraError::InvalidParam)
 }
@@ -118,8 +122,10 @@ pub struct IndraTxParams {
     pub utxos: *const IndraUtxoEntry,
     pub utxo_count: usize,
     pub sender_handle: IndraKeyHandle,
-    /// Chain id used for descriptor validation, note KDF, and transaction signing.
+    /// Chain id used for descriptor validation and transaction signing.
     pub chain_id: *const c_char,
+    /// Exact readable byte length of `chain_id`; no NUL terminator is consumed.
+    pub chain_id_len: usize,
 }
 
 /// FFI transaction builder output.
@@ -183,11 +189,9 @@ pub unsafe extern "C" fn indra_keygen_handle(
     *out_public = IndraPublicKeyInfo::zeroed();
 
     match catch_unwind(|| {
-        let mut seed_bytes = [0u8; CLASSICAL_SK_BYTES];
+        let mut seed_bytes = Zeroizing::new([0u8; CLASSICAL_SK_BYTES]);
         seed_bytes.copy_from_slice(std::slice::from_raw_parts(seed, CLASSICAL_SK_BYTES));
-        let result = keygen::generate_keys(seed_bytes);
-        seed_bytes.fill(0);
-        result.and_then(|keys| handles::store_keys(&keys))
+        keygen::generate_keys(*seed_bytes).and_then(|keys| handles::store_keys(&keys))
     }) {
         Ok(Ok((handle, public))) => {
             *out_handle = handle;
@@ -234,11 +238,13 @@ pub unsafe extern "C" fn indra_generate_mnemonic(out_phrase: *mut c_char, out_le
 ///
 /// # Safety
 ///
-/// `phrase` must point to a valid null-terminated UTF-8 C string.
+/// `phrase` must point to exactly `phrase_len` readable UTF-8 bytes. The caller
+/// retains ownership and must securely erase its mnemonic buffer after return.
 /// `out_handle` and `out_public` must point to writable storage.
 #[no_mangle]
 pub unsafe extern "C" fn indra_keygen_from_mnemonic_handle(
     phrase: *const c_char,
+    phrase_len: usize,
     out_handle: *mut IndraKeyHandle,
     out_public: *mut IndraPublicKeyInfo,
 ) -> i32 {
@@ -250,7 +256,7 @@ pub unsafe extern "C" fn indra_keygen_from_mnemonic_handle(
     *out_public = IndraPublicKeyInfo::zeroed();
 
     match catch_unwind(|| {
-        let phrase_str = bounded_cstr(phrase)?;
+        let phrase_str = Zeroizing::new(bounded_utf8(phrase, phrase_len, MAX_MNEMONIC_BYTES)?);
         keygen::generate_keys_from_mnemonic(&phrase_str).and_then(|keys| handles::store_keys(&keys))
     }) {
         Ok(Ok((handle, public))) => {
@@ -311,15 +317,16 @@ pub extern "C" fn indra_destroy_all_key_handles() -> i32 {
 ///
 /// # Safety
 ///
-/// `phrase` must point to a valid null-terminated UTF-8 C string.
+/// `phrase` must point to exactly `phrase_len` readable UTF-8 bytes. The caller
+/// retains ownership and must securely erase its mnemonic buffer after return.
 #[no_mangle]
-pub unsafe extern "C" fn indra_validate_mnemonic(phrase: *const c_char) -> i32 {
+pub unsafe extern "C" fn indra_validate_mnemonic(phrase: *const c_char, phrase_len: usize) -> i32 {
     if phrase.is_null() {
         return IndraError::NullPointer.code();
     }
 
     match catch_unwind(|| {
-        let phrase_str = bounded_cstr(phrase)?;
+        let phrase_str = Zeroizing::new(bounded_utf8(phrase, phrase_len, MAX_MNEMONIC_BYTES)?);
         if keygen::is_valid_mnemonic(&phrase_str) {
             Ok(())
         } else {
@@ -381,7 +388,7 @@ pub unsafe extern "C" fn indra_validator_id(
 ///
 /// \`params\` and \`out\` must be valid pointers. The address pointer must
 /// reference \`recipient_address_len\` readable UTF-8 bytes, \`chain_id\` must
-/// be a valid NUL-terminated UTF-8 string, and UTXO pointers must match their count.
+/// reference exactly `chain_id_len` UTF-8 bytes, and UTXO pointers must match their count.
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_tx_with_handle(
     params: *const IndraTxParams,
@@ -412,7 +419,11 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
             params_ref.recipient_address_len,
         ))
         .map_err(|_| IndraError::InvalidParam)?;
-        let chain_id = bounded_cstr(params_ref.chain_id)?;
+        let chain_id = bounded_utf8(
+            params_ref.chain_id,
+            params_ref.chain_id_len,
+            MAX_FFI_STRING_BYTES,
+        )?;
         indra_crypto::PaymentAddressV1::from_text(recipient_address, chain_id.as_bytes())
             .map_err(|_| IndraError::InvalidParam)?;
         let utxos = if params_ref.utxo_count == 0 {
@@ -421,28 +432,19 @@ pub unsafe extern "C" fn indra_build_tx_with_handle(
             std::slice::from_raw_parts(params_ref.utxos, params_ref.utxo_count)
         };
         let signing = handles::signing_material(params_ref.sender_handle)?;
-        let mut sender_classical_seed = signing.classical_seed();
-        let mut sender_ml_dsa_seed = signing.ml_dsa_seed();
+        let sender_classical_seed = Zeroizing::new(signing.classical_seed());
+        let sender_ml_dsa_seed = Zeroizing::new(signing.ml_dsa_seed());
         let wallet_context =
-            wallet::build_wallet_context(sender_classical_seed, &signing.public.pq_pk, utxos)?;
-        let built = match tx::build_with_address(
+            wallet::build_wallet_context(*sender_classical_seed, &signing.public.pq_pk, utxos)?;
+        let built = tx::build_with_address(
             recipient_address,
             params_ref.amount_spark,
             params_ref.fee_spark,
-            sender_classical_seed,
-            &sender_ml_dsa_seed,
+            *sender_classical_seed,
+            sender_ml_dsa_seed.as_ref(),
             &chain_id,
             wallet_context,
-        ) {
-            Ok(built) => built,
-            Err(error) => {
-                sender_classical_seed.fill(0);
-                sender_ml_dsa_seed.fill(0);
-                return Err(error);
-            }
-        };
-        sender_classical_seed.fill(0);
-        sender_ml_dsa_seed.fill(0);
+        )?;
 
         let tx_bytes_len = built.tx_bytes.len();
         let tx_bytes_ptr = Box::into_raw(built.tx_bytes) as *mut u8;
@@ -677,6 +679,7 @@ mod handle_tests {
             unsafe {
                 indra_keygen_from_mnemonic_handle(
                     phrase_c.as_ptr(),
+                    phrase_c.as_bytes().len(),
                     &mut mnemonic_handle,
                     &mut public,
                 )
@@ -777,6 +780,7 @@ mod handle_tests {
             utxo_count: 1,
             sender_handle,
             chain_id: chain.as_ptr(),
+            chain_id_len: chain.as_bytes().len(),
         };
         let mut result = IndraTxResult::zeroed();
         assert_eq!(
@@ -815,6 +819,7 @@ mod handle_tests {
             utxo_count: 0,
             sender_handle: INDRA_KEY_HANDLE_INVALID,
             chain_id: chain.as_ptr(),
+            chain_id_len: chain.as_bytes().len(),
         };
         let mut result = IndraTxResult::zeroed();
 
@@ -835,6 +840,7 @@ mod handle_tests {
                 handle,
                 7,
                 chain.as_ptr(),
+                chain.as_bytes().len(),
                 out.as_mut_ptr(),
                 out.len(),
             )
@@ -872,6 +878,7 @@ mod handle_tests {
                 handle,
                 9,
                 chain.as_ptr(),
+                chain.as_bytes().len(),
                 out.as_mut_ptr(),
                 out.len(),
             )
@@ -917,6 +924,7 @@ mod handle_tests {
             utxo_count: 0,
             sender_handle: INDRA_KEY_HANDLE_INVALID,
             chain_id: chain.as_ptr(),
+            chain_id_len: chain.as_bytes().len(),
         };
         assert_eq!(
             unsafe { indra_build_tx_with_handle(&tx_params, &mut result) },
@@ -928,6 +936,7 @@ mod handle_tests {
                     INDRA_KEY_HANDLE_INVALID,
                     1,
                     chain.as_ptr(),
+                    chain.as_bytes().len(),
                     out_hex.as_mut_ptr(),
                     out_hex.len(),
                 )
@@ -942,6 +951,7 @@ mod handle_tests {
                     INDRA_KEY_HANDLE_INVALID,
                     1,
                     chain.as_ptr(),
+                    chain.as_bytes().len(),
                     out_hex.as_mut_ptr(),
                     out_hex.len(),
                 )
@@ -981,6 +991,7 @@ mod handle_tests {
                         handle,
                         u64::from(i) + 1,
                         chain.as_ptr(),
+                        chain.as_bytes().len(),
                         out.as_mut_ptr(),
                         out.len(),
                     )
@@ -998,6 +1009,59 @@ mod handle_tests {
         for worker in workers {
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn exact_length_utf8_input_never_scans_past_short_allocation() {
+        let allocation = Box::new([b'x', 0]);
+        let parsed = unsafe {
+            bounded_utf8(
+                allocation.as_ptr().cast::<c_char>(),
+                1,
+                MAX_FFI_STRING_BYTES,
+            )
+        }
+        .unwrap();
+        assert_eq!(parsed, "x");
+        assert_eq!(
+            unsafe {
+                bounded_utf8(
+                    allocation.as_ptr().cast::<c_char>(),
+                    MAX_FFI_STRING_BYTES + 1,
+                    MAX_FFI_STRING_BYTES,
+                )
+            },
+            Err(IndraError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn secret_containers_have_drop_guaranteed_zeroization() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<indra_cli::KeysFile>();
+        assert_zeroize_on_drop::<indra_cli::ValidatorKeys>();
+        assert_zeroize_on_drop::<indra_crypto::PqKeypair>();
+
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct PanicProbe(Arc<AtomicBool>);
+        impl zeroize::Zeroize for PanicProbe {
+            fn zeroize(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let observed = Arc::new(AtomicBool::new(false));
+        let result = std::panic::catch_unwind({
+            let observed = Arc::clone(&observed);
+            move || {
+                let _secret = zeroize::Zeroizing::new(PanicProbe(observed));
+                panic!("exercise unwind cleanup");
+            }
+        });
+        assert!(result.is_err());
+        assert!(observed.load(Ordering::SeqCst));
     }
 
     #[test]

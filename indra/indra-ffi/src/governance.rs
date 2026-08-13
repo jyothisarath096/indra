@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    bounded_cstr,
+    bounded_utf8,
     errors::IndraError,
     handles,
     staking::{read_bytes32, read_chain_id, write_hex_to_buf},
@@ -60,8 +60,12 @@ fn build_governance_op(
     Ok(hex::encode(op.encode_to_vec()))
 }
 
-fn parse_action_json(action_json: *const c_char) -> Result<GovernableAction, IndraError> {
-    let raw = unsafe { bounded_cstr(action_json) }.map_err(|_| IndraError::InvalidJson)?;
+fn parse_action_json(
+    action_json: *const c_char,
+    action_json_len: usize,
+) -> Result<GovernableAction, IndraError> {
+    let raw = unsafe { bounded_utf8(action_json, action_json_len, crate::MAX_FFI_STRING_BYTES) }
+        .map_err(|_| IndraError::InvalidJson)?;
     let value: Value = serde_json::from_str(&raw).map_err(|_| IndraError::InvalidJson)?;
     let action_type = value
         .get("type")
@@ -143,7 +147,7 @@ where
     match catch_unwind(|| {
         let signing = handles::signing_material(args.handle)?;
         let keypair = signing.keypair()?;
-        let chain = read_chain_id(args.chain_id)?;
+        let chain = read_chain_id(args.chain_id, args.chain_id_len)?;
         let payload = make_payload(&keypair)?;
         let signer_id = Bytes32::from(signing.public.validator_id);
         let hex = build_governance_op(signer_id, args.nonce, payload, &keypair, &chain)?;
@@ -160,6 +164,7 @@ struct GovernanceHandleArgs {
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 }
@@ -167,12 +172,16 @@ struct GovernanceHandleArgs {
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
     title: *const c_char,
+    title_len: usize,
     description: *const c_char,
+    description_len: usize,
     action_json: *const c_char,
+    action_json_len: usize,
     deposit_utxo_id: *const u8,
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -188,14 +197,16 @@ pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
         |keypair| {
-            let title_str = bounded_cstr(title)?;
-            let description_str = bounded_cstr(description)?;
+            let title_str = bounded_utf8(title, title_len, crate::MAX_FFI_STRING_BYTES)?;
+            let description_str =
+                bounded_utf8(description, description_len, crate::MAX_FFI_STRING_BYTES)?;
             Ok(GovernancePayload::Propose {
-                action: parse_action_json(action_json)?,
+                action: parse_action_json(action_json, action_json_len)?,
                 deposit_utxo_id: Bytes32::from(read_bytes32(deposit_utxo_id)),
                 proposer_pubkey: hybrid_pubkey_from_keypair(keypair)?,
                 title: VariableBytes::from_slice(title_str.as_bytes())
@@ -244,6 +255,7 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -255,6 +267,7 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -280,6 +293,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -291,6 +305,7 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -314,6 +329,7 @@ pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -325,6 +341,7 @@ pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -345,6 +362,7 @@ pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -356,6 +374,7 @@ pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -373,6 +392,7 @@ pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -384,6 +404,7 @@ pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },

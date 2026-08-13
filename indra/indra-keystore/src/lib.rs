@@ -90,7 +90,7 @@ pub enum KeystoreError {
 pub type KeystoreResult<T> = Result<T, KeystoreError>;
 
 /// All public keys for a validator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ValidatorKeys {
     /// Domain-separated 32-byte identity of the complete hybrid public key.
     pub validator_id: [u8; 32],
@@ -103,7 +103,7 @@ pub struct ValidatorKeys {
 }
 
 /// A complete keys file including private seeds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct KeysFile {
     /// Validator display name chosen at key generation.
     pub name: String,

@@ -37,6 +37,9 @@ extern "C" {
 typedef uint64_t IndraKeyHandle;
 #define INDRA_KEY_HANDLE_INVALID ((IndraKeyHandle)0)
 
+/* Secret inputs remain caller-owned. Rust zeroizes its private copies, but
+ * callers must securely erase their original seed and mnemonic buffers. */
+
 typedef struct {
     uint8_t validator_id[INDRA_VALIDATOR_ID_BYTES];
     uint8_t classical_pk[INDRA_CLASSICAL_PK_BYTES];
@@ -62,6 +65,7 @@ typedef struct {
     size_t         utxo_count;
     IndraKeyHandle sender_handle;
     const char*    chain_id;
+    size_t         chain_id_len;
 } IndraTxParams;
 
 typedef struct {
@@ -86,6 +90,7 @@ int32_t indra_generate_mnemonic(
 
 int32_t indra_keygen_from_mnemonic_handle(
     const char* phrase,
+    size_t phrase_len,
     IndraKeyHandle* out_handle,
     IndraPublicKeyInfo* out_public
 );
@@ -100,7 +105,7 @@ int32_t indra_destroy_all_key_handles(void);
 
 void indra_zeroize_tx_result(IndraTxResult* result);
 
-int32_t indra_validate_mnemonic(const char* phrase);
+int32_t indra_validate_mnemonic(const char* phrase, size_t phrase_len);
 
 int32_t indra_validator_id(
     const uint8_t* classical_pk,
@@ -126,6 +131,7 @@ int32_t indra_build_register_validator_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -135,6 +141,7 @@ int32_t indra_build_self_stake_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -145,6 +152,7 @@ int32_t indra_build_delegate_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -153,6 +161,7 @@ int32_t indra_build_claim_rewards_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -162,6 +171,7 @@ int32_t indra_build_set_commission_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -171,18 +181,23 @@ int32_t indra_build_set_auto_delegate_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
 
 int32_t indra_build_governance_propose_with_handle(
     const char* title,
+    size_t title_len,
     const char* description,
+    size_t description_len,
     const char* action_json,
+    size_t action_json_len,
     const uint8_t* deposit_utxo_id,
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -195,6 +210,7 @@ int32_t indra_build_governance_commit_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -206,6 +222,7 @@ int32_t indra_build_governance_reveal_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -218,6 +235,7 @@ int32_t indra_build_governance_redelegate_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -227,6 +245,7 @@ int32_t indra_build_governance_execute_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );
@@ -236,6 +255,7 @@ int32_t indra_build_governance_cancel_with_handle(
     IndraKeyHandle handle,
     uint64_t nonce,
     const char* chain_id,
+    size_t chain_id_len,
     char* out_hex,
     size_t out_len
 );

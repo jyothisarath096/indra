@@ -1,14 +1,13 @@
 use indra_cli::{generate_from_master_seed, recover_from_mnemonic, KeysFile};
 use indra_crypto::{generate_mnemonic, validate_mnemonic};
+use zeroize::Zeroizing;
 
 use crate::errors::IndraError;
 
 /// Generate an INDRA keypair bundle from one wallet seed.
-pub fn generate_keys(mut seed: [u8; 32]) -> Result<KeysFile, IndraError> {
-    let result =
-        generate_from_master_seed(String::new(), seed).map_err(|_| IndraError::KeygenFailed);
-    seed.fill(0);
-    result
+pub fn generate_keys(seed: [u8; 32]) -> Result<KeysFile, IndraError> {
+    let seed = Zeroizing::new(seed);
+    generate_from_master_seed(String::new(), *seed).map_err(|_| IndraError::KeygenFailed)
 }
 
 /// Generate a new BIP-39 mnemonic phrase.

@@ -12,7 +12,10 @@ use indra_cli::tx_builder::{
 use indra_core::types::primitives::Bytes32;
 use indra_crypto::hybrid::HybridKeypair;
 
-use crate::{bounded_cstr, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES};
+use crate::{
+    bounded_utf8, errors::IndraError, handles, IndraKeyHandle, INDRA_OP_HEX_MAX_BYTES,
+    MAX_FFI_STRING_BYTES,
+};
 
 pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -20,8 +23,11 @@ pub(crate) unsafe fn read_bytes32(ptr: *const u8) -> [u8; 32] {
     out
 }
 
-pub(crate) unsafe fn read_chain_id(chain_id: *const c_char) -> Result<String, IndraError> {
-    bounded_cstr(chain_id)
+pub(crate) unsafe fn read_chain_id(
+    chain_id: *const c_char,
+    chain_id_len: usize,
+) -> Result<String, IndraError> {
+    bounded_utf8(chain_id, chain_id_len, MAX_FFI_STRING_BYTES)
 }
 
 pub(crate) unsafe fn write_hex_to_buf(
@@ -53,7 +59,7 @@ where
     match catch_unwind(|| {
         let signing = handles::signing_material(args.handle)?;
         let keypair = signing.keypair()?;
-        let chain = read_chain_id(args.chain_id)?;
+        let chain = read_chain_id(args.chain_id, args.chain_id_len)?;
         let hex = build(&keypair, &signing.public.validator_id, args.nonce, &chain)?;
         write_hex_to_buf(&hex, args.out_hex, args.out_len)
     }) {
@@ -68,6 +74,7 @@ struct StakingHandleArgs {
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 }
@@ -81,6 +88,7 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -95,6 +103,7 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -114,6 +123,7 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -125,6 +135,7 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -148,6 +159,7 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -159,6 +171,7 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -181,6 +194,7 @@ pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -189,6 +203,7 @@ pub unsafe extern "C" fn indra_build_claim_rewards_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -206,6 +221,7 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -217,6 +233,7 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },
@@ -240,6 +257,7 @@ pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
     handle: IndraKeyHandle,
     nonce: u64,
     chain_id: *const c_char,
+    chain_id_len: usize,
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
@@ -251,6 +269,7 @@ pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
             handle,
             nonce,
             chain_id,
+            chain_id_len,
             out_hex,
             out_len,
         },

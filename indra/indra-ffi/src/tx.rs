@@ -41,7 +41,7 @@ pub fn build_with_address(
     chain_id: &str,
     wallet_context: WalletContext,
 ) -> Result<BuiltTxOwned, IndraError> {
-    let mut params = TxParams {
+    let params = TxParams {
         chain_id,
         recipient_address,
         amount_spark,
@@ -52,16 +52,7 @@ pub fn build_with_address(
         sender_pubkey: wallet_context.sender_pubkey,
     };
 
-    let built = match build_transaction(&params) {
-        Ok(built) => built,
-        Err(error) => {
-            params.ed25519_seed.fill(0);
-            params.ml_dsa_seed_bytes.fill(0);
-            return Err(IndraError::from(error));
-        }
-    };
-    params.ed25519_seed.fill(0);
-    params.ml_dsa_seed_bytes.fill(0);
+    let built = build_transaction(&params).map_err(IndraError::from)?;
     let tx_bytes = hex::decode(&built.tx_hex).map_err(|_| IndraError::Internal)?;
     let _ = decode_transaction(&tx_bytes)?;
     let tx_id = tx_id_from_bytes(&tx_bytes);

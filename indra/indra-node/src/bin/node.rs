@@ -4258,7 +4258,7 @@ fn load_keys_data(keys_path: &str, password_file: Option<&str>) -> KeysData {
         ed25519_seed: keys.ed25519_seed,
         vrf_seed: keys.vrf_seed,
         ml_dsa_seed: keys.ml_dsa_seed,
-        pq_pk: keys.public.hybrid_pq_pk,
+        pq_pk: keys.public.hybrid_pq_pk.clone(),
     }
 }
 

@@ -22,6 +22,7 @@ use indra_crypto::{
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
     sha256, PaymentAddressV1,
 };
+use zeroize::Zeroize;
 
 use crate::{
     error::{CliError, CliResult},
@@ -53,6 +54,13 @@ pub struct TxParams<'a> {
     pub ml_dsa_seed_bytes: Vec<u8>,
     /// Sender's own pubkey (for change output).
     pub sender_pubkey: HybridPubKey,
+}
+
+impl Drop for TxParams<'_> {
+    fn drop(&mut self) {
+        self.ed25519_seed.zeroize();
+        self.ml_dsa_seed_bytes.zeroize();
+    }
 }
 
 /// The result of building a transaction.
