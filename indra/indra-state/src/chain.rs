@@ -345,16 +345,9 @@ impl Decode for ChainState {
         let staking_nonces = decode_nonce_map(r)?;
         let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
         let governance = GovernanceState::decode(r)?;
-        let delegator_identities = if r.remaining() > 0 {
-            decode_delegator_identity_registry(r)?
-        } else {
-            PersistentOrdMap::new()
-        };
-        let (retired_cold_classical_components, retired_cold_pq_components) = if r.remaining() > 0 {
-            decode_retired_cold_components(r)?
-        } else {
-            (PersistentOrdSet::new(), PersistentOrdSet::new())
-        };
+        let delegator_identities = decode_delegator_identity_registry(r)?;
+        let (retired_cold_classical_components, retired_cold_pq_components) =
+            decode_retired_cold_components(r)?;
         let consensus_snapshots = {
             let snapshots = decode_list(r, 2, "chain_state.consensus_snapshots")?;
             validate_consensus_snapshot_collection(&snapshots, height)?;

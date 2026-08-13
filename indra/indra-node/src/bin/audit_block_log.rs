@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use indra_core::{
-    codec::{ByteReader, Decode, Encode},
+    codec::{Decode, Encode},
     types::block::BlockV1,
 };
 use indra_storage::{BlockStore, PruneConfig};
@@ -76,8 +76,7 @@ fn main() {
             .get(height)
             .unwrap_or_else(|e| panic!("failed to read block {height}: {e}"));
         let encoded = block.encode_to_vec();
-        let mut reader = ByteReader::new(&encoded);
-        let decoded = BlockV1::decode(&mut reader)
+        let decoded = BlockV1::decode_exact(&encoded)
             .unwrap_or_else(|e| panic!("failed to decode re-encoded block {height}: {e}"));
         if decoded != block {
             roundtrip_failures += 1;

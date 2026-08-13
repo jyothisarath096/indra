@@ -335,25 +335,19 @@ impl Message {
                     (block_bytes.len() as u32).encode(&mut buf);
                     buf.extend_from_slice(&block_bytes);
                 }
-                // Optional trailing availability metadata. Older decoders ignore
-                // these bytes after reading the block vector, so this is safe for
-                // rolling upgrades while giving new requesters explicit pruned
-                // range information.
-                if lowest_available.is_some() || highest_available.is_some() {
-                    let mut flags = 0u8;
-                    if lowest_available.is_some() {
-                        flags |= 0x01;
-                    }
-                    if highest_available.is_some() {
-                        flags |= 0x02;
-                    }
-                    flags.encode(&mut buf);
-                    if let Some(height) = lowest_available {
-                        height.encode(&mut buf);
-                    }
-                    if let Some(height) = highest_available {
-                        height.encode(&mut buf);
-                    }
+                let mut flags = 0u8;
+                if lowest_available.is_some() {
+                    flags |= 0x01;
+                }
+                if highest_available.is_some() {
+                    flags |= 0x02;
+                }
+                flags.encode(&mut buf);
+                if let Some(height) = lowest_available {
+                    height.encode(&mut buf);
+                }
+                if let Some(height) = highest_available {
+                    height.encode(&mut buf);
                 }
                 buf
             }
@@ -426,10 +420,10 @@ impl Message {
     fn decode_payload(msg_type: MessageType, payload: &[u8]) -> NetworkResult<Self> {
         match msg_type {
             MessageType::Block => {
-                let mut r = ByteReader::new(payload);
-                let block = BlockV1::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
+                let block =
+                    BlockV1::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
                 Ok(Self::Block(block))
             }
             MessageType::Vote => {
@@ -613,40 +607,37 @@ impl Message {
                         .map_err(|e| NetworkError::DecodeFailed {
                             reason: e.to_string(),
                         })?;
-                    let mut block_reader = ByteReader::new(bytes);
-                    let block = BlockV1::decode(&mut block_reader).map_err(|e| {
-                        NetworkError::DecodeFailed {
-                            reason: e.to_string(),
-                        }
-                    })?;
-                    blocks.push(block);
-                }
-                let mut lowest_available = None;
-                let mut highest_available = None;
-                if reader.remaining() > 0 {
-                    let flags =
-                        u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                    let block =
+                        BlockV1::decode_exact(bytes).map_err(|e| NetworkError::DecodeFailed {
                             reason: e.to_string(),
                         })?;
-                    if flags & 0x01 != 0 {
-                        lowest_available = Some(u64::decode(&mut reader).map_err(|e| {
-                            NetworkError::DecodeFailed {
-                                reason: e.to_string(),
-                            }
-                        })?);
-                    }
-                    if flags & 0x02 != 0 {
-                        highest_available = Some(u64::decode(&mut reader).map_err(|e| {
-                            NetworkError::DecodeFailed {
-                                reason: e.to_string(),
-                            }
-                        })?);
-                    }
-                    if flags & !0x03 != 0 || reader.remaining() != 0 {
-                        return Err(NetworkError::DecodeFailed {
-                            reason: "invalid BlockResponse availability metadata".to_string(),
-                        });
-                    }
+                    blocks.push(block);
+                }
+                let flags = u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                    reason: e.to_string(),
+                })?;
+                let lowest_available = if flags & 0x01 != 0 {
+                    Some(
+                        u64::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                            reason: e.to_string(),
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                let highest_available = if flags & 0x02 != 0 {
+                    Some(
+                        u64::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+                            reason: e.to_string(),
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                if flags & !0x03 != 0 || reader.remaining() != 0 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "invalid BlockResponse availability metadata".to_string(),
+                    });
                 }
                 Ok(Self::BlockResponse {
                     blocks,
@@ -771,17 +762,17 @@ impl Message {
                 })
             }
             MessageType::VrfCommit => {
-                let mut r = ByteReader::new(payload);
-                let commit = VrfCommit::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
+                let commit =
+                    VrfCommit::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
                 Ok(Self::VrfCommit(commit))
             }
             MessageType::VrfReveal => {
-                let mut r = ByteReader::new(payload);
-                let reveal = VrfReveal::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
+                let reveal =
+                    VrfReveal::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
                 Ok(Self::VrfReveal(reveal))
             }
             MessageType::RequestVrfReveals => {
@@ -807,6 +798,14 @@ impl Message {
                             reason: e.to_string(),
                         }
                     })?);
+                }
+                if r.remaining() != 0 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: format!(
+                            "RequestVrfReveals contains {} trailing bytes",
+                            r.remaining()
+                        ),
+                    });
                 }
                 Ok(Self::RequestVrfReveals {
                     height,
@@ -838,12 +837,19 @@ impl Message {
                     let bytes = r.read_bytes(len).map_err(|e| NetworkError::DecodeFailed {
                         reason: e.to_string(),
                     })?;
-                    let mut rr = ByteReader::new(bytes);
-                    reveals.push(VrfReveal::decode(&mut rr).map_err(|e| {
+                    reveals.push(VrfReveal::decode_exact(bytes).map_err(|e| {
                         NetworkError::DecodeFailed {
                             reason: e.to_string(),
                         }
                     })?);
+                }
+                if r.remaining() != 0 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: format!(
+                            "VrfRevealsResponse contains {} trailing bytes",
+                            r.remaining()
+                        ),
+                    });
                 }
                 Ok(Self::VrfRevealsResponse {
                     height,
@@ -867,7 +873,7 @@ mod tests {
             MAX_VRF_PROOF_BYTES,
         },
         staking::{StakingOp, StakingOpBody},
-        vrf_election::VrfReveal,
+        vrf_election::{VrfCommit, VrfReveal},
     };
 
     fn test_block(height: u64) -> BlockV1 {
@@ -914,6 +920,18 @@ mod tests {
             vrf_pubkey: [0x03; 32],
             vrf_output: Bytes32::from([0x04; 32]),
             vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0x05; 80]).unwrap(),
+            commit_hash: Bytes32::from([0x06; 32]),
+            signature: dummy_sig(),
+        }
+    }
+
+    fn test_vrf_commit() -> VrfCommit {
+        VrfCommit {
+            chain_id_hash: Bytes32::from([0x01; 32]),
+            height: 42,
+            round: 3,
+            validator_id: Bytes32::from([0x02; 32]),
+            vrf_pubkey: [0x03; 32],
             commit_hash: Bytes32::from([0x06; 32]),
             signature: dummy_sig(),
         }
@@ -1073,6 +1091,51 @@ mod tests {
     }
 
     #[test]
+    fn vrf_wire_decoding_rejects_truncation_and_trailing_bytes_at_every_boundary() {
+        for message in [
+            Message::VrfCommit(test_vrf_commit()),
+            Message::VrfReveal(test_vrf_reveal()),
+        ] {
+            let canonical = message.encode_wire().unwrap()[4..].to_vec();
+            assert!(Message::decode_wire(&canonical[..canonical.len() - 1]).is_err());
+            let mut trailing = canonical;
+            trailing.push(0xA5);
+            assert!(Message::decode_wire(&trailing).is_err());
+        }
+
+        let response = Message::VrfRevealsResponse {
+            height: 42,
+            round: 3,
+            reveals: vec![test_vrf_reveal()],
+        };
+        let canonical = response.encode_wire().unwrap()[4..].to_vec();
+        assert!(Message::decode_wire(&canonical[..canonical.len() - 1]).is_err());
+
+        let mut nested_trailing = canonical.clone();
+        let nested_len_offset = 1 + 8 + 4 + 4;
+        let old_len = u32::from_le_bytes(
+            nested_trailing[nested_len_offset..nested_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        nested_trailing[nested_len_offset..nested_len_offset + 4]
+            .copy_from_slice(&(old_len + 1).to_le_bytes());
+        nested_trailing.push(0xA5);
+        assert!(Message::decode_wire(&nested_trailing).is_err());
+
+        let mut outer_trailing = canonical;
+        outer_trailing.push(0xA5);
+        assert!(Message::decode_wire(&outer_trailing).is_err());
+    }
+
+    #[test]
+    fn block_wire_decoding_rejects_trailing_bytes() {
+        let mut encoded = Message::Block(test_block(1)).encode_wire().unwrap()[4..].to_vec();
+        encoded.push(0xA5);
+        assert!(Message::decode_wire(&encoded).is_err());
+    }
+
+    #[test]
     fn status_round_trip() {
         let tip = Bytes32::from([0xABu8; 32]);
         let msg = Message::Status {
@@ -1224,6 +1287,13 @@ mod tests {
                 highest_available: Some(2000),
             } if got == blocks
         ));
+    }
+
+    #[test]
+    fn block_response_rejects_missing_mandatory_availability_flags() {
+        let mut legacy_truncated = vec![MessageType::BlockResponse as u8];
+        0u32.encode(&mut legacy_truncated);
+        assert!(Message::decode_wire(&legacy_truncated).is_err());
     }
 
     #[test]

@@ -164,13 +164,12 @@ impl Decode for BlockHeaderV1 {
             proposer_vrf_output: Bytes32::decode(r)?,
             proposer_vrf_proof: VariableBytes::decode(r)?,
             quorum_certificate: VariableBytes::decode(r)?,
-            polc_round: u32::decode(r).unwrap_or(NO_POLC_ROUND),
-            value_hash: Bytes32::decode(r).unwrap_or(Bytes32::ZERO),
-            election_result_hash: match u8::decode(r) {
-                Ok(0) => None,
-                Ok(1) => Some(Bytes32::decode(r)?),
-                Ok(b) => return Err(crate::error::IndraError::InvalidBool { byte: b }),
-                Err(_) => None,
+            polc_round: u32::decode(r)?,
+            value_hash: Bytes32::decode(r)?,
+            election_result_hash: match u8::decode(r)? {
+                0 => None,
+                1 => Some(Bytes32::decode(r)?),
+                b => return Err(crate::error::IndraError::InvalidBool { byte: b }),
             },
         })
     }
@@ -279,6 +278,22 @@ mod tests {
     fn header_round_trip() {
         let h = dummy_header();
         assert_eq!(h, BlockHeaderV1::decode_exact(&h.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn current_header_rejects_each_truncated_mandatory_tail_field_and_trailing_bytes() {
+        let encoded = dummy_header().encode_to_vec();
+        let election_tail = 1 + 32;
+        let value_hash_tail = 32 + election_tail;
+        let polc_tail = 4 + value_hash_tail;
+
+        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - polc_tail]).is_err());
+        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - value_hash_tail]).is_err());
+        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - election_tail]).is_err());
+
+        let mut trailing = encoded;
+        trailing.push(0xA5);
+        assert!(BlockHeaderV1::decode_exact(&trailing).is_err());
     }
 
     #[test]

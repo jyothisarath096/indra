@@ -13,7 +13,7 @@ use std::sync::{
 };
 
 use indra_core::{
-    codec::{ByteReader, Decode, Encode},
+    codec::{Decode, Encode},
     types::{block::BlockV1, primitives::MIN_PRUNE_KEEP_BLOCKS},
 };
 
@@ -430,8 +430,7 @@ fn scan_segments(dir: &Path) -> StorageResult<(BTreeMap<u64, Location>, u64, u64
                     actual,
                 });
             }
-            let mut reader = ByteReader::new(&bytes);
-            let block = BlockV1::decode(&mut reader).map_err(|e| StorageError::Corruption {
+            let block = BlockV1::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
                 height,
                 detail: e.to_string(),
             })?;
@@ -513,8 +512,7 @@ fn read_location(height: u64, location: &Location) -> StorageResult<BlockV1> {
             actual,
         });
     }
-    let mut r = ByteReader::new(&bytes);
-    BlockV1::decode(&mut r).map_err(|e| StorageError::Corruption {
+    BlockV1::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
         height,
         detail: e.to_string(),
     })
