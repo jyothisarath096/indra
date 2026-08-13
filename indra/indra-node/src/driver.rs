@@ -38,7 +38,7 @@ use indra_crypto::{
     hybrid::{verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey},
     vrf_verify, VrfOutput, VrfProof,
 };
-use indra_storage::{VoteSafetyLoadResult, VoteSafetyStore};
+use indra_storage::{PersistedConsensusLock, VoteSafetyLoadResult, VoteSafetyStore};
 
 use crate::{
     consensus_authority::{vrf_authority_from_snapshot, VrfConsensusAuthority},
@@ -365,6 +365,8 @@ pub struct ConsensusDriver {
     /// Stable value hash corresponding to `locked_value`, used only for POLC
     /// same-value checks across reproposals with different full hashes.
     locked_value_hash: Option<Bytes32>,
+    /// Verified prevote PoLC proving the current durable lock.
+    locked_polc_votes: Vec<VoteV1>,
     /// Tendermint valid value / valid round for reproposal.
     valid_round: Option<u32>,
     /// Full block hash that reached prevote quorum.
@@ -428,6 +430,7 @@ impl ConsensusDriver {
             locked_round: None,
             locked_value: None,
             locked_value_hash: None,
+            locked_polc_votes: Vec::new(),
             valid_round: None,
             valid_value: None,
             valid_block: None,
@@ -459,6 +462,7 @@ impl ConsensusDriver {
             driver.restore_last_qc_for_startup();
         }
         driver.refresh_registered_voters();
+        driver.apply_vote_safety();
         driver
     }
 
@@ -885,12 +889,6 @@ impl ConsensusDriver {
         self.consecutive_empty_reveal_rounds = 0;
         self.last_insufficient_reveal_round_counted = None;
         self.highest_pipelined_vrf_commit_height = self.engine.state.height;
-        self.locked_round = None;
-        self.locked_value = None;
-        self.locked_value_hash = None;
-        self.valid_round = None;
-        self.valid_value = None;
-        self.valid_block = None;
         self.start_round(0);
         self.apply_vote_safety();
     }
@@ -1698,7 +1696,78 @@ impl ConsensusDriver {
             .unwrap_or_default()
     }
 
-    /// Check persisted vote safety record and advance past already-voted rounds.
+    fn persisted_consensus_lock(&self) -> Result<Option<PersistedConsensusLock>, String> {
+        let Some(round) = self.locked_round else {
+            return Ok(None);
+        };
+        let block_hash = self
+            .locked_value
+            .ok_or("lock is missing full block identity")?;
+        let value_hash = self
+            .locked_value_hash
+            .ok_or("lock is missing stable value identity")?;
+        let block = self
+            .valid_block
+            .as_ref()
+            .filter(|block| block.header.block_hash() == block_hash)
+            .ok_or("lock is missing its canonical block")?
+            .clone();
+        if self.locked_polc_votes.is_empty() {
+            return Err("lock is missing its verified prevote PoLC".into());
+        }
+        Ok(Some(PersistedConsensusLock {
+            height: self.next_height(),
+            round,
+            block_hash,
+            value_hash,
+            block,
+            polc_votes: self.locked_polc_votes.clone(),
+        }))
+    }
+
+    fn verify_and_restore_consensus_lock(
+        &mut self,
+        lock: PersistedConsensusLock,
+    ) -> Result<(), String> {
+        if lock.height != self.next_height()
+            || lock.block.header.height != lock.height
+            || lock.block.header.block_hash() != lock.block_hash
+            || lock.block.header.value_hash != lock.value_hash
+        {
+            return Err("persisted lock block identities do not match current height".into());
+        }
+        let mut collector = VoteCollector::new(
+            lock.height,
+            lock.round,
+            VoteStep::Prevote,
+            self.engine.state.chain_id.clone(),
+            self.registered_voters.clone(),
+        );
+        for vote in &lock.polc_votes {
+            if vote.block_hash != lock.block_hash || vote.election_result_hash.is_some() {
+                return Err("persisted PoLC contains a vote for a different value".into());
+            }
+            collector
+                .add_vote(vote.clone())
+                .map_err(|error| format!("persisted PoLC vote failed verification: {error}"))?;
+        }
+        if !matches!(
+            collector.current_decision(),
+            VoteDecision::QuorumReached { block_hash, .. } if block_hash == lock.block_hash
+        ) {
+            return Err("persisted PoLC does not contain strict two-thirds prevote stake".into());
+        }
+        self.locked_round = Some(lock.round);
+        self.locked_value = Some(lock.block_hash);
+        self.locked_value_hash = Some(lock.value_hash);
+        self.locked_polc_votes = lock.polc_votes;
+        self.valid_round = Some(lock.round);
+        self.valid_value = Some(lock.block_hash);
+        self.valid_block = Some(lock.block);
+        Ok(())
+    }
+
+    /// Restore durable vote and lock safety state before participating.
     fn apply_vote_safety(&mut self) {
         let next_height = self.engine.state.height.saturating_add(1);
         match self.vote_safety.load() {
@@ -1706,6 +1775,24 @@ impl ConsensusDriver {
                 self.vote_safety_unavailable = None;
             }
             VoteSafetyLoadResult::Record(record) => {
+                if let Some(lock) = record.consensus_lock {
+                    if lock.height == next_height {
+                        if let Err(reason) = self.verify_and_restore_consensus_lock(lock) {
+                            let message = format!("persisted consensus lock is invalid: {reason}");
+                            eprintln!("[vote_safety] CRITICAL: {message}");
+                            self.vote_safety_unavailable = Some(message);
+                            return;
+                        }
+                    } else if lock.height > next_height {
+                        let message = format!(
+                            "persisted consensus lock height {} is ahead of next height {next_height}",
+                            lock.height
+                        );
+                        eprintln!("[vote_safety] CRITICAL: {message}");
+                        self.vote_safety_unavailable = Some(message);
+                        return;
+                    }
+                }
                 self.vote_safety_unavailable = None;
                 if record.height == next_height && record.round >= self.current_round {
                     let safe_round = record.round.saturating_add(1);
@@ -2103,7 +2190,18 @@ impl ConsensusDriver {
             VoteStep::Prevote => 0u8,
             VoteStep::Precommit => 1u8,
         };
-        if let Err(err) = self.vote_safety.record(height, round, step_byte) {
+        let persisted_lock = match self.persisted_consensus_lock() {
+            Ok(lock) => lock,
+            Err(reason) => {
+                eprintln!("[vote_safety] CRITICAL: refusing to vote: {reason}");
+                self.vote_safety_unavailable = Some(reason);
+                return vec![DriverAction::None];
+            }
+        };
+        if let Err(err) = self
+            .vote_safety
+            .record(height, round, step_byte, persisted_lock.as_ref())
+        {
             eprintln!(
                 "[vote_safety] CRITICAL: failed to persist vote safety record before signing: {err}; refusing to vote"
             );
@@ -2657,6 +2755,24 @@ impl ConsensusDriver {
                                         self.locked_value_hash = self
                                             .pending_block(&block_hash)
                                             .map(|block| block.header.value_hash);
+                                        self.locked_polc_votes = self
+                                            .vote_collectors
+                                            .get(&Self::collector_key(
+                                                vote.height,
+                                                vote.round,
+                                                VoteStep::Prevote,
+                                            ))
+                                            .map(|collector| {
+                                                collector
+                                                    .accepted_votes()
+                                                    .into_iter()
+                                                    .filter(|accepted| {
+                                                        accepted.block_hash == block_hash
+                                                    })
+                                                    .cloned()
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
                                         actions.extend(self.sign_and_record_local_vote(
                                             vote.height,
                                             vote.round,
@@ -2896,8 +3012,15 @@ impl ConsensusDriver {
                 self.locked_round = None;
                 self.locked_value = None;
                 self.locked_value_hash = None;
+                self.locked_polc_votes.clear();
                 self.valid_round = None;
                 self.valid_value = None;
+                self.valid_block = None;
+                if let Err(error) = self.vote_safety.clear() {
+                    eprintln!(
+                        "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
+                    );
+                }
                 self.start_round(0);
                 actions.extend(self.pipeline_next_height_vrf_commit_after_finalization());
                 actions.extend(self.activate_buffered_proposals_for_new_tip());
@@ -8169,7 +8292,7 @@ mod tests {
         let (mut driver, dir) = local_driver([0x51u8; 32], "proposal_round_vote_safety");
         let _local = install_active_validator(&mut driver, [0x51u8; 32], "local");
         driver.refresh_registered_voters();
-        driver.vote_safety.record(1, 5, 0).unwrap();
+        driver.vote_safety.record(1, 5, 0, None).unwrap();
 
         let block = make_strict_block(&driver, [0x51u8; 32], 5, vec![]);
         let actions = driver.process(DriverEvent::InboundBlock { from: None, block });
@@ -8494,7 +8617,7 @@ mod tests {
     fn apply_vote_safety_skips_past_voted_rounds() {
         let (mut driver, dir) = local_driver([0x4Du8; 32], "vote_safety_skip");
         driver.engine.state.height = 4;
-        driver.vote_safety.record(5, 7, 0).unwrap();
+        driver.vote_safety.record(5, 7, 0, None).unwrap();
 
         driver.apply_vote_safety();
 
@@ -8506,7 +8629,7 @@ mod tests {
     fn apply_vote_safety_ignores_old_height() {
         let (mut driver, dir) = local_driver([0x4Eu8; 32], "vote_safety_old_height");
         driver.engine.state.height = 5;
-        driver.vote_safety.record(3, 10, 0).unwrap();
+        driver.vote_safety.record(3, 10, 0, None).unwrap();
 
         driver.apply_vote_safety();
 
@@ -8563,7 +8686,7 @@ mod tests {
     #[test]
     fn valid_vote_safety_record_constrains_future_rounds() {
         let (mut driver, dir) = local_driver([0x74u8; 32], "vote_safety_valid_constrains");
-        driver.vote_safety.record(1, 2, 0).unwrap();
+        driver.vote_safety.record(1, 2, 0, None).unwrap();
         driver.apply_vote_safety();
         assert_eq!(driver.current_round(), 3);
         let actions = driver.sign_and_record_local_vote(1, 3, VoteStep::Prevote, Bytes32::ZERO);
@@ -8574,6 +8697,130 @@ mod tests {
             "higher round after persisted vote-safety record should remain allowed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_restart_restores_lock_and_rejects_conflicting_no_polc_prevote() {
+        let seed = [0x79u8; 32];
+        let (mut driver, dir) = local_driver(seed, "restart_restores_lock");
+        let local = install_active_validator(&mut driver, seed, "local");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        // Step 1-2: A received a genuine strict-two-thirds prevote PoLC and the
+        // validator persisted its resulting lock before its non-nil precommit.
+        let block_a = make_strict_block(&driver, seed, 0, vec![]);
+        let hash_a = block_a.header.block_hash();
+        let value_a = block_a.header.value_hash;
+        let prevote_a = indra_consensus::vote::produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            hash_a,
+            validator_id_for(&local),
+            DEFAULT_CHAIN_ID,
+            &local,
+        )
+        .unwrap();
+        let durable_lock = PersistedConsensusLock {
+            height: 1,
+            round: 0,
+            block_hash: hash_a,
+            value_hash: value_a,
+            block: block_a,
+            polc_votes: vec![prevote_a],
+        };
+        driver
+            .vote_safety
+            .record(1, 0, 1, Some(&durable_lock))
+            .unwrap();
+
+        // Step 3-4: crash and reconstruct from durable state. The lock and its
+        // independently verified PoLC must be restored, not merely round-skip.
+        let config = driver.engine.config.clone();
+        drop(driver);
+        let engine = NodeEngine::init(config).unwrap();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let mut restarted = ConsensusDriver::new(engine, vote_safety);
+        restarted.sync.mark_caught_up(restarted.height());
+        assert_eq!(restarted.locked_round, Some(0));
+        assert_eq!(restarted.locked_value, Some(hash_a));
+        assert_eq!(restarted.current_round(), 1);
+
+        // Step 5: a conflicting round-1 proposal without a later PoLC must get
+        // a nil prevote. Before T7-01 the restarted driver was unlocked and
+        // legitimately prevoted this conflicting full block hash.
+        let mut block_b = make_block(&restarted.engine.state);
+        block_b.header.proposer_round = 1;
+        block_b.header.polc_round = NO_POLC_ROUND;
+        block_b.header.timestamp = block_b.header.timestamp.saturating_add(1);
+        block_b.header.value_hash = block_b.compute_value_hash(restarted.engine.state.total_supply);
+        let hash_b = block_b.header.block_hash();
+        assert_ne!(hash_b, hash_a);
+        restarted.pending_blocks.insert(hash_b, block_b);
+        restarted.current_phase = RoundPhase::Propose;
+        let actions = restarted.maybe_prevote_current_round_proposal();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote)
+                if vote.step == VoteStep::Prevote && vote.block_hash == Bytes32::ZERO
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            DriverAction::BroadcastVote(vote) if vote.block_hash == hash_b
+        )));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_polc_is_durable_before_precommit_broadcast_is_returned() {
+        let (mut driver, dir) = local_driver([0x7Au8; 32], "lock_before_precommit");
+        let _local = install_active_validator(&mut driver, [0x7Au8; 32], "local");
+        let remote_a = install_active_validator(&mut driver, [0x7Bu8; 32], "remote-a");
+        let remote_b = install_active_validator(&mut driver, [0x7Cu8; 32], "remote-b");
+        let _remote_c = install_active_validator(&mut driver, [0x7Du8; 32], "remote-c");
+        driver.refresh_registered_voters();
+        driver.sync.mark_caught_up(driver.height());
+
+        let block = make_strict_block(&driver, [0x7Au8; 32], 0, vec![]);
+        let hash = block.header.block_hash();
+        let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
+        for (port, signer) in [(9711, &remote_a), (9712, &remote_b)] {
+            let vote = indra_consensus::vote::produce_vote(
+                1,
+                0,
+                VoteStep::Prevote,
+                hash,
+                validator_id_for(signer),
+                DEFAULT_CHAIN_ID,
+                signer,
+            )
+            .unwrap();
+            let actions = driver.process(DriverEvent::InboundVote {
+                from: SocketAddr::from(([127, 0, 0, 1], port)),
+                vote,
+            });
+            if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    DriverAction::BroadcastVote(vote)
+                        if vote.step == VoteStep::Precommit && vote.block_hash == hash
+                )
+            }) {
+                let VoteSafetyLoadResult::Record(record) = driver.vote_safety.load() else {
+                    panic!("precommit broadcast requires a durable safety record")
+                };
+                let lock = record
+                    .consensus_lock
+                    .expect("precommit broadcast requires a durable lock");
+                assert_eq!(lock.block_hash, hash);
+                assert!(lock.polc_votes.len() >= 3);
+                let _ = std::fs::remove_dir_all(dir);
+                return;
+            }
+        }
+        panic!("prevote quorum did not produce the expected precommit");
     }
 
     #[test]

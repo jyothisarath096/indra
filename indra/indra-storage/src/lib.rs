@@ -62,5 +62,7 @@ pub use qc_store::{
 };
 pub use segmented_block_store::{BlockStore, BlockStoreReadHandle, PruneConfig};
 pub use state_store::StateStore;
-pub use vote_safety::{VoteSafetyLoadResult, VoteSafetyRecord, VoteSafetyStore};
+pub use vote_safety::{
+    PersistedConsensusLock, VoteSafetyLoadResult, VoteSafetyRecord, VoteSafetyStore,
+};
 pub use wal::MempoolWal;
