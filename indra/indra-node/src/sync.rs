@@ -1519,6 +1519,7 @@ mod tests {
         round: u32,
         prev_qc_bytes: Vec<u8>,
     ) -> BlockV1 {
+        let requested_qc_bytes = prev_qc_bytes.clone();
         let election = build_election(state, state.height + 1, round);
         let preferred = VrfKeypair::from_seed(&[proposer_seed; 32]);
         let mut keypairs = std::collections::BTreeMap::new();
@@ -1555,10 +1556,54 @@ mod tests {
             .remove(&election_result.elected_validator_id)
             .unwrap();
         let election_result_hash = election_result.hash();
+        let projection_qc_bytes = if state.height == 0 {
+            prev_qc_bytes
+        } else {
+            let supplied_is_valid = QuorumCertificateV1::decode_exact(&prev_qc_bytes)
+                .ok()
+                .filter(|qc| qc.height == state.height && qc.block_hash == state.tip_hash)
+                .and_then(|qc| {
+                    let snapshot = state.snapshot_for_consensus_height(qc.height).ok()?;
+                    indra_core::types::qc::verify_qc_against_snapshot(
+                        &qc,
+                        snapshot,
+                        &state.chain_id,
+                    )
+                    .ok()
+                })
+                .is_some();
+            if supplied_is_valid {
+                prev_qc_bytes
+            } else {
+                let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
+                let keys: Vec<_> = snapshot
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        (0u8..=u8::MAX)
+                            .map(|seed| {
+                                HybridKeypair::new(
+                                    ClassicalKeypair::from_seed(&[seed; 32]),
+                                    PqKeypair::from_seed(&[seed; 32]).unwrap(),
+                                )
+                            })
+                            .find(|keypair| {
+                                indra_core::types::crypto::hybrid_identity_id(
+                                    &keypair.public_key().classical.0,
+                                    &keypair.public_key().pq.0,
+                                ) == entry.validator_id
+                            })
+                            .expect("test snapshot signer seed must be recoverable")
+                    })
+                    .collect();
+                let refs: Vec<_> = keys.iter().collect();
+                qc_from_test_signers(state.height, state.tip_hash, snapshot, &refs).encode_to_vec()
+            }
+        };
         let template = BlockTemplate {
             proposer_vrf_keypair: proposer_vrf,
             epoch_seed: election.epoch_seed,
-            prev_qc_bytes,
+            prev_qc_bytes: projection_qc_bytes,
             timestamp: 1_700_000_000u64.saturating_add(state.height.saturating_add(1)),
             polc_round: None,
             transactions: vec![],
@@ -1570,7 +1615,12 @@ mod tests {
             vrf_reveals,
         };
         let mut projection_state = state.clone();
-        produce_block(&template, &mut projection_state, &election).unwrap()
+        let mut block = produce_block(&template, &mut projection_state, &election).unwrap();
+        if state.height > 0 && block.header.quorum_certificate.as_slice() != requested_qc_bytes {
+            block.header.quorum_certificate =
+                VariableBytes::from_slice(&requested_qc_bytes).unwrap();
+        }
+        block
     }
 
     fn make_reveal_set_block(

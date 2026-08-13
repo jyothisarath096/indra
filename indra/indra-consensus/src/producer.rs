@@ -324,6 +324,44 @@ mod tests {
         election_result_for(election, vrf_seed).hash()
     }
 
+    fn parent_qc_bytes(state: &ChainState) -> Vec<u8> {
+        if state.height == 0 {
+            return Vec::new();
+        }
+        let hot = indra_crypto::HybridKeypair::new(
+            indra_crypto::ClassicalKeypair::from_seed(&[0x31; 32]),
+            indra_crypto::PqKeypair::from_seed(&[0x32; 32]).unwrap(),
+        );
+        let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
+        let entry = &snapshot.entries()[0];
+        let vote = crate::vote::produce_vote(
+            state.height,
+            0,
+            indra_core::types::vote::VoteStep::Precommit,
+            state.tip_hash,
+            entry.validator_id,
+            &state.chain_id,
+            &hot,
+        )
+        .unwrap();
+        crate::qc::build_qc(
+            state.height,
+            0,
+            state.tip_hash,
+            &state.chain_id,
+            &[crate::qc::QcValidator {
+                validator_id: entry.validator_id,
+                position: 0,
+                pq_pk: entry.pq_vote_pk.to_vec(),
+                classical_pk: entry.classical_vote_pk,
+                stake: entry.consensus_weight_spark,
+            }],
+            vec![&vote],
+        )
+        .unwrap()
+        .encode_to_vec()
+    }
+
     fn assert_produced_block_matches_clone_projection(block: &BlockV1, pre_state: &ChainState) {
         let mut projected_candidate = block.clone();
         projected_candidate.header.state_root = Bytes32::ZERO;
@@ -761,7 +799,7 @@ mod tests {
             let template = BlockTemplate {
                 proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
                 epoch_seed: Bytes32::from(seed),
-                prev_qc_bytes: vec![],
+                prev_qc_bytes: parent_qc_bytes(&new_state),
                 timestamp: 1_700_000_001 + index as u64,
                 polc_round: None,
                 transactions: mempool

@@ -14,11 +14,13 @@
 //!   6. Durably publish the buffered, own-QC-verified sync projection
 //!   7. Advance to next height
 
+#[cfg(test)]
+use indra_consensus::qc::verify_qc_strict;
 use indra_consensus::{
     mempool::Mempool,
     producer::{produce_block, BlockTemplate},
     proposer::{compute_proposer_vrf, elect_proposer, ProposerElection},
-    qc::{verify_qc, verify_qc_strict, QcValidator},
+    qc::{verify_qc, QcValidator},
     vote::{produce_vote_with_election_result, RegisteredVoter},
 };
 use indra_core::codec::{ByteReader, Decode};
@@ -1533,9 +1535,12 @@ impl NodeEngine {
         snapshot: &ConsensusSnapshot,
         chain_id: &str,
     ) -> NodeResult<()> {
-        let validators = Self::qc_validators_for_height(qc.height, snapshot);
-        verify_qc_strict(qc, &validators, snapshot.total_weight_spark, chain_id)
-            .map_err(NodeError::Consensus)
+        indra_core::types::qc::verify_qc_against_snapshot(qc, snapshot, chain_id)
+            .map(|_| ())
+            .map_err(|err| NodeError::BlockInvalid {
+                height: qc.height,
+                reason: format!("QC failed immutable-snapshot verification: {err}"),
+            })
     }
 
     /// Sign a local vote with an optional commit-reveal election result hash.
@@ -3698,7 +3703,14 @@ mod tests {
 
             // Model a process killed after every component store made the next
             // generation durable, but before manifest-v2 was atomically renamed.
-            let second = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
+            let parent_qc = build_single_validator_qc_bytes(
+                engine.state.height,
+                0,
+                engine.state.tip_hash,
+                [0x42u8; 32],
+                [0x42u8; 32],
+            );
+            let second = make_strict_block(&engine.state, [0x42u8; 32], parent_qc);
             let mut projected = engine.state.clone();
             indra_state::apply_block(&mut projected, &second, 0).unwrap();
             engine.block_store.append(&second).unwrap();

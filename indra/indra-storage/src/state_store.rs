@@ -771,6 +771,46 @@ mod tests {
     }
 
     fn make_block(state: &ChainState) -> BlockV1 {
+        let quorum_certificate = if state.height == 0 {
+            VariableBytes::from_slice(&[]).unwrap()
+        } else {
+            let keypair = indra_crypto::HybridKeypair::new(
+                indra_crypto::ClassicalKeypair::from_seed(&[0x41; 32]),
+                indra_crypto::PqKeypair::from_seed(&[0x42; 32]).unwrap(),
+            );
+            let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
+            let entry = &snapshot.entries()[0];
+            let bytes = indra_core::types::vote_signing::vote_signing_bytes(
+                state.height,
+                0,
+                indra_core::types::vote::VoteStep::Precommit,
+                &state.tip_hash,
+                &entry.validator_id,
+                None,
+                &state.chain_id,
+            );
+            let signature = keypair.sign(&bytes).unwrap();
+            let qc = indra_core::types::qc::QuorumCertificateV1 {
+                height: state.height,
+                round: 0,
+                block_hash: state.tip_hash,
+                election_result_hash: None,
+                signer_bitfield: {
+                    let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
+                    bits[0] = 1;
+                    bits
+                },
+                pq_signatures: vec![indra_core::types::crypto::PQVoteSig {
+                    validator_id: entry.validator_id,
+                    pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+                }],
+                classical_signatures: vec![indra_core::types::qc::ClassicalVoteSig {
+                    validator_id: entry.validator_id,
+                    classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+                }],
+            };
+            VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
+        };
         let mut block = BlockV1 {
             header: BlockHeaderV1 {
                 protocol_version: ProtocolVersion::CURRENT,
@@ -786,7 +826,7 @@ mod tests {
                 polc_round: NO_POLC_ROUND,
                 proposer_vrf_output: Bytes32::ZERO,
                 proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                quorum_certificate,
                 election_result_hash: None,
             },
             transactions: vec![],

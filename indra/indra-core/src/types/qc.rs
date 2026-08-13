@@ -3,6 +3,7 @@
 //! INDRA QCs are hybrid: they contain one ML-DSA-87 signature and one Ed25519
 //! signature per signer plus a signer bitfield, and no BLS aggregate signature.
 
+use crate::types::{consensus_snapshot::ConsensusSnapshot, vote::VoteStep};
 use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
@@ -13,6 +14,10 @@ use crate::{
         },
     },
 };
+use indra_crypto::hybrid::{
+    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
+};
+use std::collections::{HashMap, HashSet};
 
 /// Bytes needed for the signer bitfield. ceil(MAX_VALIDATORS / 8).
 pub const SIGNER_BITFIELD_BYTES: usize = MAX_VALIDATORS.div_ceil(8);
@@ -66,6 +71,164 @@ pub struct QuorumCertificateV1 {
     pub pq_signatures: Vec<PQVoteSig>,
     /// Individual Ed25519 signatures for included validators.
     pub classical_signatures: Vec<ClassicalVoteSig>,
+}
+
+/// Cryptographically verified QC authority, bound to one immutable snapshot.
+///
+/// Fields are private so state-transition callers cannot manufacture signer
+/// attribution without passing the canonical hybrid-signature verifier.
+#[derive(Debug, Clone)]
+pub struct VerifiedQc {
+    height: u64,
+    block_hash: Bytes32,
+    signer_ids: Vec<Bytes32>,
+    encoded_qc: Vec<u8>,
+}
+
+impl VerifiedQc {
+    /// Certified height.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+    /// Certified block hash.
+    pub fn block_hash(&self) -> Bytes32 {
+        self.block_hash
+    }
+    /// Validator IDs whose hybrid signatures were verified.
+    pub fn signer_ids(&self) -> &[Bytes32] {
+        &self.signer_ids
+    }
+    /// Whether this capability was minted from these exact canonical QC bytes.
+    pub fn matches_encoded_qc(&self, bytes: &[u8]) -> bool {
+        self.encoded_qc == bytes
+    }
+}
+
+/// Failure from authoritative QC verification against a frozen snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QcVerificationError {
+    /// A set bit has no corresponding snapshot member.
+    #[error("QC signer bitfield references an absent validator")]
+    UnknownSignerPosition,
+    /// Verified signer weight is not strictly greater than two thirds.
+    #[error("QC signed stake does not exceed two thirds")]
+    InsufficientStake,
+    /// One validator appears more than once in a signature list.
+    #[error("QC contains a duplicate signer signature")]
+    DuplicateSignature,
+    /// Signature-list length disagrees with the signer bitfield.
+    #[error("QC signature count does not match its signer bitfield")]
+    SignatureCountMismatch,
+    /// A bitfield signer lacks one component signature.
+    #[error("QC is missing a signer signature")]
+    MissingSignature,
+    /// An ML-DSA-87 signature is malformed or invalid.
+    #[error("QC contains an invalid ML-DSA-87 signature")]
+    InvalidPqSignature,
+    /// An Ed25519 signature is malformed or invalid.
+    #[error("QC contains an invalid Ed25519 signature")]
+    InvalidClassicalSignature,
+}
+
+/// Verify every hybrid vote signature and the exact strict-two-thirds stake
+/// threshold against the immutable authority snapshot governing `qc.height`.
+pub fn verify_qc_against_snapshot(
+    qc: &QuorumCertificateV1,
+    snapshot: &ConsensusSnapshot,
+    chain_id: &str,
+) -> Result<VerifiedQc, QcVerificationError> {
+    let mut signers = Vec::new();
+    for (byte_index, byte) in qc.signer_bitfield.iter().copied().enumerate() {
+        for bit_index in 0..8 {
+            let position = byte_index * 8 + bit_index;
+            if position >= crate::types::primitives::MAX_VALIDATORS {
+                break;
+            }
+            if (byte >> bit_index) & 1 == 1 {
+                signers.push(
+                    snapshot
+                        .entries()
+                        .get(position)
+                        .ok_or(QcVerificationError::UnknownSignerPosition)?,
+                );
+            }
+        }
+    }
+    let signed_stake = signers.iter().fold(0u64, |sum, entry| {
+        sum.saturating_add(entry.consensus_weight_spark)
+    });
+    if !crate::types::primitives::has_strict_two_thirds_quorum(
+        signed_stake,
+        snapshot.total_weight_spark,
+    ) {
+        return Err(QcVerificationError::InsufficientStake);
+    }
+    if qc.pq_signatures.len() != signers.len() || qc.classical_signatures.len() != signers.len() {
+        return Err(QcVerificationError::SignatureCountMismatch);
+    }
+    let mut pq = HashMap::new();
+    let mut seen = HashSet::new();
+    for signature in &qc.pq_signatures {
+        if !seen.insert(signature.validator_id) {
+            return Err(QcVerificationError::DuplicateSignature);
+        }
+        pq.insert(signature.validator_id, signature);
+    }
+    let mut classical = HashMap::new();
+    seen.clear();
+    for signature in &qc.classical_signatures {
+        if !seen.insert(signature.validator_id) {
+            return Err(QcVerificationError::DuplicateSignature);
+        }
+        classical.insert(signature.validator_id, signature);
+    }
+    let mut signer_ids = Vec::with_capacity(signers.len());
+    for signer in signers {
+        let signing_bytes = crate::types::vote_signing::vote_signing_bytes(
+            qc.height,
+            qc.round,
+            VoteStep::Precommit,
+            &qc.block_hash,
+            &signer.validator_id,
+            qc.election_result_hash.as_ref(),
+            chain_id,
+        );
+        let pq_signature = pq
+            .get(&signer.validator_id)
+            .ok_or(QcVerificationError::MissingSignature)?;
+        let pq_bytes: [u8; indra_crypto::PQ_SIG_BYTES] = pq_signature
+            .pq_sig
+            .as_slice()
+            .try_into()
+            .map_err(|_| QcVerificationError::InvalidPqSignature)?;
+        verify_pq(
+            &signing_bytes,
+            &PqSignature(pq_bytes),
+            &PqPublicKey(signer.pq_vote_pk.clone()),
+        )
+        .map_err(|_| QcVerificationError::InvalidPqSignature)?;
+        let classical_signature = classical
+            .get(&signer.validator_id)
+            .ok_or(QcVerificationError::MissingSignature)?;
+        let classical_bytes: [u8; indra_crypto::CLASSICAL_SIG_BYTES] = classical_signature
+            .classical_sig
+            .as_slice()
+            .try_into()
+            .map_err(|_| QcVerificationError::InvalidClassicalSignature)?;
+        verify_classical(
+            &signing_bytes,
+            &ClassicalSignature(classical_bytes),
+            &ClassicalPublicKey(signer.classical_vote_pk),
+        )
+        .map_err(|_| QcVerificationError::InvalidClassicalSignature)?;
+        signer_ids.push(signer.validator_id);
+    }
+    Ok(VerifiedQc {
+        height: qc.height,
+        block_hash: qc.block_hash,
+        signer_ids,
+        encoded_qc: qc.encode_to_vec(),
+    })
 }
 
 impl QuorumCertificateV1 {

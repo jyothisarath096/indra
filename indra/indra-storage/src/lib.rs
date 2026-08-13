@@ -57,7 +57,8 @@ pub use epoch_store::{EpochStore, EpochStoreReadHandle};
 pub use error::{StorageError, StorageResult};
 pub use manifest::{load_chain_manifest, save_chain_manifest, ChainManifest};
 pub use qc_store::{
-    clear_pending_last_qc, load_last_qc, load_pending_last_qc, save_last_qc, save_pending_last_qc,
+    clear_last_qc, clear_pending_last_qc, load_last_qc, load_pending_last_qc, save_last_qc,
+    save_pending_last_qc,
 };
 pub use segmented_block_store::{BlockStore, BlockStoreReadHandle, PruneConfig};
 pub use state_store::StateStore;

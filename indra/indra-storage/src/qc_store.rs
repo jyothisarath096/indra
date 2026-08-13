@@ -49,6 +49,11 @@ pub fn load_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> {
     }
 }
 
+/// Remove a persisted QC that failed startup authority verification.
+pub fn clear_last_qc(state_dir: &Path) -> StorageResult<()> {
+    clear_qc_file(&state_dir.join(LAST_QC_FILE))
+}
+
 /// Read the staged current-tip QC bytes, if any.
 pub fn load_pending_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> {
     let path = state_dir.join(PENDING_LAST_QC_FILE);
@@ -61,7 +66,10 @@ pub fn load_pending_last_qc(state_dir: &Path) -> StorageResult<Option<Vec<u8>>> 
 
 /// Remove the staged current-tip QC after it has been promoted or found stale.
 pub fn clear_pending_last_qc(state_dir: &Path) -> StorageResult<()> {
-    let path = state_dir.join(PENDING_LAST_QC_FILE);
+    clear_qc_file(&state_dir.join(PENDING_LAST_QC_FILE))
+}
+
+fn clear_qc_file(path: &Path) -> StorageResult<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => {
             if let Some(parent) = path.parent() {

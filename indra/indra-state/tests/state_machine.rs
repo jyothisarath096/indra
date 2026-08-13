@@ -15,6 +15,7 @@ use indra_core::{
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
+        vote::VoteStep,
     },
     Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
@@ -197,15 +198,15 @@ fn make_tx(
 
 fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
     let height = state.height + 1;
-    let quorum_certificate = if height % EPOCH_DURATION_BLOCKS == 0 {
+    let quorum_certificate = if height > 1 {
         let signer_ids: Vec<_> = state
             .validators
             .active_validators()
             .map(|validator| validator.validator_id)
             .collect();
-        qc_bytes_for_signers(&signer_ids, height - 1)
+        qc_bytes_for_signers(state, &signer_ids, height - 1)
     } else {
-        VariableBytes::from_slice(&[0u8; 32]).unwrap()
+        VariableBytes::from_slice(&[]).unwrap()
     };
     BlockV1 {
         header: BlockHeaderV1 {
@@ -275,33 +276,58 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
 }
 
 fn qc_bytes_for_signers(
+    state: &ChainState,
     signer_ids: &[Bytes32],
     certified_height: u64,
 ) -> VariableBytes<MAX_QC_SIZE_BYTES> {
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
-    for slot in 0..signer_ids.len() {
-        signer_bitfield[slot / 8] |= 1 << (slot % 8);
+    let snapshot = state
+        .snapshot_for_consensus_height(certified_height)
+        .unwrap();
+    for signer_id in signer_ids {
+        let (position, _) = snapshot.entry_with_position(signer_id).unwrap();
+        signer_bitfield[position / 8] |= 1 << (position % 8);
     }
+    let signed: Vec<_> = signer_ids
+        .iter()
+        .map(|validator_id| {
+            let keypair = std::iter::once([0xF0; 32])
+                .chain((0..4u8).map(|index| [0xA0 + index; 32]))
+                .chain((1..=21u8).map(|seed| [seed; 32]))
+                .map(make_test_keypair)
+                .find(|(key, _)| key.identity_id() == *validator_id)
+                .map(|(_, keypair)| keypair)
+                .expect("QC signer seed must be known to the integration fixture");
+            let bytes = indra_core::types::vote_signing::vote_signing_bytes(
+                certified_height,
+                0,
+                VoteStep::Precommit,
+                &state.tip_hash,
+                validator_id,
+                None,
+                &state.chain_id,
+            );
+            (*validator_id, keypair.sign(&bytes).unwrap())
+        })
+        .collect();
     let qc = QuorumCertificateV1 {
         height: certified_height,
         round: 0,
-        block_hash: Bytes32::from([0xC1; 32]),
+        block_hash: state.tip_hash,
         election_result_hash: None,
         signer_bitfield,
-        pq_signatures: signer_ids
+        pq_signatures: signed
             .iter()
-            .copied()
-            .map(|validator_id| PQVoteSig {
-                validator_id,
-                pq_sig: VariableBytes::from_slice(&[0xDD; 32]).unwrap(),
+            .map(|(validator_id, signature)| PQVoteSig {
+                validator_id: *validator_id,
+                pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
             })
             .collect(),
-        classical_signatures: signer_ids
+        classical_signatures: signed
             .iter()
-            .copied()
-            .map(|validator_id| ClassicalVoteSig {
-                validator_id,
-                classical_sig: VariableBytes::from_slice(&[0xCC; 64]).unwrap(),
+            .map(|(validator_id, signature)| ClassicalVoteSig {
+                validator_id: *validator_id,
+                classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
             })
             .collect(),
     };
@@ -311,7 +337,7 @@ fn qc_bytes_for_signers(
 fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockV1 {
     let mut block = make_block(state, vec![]);
     block.header.quorum_certificate =
-        qc_bytes_for_signers(signer_ids, block.header.height.saturating_sub(1));
+        qc_bytes_for_signers(state, signer_ids, block.header.height.saturating_sub(1));
     block
 }
 
@@ -392,7 +418,7 @@ fn apply_block_updates_last_active_epoch_for_qc_signers() {
         );
     }
 
-    let block = make_block_with_qc(&state, &signer_ids[..2]);
+    let block = make_block_with_qc(&state, &signer_ids[..3]);
     apply_block(&mut state, &block, 0).unwrap();
 
     let expected_epoch = indra_state::epoch::epoch_for_height(block.header.height);
@@ -418,7 +444,7 @@ fn apply_block_updates_last_active_epoch_for_qc_signers() {
             .get(&signer_ids[2])
             .unwrap()
             .last_active_epoch,
-        0
+        expected_epoch
     );
     assert_eq!(
         state

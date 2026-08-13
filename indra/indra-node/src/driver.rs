@@ -500,8 +500,8 @@ impl ConsensusDriver {
         let state_dir = self.engine.config.state_dir();
         match self.engine.load_persisted_qc() {
             Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
-                match QuorumCertificateV1::decode_exact(&qc_bytes) {
-                    Ok(qc) if qc.height == state_height => {
+                match self.verify_persisted_tip_qc(&qc_bytes) {
+                    Ok(qc) => {
                         eprintln!(
                             "[driver] restored last_qc_bytes ({} bytes) for height {}",
                             qc_bytes.len(),
@@ -511,17 +511,12 @@ impl ConsensusDriver {
                         let _ = indra_storage::clear_pending_last_qc(&state_dir);
                         return;
                     }
-                    Ok(qc) => {
-                        eprintln!(
-                            "[driver] persisted QC height {} does not match current state height {} — checking pending current-tip QC",
-                            qc.height, state_height,
-                        );
-                    }
                     Err(err) => {
                         eprintln!(
-                            "[driver] WARNING: persisted QC at height {} is not decodable by this binary: {} — checking pending current-tip QC",
+                            "[driver] WARNING: persisted QC at height {} is not trusted: {} — discarding and checking pending current-tip QC",
                             state_height, err,
                         );
+                        let _ = indra_storage::clear_last_qc(&state_dir);
                     }
                 }
             }
@@ -540,8 +535,8 @@ impl ConsensusDriver {
 
         match indra_storage::load_pending_last_qc(&state_dir) {
             Ok(Some(qc_bytes)) if !qc_bytes.is_empty() => {
-                match QuorumCertificateV1::decode_exact(&qc_bytes) {
-                    Ok(qc) if qc.height == state_height => {
+                match self.verify_persisted_tip_qc(&qc_bytes) {
+                    Ok(qc) => {
                         eprintln!(
                             "[driver] restored pending last_qc_bytes ({} bytes) for height {} after commit-boundary recovery",
                             qc_bytes.len(),
@@ -559,16 +554,9 @@ impl ConsensusDriver {
                         }
                         return;
                     }
-                    Ok(qc) => {
-                        eprintln!(
-                            "[driver] pending QC height {} does not match current state height {} — discarding and requesting from peers",
-                            qc.height, state_height,
-                        );
-                        let _ = indra_storage::clear_pending_last_qc(&state_dir);
-                    }
                     Err(err) => {
                         eprintln!(
-                            "[driver] WARNING: pending QC at height {} is not decodable by this binary: {} — discarding and requesting from peers",
+                            "[driver] WARNING: pending QC at height {} is not trusted: {} — discarding and requesting from peers",
                             state_height, err,
                         );
                         let _ = indra_storage::clear_pending_last_qc(&state_dir);
@@ -595,6 +583,32 @@ impl ConsensusDriver {
             "[driver] WARNING: no current-tip QC available at height {} — node will not propose until another validator proposes first",
             state_height,
         );
+    }
+
+    fn verify_persisted_tip_qc(&self, qc_bytes: &[u8]) -> Result<QuorumCertificateV1, String> {
+        let qc = QuorumCertificateV1::decode_exact(qc_bytes)
+            .map_err(|err| format!("invalid encoding: {err}"))?;
+        if qc.height != self.engine.state.height {
+            return Err(format!(
+                "certifies height {}, canonical tip is height {}",
+                qc.height, self.engine.state.height,
+            ));
+        }
+        if qc.block_hash != self.engine.state.tip_hash {
+            return Err("does not certify the canonical tip hash".to_string());
+        }
+        let snapshot = self
+            .engine
+            .state
+            .snapshot_for_consensus_height(qc.height)
+            .map_err(|err| format!("governing snapshot unavailable: {err}"))?;
+        indra_core::types::qc::verify_qc_against_snapshot(
+            &qc,
+            snapshot,
+            &self.engine.state.chain_id,
+        )
+        .map_err(|err| format!("hybrid quorum verification failed: {err}"))?;
+        Ok(qc)
     }
 
     fn decode_qc_height(qc_bytes: &[u8]) -> Option<u64> {
@@ -4146,6 +4160,28 @@ mod tests {
             vrf_reveals: evidence,
         };
 
+        if height > 1 {
+            let signing_keys: Vec<_> = active_seeds
+                .iter()
+                .map(|seed| {
+                    HybridKeypair::new(
+                        ClassicalKeypair::from_seed(seed),
+                        PqKeypair::from_seed(seed).unwrap(),
+                    )
+                })
+                .collect();
+            let signer_refs: Vec<_> = signing_keys.iter().collect();
+            let parent_qc = qc_bytes_from_signers(
+                driver,
+                &signer_refs,
+                height - 1,
+                0,
+                driver.engine.state.tip_hash,
+                None,
+            );
+            block.header.quorum_certificate = VariableBytes::from_slice(&parent_qc).unwrap();
+        }
+
         let mut projected = driver.engine.state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
         let roots = compute_state_roots(&projected);
@@ -4171,6 +4207,27 @@ mod tests {
         block.header.state_root = roots.state_root;
         block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);
+    }
+
+    fn parent_qc_for_test_seeds(driver: &ConsensusDriver, seeds: &[[u8; 32]]) -> Vec<u8> {
+        let keys: Vec<_> = seeds
+            .iter()
+            .map(|seed| {
+                HybridKeypair::new(
+                    ClassicalKeypair::from_seed(seed),
+                    PqKeypair::from_seed(seed).unwrap(),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = keys.iter().collect();
+        qc_bytes_from_signers(
+            driver,
+            &refs,
+            driver.engine.state.height,
+            0,
+            driver.engine.state.tip_hash,
+            None,
+        )
     }
 
     fn set_complete_vrf_state_with_divergent_result(
@@ -6563,7 +6620,7 @@ mod tests {
             .block_store
             .append(&crate::genesis::build_genesis_block())
             .unwrap();
-        let mut stored_parent = make_block(&driver.engine.state);
+        let mut stored_parent = crate::genesis::build_genesis_block();
         stored_parent.header.height = height - 1;
         driver.engine.block_store.append(&stored_parent).unwrap();
         driver.engine.state.tip_hash = stored_parent.header.block_hash();
@@ -6702,7 +6759,7 @@ mod tests {
             .block_store
             .append(&crate::genesis::build_genesis_block())
             .unwrap();
-        let mut stored_parent = make_block(&driver.engine.state);
+        let mut stored_parent = crate::genesis::build_genesis_block();
         stored_parent.header.height = height - 1;
         driver.engine.block_store.append(&stored_parent).unwrap();
         driver.engine.state.tip_hash = stored_parent.header.block_hash();
@@ -6981,7 +7038,7 @@ mod tests {
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
             epoch_seed: election.epoch_seed,
-            prev_qc_bytes: vec![],
+            prev_qc_bytes: parent_qc_for_test_seeds(&driver, &seeds),
             timestamp: 1_700_000_001,
             polc_round: None,
             transactions: vec![],
@@ -7062,7 +7119,7 @@ mod tests {
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&proposer_seed),
             epoch_seed: election.epoch_seed,
-            prev_qc_bytes: vec![],
+            prev_qc_bytes: parent_qc_for_test_seeds(&driver, &seeds),
             timestamp: 1_700_000_001,
             polc_round: None,
             transactions: vec![],
@@ -9564,7 +9621,10 @@ mod tests {
         });
         assert_eq!(driver.height(), 2);
 
-        let malformed_block3 = make_strict_block(&driver, [0xA4u8; 32], 0, qc_for_height_1);
+        let mut malformed_block3 =
+            make_strict_block(&driver, [0xA4u8; 32], 0, driver.last_qc_bytes());
+        malformed_block3.header.quorum_certificate =
+            VariableBytes::from_slice(&qc_for_height_1).unwrap();
         let malformed_hash = malformed_block3.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock {
             from: None,
@@ -9670,6 +9730,37 @@ mod tests {
             "restarted driver should restore persisted QC"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_discards_structurally_valid_qc_with_forged_signatures() {
+        let seed = [0x68u8; 32];
+        let (mut driver, dir) = local_driver(seed, "restore_forged_qc");
+        let _local = install_active_validator(&mut driver, seed, "local");
+        driver.refresh_registered_voters();
+        let block = make_strict_block(&driver, seed, 0, vec![]);
+        let _ = driver.process(DriverEvent::InboundBlock { from: None, block });
+        let mut qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
+        let mut forged_signature = qc.pq_signatures[0].pq_sig.as_slice().to_vec();
+        forged_signature[0] ^= 0x80;
+        qc.pq_signatures[0].pq_sig = VariableBytes::from_slice(&forged_signature).unwrap();
+        let forged = qc.encode_to_vec();
+        indra_storage::save_last_qc(&driver.engine.config.state_dir(), &forged).unwrap();
+        indra_storage::save_pending_last_qc(&driver.engine.config.state_dir(), &forged).unwrap();
+        let config = driver.engine.config.clone();
+        drop(driver);
+
+        let engine = NodeEngine::init(config).unwrap();
+        let state_dir = engine.config.state_dir();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let restarted = ConsensusDriver::new(engine, vote_safety);
+        assert!(restarted.last_qc_bytes().is_empty());
+        assert!(indra_storage::load_last_qc(&state_dir).unwrap().is_none());
+        assert!(indra_storage::load_pending_last_qc(&state_dir)
+            .unwrap()
+            .is_none());
+        assert!(!restarted.request_qc_if_needed().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
