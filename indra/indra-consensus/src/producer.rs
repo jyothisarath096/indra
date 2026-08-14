@@ -18,16 +18,15 @@
 use indra_core::{
     codec::Encode,
     types::{
-        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
         governance::GovernanceOpV2,
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_BLOCK_SIZE_BYTES,
-            MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
+            MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
         },
         slashing::SlashEvidenceV2,
         staking::StakingOp,
         transaction::TransactionV1,
-        vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     },
 };
 use indra_crypto::VrfKeypair;
@@ -42,8 +41,6 @@ use crate::{
 pub struct BlockTemplate {
     /// The proposer's VRF keypair.
     pub proposer_vrf_keypair: VrfKeypair,
-    /// The epoch seed (SHA-256 of last epoch's final block hash).
-    pub epoch_seed: Bytes32,
     /// The serialised QC for the previous height (to embed in this header).
     /// Empty bytes for the first block.
     pub prev_qc_bytes: Vec<u8>,
@@ -59,18 +56,6 @@ pub struct BlockTemplate {
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Slash evidence selected for inclusion.
     pub slash_evidence: Vec<SlashEvidenceV2>,
-    /// Commit-reveal election result hash for this proposal, when active.
-    pub election_result_hash: Option<Bytes32>,
-    /// Authoritative commit-reveal election result, when known to the caller.
-    ///
-    /// Post reveal-set activation, the driver computes this from quorum-backed
-    /// reveal evidence. Block production must validate against that single
-    /// authority instead of independently rebuilding an election result from
-    /// the local VRF output, because sync/proposal verification treats
-    /// proposer identity and reveal-set election evidence as separate checks.
-    pub election_result: Option<VrfElectionResult>,
-    /// Full reveal evidence used by the proposer-specified election set.
-    pub vrf_reveals: Vec<VrfRevealEvidence>,
 }
 
 /// Produce a block from contents already selected against a shared scratch state.
@@ -86,7 +71,7 @@ pub fn produce_block(
     template: &BlockTemplate,
     state: &mut ChainState,
     election: &ProposerElection,
-) -> ConsensusResult<BlockV1> {
+) -> ConsensusResult<BlockVNext> {
     // Verify this keypair is the elected proposer
     let slot = compute_proposer_vrf(
         election
@@ -98,51 +83,24 @@ pub fn produce_block(
                 ConsensusError::wrong_proposer("local VRF key is not in election candidates")
             })?,
         &template.proposer_vrf_keypair,
-        &template.epoch_seed,
-        election.height,
-        election.round,
+        election,
     );
-
-    let election_result_hash = {
-        if let Some(result) = template.election_result {
-            if result.height != election.height
-                || result.round != election.round
-                || result.elected_validator_id != slot.proposer_id
-            {
-                return Err(ConsensusError::wrong_proposer(
-                    "authoritative election result does not match proposer slot",
-                ));
-            }
-            if result.reveal_set_commitment != compute_reveal_set_commitment(&template.vrf_reveals)
-            {
-                return Err(ConsensusError::wrong_proposer(
-                    "authoritative reveal-set commitment does not match proposal evidence",
-                ));
-            }
-            let result_hash = result.hash();
-            if template
-                .election_result_hash
-                .is_some_and(|hash| hash != result_hash)
-            {
-                return Err(ConsensusError::wrong_proposer(
-                    "provided election_result_hash disagrees with authoritative result",
-                ));
-            }
-            Some(result_hash)
-        } else {
-            return Err(ConsensusError::wrong_proposer(
-                "missing authoritative election result",
-            ));
-        }
-    };
+    let slot = slot?;
+    if !slot.eligible {
+        return Err(ConsensusError::wrong_proposer(
+            "local validator is not eligible for this round",
+        ));
+    }
 
     let selected = template.transactions.clone();
 
     // Build VRF proof bytes for header
-    let vrf_proof_bytes = VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&slot.vrf_proof.0)
-        .map_err(|_| ConsensusError::CryptoError {
-            detail: "VRF proof too large".to_string(),
-        })?;
+    let vrf_proof_bytes = VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+        &slot.vrf_proof.0,
+    )
+    .map_err(|_| ConsensusError::CryptoError {
+        detail: "VRF proof too large".to_string(),
+    })?;
 
     // Embed previous QC
     let qc_bytes = VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&template.prev_qc_bytes)
@@ -152,7 +110,7 @@ pub fn produce_block(
 
     let height = state.height + 1;
 
-    let header = BlockHeaderV1 {
+    let header = BlockHeaderVNext {
         protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
         height,
         prev_hash: state.tip_hash,
@@ -164,19 +122,27 @@ pub fn produce_block(
         base_fee: state.base_fee,
         proposer_round: election.round,
         polc_round: template.polc_round.unwrap_or(NO_POLC_ROUND),
-        proposer_vrf_output: Bytes32::from(slot.vrf_output.0),
+        proposer_id: slot.proposer_id,
+        vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+        election_seed: election.election_seed,
+        proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+            &slot.vrf_output.0,
+        )
+        .map_err(|e| ConsensusError::CryptoError {
+            detail: e.to_string(),
+        })?,
         proposer_vrf_proof: vrf_proof_bytes,
+        sortition_claim: SortitionClaimV1::PraosThreshold,
+        proposer_priority: slot.priority,
         quorum_certificate: qc_bytes,
-        election_result_hash,
     };
 
-    let mut block = BlockV1 {
+    let mut block = BlockVNext {
         header,
         transactions: selected,
         slashing_evidence: template.slash_evidence.clone(),
         governance_ops: template.governance_ops.clone(),
         staking_ops: template.staking_ops.clone(),
-        vrf_reveals: template.vrf_reveals.clone(),
     };
 
     // Keep the largest deterministic prefix of the coordinator's selection.
@@ -225,12 +191,16 @@ fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
 mod tests {
     use super::*;
     use crate::mempool::Mempool;
-    use crate::proposer::VRF_FALLBACK_OUTPUT;
     use indra_crypto::VrfKeypair;
-    use indra_state::{apply_block, state_root, ChainState, ValidatorEntry, ValidatorStatus};
+    use indra_state::{
+        apply_block_for_test as apply_block, state_root, ChainState, ValidatorEntry,
+        ValidatorStatus,
+    };
 
     fn finalized_state(vrf_seed: &[u8; 32]) -> ChainState {
         let mut state = ChainState::new_genesis();
+        state.active_slot_coefficient_numerator = 1u64 << 63;
+        state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
         let hot = indra_crypto::HybridKeypair::new(
             indra_crypto::ClassicalKeypair::from_seed(&[0x31; 32]),
             indra_crypto::PqKeypair::from_seed(&[0x32; 32]).unwrap(),
@@ -250,6 +220,9 @@ mod tests {
                 hybrid_classical_pk: Some(public.classical.0),
                 hybrid_pq_pk: Some(public.pq.0.to_vec()),
                 vrf_pk: Some(vrf_pk),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: 1_000_000,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -284,7 +257,10 @@ mod tests {
         let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
         let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
         ProposerElection {
-            epoch_seed: Bytes32::from(*seed),
+            chain_id: b"indra-testnet-1".to_vec(),
+            election_seed: indra_core::types::primitives::Bytes64([seed[0]; 64]),
+            snapshot_root: Bytes32::from([0xA0; 32]),
+            active_slot_coefficient_numerator: 1u64 << 63,
             height,
             round,
             candidates: vec![crate::proposer::ProposerCandidate {
@@ -295,33 +271,27 @@ mod tests {
         }
     }
 
-    fn election_result_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> VrfElectionResult {
-        let vrf = VrfKeypair::from_seed(&vrf_seed);
-        let validator_id = election
-            .candidates
-            .iter()
-            .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+    fn eligible_election(
+        seed: &[u8; 32],
+        height: u64,
+        vrf_seed: [u8; 32],
+        stake: u64,
+    ) -> ProposerElection {
+        for round in 0..1024 {
+            let election = make_election(seed, height, round, vrf_seed, stake);
+            let candidate = &election.candidates[0];
+            if compute_proposer_vrf(
+                candidate.validator_id,
+                &VrfKeypair::from_seed(&vrf_seed),
+                &election,
+            )
             .unwrap()
-            .validator_id;
-        let slot = compute_proposer_vrf(
-            validator_id,
-            &vrf,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        VrfElectionResult {
-            height: election.height,
-            round: election.round,
-            elected_validator_id: validator_id,
-            elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-            fallback_used: false,
-            reveal_set_commitment: compute_reveal_set_commitment(&[]),
+            .eligible
+            {
+                return election;
+            }
         }
-    }
-
-    fn election_hash_for(election: &ProposerElection, vrf_seed: [u8; 32]) -> Bytes32 {
-        election_result_for(election, vrf_seed).hash()
+        panic!("test proposer did not become eligible within the protocol round bound")
     }
 
     fn parent_qc_bytes(state: &ChainState) -> Vec<u8> {
@@ -362,7 +332,7 @@ mod tests {
         .encode_to_vec()
     }
 
-    fn assert_produced_block_matches_clone_projection(block: &BlockV1, pre_state: &ChainState) {
+    fn assert_produced_block_matches_clone_projection(block: &BlockVNext, pre_state: &ChainState) {
         let mut projected_candidate = block.clone();
         projected_candidate.header.state_root = Bytes32::ZERO;
         projected_candidate.header.validator_set_root = Bytes32::ZERO;
@@ -381,7 +351,10 @@ mod tests {
         );
     }
 
-    fn clone_reference_block_from_produced(produced: &BlockV1, pre_state: &ChainState) -> BlockV1 {
+    fn clone_reference_block_from_produced(
+        produced: &BlockVNext,
+        pre_state: &ChainState,
+    ) -> BlockVNext {
         let mut reference = produced.clone();
         reference.header.state_root = Bytes32::ZERO;
         reference.header.validator_set_root = Bytes32::ZERO;
@@ -401,11 +374,10 @@ mod tests {
         let seed = [0x42u8; 32];
         let mut state = finalized_state(&seed);
         let mempool = Mempool::default_config();
-        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let election = eligible_election(&seed, 1, seed, 1_000_000);
 
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-            epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
@@ -420,53 +392,12 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: Some(election_result_for(&election, seed)),
-            vrf_reveals: vec![],
         };
 
         let block = produce_block(&template, &mut state, &election).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.header.prev_hash, state.tip_hash);
         assert_eq!(block.transactions.len(), 0);
-    }
-
-    #[test]
-    fn block_header_commits_to_election_result_hash() {
-        let seed = [0x43u8; 32];
-        let mut state = finalized_state(&seed);
-        let mempool = Mempool::default_config();
-        let election = make_election(&seed, 1, 0, seed, 1_000_000);
-        let election_hash = election_hash_for(&election, seed);
-        let template = BlockTemplate {
-            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-            epoch_seed: Bytes32::from(seed),
-            prev_qc_bytes: vec![],
-            timestamp: 1_700_000_001,
-            polc_round: None,
-            transactions: mempool
-                .select_for_block(
-                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
-                    state.height,
-                )
-                .into_iter()
-                .map(|entry| entry.tx.clone())
-                .collect(),
-            slash_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            election_result_hash: Some(election_hash),
-            election_result: Some(election_result_for(&election, seed)),
-            vrf_reveals: vec![],
-        };
-
-        let block = produce_block(&template, &mut state, &election).unwrap();
-        let original_hash = block.header.block_hash();
-        let mut tampered = block.header.clone();
-        tampered.election_result_hash = Some(Bytes32::from([0x44; 32]));
-
-        assert_eq!(block.header.election_result_hash, Some(election_hash));
-        assert_ne!(original_hash, tampered.block_hash());
     }
 
     #[test]
@@ -477,10 +408,9 @@ mod tests {
         let wrong_seed = [0x99u8; 32];
 
         // Election uses seed 0x42, but template uses wrong_seed
-        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let election = eligible_election(&seed, 1, seed, 1_000_000);
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&wrong_seed),
-            epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
@@ -495,9 +425,6 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: None,
-            vrf_reveals: vec![],
         };
 
         assert!(matches!(
@@ -508,220 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_reveal_set_result_is_single_proposer_authority() {
-        let seed = [0x57u8; 32];
-        let mut state = finalized_state(&seed);
-        state.height = 0;
-        let mempool = Mempool::default_config();
-        let height = state.height + 1;
-        let election = make_election(&seed, height, 0, seed, 1_000_000);
-        let vrf = VrfKeypair::from_seed(&seed);
-        let validator_id = election
-            .candidates
-            .iter()
-            .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
-            .unwrap()
-            .validator_id;
-        let authoritative_result = VrfElectionResult {
-            height,
-            round: 0,
-            elected_validator_id: validator_id,
-            // This intentionally differs from the local proof output. It
-            // models the reveal-set result as the single authority; the
-            // header proof still proves the elected validator owns its key.
-            elected_vrf_output: VRF_FALLBACK_OUTPUT,
-            fallback_used: false,
-            reveal_set_commitment: compute_reveal_set_commitment(&[]),
-        };
-        let template = BlockTemplate {
-            proposer_vrf_keypair: vrf,
-            epoch_seed: election.epoch_seed,
-            prev_qc_bytes: vec![],
-            timestamp: 1_700_000_001,
-            polc_round: None,
-            transactions: mempool
-                .select_for_block(
-                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
-                    state.height,
-                )
-                .into_iter()
-                .map(|entry| entry.tx.clone())
-                .collect(),
-            slash_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            election_result_hash: None,
-            election_result: Some(authoritative_result),
-            vrf_reveals: vec![],
-        };
-
-        let block = produce_block(&template, &mut state, &election).unwrap();
-
-        assert_eq!(
-            block.header.election_result_hash,
-            Some(authoritative_result.hash())
-        );
-        assert_ne!(
-            block.header.proposer_vrf_output, authoritative_result.elected_vrf_output,
-            "header proof output is identity proof material, not the reveal-set election authority"
-        );
-    }
-
-    #[test]
-    fn wrong_candidate_rejected_by_authoritative_result() {
-        let mut state = ChainState::new_genesis();
-        state.height = 0;
-        let mempool = Mempool::default_config();
-        let epoch_seed = [0x58u8; 32];
-        let seed_a = [0x59u8; 32];
-        let seed_b = [0x5Au8; 32];
-        let height = state.height + 1;
-        let round = 0;
-        let vrf_a = VrfKeypair::from_seed(&seed_a);
-        let vrf_b = VrfKeypair::from_seed(&seed_b);
-        let id_a = Bytes32::from(indra_crypto::sha256(&vrf_a.public_key()));
-        let id_b = Bytes32::from(indra_crypto::sha256(&vrf_b.public_key()));
-        let election = ProposerElection {
-            epoch_seed: Bytes32::from(epoch_seed),
-            height,
-            round,
-            candidates: vec![
-                crate::proposer::ProposerCandidate {
-                    validator_id: id_a,
-                    vrf_pubkey: vrf_a.public_key(),
-                    stake: 1_000_000,
-                },
-                crate::proposer::ProposerCandidate {
-                    validator_id: id_b,
-                    vrf_pubkey: vrf_b.public_key(),
-                    stake: 1_000_000,
-                },
-            ],
-        };
-        assert!(
-            election
-                .candidates
-                .iter()
-                .any(|candidate| candidate.vrf_pubkey == vrf_b.public_key()),
-            "candidate lookup must succeed for B; this test targets the authoritative elected-id check"
-        );
-        let authoritative_result = VrfElectionResult {
-            height,
-            round,
-            elected_validator_id: id_a,
-            elected_vrf_output: VRF_FALLBACK_OUTPUT,
-            fallback_used: false,
-            reveal_set_commitment: compute_reveal_set_commitment(&[]),
-        };
-        let template = BlockTemplate {
-            proposer_vrf_keypair: vrf_b,
-            epoch_seed: election.epoch_seed,
-            prev_qc_bytes: vec![],
-            timestamp: 1_700_000_001,
-            polc_round: None,
-            transactions: mempool
-                .select_for_block(
-                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
-                    state.height,
-                )
-                .into_iter()
-                .map(|entry| entry.tx.clone())
-                .collect(),
-            slash_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            election_result_hash: None,
-            election_result: Some(authoritative_result),
-            vrf_reveals: vec![],
-        };
-
-        assert!(matches!(
-            produce_block(&template, &mut state, &election),
-            Err(ConsensusError::WrongProposer { reason })
-                if reason == "authoritative election result does not match proposer slot"
-        ));
-    }
-
-    #[test]
-    fn wrong_proposer_reasons_are_distinct_for_authoritative_checks() {
-        let mut state = ChainState::new_genesis();
-        state.height = 0;
-        let mempool = Mempool::default_config();
-        let seed = [0x5Bu8; 32];
-        let height = state.height + 1;
-        let election = make_election(&seed, height, 0, seed, 1_000_000);
-        let vrf = VrfKeypair::from_seed(&seed);
-        let validator_id = election.candidates[0].validator_id;
-        let base_result = VrfElectionResult {
-            height,
-            round: 0,
-            elected_validator_id: validator_id,
-            elected_vrf_output: VRF_FALLBACK_OUTPUT,
-            fallback_used: false,
-            reveal_set_commitment: compute_reveal_set_commitment(&[]),
-        };
-        let base_template = BlockTemplate {
-            proposer_vrf_keypair: vrf,
-            epoch_seed: election.epoch_seed,
-            prev_qc_bytes: vec![],
-            timestamp: 1_700_000_001,
-            polc_round: None,
-            transactions: mempool
-                .select_for_block(
-                    indra_core::types::primitives::MAX_TX_PER_BLOCK,
-                    state.height,
-                )
-                .into_iter()
-                .map(|entry| entry.tx.clone())
-                .collect(),
-            slash_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            election_result_hash: None,
-            election_result: Some(base_result),
-            vrf_reveals: vec![],
-        };
-
-        let mut mismatched_evidence = base_template;
-        mismatched_evidence.vrf_reveals = vec![VrfRevealEvidence {
-            validator_id,
-            vrf_output: Bytes32::from([0xAB; 32]),
-            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0xCD; 80]).unwrap(),
-        }];
-        assert!(matches!(
-            produce_block(&mismatched_evidence, &mut state, &election),
-            Err(ConsensusError::WrongProposer { reason })
-                if reason == "authoritative reveal-set commitment does not match proposal evidence"
-        ));
-
-        let mut mismatched_hash = mismatched_evidence;
-        mismatched_hash.vrf_reveals = vec![];
-        mismatched_hash.election_result_hash = Some(Bytes32::from([0xEF; 32]));
-        assert!(matches!(
-            produce_block(&mismatched_hash, &mut state, &election),
-            Err(ConsensusError::WrongProposer { reason })
-                if reason == "provided election_result_hash disagrees with authoritative result"
-        ));
-
-        let mut missing_result = mismatched_hash;
-        missing_result.election_result_hash = None;
-        missing_result.election_result = None;
-        assert!(matches!(
-            produce_block(&missing_result, &mut state, &election),
-            Err(ConsensusError::WrongProposer { reason })
-                if reason == "missing authoritative election result"
-        ));
-    }
-
-    #[test]
     fn block_height_increments() {
         let seed = [0x10u8; 32];
         let mut state = finalized_state(&seed);
         let mempool = Mempool::default_config();
-        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let election = eligible_election(&seed, 1, seed, 1_000_000);
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-            epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
@@ -736,9 +456,6 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: Some(election_result_for(&election, seed)),
-            vrf_reveals: vec![],
         };
         let block = produce_block(&template, &mut state, &election).unwrap();
         assert_eq!(block.header.height, state.height + 1);
@@ -750,10 +467,9 @@ mod tests {
         let mut state = finalized_state(&seed);
         let original = state.clone();
         let mempool = Mempool::default_config();
-        let election = make_election(&seed, 1, 0, seed, 1_000_000);
+        let election = eligible_election(&seed, 1, seed, 1_000_000);
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-            epoch_seed: Bytes32::from(seed),
             prev_qc_bytes: vec![],
             timestamp: 1_700_000_001,
             polc_round: None,
@@ -768,9 +484,6 @@ mod tests {
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            election_result_hash: Some(election_hash_for(&election, seed)),
-            election_result: Some(election_result_for(&election, seed)),
-            vrf_reveals: vec![],
         };
 
         let block = produce_block(&template, &mut state, &election).unwrap();
@@ -795,10 +508,9 @@ mod tests {
         for (index, _seed_byte) in [0x70u8, 0x71, 0x72].into_iter().enumerate() {
             let seed = consensus_seed;
             let height = new_state.height + 1;
-            let election = make_election(&seed, height, 0, seed, 1_000_000);
+            let election = eligible_election(&seed, height, seed, 1_000_000);
             let template = BlockTemplate {
                 proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
-                epoch_seed: Bytes32::from(seed),
                 prev_qc_bytes: parent_qc_bytes(&new_state),
                 timestamp: 1_700_000_001 + index as u64,
                 polc_round: None,
@@ -813,9 +525,6 @@ mod tests {
                 slash_evidence: vec![],
                 governance_ops: vec![],
                 staking_ops: vec![],
-                election_result_hash: Some(election_hash_for(&election, seed)),
-                election_result: Some(election_result_for(&election, seed)),
-                vrf_reveals: vec![],
             };
 
             let produced = produce_block(&template, &mut new_state, &election).unwrap();

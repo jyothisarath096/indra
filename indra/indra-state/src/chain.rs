@@ -5,7 +5,6 @@
 
 use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
-use indra_core::types::consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 use indra_core::types::crypto::HybridPubKey;
 use indra_core::types::reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
@@ -13,9 +12,13 @@ use indra_core::types::reward_economic_snapshot::{
 use indra_core::types::slash_membership::{
     compute_slash_membership_root, SlashMembershipRootRecord, MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
 };
+use indra_core::types::{
+    block::VrfSuiteV1,
+    consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
+};
 
 use indra_core::types::primitives::{
-    Bytes32, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+    Bytes32, Bytes64, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
     INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_STAKE_POSITIONS_PER_VALIDATOR,
     MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
     MAX_TRANCHES_TOTAL,
@@ -103,6 +106,15 @@ pub struct ChainState {
     /// The bounded ordered vector supports Stage 3's greatest-activation-height
     /// lookup without introducing a separately mutable index.
     pub consensus_snapshots: Vec<ConsensusSnapshot>,
+
+    /// Immutable genesis-selected numerator in `f=F/2^64`; zero only before genesis finalization.
+    pub active_slot_coefficient_numerator: u64,
+    /// Current QC-certified election seed.
+    pub election_seed: Bytes64,
+    /// Seed format version.
+    pub election_seed_version: u8,
+    /// First height to which `election_seed` applies.
+    pub election_seed_height: u64,
 
     /// Epoch-start commission/delegation basis paired with consensus authority.
     pub reward_economic_snapshot: Option<RewardEconomicSnapshot>,
@@ -204,6 +216,7 @@ impl ChainState {
             epoch_fees_burned: _,
             epoch_slashed_spark: _,
             epoch_slash_event_count: _,
+            ..
         } = before;
         let mut changed = std::collections::BTreeSet::new();
         macro_rules! changed {
@@ -281,6 +294,10 @@ impl Encode for ChainState {
             buf,
         );
         encode_list(&self.consensus_snapshots, buf);
+        self.active_slot_coefficient_numerator.encode(buf);
+        self.election_seed.encode(buf);
+        self.election_seed_version.encode(buf);
+        self.election_seed_height.encode(buf);
         self.reward_economic_snapshot.is_some().encode(buf);
         if let Some(snapshot) = &self.reward_economic_snapshot {
             snapshot.encode(buf);
@@ -315,6 +332,10 @@ impl Encode for ChainState {
                 &self.retired_cold_pq_components,
             )
             + list_encoded_len(&self.consensus_snapshots)
+            + 8
+            + 64
+            + 1
+            + 8
             + 1
             + self
                 .reward_economic_snapshot
@@ -353,6 +374,16 @@ impl Decode for ChainState {
             validate_consensus_snapshot_collection(&snapshots, height)?;
             snapshots
         };
+        let active_slot_coefficient_numerator = u64::decode(r)?;
+        indra_core::sortition::validate_f(active_slot_coefficient_numerator)?;
+        let election_seed = Bytes64::decode(r)?;
+        let election_seed_version = u8::decode(r)?;
+        let election_seed_height = u64::decode(r)?;
+        if election_seed_version != 1 {
+            return Err(IndraError::InvalidSortition(
+                "unsupported election seed version".into(),
+            ));
+        }
         let reward_economic_snapshot = if bool::decode(r)? {
             Some(RewardEconomicSnapshot::decode(r)?)
         } else {
@@ -406,6 +437,10 @@ impl Decode for ChainState {
             utxos,
             validators,
             consensus_snapshots,
+            active_slot_coefficient_numerator,
+            election_seed,
+            election_seed_version,
+            election_seed_height,
             reward_economic_snapshot,
             slash_membership_roots,
             evicted_validator_tombstones,
@@ -454,6 +489,10 @@ impl ChainState {
             utxos: UtxoSet::new(),
             validators: ValidatorSet::new(),
             consensus_snapshots: Vec::new(),
+            active_slot_coefficient_numerator: 0,
+            election_seed: Bytes64::ZERO,
+            election_seed_version: 1,
+            election_seed_height: 1,
             reward_economic_snapshot: None,
             slash_membership_roots: Vec::new(),
             evicted_validator_tombstones: PersistentOrdMap::new(),
@@ -560,12 +599,24 @@ impl ChainState {
                         validator.validator_id
                     ))
                 })?;
-            let vrf_pk = validator.vrf_pk.ok_or_else(|| {
-                crate::error::StateError::InvalidConsensusSnapshot(format!(
-                    "active validator {} has no VRF key",
-                    validator.validator_id
-                ))
-            })?;
+            let snapshot_epoch = source_boundary_height / EPOCH_DURATION_BLOCKS;
+            let (vrf_pk, vrf_key_activation_epoch) = match (
+                validator.pending_vrf_pk,
+                validator.pending_vrf_activation_epoch,
+            ) {
+                (Some(pending), Some(activation)) if activation <= snapshot_epoch => {
+                    (pending, activation)
+                }
+                _ => (
+                    validator.vrf_pk.ok_or_else(|| {
+                        crate::error::StateError::InvalidConsensusSnapshot(format!(
+                            "active validator {} has no VRF key",
+                            validator.validator_id
+                        ))
+                    })?,
+                    validator.vrf_key_activation_epoch,
+                ),
+            };
             entries.push(
                 ConsensusSnapshotEntry::new(
                     validator.validator_id,
@@ -573,6 +624,8 @@ impl ChainState {
                     classical_vote_pk,
                     pq_vote_pk,
                     vrf_pk,
+                    VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                    vrf_key_activation_epoch,
                 )
                 .map_err(|error| {
                     crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
@@ -580,8 +633,13 @@ impl ChainState {
             );
         }
         entries.sort_by_key(|entry| entry.validator_id.0);
-        ConsensusSnapshot::new(activation_height, source_boundary_height, entries)
-            .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))
+        ConsensusSnapshot::new(
+            activation_height,
+            source_boundary_height,
+            entries,
+            self.active_slot_coefficient_numerator,
+        )
+        .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))
     }
 
     /// Build the Section 3.3 snapshot for a chain whose snapshot gate is height 1.
@@ -697,6 +755,10 @@ impl ChainState {
 
     /// Finalize genesis authority after the validator set has been populated.
     pub fn finalize_genesis(&mut self) -> crate::error::StateResult<()> {
+        #[cfg(test)]
+        if self.active_slot_coefficient_numerator == 0 {
+            self.active_slot_coefficient_numerator = 1u64 << 63;
+        }
         if self.height != 0 || !self.consensus_snapshots.is_empty() {
             return Err(crate::error::StateError::InvalidConsensusSnapshot(
                 "genesis snapshot initialization requires pristine height-zero snapshot state"
@@ -1679,6 +1741,9 @@ mod tests {
             hybrid_classical_pk: Some(public.classical.0),
             hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(vrf.public_key()),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: stake,
             status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 0,

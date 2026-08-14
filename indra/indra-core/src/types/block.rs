@@ -5,18 +5,68 @@ use crate::{
     error::IndraResult,
     ssz::sha256,
     types::{
+        crypto::HybridSignature,
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_ACTIVE_VALIDATORS,
+            Bytes32, Bytes64, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION,
             MAX_GOV_OPS_PER_BLOCK, MAX_QC_SIZE_BYTES, MAX_SLASHES_PER_BLOCK,
-            MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK, MAX_VRF_PROOF_BYTES,
+            MAX_STAKING_OPS_PER_BLOCK, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+            MAX_TX_PER_BLOCK,
         },
         slashing::SlashEvidenceV2,
         staking::StakingOp,
         transaction::TransactionV1,
-        vrf_election::VrfRevealEvidence,
     },
 };
+
+/// Sole accepted standard VRF suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrfSuiteV1 {
+    /// RFC 9381 ECVRF-EDWARDS25519-SHA512-ELL2.
+    EcvrfEdwards25519Sha512Ell2 = 1,
+}
+impl Encode for VrfSuiteV1 {
+    fn encode(&self, b: &mut Vec<u8>) {
+        (*self as u8).encode(b)
+    }
+    fn encoded_len(&self) -> usize {
+        1
+    }
+}
+impl Decode for VrfSuiteV1 {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(r)? {
+            1 => Ok(Self::EcvrfEdwards25519Sha512Ell2),
+            v => Err(crate::error::IndraError::InvalidSortition(format!(
+                "unsupported VRF suite {v}"
+            ))),
+        }
+    }
+}
+/// Sole accepted sortition construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortitionClaimV1 {
+    /// Certified Praos threshold.
+    PraosThreshold = 1,
+}
+impl Encode for SortitionClaimV1 {
+    fn encode(&self, b: &mut Vec<u8>) {
+        (*self as u8).encode(b)
+    }
+    fn encoded_len(&self) -> usize {
+        1
+    }
+}
+impl Decode for SortitionClaimV1 {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        match u8::decode(r)? {
+            1 => Ok(Self::PraosThreshold),
+            v => Err(crate::error::IndraError::InvalidSortition(format!(
+                "unsupported sortition claim {v}"
+            ))),
+        }
+    }
+}
 
 /// Sentinel value meaning a proposal did not carry a prior PoLC round.
 pub const NO_POLC_ROUND: u32 = u32::MAX;
@@ -32,7 +82,7 @@ pub const NO_POLC_ROUND: u32 = u32::MAX;
 /// only to recognize a value across reproposals. It is not a substitute for
 /// the full block hash certified by votes and QCs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockHeaderV1 {
+pub struct BlockHeaderVNext {
     /// Must equal [`BLOCK_FORMAT_VERSION`].
     pub protocol_version: ProtocolVersion,
     /// Block height (starts at 1, monotonically increasing).
@@ -57,21 +107,25 @@ pub struct BlockHeaderV1 {
     ///
     /// `NO_POLC_ROUND` means no prior PoLC was attached.
     pub polc_round: u32,
-    /// Proposer's VRF output (32 bytes).
-    pub proposer_vrf_output: Bytes32,
-    /// Proposer's VRF proof.
-    pub proposer_vrf_proof: VariableBytes<MAX_VRF_PROOF_BYTES>,
     /// Quorum certificate for the PREVIOUS block (proving it was finalised).
     pub quorum_certificate: VariableBytes<MAX_QC_SIZE_BYTES>,
-    /// Hash of the commit-reveal VRF election result for this proposal.
-    ///
-    /// Present when commit-reveal proposer election is active. Because
-    /// `block_hash()` hashes the canonical header encoding, QCs over the block
-    /// hash also certify this election result hash.
-    pub election_result_hash: Option<Bytes32>,
+    /// Snapshot identity of the proposer.
+    pub proposer_id: Bytes32,
+    /// Standard VRF suite.
+    pub vrf_suite: VrfSuiteV1,
+    /// Locally-derived election seed.
+    pub election_seed: Bytes64,
+    /// Full standard VRF output.
+    pub proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+    /// Full standard VRF proof.
+    pub proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+    /// Sortition claim.
+    pub sortition_claim: SortitionClaimV1,
+    /// Full-width proposal priority.
+    pub proposer_priority: Bytes64,
 }
 
-impl BlockHeaderV1 {
+impl BlockHeaderVNext {
     /// Compute the canonical full-header block hash.
     pub fn block_hash(&self) -> Bytes32 {
         Bytes32::from(sha256(&self.encode_to_vec()))
@@ -101,7 +155,7 @@ impl BlockHeaderV1 {
     }
 }
 
-impl Encode for BlockHeaderV1 {
+impl Encode for BlockHeaderVNext {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.protocol_version.encode(buf);
         self.height.encode(buf);
@@ -112,17 +166,16 @@ impl Encode for BlockHeaderV1 {
         self.mempool_set_root.encode(buf);
         self.base_fee.encode(buf);
         self.proposer_round.encode(buf);
-        self.proposer_vrf_output.encode(buf);
-        self.proposer_vrf_proof.encode(buf);
         self.quorum_certificate.encode(buf);
         self.polc_round.encode(buf);
         self.value_hash.encode(buf);
-        if let Some(hash) = self.election_result_hash {
-            1u8.encode(buf);
-            hash.encode(buf);
-        } else {
-            0u8.encode(buf);
-        }
+        self.proposer_id.encode(buf);
+        self.vrf_suite.encode(buf);
+        self.election_seed.encode(buf);
+        self.proposer_vrf_output.encode(buf);
+        self.proposer_vrf_proof.encode(buf);
+        self.sortition_claim.encode(buf);
+        self.proposer_priority.encode(buf);
     }
     fn encoded_len(&self) -> usize {
         2 + 8
@@ -135,15 +188,18 @@ impl Encode for BlockHeaderV1 {
             + 8
             + 4
             + 4
-            + 32
-            + self.proposer_vrf_proof.encoded_len()
             + self.quorum_certificate.encoded_len()
+            + 32
             + 1
-            + self.election_result_hash.map(|_| 32).unwrap_or(0)
+            + 64
+            + self.proposer_vrf_output.encoded_len()
+            + self.proposer_vrf_proof.encoded_len()
+            + 1
+            + 64
     }
 }
 
-impl Decode for BlockHeaderV1 {
+impl Decode for BlockHeaderVNext {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let protocol_version = ProtocolVersion::decode(r)?;
         if protocol_version.0 != BLOCK_FORMAT_VERSION {
@@ -151,7 +207,7 @@ impl Decode for BlockHeaderV1 {
                 version: protocol_version.0,
             });
         }
-        Ok(Self {
+        let header = Self {
             protocol_version,
             height: u64::decode(r)?,
             prev_hash: Bytes32::decode(r)?,
@@ -161,25 +217,35 @@ impl Decode for BlockHeaderV1 {
             mempool_set_root: Bytes32::decode(r)?,
             base_fee: u64::decode(r)?,
             proposer_round: u32::decode(r)?,
-            proposer_vrf_output: Bytes32::decode(r)?,
-            proposer_vrf_proof: VariableBytes::decode(r)?,
             quorum_certificate: VariableBytes::decode(r)?,
             polc_round: u32::decode(r)?,
             value_hash: Bytes32::decode(r)?,
-            election_result_hash: match u8::decode(r)? {
-                0 => None,
-                1 => Some(Bytes32::decode(r)?),
-                b => return Err(crate::error::IndraError::InvalidBool { byte: b }),
-            },
-        })
+            proposer_id: Bytes32::decode(r)?,
+            vrf_suite: VrfSuiteV1::decode(r)?,
+            election_seed: Bytes64::decode(r)?,
+            proposer_vrf_output: VariableBytes::decode(r)?,
+            proposer_vrf_proof: VariableBytes::decode(r)?,
+            sortition_claim: SortitionClaimV1::decode(r)?,
+            proposer_priority: Bytes64::decode(r)?,
+        };
+        let genesis_exception = header.height == 0
+            && header.proposer_id == Bytes32::ZERO
+            && header.proposer_vrf_output.is_empty()
+            && header.proposer_vrf_proof.is_empty();
+        if !genesis_exception
+            && (header.proposer_vrf_output.len() != 64 || header.proposer_vrf_proof.len() != 80)
+        {
+            return Err(crate::error::IndraError::VrfProofInvalid);
+        }
+        Ok(header)
     }
 }
 
 /// A complete INDRA v1 block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockV1 {
+pub struct BlockVNext {
     /// Block header.
-    pub header: BlockHeaderV1,
+    pub header: BlockHeaderVNext,
     /// Transactions (0–200).
     pub transactions: Vec<TransactionV1>,
     /// Membership-proven slash evidence (0–3).
@@ -188,23 +254,15 @@ pub struct BlockV1 {
     pub governance_ops: Vec<GovernanceOpV2>,
     /// Staking operations (0–10).
     pub staking_ops: Vec<StakingOp>,
-    /// Full VRF reveal evidence used to compute the commit-reveal election result.
-    ///
-    /// Always encoded, even when empty. Retention follows ordinary block-body
-    /// retention: pruned validators keep
-    /// it for their configured block window, while archive nodes keep it for
-    /// full history.
-    pub vrf_reveals: Vec<VrfRevealEvidence>,
 }
 
-impl Encode for BlockV1 {
+impl Encode for BlockVNext {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.header.encode(buf);
         encode_list(&self.transactions, buf);
         encode_list(&self.slashing_evidence, buf);
         encode_list(&self.governance_ops, buf);
         encode_list(&self.staking_ops, buf);
-        encode_list(&self.vrf_reveals, buf);
     }
     fn encoded_len(&self) -> usize {
         self.header.encoded_len()
@@ -212,13 +270,12 @@ impl Encode for BlockV1 {
             + list_encoded_len(&self.slashing_evidence)
             + list_encoded_len(&self.governance_ops)
             + list_encoded_len(&self.staking_ops)
-            + list_encoded_len(&self.vrf_reveals)
     }
 }
 
-impl Decode for BlockV1 {
+impl Decode for BlockVNext {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
-        let header = BlockHeaderV1::decode(r)?;
+        let header = BlockHeaderVNext::decode(r)?;
         let transactions = decode_list(r, MAX_TX_PER_BLOCK, "transactions")?;
         let slashing_evidence = decode_list(r, MAX_SLASHES_PER_BLOCK, "slashing_evidence")?;
         Ok(Self {
@@ -227,16 +284,75 @@ impl Decode for BlockV1 {
             slashing_evidence,
             governance_ops: decode_list(r, MAX_GOV_OPS_PER_BLOCK, "governance_ops")?,
             staking_ops: decode_list(r, MAX_STAKING_OPS_PER_BLOCK, "staking_ops")?,
-            vrf_reveals: decode_list(r, MAX_ACTIVE_VALIDATORS, "vrf_reveals")?,
         })
     }
 }
 
-impl BlockV1 {
+/// Canonical proposal envelope; authorization is excluded from block identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockProposalVNext {
+    /// Complete unsigned block.
+    pub block: BlockVNext,
+    /// Full hybrid authorization.
+    pub proposer_authorization: HybridSignature,
+}
+impl BlockProposalVNext {
+    /// Exact full-block authorization transcript.
+    pub fn signing_bytes(&self, chain_id: &[u8]) -> IndraResult<Vec<u8>> {
+        let n = u16::try_from(chain_id.len()).map_err(|_| {
+            crate::error::IndraError::LengthExceeded {
+                field: "chain_id",
+                max: u16::MAX as usize,
+                actual: chain_id.len(),
+            }
+        })?;
+        let block = self.block.encode_to_vec();
+        let mut o = b"INDRA-PROPOSAL-AUTH-v1".to_vec();
+        o.extend_from_slice(&n.to_be_bytes());
+        o.extend_from_slice(chain_id);
+        self.block.header.height.encode(&mut o);
+        self.block.header.proposer_round.encode(&mut o);
+        self.block.header.proposer_id.encode(&mut o);
+        (block.len() as u64).encode(&mut o);
+        o.extend_from_slice(&block);
+        Ok(o)
+    }
+}
+impl Encode for BlockProposalVNext {
+    fn encode(&self, b: &mut Vec<u8>) {
+        self.block.encode(b);
+        self.proposer_authorization.encode(b)
+    }
+    fn encoded_len(&self) -> usize {
+        self.block.encoded_len() + self.proposer_authorization.encoded_len()
+    }
+}
+impl Decode for BlockProposalVNext {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            block: BlockVNext::decode(r)?,
+            proposer_authorization: HybridSignature::decode(r)?,
+        })
+    }
+}
+
+impl core::ops::Deref for BlockProposalVNext {
+    type Target = BlockVNext;
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+impl core::ops::DerefMut for BlockProposalVNext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.block
+    }
+}
+
+impl BlockVNext {
     /// Recompute this block's stable consensus value hash from its stable
     /// content fields and projected post-state total supply.
     pub fn compute_value_hash(&self, total_supply: u64) -> Bytes32 {
-        BlockHeaderV1::compute_value_hash(
+        BlockHeaderVNext::compute_value_hash(
             self.header.height,
             self.header.prev_hash,
             self.header.timestamp,
@@ -248,14 +364,13 @@ impl BlockV1 {
         )
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codec::Decode;
 
-    fn dummy_header() -> BlockHeaderV1 {
-        BlockHeaderV1 {
+    fn dummy_header() -> BlockHeaderVNext {
+        BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height: 1,
             prev_hash: Bytes32::ZERO,
@@ -267,33 +382,36 @@ mod tests {
             base_fee: 100,
             proposer_round: 0,
             polc_round: NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::from([0x44u8; 32]),
+            proposer_id: Bytes32::from([0x43u8; 32]),
+            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: Bytes64([0x42; 64]),
+            proposer_vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
             proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+            sortition_claim: SortitionClaimV1::PraosThreshold,
+            proposer_priority: Bytes64([0x45; 64]),
             quorum_certificate: VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),
-            election_result_hash: Some(Bytes32::from([0xCCu8; 32])),
         }
     }
 
     #[test]
     fn header_round_trip() {
         let h = dummy_header();
-        assert_eq!(h, BlockHeaderV1::decode_exact(&h.encode_to_vec()).unwrap());
+        assert_eq!(
+            h,
+            BlockHeaderVNext::decode_exact(&h.encode_to_vec()).unwrap()
+        );
     }
 
     #[test]
     fn current_header_rejects_each_truncated_mandatory_tail_field_and_trailing_bytes() {
         let encoded = dummy_header().encode_to_vec();
-        let election_tail = 1 + 32;
-        let value_hash_tail = 32 + election_tail;
-        let polc_tail = 4 + value_hash_tail;
-
-        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - polc_tail]).is_err());
-        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - value_hash_tail]).is_err());
-        assert!(BlockHeaderV1::decode_exact(&encoded[..encoded.len() - election_tail]).is_err());
+        for removed in 1..=80 {
+            assert!(BlockHeaderVNext::decode_exact(&encoded[..encoded.len() - removed]).is_err());
+        }
 
         let mut trailing = encoded;
         trailing.push(0xA5);
-        assert!(BlockHeaderV1::decode_exact(&trailing).is_err());
+        assert!(BlockHeaderVNext::decode_exact(&trailing).is_err());
     }
 
     #[test]
@@ -314,7 +432,7 @@ mod tests {
     #[test]
     fn value_hash_is_stable_across_round_metadata_changes() {
         let h = dummy_header();
-        let base = BlockHeaderV1::compute_value_hash(
+        let base = BlockHeaderVNext::compute_value_hash(
             h.height,
             h.prev_hash,
             h.timestamp,
@@ -328,9 +446,9 @@ mod tests {
         let mut changed = h.clone();
         changed.proposer_round = 7;
         changed.polc_round = 3;
-        changed.proposer_vrf_output = Bytes32::from([0x55u8; 32]);
+        changed.proposer_vrf_output = VariableBytes::from_slice(&[0x55u8; 64]).unwrap();
 
-        let changed_hash = BlockHeaderV1::compute_value_hash(
+        let changed_hash = BlockHeaderVNext::compute_value_hash(
             changed.height,
             changed.prev_hash,
             changed.timestamp,
@@ -346,14 +464,51 @@ mod tests {
 
     #[test]
     fn empty_block_round_trip() {
-        let b = BlockV1 {
+        let b = BlockVNext {
             header: dummy_header(),
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
         };
-        assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
+        assert_eq!(b, BlockVNext::decode_exact(&b.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn proposal_envelope_is_exact_and_signing_transcript_binds_complete_block() {
+        let block = BlockVNext {
+            header: dummy_header(),
+            transactions: vec![],
+            slashing_evidence: vec![],
+            governance_ops: vec![],
+            staking_ops: vec![],
+        };
+        let proposal = BlockProposalVNext {
+            block,
+            proposer_authorization: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[1; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[2; 4627]).unwrap(),
+            },
+        };
+        let unsigned_block_len = proposal.block.encoded_len();
+        let encoded = proposal.encode_to_vec();
+        assert_eq!(
+            encoded.len() - unsigned_block_len,
+            4 + 64 + 4 + 4_627,
+            "mandatory hybrid proposer envelope adds exactly 4,699 bytes per stored block"
+        );
+        assert_eq!(
+            proposal,
+            BlockProposalVNext::decode_exact(&encoded).unwrap()
+        );
+        let mut trailing = encoded;
+        trailing.push(0xA5);
+        assert!(BlockProposalVNext::decode_exact(&trailing).is_err());
+
+        let baseline = proposal.signing_bytes(b"indra-test").unwrap();
+        let mut changed = proposal.clone();
+        changed.block.header.timestamp += 1;
+        assert_ne!(baseline, changed.signing_bytes(b"indra-test").unwrap());
+        assert_ne!(baseline, proposal.signing_bytes(b"other-chain").unwrap());
     }
 }

@@ -4,14 +4,15 @@
 //!
 //! ## What this crate does
 //!
-//! Takes a `BlockV1` and a `ChainState`, validates the block against the
+//! Takes a `BlockVNext` and a `ChainState`, validates the block against the
 //! current state, and produces a new `ChainState`. This is the core of the
 //! protocol: everything else (networking, storage, consensus) exists to
 //! feed blocks into this function.
 //!
 //! ## What this crate does NOT do
 //!
-//! - VRF / proposer-election verification (handled by block import and consensus layers)
+//! - VRF / proposer-election verification (handled by block import and consensus layers,
+//!   which must supply a `VerifiedProposal` capability to the public transition API)
 //! - Disk persistence — Phase 5
 //! - P2P networking — Phase 4
 //!
@@ -56,6 +57,9 @@ pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use apply::apply_block_for_test;
 pub use apply::{
     apply_block, apply_block_with_effects, project_block_for_roots, try_apply_governance_candidate,
     try_apply_slash_candidate, try_apply_slash_candidate_at_index, try_apply_staking_candidate,

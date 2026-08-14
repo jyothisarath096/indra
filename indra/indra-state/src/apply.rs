@@ -36,7 +36,7 @@ use std::collections::HashSet;
 use indra_core::{
     codec::{Decode, Encode},
     types::{
-        block::BlockV1,
+        block::BlockVNext,
         crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
@@ -44,13 +44,13 @@ use indra_core::{
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
+        proposal::VerifiedProposal,
         qc::{verify_qc_against_snapshot, QuorumCertificateV1, VerifiedQc},
         slash_membership::SlashMembershipRootRecord,
         slashing::{SlashEvidenceV1, SlashEvidenceV2},
         staking::StakingOp,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
-        vrf_election::VrfElectionResult,
     },
     EpochRecord,
 };
@@ -199,6 +199,21 @@ pub fn try_apply_verified_slash_candidate(
 mod tests {
     use super::*;
 
+    fn apply_block(
+        state: &mut ChainState,
+        block: &BlockVNext,
+        timestamp: u64,
+    ) -> StateResult<Option<EpochRecord>> {
+        apply_block_with_effects(state, block, timestamp).map(|outcome| outcome.epoch_record)
+    }
+    fn apply_block_with_effects(
+        state: &mut ChainState,
+        block: &BlockVNext,
+        timestamp: u64,
+    ) -> StateResult<crate::AppliedBlockOutcome> {
+        super::apply_block_contents(state, block, timestamp)
+    }
+
     use crate::chain::ChainState;
     use crate::governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution, VoteCommit, VoteReveal,
@@ -208,7 +223,7 @@ mod tests {
     use indra_core::{
         codec::Encode,
         types::{
-            block::{BlockHeaderV1, BlockV1},
+            block::{BlockHeaderVNext, BlockVNext},
             crypto::PQVoteSig,
             governance::{
                 compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
@@ -357,6 +372,9 @@ mod tests {
                 hybrid_classical_pk: Some(pubkey.classical_pk.0),
                 hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
                 vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -696,6 +714,9 @@ mod tests {
                 hybrid_classical_pk: Some(public.classical.0),
                 hybrid_pq_pk: Some(public.pq.0.to_vec()),
                 vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: stake,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -1242,7 +1263,6 @@ mod tests {
             step,
             &block_hash,
             &validator_id,
-            None,
             DEFAULT_CHAIN_ID,
         );
         let sig = keypair.sign(&signing_bytes).unwrap();
@@ -1252,7 +1272,6 @@ mod tests {
             step,
             block_hash,
             validator_id,
-            election_result_hash: None,
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
                 pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -1324,7 +1343,7 @@ mod tests {
         tx
     }
 
-    fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
+    fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockVNext {
         let height = state.height + 1;
         make_block_at_height(state, txs, height, 1_700_000_000 + height)
     }
@@ -1370,7 +1389,7 @@ mod tests {
         txs: Vec<TransactionV1>,
         height: u64,
         timestamp: u64,
-    ) -> BlockV1 {
+    ) -> BlockVNext {
         let quorum_certificate = if height <= 1 {
             VariableBytes::from_slice(&[]).unwrap()
         } else {
@@ -1399,7 +1418,6 @@ mod tests {
                 height: height - 1,
                 round: 0,
                 block_hash: state.tip_hash,
-                election_result_hash: None,
                 signer_bitfield: {
                     let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                     for position in 0..votes.len() {
@@ -1424,8 +1442,8 @@ mod tests {
             };
             VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
         };
-        BlockV1 {
-            header: BlockHeaderV1 {
+        BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion(BLOCK_FORMAT_VERSION),
                 height,
                 prev_hash: state.tip_hash,
@@ -1437,16 +1455,19 @@ mod tests {
                 base_fee: state.base_fee,
                 proposer_round: 0,
                 polc_round: indra_core::types::block::NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                proposer_id: Bytes32::from([0x91; 32]),
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: state.election_seed,
+                proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
                 quorum_certificate,
-                election_result_hash: None,
             },
             transactions: txs,
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
         }
     }
 
@@ -1483,7 +1504,7 @@ mod tests {
 
     fn clone_atomic_reference_apply_block(
         pre_state: &ChainState,
-        block: &BlockV1,
+        block: &BlockVNext,
         timestamp_secs: u64,
     ) -> StateResult<OracleOutcome> {
         let mut scratch = pre_state.clone();
@@ -1573,7 +1594,7 @@ mod tests {
         )
     }
 
-    fn assert_all_failpoints_roll_back(state: &ChainState, block: &BlockV1) -> usize {
+    fn assert_all_failpoints_roll_back(state: &ChainState, block: &BlockVNext) -> usize {
         crate::txn::set_fail_after_mutation(None);
         let mut success_state = state.clone();
         apply_block(&mut success_state, block, 0).unwrap();
@@ -1599,7 +1620,7 @@ mod tests {
         mutation_count
     }
 
-    fn empty_block_at(state: &ChainState, height: u64, timestamp: u64) -> BlockV1 {
+    fn empty_block_at(state: &ChainState, height: u64, timestamp: u64) -> BlockVNext {
         make_block_at_height(state, vec![], height, timestamp)
     }
 
@@ -2096,7 +2117,6 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: state.tip_hash,
-            election_result_hash: None,
             signer_bitfield: {
                 let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                 bits[0] = 1;
@@ -3033,31 +3053,6 @@ mod tests {
     }
 
     #[test]
-    fn slash_reporter_identity_multiple_match_returns_none() {
-        let proposer_id = Bytes32::from([0xD1; 32]);
-        let state = canonical_test_genesis();
-        let mut block = make_block(&state, vec![]);
-        block.header.proposer_vrf_output = Bytes32::from([0x4F; 32]);
-        block.header.election_result_hash = Some(
-            VrfElectionResult {
-                height: block.header.height,
-                round: block.header.proposer_round,
-                elected_validator_id: proposer_id,
-                elected_vrf_output: block.header.proposer_vrf_output,
-                fallback_used: false,
-                reveal_set_commitment: Bytes32::ZERO,
-            }
-            .hash(),
-        );
-
-        assert_eq!(
-            slash_reporter_validator_id_from_candidate_ids([proposer_id, proposer_id], &block),
-            None,
-            "ambiguous candidate matches must preserve the prior uniqueness-required behavior"
-        );
-    }
-
-    #[test]
     fn concurrent_identical_synthetic_rewards_have_distinct_utxo_coordinates() {
         let mut state = ChainState::new_genesis();
         let (owner, _) = make_test_keypair([0xD8; 32]);
@@ -3531,64 +3526,23 @@ fn create_slash_reporter_reward_utxo(
     Ok(reward_utxo_id)
 }
 
-const VRF_FALLBACK_OUTPUT_BYTES: Bytes32 = Bytes32([0xFF; 32]);
-
 fn slash_reporter_pubkey_for_block(
     state: &ChainState,
-    block: &BlockV1,
+    block: &BlockVNext,
 ) -> StateResult<Option<HybridPubKey>> {
     let snapshot = state
         .snapshot_for_consensus_height(block.header.height)
         .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
-    let proposer_id = slash_reporter_validator_id_from_candidate_ids(
-        snapshot.entries().iter().map(|entry| entry.validator_id),
-        block,
-    );
-    Ok(proposer_id.and_then(|proposer_id| {
-        snapshot
-            .entries()
-            .iter()
-            .find(|entry| entry.validator_id == proposer_id)
-            .and_then(|entry| {
-                Some(HybridPubKey {
-                    classical_pk: Bytes32::from(entry.classical_vote_pk),
-                    pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
-                })
+    Ok(snapshot
+        .entries()
+        .iter()
+        .find(|entry| entry.validator_id == block.header.proposer_id)
+        .and_then(|entry| {
+            Some(HybridPubKey {
+                classical_pk: Bytes32::from(entry.classical_vote_pk),
+                pq_pk: indra_core::VariableBytes::from_slice(&entry.pq_vote_pk).ok()?,
             })
-    }))
-}
-
-fn slash_reporter_validator_id_from_candidate_ids<I>(
-    candidate_ids: I,
-    block: &BlockV1,
-) -> Option<Bytes32>
-where
-    I: IntoIterator<Item = Bytes32>,
-{
-    let header_hash = block.header.election_result_hash?;
-    let mut matches = candidate_ids.into_iter().filter_map(|validator_id| {
-        let normal = VrfElectionResult {
-            height: block.header.height,
-            round: block.header.proposer_round,
-            elected_validator_id: validator_id,
-            elected_vrf_output: block.header.proposer_vrf_output,
-            fallback_used: false,
-            reveal_set_commitment: Bytes32::ZERO,
-        }
-        .hash();
-        let fallback = VrfElectionResult {
-            height: block.header.height,
-            round: block.header.proposer_round,
-            elected_validator_id: validator_id,
-            elected_vrf_output: VRF_FALLBACK_OUTPUT_BYTES,
-            fallback_used: true,
-            reveal_set_commitment: Bytes32::ZERO,
-        }
-        .hash();
-        (header_hash == normal || header_hash == fallback).then_some(validator_id)
-    });
-    let proposer_id = matches.next()?;
-    matches.next().is_none().then_some(proposer_id)
+        }))
 }
 
 fn verify_vote_sig_with_keys(
@@ -3614,7 +3568,6 @@ fn verify_vote_sig_with_keys(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
-        vote.election_result_hash.as_ref(),
         chain_id,
     );
     let pk = HybridPublicKey {
@@ -3628,10 +3581,11 @@ fn verify_vote_sig_with_keys(
 /// Apply a block to the chain state, updating UTXOs, fees and validators.
 pub fn apply_block(
     state: &mut ChainState,
-    block: &BlockV1,
+    verified_proposal: &VerifiedProposal<'_>,
     timestamp_secs: u64, // Wall-clock time (live) or 0 (replay).
 ) -> StateResult<Option<EpochRecord>> {
-    apply_block_with_effects(state, block, timestamp_secs).map(|outcome| outcome.epoch_record)
+    apply_block_with_effects(state, verified_proposal, timestamp_secs)
+        .map(|outcome| outcome.epoch_record)
 }
 
 /// Apply a block and return the effects of the committed canonical transition.
@@ -3640,7 +3594,17 @@ pub fn apply_block(
 /// are returned only after that transaction commits successfully.
 pub fn apply_block_with_effects(
     state: &mut ChainState,
-    block: &BlockV1,
+    verified_proposal: &VerifiedProposal<'_>,
+    timestamp_secs: u64,
+) -> StateResult<crate::AppliedBlockOutcome> {
+    apply_block_contents(state, verified_proposal.block(), timestamp_secs)
+}
+
+// Deliberately private: only the capability-bearing public entry point and
+// this module's state-machine unit tests may apply unsigned block contents.
+fn apply_block_contents(
+    state: &mut ChainState,
+    block: &BlockVNext,
     timestamp_secs: u64,
 ) -> StateResult<crate::AppliedBlockOutcome> {
     validate_block_header(state, block)?;
@@ -3655,6 +3619,16 @@ pub fn apply_block_with_effects(
         epoch_record,
         effects,
     })
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn apply_block_for_test(
+    state: &mut ChainState,
+    block: &BlockVNext,
+    timestamp_secs: u64,
+) -> StateResult<Option<EpochRecord>> {
+    apply_block_contents(state, block, timestamp_secs).map(|outcome| outcome.epoch_record)
 }
 
 /// Atomically validate/apply a candidate with a block-attempt-frozen dust floor.
@@ -3811,7 +3785,7 @@ pub fn try_apply_slash_candidate_at_index(
 /// detached `ChainState` clone.
 pub fn project_block_for_roots(
     state: &mut ChainState,
-    block: &BlockV1,
+    block: &BlockVNext,
     timestamp_secs: u64,
 ) -> StateResult<ProjectedBlockRoots> {
     validate_block_header(state, block)?;
@@ -3845,7 +3819,7 @@ pub fn project_block_for_roots(
 
 fn apply_block_inner(
     txn: &mut StateTxn<'_>,
-    block: &BlockV1,
+    block: &BlockVNext,
     verified_qc: Option<&VerifiedQc>,
     timestamp_secs: u64,
 ) -> StateResult<Option<EpochRecord>> {
@@ -3861,6 +3835,18 @@ fn apply_block_inner(
     // ── Phase 1: Block-level validation (read-only) ───────────────────────
 
     validate_block_header(txn.state(), block)?;
+    let governing_snapshot_root = txn
+        .state()
+        .snapshot_for_consensus_height(block.header.height)
+        .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?
+        .snapshot_root;
+    let next_seed = indra_core::types::proposal::next_election_seed(
+        txn.state().chain_id.as_bytes(),
+        &txn.state().election_seed,
+        block,
+        &governing_snapshot_root,
+    )
+    .map_err(|error| StateError::InvalidConsensusSnapshot(error.to_string()))?;
     let transition_context = if is_epoch_boundary(block.header.height) {
         let expected_parent =
             block
@@ -4080,6 +4066,7 @@ fn apply_block_inner(
 
     // Advance height and tip hash
     txn.set_tip(block.header.height, block.header.block_hash())?;
+    txn.set_election_seed(next_seed, block.header.height.saturating_add(1))?;
 
     // Credit the certified parent's activity before the transition
     // so the closing epoch's final QC participates in liveness evaluation.
@@ -4150,7 +4137,7 @@ fn governance_operation_epoch(
 /// execute the same state transition.
 fn update_last_active_epoch_from_block_qc(
     state: &mut ChainState,
-    block: &BlockV1,
+    block: &BlockVNext,
     verified_qc: Option<&VerifiedQc>,
     context: Option<&crate::epoch::EpochTransitionContext>,
 ) -> StateResult<()> {
@@ -4191,7 +4178,7 @@ fn update_last_active_epoch_from_block_qc(
 
 fn verify_embedded_parent_qc(
     state: &ChainState,
-    block: &BlockV1,
+    block: &BlockVNext,
 ) -> StateResult<Option<VerifiedQc>> {
     if block.header.height <= 1 {
         if !block.header.quorum_certificate.as_slice().is_empty() {
@@ -4231,7 +4218,7 @@ fn verify_embedded_parent_qc(
 }
 
 /// Validate block-level invariants (does not touch state).
-fn validate_block_header(state: &ChainState, block: &BlockV1) -> StateResult<()> {
+fn validate_block_header(state: &ChainState, block: &BlockVNext) -> StateResult<()> {
     // Protocol version
     if block.header.protocol_version.0 != BLOCK_FORMAT_VERSION {
         return Err(StateError::UnsupportedVersion {

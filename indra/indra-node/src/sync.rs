@@ -17,24 +17,15 @@ use std::{
 };
 
 use indra_consensus::mempool::Mempool;
-use indra_consensus::proposer::{
-    compute_fallback_election_result, compute_vrf_input, elect_proposer_from_reveals,
-    ProposerCandidate, ProposerElection,
-};
 use indra_core::codec::Decode;
-use indra_core::types::block::BlockV1;
-use indra_core::types::primitives::{
-    has_strict_two_thirds_quorum, Bytes32, MAX_VRF_EMPTY_REVEAL_ROUNDS,
-};
-use indra_core::types::vrf_election::{compute_reveal_set_commitment, VrfElectionResult};
+use indra_core::types::block::{BlockProposalVNext, BlockVNext};
+use indra_core::types::primitives::Bytes32;
 use indra_core::EpochRecord;
-use indra_crypto::{vrf_verify, VrfOutput, VrfProof};
 use indra_state::{apply_block_with_effects, CanonicalStateEffects, ChainState};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_storage::{BlockStore, StateStore};
 
 use crate::{
-    consensus_authority::{vrf_authority_from_snapshot, VrfConsensusAuthority},
     error::{NodeError, NodeResult},
     state_root::compute_state_roots,
 };
@@ -79,7 +70,7 @@ pub struct OutstandingSyncRequest {
 #[derive(Debug, Clone)]
 pub struct ProvisionalSyncBlock {
     /// Fully validated but not yet finalized block.
-    pub block: BlockV1,
+    pub block: BlockProposalVNext,
     /// Authenticated identity which supplied the block.
     pub source_validator_id: Bytes32,
     /// Transport endpoint which supplied the block.
@@ -93,6 +84,8 @@ pub struct ProvisionalSyncBlock {
 /// Cryptographic attribution for a failed H/H+1 certification pair.
 #[derive(Debug)]
 pub enum PairVerificationError {
+    /// The provisional proposal envelope itself is unauthorized or ineligible.
+    ProvisionalProposalWrong(NodeError),
     /// H+1 carries a valid quorum certificate for a different height-H hash,
     /// proving that the provisional H supplied earlier is not canonical.
     ProvisionalBlockWrong {
@@ -173,7 +166,7 @@ impl SyncState {
             provisional_height: self
                 .provisional
                 .as_ref()
-                .map(|pending| pending.block.header.height),
+                .map(|pending| pending.block.block.header.height),
             corroboration_claim_count: self
                 .height_claims
                 .values()
@@ -341,7 +334,7 @@ impl SyncState {
         let from_height = self
             .provisional
             .as_ref()
-            .map(|pending| pending.block.header.height.saturating_add(1))
+            .map(|pending| pending.block.block.header.height.saturating_add(1))
             .unwrap_or_else(|| local_height.saturating_add(1));
         let target_height = self.best_peer_height;
         // Fetch one look-ahead block because H+1 carries the QC finalising H.
@@ -413,7 +406,7 @@ impl SyncState {
         let from_height = self
             .provisional
             .as_ref()
-            .map(|pending| pending.block.header.height.saturating_add(1))
+            .map(|pending| pending.block.block.header.height.saturating_add(1))
             .unwrap_or_else(|| local_height.saturating_add(1));
         let to_height = target_height
             .saturating_add(1)
@@ -439,7 +432,7 @@ impl SyncState {
         &mut self,
         validator_id: Bytes32,
         peer: SocketAddr,
-        blocks: &[BlockV1],
+        blocks: &[BlockProposalVNext],
     ) -> Result<OutstandingSyncRequest, &'static str> {
         let request = self.outstanding.ok_or("no sync request is outstanding")?;
         if !matches!(self.phase, SyncPhase::Downloading { .. }) {
@@ -449,14 +442,14 @@ impl SyncState {
             return Err("response source does not match selected sync peer");
         }
         if blocks.iter().any(|block| {
-            block.header.height < request.from_height || block.header.height > request.to_height
+            block.block.header.height < request.from_height
+                || block.block.header.height > request.to_height
         }) {
             return Err("response contains a block outside the requested range");
         }
-        if blocks
-            .windows(2)
-            .any(|pair| pair[1].header.height != pair[0].header.height.saturating_add(1))
-        {
+        if blocks.windows(2).any(|pair| {
+            pair[1].block.header.height != pair[0].block.header.height.saturating_add(1)
+        }) {
             return Err("response block heights are not contiguous");
         }
         self.outstanding = None;
@@ -476,13 +469,13 @@ impl SyncState {
     /// Replace the single bounded provisional slot after full validation.
     pub fn stage_provisional(
         &mut self,
-        block: BlockV1,
+        block: BlockProposalVNext,
         prepared: PreparedSyncBlock,
         source_validator_id: Bytes32,
         source: SocketAddr,
         now: Instant,
     ) {
-        let staged_height = block.header.height;
+        let staged_height = block.block.header.height;
         self.provisional = Some(ProvisionalSyncBlock {
             block,
             source_validator_id,
@@ -633,7 +626,7 @@ impl SyncState {
 /// test crate; production sync must use the provisional coordinator.
 #[doc(hidden)]
 pub fn import_unfinalized_block_for_test(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &mut ChainState,
     mempool: &mut Mempool,
     block_store: &mut BlockStore,
@@ -641,7 +634,7 @@ pub fn import_unfinalized_block_for_test(
     timestamp_secs: u64,
 ) -> NodeResult<Option<EpochRecord>> {
     import_unfinalized_block_with_effects_for_test(
-        block,
+        proposal,
         state,
         mempool,
         block_store,
@@ -656,7 +649,7 @@ pub fn import_unfinalized_block_for_test(
 /// This omits forward-looking own-QC verification and must never be wired to
 /// untrusted network input. See [`import_unfinalized_block_for_test`].
 fn import_unfinalized_block_with_effects_for_test(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &mut ChainState,
     mempool: &mut Mempool,
     block_store: &mut BlockStore,
@@ -664,7 +657,7 @@ fn import_unfinalized_block_with_effects_for_test(
     timestamp_secs: u64,
 ) -> NodeResult<indra_state::AppliedBlockOutcome> {
     import_unfinalized_block_with_durable_hook_for_test(
-        block,
+        proposal,
         state,
         mempool,
         block_store,
@@ -680,7 +673,7 @@ fn import_unfinalized_block_with_effects_for_test(
 /// untrusted network input. The hook runs after the block and interval
 /// snapshot are durable but before canonical memory or pending pools change.
 fn import_unfinalized_block_with_durable_hook_for_test<F>(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &mut ChainState,
     mempool: &mut Mempool,
     block_store: &mut BlockStore,
@@ -691,9 +684,9 @@ fn import_unfinalized_block_with_durable_hook_for_test<F>(
 where
     F: FnOnce(&ChainState, &Option<EpochRecord>, u64) -> NodeResult<()>,
 {
-    let projection = validate_imported_block(block, state, timestamp_secs)?;
+    let projection = validate_imported_block(proposal, state, timestamp_secs)?;
     commit_prepared_with_durable_hook(
-        block,
+        proposal,
         projection,
         state,
         mempool,
@@ -706,7 +699,7 @@ where
 /// Durably publish an already-verified provisional projection without
 /// repeating cryptographic or state validation.
 pub(crate) fn commit_prepared_with_durable_hook<F>(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     projection: PreparedSyncBlock,
     state: &mut ChainState,
     mempool: &mut Mempool,
@@ -717,6 +710,7 @@ pub(crate) fn commit_prepared_with_durable_hook<F>(
 where
     F: FnOnce(&ChainState, &Option<EpochRecord>, u64) -> NodeResult<()>,
 {
+    let block = &proposal.block;
     let height = block.header.height;
     if projection.block_hash != block.header.block_hash()
         || projection.pre_height != state.height
@@ -730,10 +724,10 @@ where
 
     // Store genesis placeholder if block_store is empty and this is height 1
     if block_store.is_empty() && height == 1 {
-        let genesis = crate::genesis::build_genesis_block();
+        let genesis = crate::genesis::build_genesis_proposal();
         block_store.append(&genesis)?;
     }
-    block_store.append(block)?;
+    block_store.append(proposal)?;
 
     // Snapshot the verified detached state before it becomes canonical. An I/O
     // failure therefore cannot leave memory ahead of the durable snapshot.
@@ -768,19 +762,19 @@ where
 /// path because `BlockStore` itself intentionally requires contiguous heights
 /// from genesis and cannot be jumped to `u64::MAX - 1`.
 fn validate_imported_block(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &ChainState,
     timestamp_secs: u64,
 ) -> NodeResult<PreparedSyncBlock> {
+    let block = &proposal.block;
     let height = block.header.height;
-
-    verify_imported_block_proposer(block, state)?;
+    let verified = verify_imported_proposal(proposal, state)?;
 
     if height > 1 {
         verify_block_qc(block, state)?;
     }
 
-    project_and_verify_block_state_root(block, state, timestamp_secs)
+    project_and_verify_block_state_root(&verified, state, timestamp_secs)
 }
 
 fn publish_committed_effects(
@@ -803,333 +797,33 @@ fn publish_committed_effects(
     mempool.apply_canonical_effects(state, effects);
 }
 
-/// Whether proposer verification is required for one consensus height.
-///
-/// Legacy heights preserve the original live-registry condition. Governed
-/// heights resolve their canonical snapshot and fail closed if lookup fails;
-/// live registry status must never suppress verification for snapshot members.
-pub(crate) fn proposer_verification_required(state: &ChainState, height: u64) -> NodeResult<bool> {
-    let snapshot = state.snapshot_for_consensus_height(height)?;
-    Ok(!snapshot.entries().is_empty())
-}
-
-fn verify_imported_block_proposer(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
-    if proposer_verification_required(state, block.header.height)? {
-        verify_proposer_vrf(block, state)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_proposer_vrf(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
-    let (matched_validator_id, candidates, epoch_seed) =
-        verify_proposer_vrf_key_ownership(block, state)?;
-
-    let _ = (candidates, epoch_seed);
-    verify_commit_reveal_proposer_result(block, matched_validator_id, state)
-}
-
-fn verify_proposer_vrf_key_ownership(
-    block: &BlockV1,
+/// Verify proposer authorization and eligibility against the governing snapshot.
+/// Snapshot lookup and both independent cryptographic checks fail closed at every
+/// imported height; there is no legacy or live-registry bypass.
+fn verify_imported_proposal<'a>(
+    proposal: &'a indra_core::types::block::BlockProposalVNext,
     state: &ChainState,
-) -> NodeResult<(
-    indra_core::Bytes32,
-    Vec<ProposerCandidate>,
-    indra_core::Bytes32,
-)> {
-    let proof_bytes = block.header.proposer_vrf_proof.as_slice();
-    let output = block.header.proposer_vrf_output;
-
-    if proof_bytes.is_empty() || output == indra_core::Bytes32::ZERO {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "missing proposer VRF proof/output at height {} round {}",
-                block.header.height, block.header.proposer_round,
-            ),
-        });
-    }
-
-    // Bind VRF verification to the block's declared parent hash so the
-    // verifier uses the same epoch seed the proposer saw when building
-    // this header, even if the local node's mutable state has moved.
-    let epoch_seed = indra_core::types::primitives::Bytes32::from(indra_crypto::sha256(
-        &block.header.prev_hash.0,
-    ));
-    let candidates = if let Some(authority) =
-        snapshot_vrf_authority_for_block(block, state, epoch_seed)?
-    {
-        authority.election.candidates
-    } else {
-        let candidates: Vec<ProposerCandidate> = state
-            .validators
-            .active_validators()
-            .filter_map(|validator| {
-                validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-                    validator_id: validator.validator_id,
-                    vrf_pubkey: vrf_pk,
-                    stake: validator.stake_spark,
-                })
-            })
-            .collect();
-
-        if candidates.len() != state.validators.active_count() {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: format!(
-                    "VRF verification impossible at height {} round {}: {} validators have VRF keys but {} are active",
-                    block.header.height,
-                    block.header.proposer_round,
-                    candidates.len(),
-                    state.validators.active_count(),
-                ),
-            });
-        }
-        candidates
-    };
-    let vrf_input = compute_vrf_input(
-        &epoch_seed.0,
-        block.header.height,
-        block.header.proposer_round,
-    );
-    let proof = VrfProof(proof_bytes.to_vec());
-    let output = VrfOutput(block.header.proposer_vrf_output.0);
-
-    let matching_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| vrf_verify(&candidate.vrf_pubkey, &vrf_input, &output, &proof).is_ok())
-        .collect();
-
-    if matching_candidates.len() != 1 {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "proposer VRF proof matched {} active validators at height {} round {}",
-                matching_candidates.len(),
-                block.header.height,
-                block.header.proposer_round,
-            ),
-        });
-    }
-
-    Ok((matching_candidates[0].validator_id, candidates, epoch_seed))
-}
-
-fn snapshot_vrf_authority_for_block(
-    block: &BlockV1,
-    state: &ChainState,
-    epoch_seed: Bytes32,
-) -> NodeResult<Option<VrfConsensusAuthority>> {
-    let snapshot = state.snapshot_for_consensus_height(block.header.height)?;
-    Ok(Some(vrf_authority_from_snapshot(
-        block.header.height,
-        block.header.proposer_round,
-        epoch_seed,
+) -> NodeResult<indra_core::types::proposal::VerifiedProposal<'a>> {
+    let snapshot = state.snapshot_for_consensus_height(proposal.block.header.height)?;
+    indra_core::types::proposal::verify_proposal(
+        proposal,
+        state.chain_id.as_bytes(),
+        &state.election_seed,
         snapshot,
-    )))
+    )
+    .map_err(|error| NodeError::BlockInvalid {
+        height: proposal.block.header.height,
+        reason: format!("proposal authorization or eligibility failed: {error}"),
+    })
 }
 
-fn verify_commit_reveal_proposer_result(
-    block: &BlockV1,
-    proposer_id: indra_core::Bytes32,
-    state: &ChainState,
-) -> NodeResult<()> {
-    let result = verify_reveal_set_evidence(block, state)?;
-    if result.elected_validator_id != proposer_id {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "reveal-set election elected {} but proposer VRF proof belongs to {}",
-                hex::encode(&result.elected_validator_id.0[..4]),
-                hex::encode(&proposer_id.0[..4]),
-            ),
-        });
-    }
-
-    Ok(())
-}
-
-/// Verify post-activation reveal-set evidence from block data alone.
-///
-/// This is the VRF-07 sync/audit path: it does not rely on having observed
-/// the original live gossip. Evidence retention follows normal block-body
-/// retention semantics.
-pub(crate) fn verify_reveal_set_evidence(
-    block: &BlockV1,
-    state: &ChainState,
-) -> NodeResult<VrfElectionResult> {
-    let Some(header_hash) = block.header.election_result_hash else {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: "missing election_result_hash for reveal-set election".into(),
-        });
-    };
-
-    let mut last_id = None;
-    let mut revealed_outputs = std::collections::BTreeMap::new();
-    let mut revealed_stake = 0u64;
-    let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
-    let snapshot_authority = snapshot_vrf_authority_for_block(block, state, epoch_seed)?;
-    let vrf_input = compute_vrf_input(
-        &epoch_seed.0,
-        block.header.height,
-        block.header.proposer_round,
-    );
-
-    for evidence in &block.vrf_reveals {
-        if last_id.is_some_and(|previous| evidence.validator_id <= previous) {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: "vrf reveal evidence must be sorted by unique validator_id".into(),
-            });
-        }
-        last_id = Some(evidence.validator_id);
-
-        let (vrf_pk, weight) = if let Some(authority) = snapshot_authority.as_ref() {
-            let Some(candidate) = authority
-                .election
-                .candidates
-                .iter()
-                .find(|candidate| candidate.validator_id == evidence.validator_id)
-            else {
-                return Err(NodeError::BlockInvalid {
-                    height: block.header.height,
-                    reason: format!(
-                        "vrf reveal evidence references validator {} outside S({})",
-                        hex::encode(&evidence.validator_id.0[..4]),
-                        block.header.height,
-                    ),
-                });
-            };
-            (candidate.vrf_pubkey, candidate.stake)
-        } else {
-            let Some(validator) = state.validators.get(&evidence.validator_id) else {
-                return Err(NodeError::BlockInvalid {
-                    height: block.header.height,
-                    reason: format!(
-                        "vrf reveal evidence references unknown validator {}",
-                        hex::encode(&evidence.validator_id.0[..4]),
-                    ),
-                });
-            };
-            if !validator.is_active() {
-                return Err(NodeError::BlockInvalid {
-                    height: block.header.height,
-                    reason: format!(
-                        "vrf reveal evidence references inactive validator {}",
-                        hex::encode(&evidence.validator_id.0[..4]),
-                    ),
-                });
-            }
-            let Some(vrf_pk) = validator.vrf_pk else {
-                return Err(NodeError::BlockInvalid {
-                    height: block.header.height,
-                    reason: format!(
-                        "vrf reveal evidence validator {} has no registered VRF key",
-                        hex::encode(&evidence.validator_id.0[..4]),
-                    ),
-                });
-            };
-            (vrf_pk, validator.stake_spark)
-        };
-        let output = VrfOutput(evidence.vrf_output.0);
-        let proof = VrfProof(evidence.vrf_proof.as_slice().to_vec());
-        vrf_verify(&vrf_pk, &vrf_input, &output, &proof).map_err(|_| NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "invalid VRF reveal proof for validator {}",
-                hex::encode(&evidence.validator_id.0[..4]),
-            ),
-        })?;
-
-        revealed_stake = revealed_stake.saturating_add(weight);
-        revealed_outputs.insert(evidence.validator_id, evidence.vrf_output);
-    }
-
-    let (election, total_stake) = if let Some(authority) = snapshot_authority {
-        (authority.election, authority.total_weight)
-    } else {
-        let candidates: Vec<_> = state
-            .validators
-            .active_validators()
-            .filter_map(|validator| {
-                validator.vrf_pk.map(|vrf_pubkey| ProposerCandidate {
-                    validator_id: validator.validator_id,
-                    vrf_pubkey,
-                    stake: validator.stake_spark,
-                })
-            })
-            .collect();
-        if candidates.len() != state.validators.active_count() {
-            return Err(NodeError::BlockInvalid {
-                height: block.header.height,
-                reason: "reveal-set election impossible: not every active validator has a VRF key"
-                    .into(),
-            });
-        }
-        (
-            ProposerElection {
-                epoch_seed,
-                height: block.header.height,
-                round: block.header.proposer_round,
-                candidates,
-            },
-            state.validators.total_active_stake(),
-        )
-    };
-    if !has_strict_two_thirds_quorum(revealed_stake, total_stake) {
-        if block.vrf_reveals.is_empty() {
-            let mut fallback =
-                compute_fallback_election_result(&election).map_err(NodeError::Consensus)?;
-            fallback.reveal_set_commitment = compute_reveal_set_commitment(&[]);
-            if header_hash == fallback.hash() {
-                let minimum_fallback_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
-                if block.header.proposer_round < minimum_fallback_round {
-                    return Err(NodeError::BlockInvalid {
-                        height: block.header.height,
-                        reason: format!(
-                            "fallback election claimed at round {} before minimum fallback round {}",
-                            block.header.proposer_round, minimum_fallback_round,
-                        ),
-                    });
-                }
-                return Ok(fallback);
-            }
-        }
-
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "vrf reveal set below quorum (requires strict two-thirds): revealed_stake={} total_stake={}",
-                revealed_stake, total_stake,
-            ),
-        });
-    }
-
-    let mut result =
-        elect_proposer_from_reveals(&election, &revealed_outputs).map_err(NodeError::Consensus)?;
-    result.reveal_set_commitment = compute_reveal_set_commitment(&block.vrf_reveals);
-
-    if header_hash != result.hash() {
-        return Err(NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!(
-                "election_result_hash {} does not match reveal-set result {}",
-                hex::encode(&header_hash.0[..4]),
-                hex::encode(&result.hash().0[..4]),
-            ),
-        });
-    }
-
-    Ok(result)
-}
-
-pub(crate) fn verify_block_qc(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
+pub(crate) fn verify_block_qc(block: &BlockVNext, state: &ChainState) -> NodeResult<()> {
     verify_block_qc_with(block, state, None)
 }
 
 /// Verify a peer-sourced embedded QC through the node's bounded worker.
 pub(crate) fn verify_network_block_qc(
-    block: &BlockV1,
+    block: &BlockVNext,
     state: &ChainState,
     verifier: &crate::qc_verification::NetworkQcVerifier,
 ) -> NodeResult<()> {
@@ -1137,7 +831,7 @@ pub(crate) fn verify_network_block_qc(
 }
 
 fn verify_block_qc_with(
-    block: &BlockV1,
+    block: &BlockVNext,
     state: &ChainState,
     verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
 ) -> NodeResult<()> {
@@ -1189,36 +883,38 @@ fn verify_block_qc_with(
 
 /// Fully validate a next-height candidate without publishing any state.
 pub fn verify_sync_candidate(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &ChainState,
     timestamp_secs: u64,
 ) -> NodeResult<PreparedSyncBlock> {
-    verify_imported_block_proposer(block, state)?;
+    let block = &proposal.block;
+    let verified = verify_imported_proposal(proposal, state)?;
     if block.header.height > 1 {
         verify_block_qc(block, state)?;
     }
-    project_and_verify_block_state_root(block, state, timestamp_secs)
+    project_and_verify_block_state_root(&verified, state, timestamp_secs)
 }
 
 /// Fully validate a peer-sourced candidate using bounded QC verification.
 pub fn verify_network_sync_candidate(
-    block: &BlockV1,
+    proposal: &BlockProposalVNext,
     state: &ChainState,
     timestamp_secs: u64,
     verifier: &crate::qc_verification::NetworkQcVerifier,
 ) -> NodeResult<PreparedSyncBlock> {
-    verify_imported_block_proposer(block, state)?;
+    let block = &proposal.block;
+    let verified = verify_imported_proposal(proposal, state)?;
     if block.header.height > 1 {
         verify_network_block_qc(block, state, verifier)?;
     }
-    project_and_verify_block_state_root(block, state, timestamp_secs)
+    project_and_verify_block_state_root(&verified, state, timestamp_secs)
 }
 
 /// Verify the certificate carried by H+1 against a provisional H and
 /// attribute a mismatch cryptographically rather than blaming H blindly.
 pub fn verify_provisional_certificate(
-    provisional: &BlockV1,
-    carrier: &BlockV1,
+    provisional: &BlockProposalVNext,
+    carrier: &BlockProposalVNext,
     canonical_state: &ChainState,
 ) -> Result<(), PairVerificationError> {
     verify_provisional_certificate_with(provisional, carrier, canonical_state, None)
@@ -1226,8 +922,8 @@ pub fn verify_provisional_certificate(
 
 /// Verify a peer-sourced provisional carrier through bounded QC verification.
 pub fn verify_network_provisional_certificate(
-    provisional: &BlockV1,
-    carrier: &BlockV1,
+    provisional: &BlockProposalVNext,
+    carrier: &BlockProposalVNext,
     canonical_state: &ChainState,
     verifier: &crate::qc_verification::NetworkQcVerifier,
 ) -> Result<(), PairVerificationError> {
@@ -1235,11 +931,19 @@ pub fn verify_network_provisional_certificate(
 }
 
 fn verify_provisional_certificate_with(
-    provisional: &BlockV1,
-    carrier: &BlockV1,
+    provisional: &BlockProposalVNext,
+    carrier: &BlockProposalVNext,
     canonical_state: &ChainState,
     verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
 ) -> Result<(), PairVerificationError> {
+    let projected = match verifier {
+        Some(network) => verify_network_sync_candidate(provisional, canonical_state, 0, network),
+        None => verify_sync_candidate(provisional, canonical_state, 0),
+    }
+    .map_err(PairVerificationError::ProvisionalProposalWrong)?;
+    let provisional = &provisional.block;
+    let carrier_proposal = carrier;
+    let carrier = &carrier_proposal.block;
     let qc = indra_core::types::qc::QuorumCertificateV1::decode_exact(
         carrier.header.quorum_certificate.as_slice(),
     )
@@ -1271,6 +975,13 @@ fn verify_provisional_certificate_with(
             certified_hash: qc.block_hash,
         });
     }
+    // Only after the valid QC confirms that H is the branch being evaluated
+    // can H+1's height-specific seed be derived from the projected H state.
+    // If the QC certifies a different H, that quorum already proves the
+    // provisional branch wrong; attempting proposer verification against the
+    // wrong branch's derived seed would invert fault attribution.
+    verify_imported_proposal(carrier_proposal, &projected.state)
+        .map_err(PairVerificationError::CertificateCarrierWrong)?;
     if carrier.header.prev_hash != provisional_hash {
         return Err(PairVerificationError::CertificateCarrierWrong(
             NodeError::BlockInvalid {
@@ -1284,7 +995,7 @@ fn verify_provisional_certificate_with(
 
 /// Verify a directly requested QC for the bounded provisional block.
 pub fn verify_direct_provisional_qc(
-    provisional: &BlockV1,
+    provisional: &BlockProposalVNext,
     qc_bytes: &[u8],
     canonical_state: &ChainState,
 ) -> NodeResult<()> {
@@ -1293,7 +1004,7 @@ pub fn verify_direct_provisional_qc(
 
 /// Verify a directly requested peer QC through bounded QC verification.
 pub fn verify_network_direct_provisional_qc(
-    provisional: &BlockV1,
+    provisional: &BlockProposalVNext,
     qc_bytes: &[u8],
     canonical_state: &ChainState,
     verifier: &crate::qc_verification::NetworkQcVerifier,
@@ -1302,11 +1013,13 @@ pub fn verify_network_direct_provisional_qc(
 }
 
 fn verify_direct_provisional_qc_with(
-    provisional: &BlockV1,
+    provisional: &BlockProposalVNext,
     qc_bytes: &[u8],
     canonical_state: &ChainState,
     verifier: Option<&crate::qc_verification::NetworkQcVerifier>,
 ) -> NodeResult<()> {
+    verify_imported_proposal(provisional, canonical_state)?;
+    let provisional = &provisional.block;
     let qc =
         indra_core::types::qc::QuorumCertificateV1::decode_exact(qc_bytes).map_err(|error| {
             NodeError::BlockInvalid {
@@ -1368,10 +1081,11 @@ pub struct PreparedSyncBlock {
 }
 
 pub(crate) fn project_and_verify_block_state_root(
-    block: &BlockV1,
+    verified: &indra_core::types::proposal::VerifiedProposal<'_>,
     pre_state: &ChainState,
     timestamp_secs: u64,
 ) -> NodeResult<PreparedSyncBlock> {
+    let block = verified.block();
     let expected_state_root = block.header.state_root;
     let expected_validator_root = block.header.validator_set_root;
 
@@ -1379,12 +1093,13 @@ pub(crate) fn project_and_verify_block_state_root(
     // same projection only after all header commitments match, so import/replay
     // never applies the same block a second time.
     let mut projected = pre_state.clone();
-    let outcome = apply_block_with_effects(&mut projected, block, timestamp_secs).map_err(|e| {
-        NodeError::BlockInvalid {
-            height: block.header.height,
-            reason: format!("block failed during pre-apply root verification: {e}"),
-        }
-    })?;
+    let outcome =
+        apply_block_with_effects(&mut projected, verified, timestamp_secs).map_err(|e| {
+            NodeError::BlockInvalid {
+                height: block.header.height,
+                reason: format!("block failed during pre-apply root verification: {e}"),
+            }
+        })?;
     let epoch_record = outcome.epoch_record;
 
     let actual_roots = compute_state_roots(&projected);
@@ -1437,8 +1152,12 @@ pub(crate) fn project_and_verify_block_state_root(
 }
 
 #[cfg(test)]
-pub(crate) fn verify_block_state_root(block: &BlockV1, state: &ChainState) -> NodeResult<()> {
-    project_and_verify_block_state_root(block, state, 0).map(|_| ())
+pub(crate) fn verify_block_state_root(
+    proposal: &BlockProposalVNext,
+    state: &ChainState,
+) -> NodeResult<()> {
+    let verified = verify_imported_proposal(proposal, state)?;
+    project_and_verify_block_state_root(&verified, state, 0).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1447,27 +1166,26 @@ mod tests {
     use indra_consensus::qc::{verify_qc_strict, QcValidator};
     use indra_consensus::{
         producer::{produce_block, BlockTemplate},
-        proposer::{compute_proposer_vrf, elect_proposer, ProposerCandidate, ProposerElection},
+        proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection},
         qc::build_qc,
         vote::produce_vote,
     };
     use indra_core::{
         codec::Encode,
         types::{
-            block::{BlockHeaderV1, BlockV1},
+            block::BlockVNext,
             primitives::{DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS},
             vote::VoteStep,
-            vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
         },
-        Bytes32, ProtocolVersion, QuorumCertificateV1, VariableBytes,
+        Bytes32, QuorumCertificateV1, VariableBytes,
     };
     use indra_crypto::{
         hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
         VrfKeypair,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_state_roots, compute_validator_set_root,
-        ValidatorEntry, ValidatorStatus,
+        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
+        ValidatorStatus,
     };
     use indra_storage::StateStore;
     use std::path::PathBuf;
@@ -1529,6 +1247,9 @@ mod tests {
                 hybrid_classical_pk: Some(public.classical.0),
                 hybrid_pq_pk: with_pq_key.then(|| public.pq.0.to_vec()),
                 vrf_pk: with_vrf_key.then(|| vrf.public_key()),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: stake,
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -1560,24 +1281,25 @@ mod tests {
     }
 
     fn build_election(state: &ChainState, height: u64, round: u32) -> ProposerElection {
-        let epoch_seed = Bytes32::from(indra_crypto::sha256(&state.tip_hash.0));
-        let mut candidates: Vec<_> = state
-            .validators
-            .active_validators()
-            .filter_map(|validator| {
-                validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-                    validator_id: validator.validator_id,
-                    vrf_pubkey: vrf_pk,
-                    stake: validator.stake_spark,
-                })
-            })
-            .collect();
-        candidates.sort_by_key(|candidate| candidate.validator_id.0);
+        let snapshot = state
+            .snapshot_for_consensus_height(height)
+            .expect("test state must carry the governing consensus snapshot");
         ProposerElection {
-            epoch_seed,
+            chain_id: state.chain_id.as_bytes().to_vec(),
+            election_seed: state.election_seed,
+            snapshot_root: snapshot.snapshot_root,
+            active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
             height,
             round,
-            candidates,
+            candidates: snapshot
+                .entries()
+                .iter()
+                .map(|entry| ProposerCandidate {
+                    validator_id: entry.validator_id,
+                    vrf_pubkey: entry.vrf_pk,
+                    stake: entry.consensus_weight_spark,
+                })
+                .collect(),
         }
     }
 
@@ -1588,236 +1310,56 @@ mod tests {
         state.consensus_snapshots.push(snapshot);
     }
 
-    fn elect_with_verified_output_for_seed(
-        election: &ProposerElection,
-        seed: u8,
-    ) -> Option<Bytes32> {
-        let keypair = VrfKeypair::from_seed(&[seed; 32]);
-        let validator_id = election
-            .candidates
-            .iter()
-            .find(|candidate| candidate.vrf_pubkey == keypair.public_key())?
-            .validator_id;
-        let elected = elect_proposer(election, election.height).ok()?;
-        (elected == validator_id).then_some(elected)
-    }
-
     fn make_strict_block(
         state: &ChainState,
         proposer_seed: u8,
         round: u32,
         prev_qc_bytes: Vec<u8>,
-    ) -> BlockV1 {
-        let requested_qc_bytes = prev_qc_bytes.clone();
-        let election = build_election(state, state.height + 1, round);
-        let preferred = VrfKeypair::from_seed(&[proposer_seed; 32]);
-        let mut keypairs = std::collections::BTreeMap::new();
-        let mut revealed = std::collections::BTreeMap::new();
-        let mut vrf_reveals = Vec::new();
-        for candidate in &election.candidates {
-            let keypair = if preferred.public_key() == candidate.vrf_pubkey {
-                preferred.clone()
-            } else {
-                (0u8..=u8::MAX)
-                    .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
-                    .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
-                    .expect("test validator VRF seed must be recoverable")
-            };
-            let slot = compute_proposer_vrf(
-                candidate.validator_id,
-                &keypair,
-                &election.epoch_seed,
-                election.height,
-                election.round,
-            );
-            let output = Bytes32::from(slot.vrf_output.0);
-            revealed.insert(candidate.validator_id, output);
-            vrf_reveals.push(VrfRevealEvidence {
-                validator_id: candidate.validator_id,
-                vrf_output: output,
-                vrf_proof: indra_core::VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
-            });
-            keypairs.insert(candidate.validator_id, keypair);
-        }
-        let mut election_result = elect_proposer_from_reveals(&election, &revealed).unwrap();
-        election_result.reveal_set_commitment = compute_reveal_set_commitment(&vrf_reveals);
-        let proposer_vrf = keypairs
-            .remove(&election_result.elected_validator_id)
-            .unwrap();
-        let election_result_hash = election_result.hash();
-        let projection_qc_bytes = if state.height == 0 {
-            prev_qc_bytes
-        } else {
-            let supplied_is_valid = QuorumCertificateV1::decode_exact(&prev_qc_bytes)
-                .ok()
-                .filter(|qc| qc.height == state.height && qc.block_hash == state.tip_hash)
-                .and_then(|qc| {
-                    let snapshot = state.snapshot_for_consensus_height(qc.height).ok()?;
-                    indra_core::types::qc::verify_qc_against_snapshot(
-                        &qc,
-                        snapshot,
-                        &state.chain_id,
-                    )
-                    .ok()
-                })
-                .is_some();
-            if supplied_is_valid {
-                prev_qc_bytes
-            } else {
-                let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
-                let keys: Vec<_> = snapshot
-                    .entries()
+    ) -> indra_core::types::block::BlockProposalVNext {
+        let proposer = VrfKeypair::from_seed(&[proposer_seed; 32]);
+        let election = (round..round.saturating_add(4_096))
+            .find_map(|candidate_round| {
+                let election = build_election(state, state.height + 1, candidate_round);
+                let candidate = election
+                    .candidates
                     .iter()
-                    .map(|entry| {
-                        (0u8..=u8::MAX)
-                            .map(|seed| {
-                                HybridKeypair::new(
-                                    ClassicalKeypair::from_seed(&[seed; 32]),
-                                    PqKeypair::from_seed(&[seed; 32]).unwrap(),
-                                )
-                            })
-                            .find(|keypair| {
-                                indra_core::types::crypto::hybrid_identity_id(
-                                    &keypair.public_key().classical.0,
-                                    &keypair.public_key().pq.0,
-                                ) == entry.validator_id
-                            })
-                            .expect("test snapshot signer seed must be recoverable")
-                    })
-                    .collect();
-                let refs: Vec<_> = keys.iter().collect();
-                qc_from_test_signers(state.height, state.tip_hash, snapshot, &refs).encode_to_vec()
-            }
-        };
+                    .find(|candidate| candidate.vrf_pubkey == proposer.public_key())?;
+                compute_proposer_vrf(candidate.validator_id, &proposer, &election)
+                    .ok()?
+                    .eligible
+                    .then_some(election)
+            })
+            .expect("requested test proposer must become eligible within the bounded round search");
         let template = BlockTemplate {
-            proposer_vrf_keypair: proposer_vrf,
-            epoch_seed: election.epoch_seed,
-            prev_qc_bytes: projection_qc_bytes,
+            proposer_vrf_keypair: proposer,
+            prev_qc_bytes,
             timestamp: 1_700_000_000u64.saturating_add(state.height.saturating_add(1)),
             polc_round: None,
             transactions: vec![],
             slash_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            election_result_hash: Some(election_result_hash),
-            election_result: Some(election_result),
-            vrf_reveals,
         };
         let mut projection_state = state.clone();
-        let mut block = produce_block(&template, &mut projection_state, &election).unwrap();
-        if state.height > 0 && block.header.quorum_certificate.as_slice() != requested_qc_bytes {
-            block.header.quorum_certificate =
-                VariableBytes::from_slice(&requested_qc_bytes).unwrap();
-        }
-        block
-    }
-
-    fn make_reveal_set_block(
-        state: &ChainState,
-        active_seeds: &[u8],
-        reveal_seeds: &[u8],
-    ) -> BlockV1 {
-        make_reveal_set_block_at(state, u64::MAX, active_seeds, reveal_seeds)
-    }
-
-    fn make_reveal_set_block_at(
-        state: &ChainState,
-        height: u64,
-        active_seeds: &[u8],
-        reveal_seeds: &[u8],
-    ) -> BlockV1 {
-        make_reveal_set_block_at_round(state, height, 0, active_seeds, reveal_seeds)
-    }
-
-    fn make_reveal_set_block_at_round(
-        state: &ChainState,
-        height: u64,
-        round: u32,
-        active_seeds: &[u8],
-        reveal_seeds: &[u8],
-    ) -> BlockV1 {
-        let election = build_election(state, height, round);
-        let mut revealed_outputs = std::collections::BTreeMap::new();
-        let mut evidence = Vec::new();
-
-        for seed in reveal_seeds {
-            let keypair = VrfKeypair::from_seed(&[*seed; 32]);
-            let validator_id = election
-                .candidates
-                .iter()
-                .find(|candidate| candidate.vrf_pubkey == keypair.public_key())
-                .expect("reveal seed must belong to active validator set")
-                .validator_id;
-            let slot =
-                compute_proposer_vrf(validator_id, &keypair, &election.epoch_seed, height, round);
-            let vrf_output = Bytes32::from(slot.vrf_output.0);
-            revealed_outputs.insert(validator_id, vrf_output);
-            evidence.push(VrfRevealEvidence {
-                validator_id,
-                vrf_output,
-                vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
-            });
-        }
-        evidence.sort_by_key(|item| item.validator_id.0);
-
-        let mut result = elect_proposer_from_reveals(&election, &revealed_outputs).unwrap();
-        result.reveal_set_commitment = compute_reveal_set_commitment(&evidence);
-        let proposer_seed = active_seeds
-            .iter()
-            .find(|seed| {
-                let keypair = VrfKeypair::from_seed(&[**seed; 32]);
-                election.candidates.iter().any(|candidate| {
-                    candidate.validator_id == result.elected_validator_id
-                        && candidate.vrf_pubkey == keypair.public_key()
-                })
-            })
-            .copied()
-            .expect("elected proposer must be among active test seeds");
-        let proposer_keypair = VrfKeypair::from_seed(&[proposer_seed; 32]);
-        let proposer_slot = compute_proposer_vrf(
-            result.elected_validator_id,
-            &proposer_keypair,
-            &election.epoch_seed,
-            height,
-            round,
+        let block = produce_block(&template, &mut projection_state, &election).unwrap();
+        let signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[proposer_seed; 32]),
+            PqKeypair::from_seed(&[proposer_seed; 32]).unwrap(),
         );
-
-        let mut block = BlockV1 {
-            header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion(
-                    indra_core::types::primitives::BLOCK_FORMAT_VERSION,
-                ),
-                height,
-                prev_hash: state.tip_hash,
-                timestamp: 1_800_000_000,
-                state_root: Bytes32::ZERO,
-                validator_set_root: Bytes32::ZERO,
-                mempool_set_root: Bytes32::ZERO,
-                value_hash: Bytes32::ZERO,
-                base_fee: state.base_fee,
-                proposer_round: round,
-                polc_round: indra_core::types::block::NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::from(proposer_slot.vrf_output.0),
-                proposer_vrf_proof: VariableBytes::from_slice(&proposer_slot.vrf_proof.0).unwrap(),
-                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: Some(result.hash()),
+        let mut proposal = indra_core::types::block::BlockProposalVNext {
+            block,
+            proposer_authorization: indra_core::types::crypto::HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[]).unwrap(),
             },
-            transactions: vec![],
-            slashing_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            vrf_reveals: evidence,
         };
-
-        if state.height.saturating_add(1) == block.header.height {
-            let mut projected = state.clone();
-            apply_block(&mut projected, &block, 0).unwrap();
-            let roots = compute_state_roots(&projected);
-            block.header.state_root = roots.state_root;
-            block.header.validator_set_root = roots.validator_set_root;
-            block.header.value_hash = block.compute_value_hash(projected.total_supply);
-        }
-        block
+        let transcript = proposal.signing_bytes(state.chain_id.as_bytes()).unwrap();
+        let signature = signer.sign(&transcript).unwrap();
+        proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
+            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+        };
+        proposal
     }
 
     fn build_qc_bytes(
@@ -1894,7 +1436,7 @@ mod tests {
         .unwrap()
     }
 
-    fn make_block(state: &ChainState) -> BlockV1 {
+    fn make_block(state: &ChainState) -> indra_core::types::block::BlockProposalVNext {
         let candidate = build_election(state, state.height + 1, 0)
             .candidates
             .into_iter()
@@ -1903,17 +1445,124 @@ mod tests {
         let proposer_seed = (0u8..=u8::MAX)
             .find(|seed| VrfKeypair::from_seed(&[*seed; 32]).public_key() == candidate.vrf_pubkey)
             .expect("test proposer VRF seed must be recoverable");
-        make_strict_block(state, proposer_seed, 0, vec![])
+        let mut proposal = make_strict_block(state, proposer_seed, 0, vec![]);
+        // `canonical_test_genesis` deliberately uses independent hot and VRF
+        // seeds. Re-authorize the proposal with that fixture's registered hot
+        // hybrid key; eligibility and authorization are independent proofs.
+        let signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xD1; 32]),
+            PqKeypair::from_seed(&[0xD2; 32]).unwrap(),
+        );
+        let signature = signer
+            .sign(&proposal.signing_bytes(state.chain_id.as_bytes()).unwrap())
+            .unwrap();
+        proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
+            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+        };
+        proposal
+    }
+
+    fn authorize_canonical_test_proposal(
+        proposal: &mut indra_core::types::block::BlockProposalVNext,
+        chain_id: &[u8],
+    ) {
+        authorize_test_proposal(proposal, chain_id, [0xD1; 32], [0xD2; 32]);
+    }
+
+    fn authorize_test_proposal(
+        proposal: &mut indra_core::types::block::BlockProposalVNext,
+        chain_id: &[u8],
+        classical_seed: [u8; 32],
+        pq_seed: [u8; 32],
+    ) {
+        let signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&classical_seed),
+            PqKeypair::from_seed(&pq_seed).unwrap(),
+        );
+        let signature = signer
+            .sign(&proposal.signing_bytes(chain_id).unwrap())
+            .unwrap();
+        proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
+            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+        };
+    }
+
+    fn replace_qc_and_reauthorize(
+        proposal: &mut indra_core::types::block::BlockProposalVNext,
+        qc_bytes: Vec<u8>,
+        signer_seed: u8,
+        chain_id: &[u8],
+    ) {
+        proposal.block.header.quorum_certificate =
+            VariableBytes::from_slice(&qc_bytes).expect("adversarial QC fits protocol cap");
+        let signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[signer_seed; 32]),
+            PqKeypair::from_seed(&[signer_seed; 32]).unwrap(),
+        );
+        let signature = signer
+            .sign(&proposal.signing_bytes(chain_id).unwrap())
+            .unwrap();
+        proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
+            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+        };
+    }
+
+    fn apply_verified_test(
+        state: &mut ChainState,
+        proposal: &indra_core::types::block::BlockProposalVNext,
+        timestamp_secs: u64,
+    ) -> Result<Option<EpochRecord>, String> {
+        let snapshot = state
+            .snapshot_for_consensus_height(proposal.header.height)
+            .map_err(|error| error.to_string())?;
+        let verified = indra_core::types::proposal::verify_proposal(
+            proposal,
+            state.chain_id.as_bytes(),
+            &state.election_seed,
+            snapshot,
+        )
+        .map_err(|error| error.to_string())?;
+        apply_block(state, &verified, timestamp_secs).map_err(|error| error.to_string())
+    }
+
+    fn verify_test<'a>(
+        state: &ChainState,
+        proposal: &'a indra_core::types::block::BlockProposalVNext,
+    ) -> indra_core::types::proposal::VerifiedProposal<'a> {
+        let snapshot = state
+            .snapshot_for_consensus_height(proposal.header.height)
+            .unwrap();
+        indra_core::types::proposal::verify_proposal(
+            proposal,
+            state.chain_id.as_bytes(),
+            &state.election_seed,
+            snapshot,
+        )
+        .unwrap()
     }
 
     fn reference_two_step_validate_and_apply(
-        block: &BlockV1,
+        block: &indra_core::types::block::BlockProposalVNext,
         state: &mut ChainState,
         mempool: &mut Mempool,
         timestamp_secs: u64,
     ) -> NodeResult<Option<EpochRecord>> {
         verify_block_state_root(block, state)?;
-        let outcome = apply_block_with_effects(state, block, timestamp_secs).map_err(|e| {
+        let snapshot = state.snapshot_for_consensus_height(block.header.height)?;
+        let verified = indra_core::types::proposal::verify_proposal(
+            block,
+            state.chain_id.as_bytes(),
+            &state.election_seed,
+            snapshot,
+        )
+        .map_err(|e| NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: e.to_string(),
+        })?;
+        let outcome = apply_block_with_effects(state, &verified, timestamp_secs).map_err(|e| {
             NodeError::BlockInvalid {
                 height: block.header.height,
                 reason: e.to_string(),
@@ -1927,7 +1576,7 @@ mod tests {
     fn assert_import_state_equivalent(
         reference_state: &ChainState,
         actual_state: &ChainState,
-        block: &BlockV1,
+        block: &BlockVNext,
     ) {
         assert_eq!(reference_state, actual_state);
         assert_eq!(
@@ -2030,13 +1679,15 @@ mod tests {
         for _ in 0..4 {
             let block = make_strict_block(&state, 0x71, 0, prev_qc.clone());
             let mut old_reference = state.clone();
-            let old_epoch_record = apply_block(&mut old_reference, &block, 1_900_000_000).unwrap();
+            let old_epoch_record =
+                apply_verified_test(&mut old_reference, &block, 1_900_000_000).unwrap();
             let old_state_root = compute_state_root(&old_reference);
             let old_validator_set_root = compute_validator_set_root(&old_reference);
             let old_value_hash = block.compute_value_hash(old_reference.total_supply);
 
+            let verified = verify_test(&state, &block);
             let optimized =
-                project_and_verify_block_state_root(&block, &state, 1_900_000_000).unwrap();
+                project_and_verify_block_state_root(&verified, &state, 1_900_000_000).unwrap();
             assert_eq!(optimized.epoch_record, old_epoch_record);
             assert_eq!(optimized.state, old_reference);
             assert_eq!(compute_state_root(&optimized.state), old_state_root);
@@ -2115,6 +1766,7 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
         let mut block = make_block(&state);
         block.header.state_root = Bytes32::from([0xEE; 32]);
+        authorize_canonical_test_proposal(&mut block, state.chain_id.as_bytes());
 
         let err = import_unfinalized_block_for_test(
             &block,
@@ -2159,6 +1811,7 @@ mod tests {
         let state_store = StateStore::open(dir.join("state")).unwrap();
         let mut block = make_block(&state);
         block.header.base_fee = block.header.base_fee.saturating_add(1);
+        authorize_canonical_test_proposal(&mut block, state.chain_id.as_bytes());
 
         let err = import_unfinalized_block_for_test(
             &block,
@@ -2203,7 +1856,7 @@ mod tests {
         let block = make_block(&state);
 
         block_store
-            .append(&crate::genesis::build_genesis_block())
+            .append(&crate::genesis::build_genesis_proposal())
             .unwrap();
         block_store.append(&block).unwrap();
         let error = import_unfinalized_block_for_test(
@@ -2228,25 +1881,55 @@ mod tests {
 
         let mut bad_state_root = make_block(&state);
         bad_state_root.header.state_root = Bytes32::from([0xE1; 32]);
+        authorize_canonical_test_proposal(&mut bad_state_root, state.chain_id.as_bytes());
         let err = verify_block_state_root(&bad_state_root, &state).unwrap_err();
         assert!(err.to_string().contains("state_root mismatch"));
 
         let mut bad_validator_root = make_block(&state);
         bad_validator_root.header.validator_set_root = Bytes32::from([0xE2; 32]);
+        authorize_canonical_test_proposal(&mut bad_validator_root, state.chain_id.as_bytes());
         let err = verify_block_state_root(&bad_validator_root, &state).unwrap_err();
         assert!(err.to_string().contains("validator_set_root mismatch"));
 
         let mut bad_value_hash = make_block(&state);
         bad_value_hash.header.value_hash = Bytes32::from([0xE3; 32]);
+        authorize_canonical_test_proposal(&mut bad_value_hash, state.chain_id.as_bytes());
         let err = verify_block_state_root(&bad_value_hash, &state).unwrap_err();
         assert!(err.to_string().contains("value_hash mismatch"));
 
         let mut apply_failure = make_block(&state);
         apply_failure.header.prev_hash = Bytes32::from([0xE4; 32]);
+        authorize_canonical_test_proposal(&mut apply_failure, state.chain_id.as_bytes());
         let err = verify_block_state_root(&apply_failure, &state).unwrap_err();
         assert!(err
             .to_string()
             .contains("block failed during pre-apply root verification"));
+    }
+
+    #[test]
+    fn governed_sync_verification_fails_closed_without_snapshot() {
+        let mut state = crate::genesis::canonical_test_genesis();
+        let proposal = make_block(&state);
+        state.consensus_snapshots.clear();
+        let error = verify_block_state_root(&proposal, &state).unwrap_err();
+        assert!(error.to_string().contains("consensus snapshot"));
+    }
+
+    #[test]
+    fn sync_import_guard_uses_snapshot_when_live_active_set_is_empty() {
+        let mut state = crate::genesis::canonical_test_genesis();
+        let proposal = make_block(&state);
+        for validator_id in state
+            .validators
+            .active_validators()
+            .map(|validator| validator.validator_id)
+            .collect::<Vec<_>>()
+        {
+            state.validators.get_mut(&validator_id).unwrap().status =
+                indra_state::ValidatorStatus::Registered;
+        }
+        assert_eq!(state.validators.active_count(), 0);
+        verify_block_state_root(&proposal, &state).unwrap();
     }
 
     #[test]
@@ -2319,6 +2002,7 @@ mod tests {
         // Try to import height 5 when we're at genesis (height 0)
         let mut block = make_block(&state);
         block.header.height = 5;
+        authorize_canonical_test_proposal(&mut block, state.chain_id.as_bytes());
         assert!(import_unfinalized_block_for_test(
             &block,
             &mut state,
@@ -2581,6 +2265,12 @@ mod tests {
         unfinalized_fork.header.timestamp = unfinalized_fork.header.timestamp.saturating_add(1);
         unfinalized_fork.header.value_hash =
             unfinalized_fork.compute_value_hash(state.total_supply);
+        authorize_test_proposal(
+            &mut unfinalized_fork,
+            state.chain_id.as_bytes(),
+            [0xB1; 32],
+            [0xB1; 32],
+        );
         verify_sync_candidate(&unfinalized_fork, &state, 0).unwrap();
 
         let qc = build_qc_bytes(
@@ -2593,7 +2283,7 @@ mod tests {
             10_000,
         );
         let mut after_real = state.clone();
-        apply_block(&mut after_real, &real, 0).unwrap();
+        apply_verified_test(&mut after_real, &real, 0).unwrap();
         let carrier = make_strict_block(&after_real, 0xB1, 0, qc);
 
         match verify_provisional_certificate(&unfinalized_fork, &carrier, &state) {
@@ -2624,8 +2314,18 @@ mod tests {
         );
         *qc.last_mut().unwrap() ^= 0x01;
         let mut after_block = state.clone();
-        apply_block(&mut after_block, &block, 0).unwrap();
-        let carrier = make_strict_block(&after_block, 0xB2, 0, qc);
+        apply_verified_test(&mut after_block, &block, 0).unwrap();
+        let valid_qc = build_qc_bytes(
+            block.header.height,
+            block.header.proposer_round,
+            block.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut carrier = make_strict_block(&after_block, 0xB2, 0, valid_qc);
+        replace_qc_and_reauthorize(&mut carrier, qc, 0xB2, after_block.chain_id.as_bytes());
 
         assert!(matches!(
             verify_provisional_certificate(&block, &carrier, &state),
@@ -2649,22 +2349,34 @@ mod tests {
         );
         let stake = source.state.validators.total_active_stake();
 
-        let block1 = make_strict_block(&source.state, 0x42, 0, vec![]);
-        source.commit_block(&block1).unwrap();
+        let mut block1 = make_strict_block(&source.state, 0x42, 0, vec![]);
+        authorize_test_proposal(
+            &mut block1,
+            source.state.chain_id.as_bytes(),
+            [0x42; 32],
+            [0x43; 32],
+        );
+        source.commit_proposal(&block1).unwrap();
         let qc1 = build_qc_bytes(
             1,
-            0,
+            block1.header.proposer_round,
             block1.header.block_hash(),
             validator_id,
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             stake,
         );
-        let block2 = make_strict_block(&source.state, 0x42, 0, qc1);
-        source.commit_block(&block2).unwrap();
+        let mut block2 = make_strict_block(&source.state, 0x42, 0, qc1);
+        authorize_test_proposal(
+            &mut block2,
+            source.state.chain_id.as_bytes(),
+            [0x42; 32],
+            [0x43; 32],
+        );
+        source.commit_proposal(&block2).unwrap();
         let qc2 = build_qc_bytes(
             2,
-            0,
+            block2.header.proposer_round,
             block2.header.block_hash(),
             validator_id,
             &hybrid,
@@ -2718,7 +2430,7 @@ mod tests {
                 hybrid.public_key().pq.0.to_vec(),
                 10_000,
             );
-            apply_block(&mut builder, &block, 0).unwrap();
+            apply_verified_test(&mut builder, &block, 0).unwrap();
             blocks.push(block);
         }
 
@@ -2909,7 +2621,7 @@ mod tests {
             install_active_validator(&mut state, 0x11, 10_000, true, true);
         let block = make_strict_block(&state, 0x11, 0, vec![]);
 
-        assert!(verify_proposer_vrf(&block, &state).is_ok());
+        let _ = verify_test(&state, &block);
         assert!(verify_block_qc(&block, &state).is_ok());
         assert!(verify_block_state_root(&block, &state).is_ok());
     }
@@ -2917,12 +2629,21 @@ mod tests {
     #[test]
     fn strict_block_two_rejects_empty_qc() {
         let mut state = ChainState::new_genesis();
-        let (_validator_id, _hybrid) =
-            install_active_validator(&mut state, 0x12, 10_000, true, true);
+        let (validator_id, hybrid) = install_active_validator(&mut state, 0x12, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x12, 0, vec![]);
-        apply_block(&mut state, &block1, 0).unwrap();
+        apply_verified_test(&mut state, &block1, 0).unwrap();
 
-        let block2 = make_strict_block(&state, 0x12, 0, vec![]);
+        let valid_qc = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut block2 = make_strict_block(&state, 0x12, 0, valid_qc);
+        replace_qc_and_reauthorize(&mut block2, vec![], 0x12, state.chain_id.as_bytes());
         let err = verify_block_qc(&block2, &state).unwrap_err();
         match err {
             NodeError::BlockInvalid { reason, .. } => {
@@ -2938,7 +2659,7 @@ mod tests {
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x14, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x14, 0, vec![]);
-        apply_block(&mut state, &block1, 0).unwrap();
+        apply_verified_test(&mut state, &block1, 0).unwrap();
 
         let wrong_qc_bytes = build_qc_bytes(
             3,
@@ -2949,7 +2670,17 @@ mod tests {
             hybrid.public_key().pq.0.to_vec(),
             10_000,
         );
-        let block2 = make_strict_block(&state, 0x14, 0, wrong_qc_bytes);
+        let valid_qc = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut block2 = make_strict_block(&state, 0x14, 0, valid_qc);
+        replace_qc_and_reauthorize(&mut block2, wrong_qc_bytes, 0x14, state.chain_id.as_bytes());
 
         let err = verify_block_qc(&block2, &state).unwrap_err();
         match err {
@@ -2971,7 +2702,7 @@ mod tests {
         let block1 = make_strict_block(&state, 0x15, 0, vec![]);
         let wrong_parent_hash = Bytes32::from([0xB0; 32]);
         assert_ne!(wrong_parent_hash, block1.header.block_hash());
-        apply_block(&mut state, &block1, 0).unwrap();
+        apply_verified_test(&mut state, &block1, 0).unwrap();
 
         let wrong_parent_qc_bytes = build_qc_bytes(
             block1.header.height,
@@ -2982,7 +2713,22 @@ mod tests {
             hybrid.public_key().pq.0.to_vec(),
             10_000,
         );
-        let block2 = make_strict_block(&state, 0x15, 0, wrong_parent_qc_bytes);
+        let valid_qc = build_qc_bytes(
+            block1.header.height,
+            block1.header.proposer_round,
+            block1.header.block_hash(),
+            validator_id,
+            &hybrid,
+            hybrid.public_key().pq.0.to_vec(),
+            10_000,
+        );
+        let mut block2 = make_strict_block(&state, 0x15, 0, valid_qc);
+        replace_qc_and_reauthorize(
+            &mut block2,
+            wrong_parent_qc_bytes,
+            0x15,
+            state.chain_id.as_bytes(),
+        );
 
         let err = verify_block_qc(&block2, &state).unwrap_err();
         match err {
@@ -3002,7 +2748,7 @@ mod tests {
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x16, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x16, 0, vec![]);
-        apply_block(&mut state, &block1, 0).unwrap();
+        apply_verified_test(&mut state, &block1, 0).unwrap();
 
         let qc_bytes = build_qc_bytes(
             block1.header.height,
@@ -3023,7 +2769,7 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x17, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x17, 0, vec![]);
-        let mut qc_bytes = build_qc_bytes(
+        let valid_qc = build_qc_bytes(
             block1.header.height,
             block1.header.proposer_round,
             block1.header.block_hash(),
@@ -3032,11 +2778,18 @@ mod tests {
             hybrid.public_key().pq.0.to_vec(),
             10_000,
         );
+        let mut qc_bytes = valid_qc.clone();
         qc_bytes.push(0xA5);
 
         let mut after_block = state.clone();
-        apply_block(&mut after_block, &block1, 0).unwrap();
-        let carrier = make_strict_block(&after_block, 0x17, 0, qc_bytes.clone());
+        apply_verified_test(&mut after_block, &block1, 0).unwrap();
+        let mut carrier = make_strict_block(&after_block, 0x17, 0, valid_qc);
+        replace_qc_and_reauthorize(
+            &mut carrier,
+            qc_bytes.clone(),
+            0x17,
+            after_block.chain_id.as_bytes(),
+        );
 
         assert!(verify_block_qc(&carrier, &after_block).is_err());
         assert!(matches!(
@@ -3092,127 +2845,6 @@ mod tests {
             1,
             "the first rejection must be cached for every exact replay"
         );
-    }
-
-    #[test]
-    fn legacy_header_vrf_mismatch_does_not_override_authoritative_reveal_evidence() {
-        let mut state = ChainState::new_genesis();
-        let (validator_a, _hybrid_a) =
-            install_active_validator(&mut state, 0x21, 10_000, true, true);
-        let (validator_b, _hybrid_b) =
-            install_active_validator(&mut state, 0x22, 10_000, true, true);
-
-        let mismatch_round = (0..32u32)
-            .find(|round| {
-                let election = build_election(&state, 1, *round);
-                elect_with_verified_output_for_seed(&election, 0x22) == Some(validator_b)
-                    && elect_with_verified_output_for_seed(&election, 0x21) != Some(validator_a)
-            })
-            .expect("expected a round won by B and not by tampered A");
-
-        let mut tampered = make_strict_block(&state, 0x22, mismatch_round, vec![]);
-        let election = build_election(&state, 1, mismatch_round);
-        let slot = compute_proposer_vrf(
-            validator_a,
-            &VrfKeypair::from_seed(&[0x21; 32]),
-            &election.epoch_seed,
-            1,
-            mismatch_round,
-        );
-        tampered.header.proposer_vrf_output = Bytes32::from(slot.vrf_output.0);
-        tampered.header.proposer_vrf_proof = VariableBytes::from_slice(&slot.vrf_proof.0).unwrap();
-        verify_proposer_vrf(&tampered, &state).unwrap();
-    }
-
-    #[test]
-    fn sync_verify_accepts_commit_reveal_header_hash_without_ephemeral_messages() {
-        let mut state = ChainState::new_genesis();
-        install_active_validator(&mut state, 0x41, 10_000, true, true);
-        install_active_validator(&mut state, 0x42, 10_000, true, true);
-
-        let round = 2u32;
-        let winner_block = make_strict_block(&state, 0x41, round, vec![]);
-        assert!(
-            verify_proposer_vrf(&winner_block, &state).is_ok(),
-            "sync proposer verification must not require ephemeral commit/reveal messages"
-        );
-    }
-
-    #[test]
-    fn sync_verify_rejects_tampered_election_result_hash() {
-        let mut state = ChainState::new_genesis();
-        install_active_validator(&mut state, 0x41, 10_000, true, true);
-
-        let mut loser_block = make_strict_block(&state, 0x41, 2, vec![]);
-        loser_block.header.election_result_hash = Some(Bytes32::from([0xEE; 32]));
-
-        let err = verify_proposer_vrf(&loser_block, &state).unwrap_err();
-        match err {
-            NodeError::BlockInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("election_result_hash"),
-                    "unexpected rejection reason: {reason}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sync_proposer_verification_matches_live_snapshot_authority() {
-        let mut state = ChainState::new_genesis();
-        let mut ids = Vec::new();
-        for seed in [0xA1, 0xA2, 0xA3, 0xA4] {
-            ids.push(install_active_validator(&mut state, seed, 10_000, true, true).0);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-        let block = make_reveal_set_block(&state, &[0xA1, 0xA2, 0xA3, 0xA4], &[0xA1, 0xA2, 0xA3]);
-        let snapshot = state.snapshot_for_consensus_height(u64::MAX).unwrap();
-        let epoch_seed = Bytes32::from(indra_crypto::sha256(&block.header.prev_hash.0));
-        let live_authority = vrf_authority_from_snapshot(
-            block.header.height,
-            block.header.proposer_round,
-            epoch_seed,
-            snapshot,
-        );
-
-        state.validators.get_mut(&ids[0]).unwrap().stake_spark = 1_000_000;
-        state.validators.get_mut(&ids[1]).unwrap().status = ValidatorStatus::Registered;
-
-        let (_, sync_candidates, _) = verify_proposer_vrf_key_ownership(&block, &state).unwrap();
-        assert_eq!(
-            sync_candidates.len(),
-            live_authority.election.candidates.len()
-        );
-        for (sync, live) in sync_candidates
-            .iter()
-            .zip(&live_authority.election.candidates)
-        {
-            assert_eq!(sync.validator_id, live.validator_id);
-            assert_eq!(sync.vrf_pubkey, live.vrf_pubkey);
-            assert_eq!(sync.stake, live.stake);
-        }
-        assert!(verify_proposer_vrf(&block, &state).is_ok());
-    }
-
-    #[test]
-    fn sync_reveal_verification_matches_live_snapshot_quorum() {
-        let mut state = ChainState::new_genesis();
-        let mut ids = Vec::new();
-        for seed in [0xA5, 0xA6, 0xA7, 0xA8] {
-            ids.push(install_active_validator(&mut state, seed, 10_000, true, true).0);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-        let block = make_reveal_set_block(&state, &[0xA5, 0xA6, 0xA7, 0xA8], &[0xA5, 0xA6, 0xA7]);
-        let expected = block.header.election_result_hash;
-
-        state.validators.get_mut(&ids[0]).unwrap().stake_spark = 1;
-        state.validators.get_mut(&ids[1]).unwrap().stake_spark = 1;
-        state.validators.get_mut(&ids[2]).unwrap().status = ValidatorStatus::Registered;
-        state.validators.get_mut(&ids[3]).unwrap().stake_spark = 10_000_000;
-
-        let result = verify_reveal_set_evidence(&block, &state).unwrap();
-        assert_eq!(Some(result.hash()), expected);
     }
 
     #[test]
@@ -3394,129 +3026,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_gate_sync_proposer_and_reveal_behavior_is_unchanged() {
-        let mut state = ChainState::new_genesis();
-        install_active_validator(&mut state, 0xB5, 10_000, true, true);
-        let block = make_strict_block(&state, 0xB5, 0, vec![]);
-        let expected = build_election(&state, 1, 0);
-
-        let (_, candidates, epoch_seed) =
-            verify_proposer_vrf_key_ownership(&block, &state).unwrap();
-        assert_eq!(candidates.len(), expected.candidates.len());
-        for (actual, expected) in candidates.iter().zip(&expected.candidates) {
-            assert_eq!(actual.validator_id, expected.validator_id);
-            assert_eq!(actual.vrf_pubkey, expected.vrf_pubkey);
-            assert_eq!(actual.stake, expected.stake);
-        }
-        assert_eq!(epoch_seed, expected.epoch_seed);
-        assert!(verify_proposer_vrf(&block, &state).is_ok());
-    }
-
-    #[test]
-    fn sync_import_guard_uses_snapshot_when_live_active_set_is_empty() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = install_active_validator(&mut state, 0xBE, 10_000, true, true);
-        install_test_snapshot_at_inert_gate(&mut state);
-        let valid = make_reveal_set_block(&state, &[0xBE], &[0xBE]);
-
-        assert!(verify_imported_block_proposer(&valid, &state).is_ok());
-
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
-        assert_eq!(state.validators.active_count(), 0);
-        assert!(
-            verify_imported_block_proposer(&valid, &state).is_ok(),
-            "sync must verify the snapshot-authorized proposer despite live demotion"
-        );
-
-        let mut invalid = valid;
-        invalid.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xBF; 32]).unwrap();
-        assert!(
-            verify_imported_block_proposer(&invalid, &state).is_err(),
-            "sync must catch an invalid proposer proof instead of skipping verification"
-        );
-    }
-
-    #[test]
-    fn sync_import_guard_fails_closed_when_governed_snapshot_is_missing() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = install_active_validator(&mut state, 0xC0, 10_000, true, true);
-        let block = make_reveal_set_block(&state, &[0xC0], &[0xC0]);
-        state.consensus_snapshots.clear();
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
-        assert_eq!(state.validators.active_count(), 0);
-
-        assert!(matches!(
-            verify_imported_block_proposer(&block, &state),
-            Err(NodeError::ConsensusSnapshotLookup(_))
-        ));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn sync_import_guard_preserves_pre_gate_behavior() {
-        let mut state = ChainState::new_genesis();
-        let (validator_id, _) = install_active_validator(&mut state, 0xC1, 10_000, true, true);
-        let valid = make_strict_block(&state, 0xC1, 0, vec![]);
-        assert!(verify_imported_block_proposer(&valid, &state).is_ok());
-
-        state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Registered;
-        let mut invalid = valid;
-        invalid.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xC2; 32]).unwrap();
-        assert!(!consensus_snapshot_active(invalid.header.height));
-        assert!(
-            verify_imported_block_proposer(&invalid, &state).is_ok(),
-            "legacy sync path must retain its live-empty verification skip"
-        );
-    }
-
-    #[test]
-    fn governed_sync_verification_fails_closed_without_snapshot() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0xB6, 0xB7, 0xB8, 0xB9] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        let block = make_reveal_set_block(&state, &[0xB6, 0xB7, 0xB8, 0xB9], &[0xB6, 0xB7, 0xB8]);
-        state.consensus_snapshots.clear();
-
-        assert!(matches!(
-            verify_proposer_vrf(&block, &state),
-            Err(NodeError::ConsensusSnapshotLookup(_))
-        ));
-        assert!(matches!(
-            verify_reveal_set_evidence(&block, &state),
-            Err(NodeError::ConsensusSnapshotLookup(_))
-        ));
-    }
-
-    #[test]
-    fn sync_replay_matches_live_across_snapshot_activation_boundary() {
-        let mut canonical = ChainState::new_genesis();
-        let mut ids = Vec::new();
-        for seed in [0xBA, 0xBB, 0xBC, 0xBD] {
-            ids.push(install_active_validator(&mut canonical, seed, 10_000, true, true).0);
-        }
-        let pre_gate = make_strict_block(&canonical, 0xBA, 0, vec![]);
-        install_test_snapshot_at_inert_gate(&mut canonical);
-        let post_gate =
-            make_reveal_set_block(&canonical, &[0xBA, 0xBB, 0xBC, 0xBD], &[0xBA, 0xBB, 0xBC]);
-
-        let mut live_state = canonical.clone();
-        let mut sync_state = canonical.clone();
-        live_state.validators.get_mut(&ids[0]).unwrap().stake_spark = 50_000;
-        sync_state.validators.get_mut(&ids[1]).unwrap().status = ValidatorStatus::Registered;
-
-        assert_eq!(
-            verify_proposer_vrf(&pre_gate, &live_state).is_ok(),
-            verify_proposer_vrf(&pre_gate, &sync_state).is_ok()
-        );
-        let live_result = verify_reveal_set_evidence(&post_gate, &live_state).unwrap();
-        let sync_result = verify_reveal_set_evidence(&post_gate, &sync_state).unwrap();
-        assert_eq!(live_result, sync_result);
-        assert!(verify_proposer_vrf(&post_gate, &live_state).is_ok());
-        assert!(verify_proposer_vrf(&post_gate, &sync_state).is_ok());
-    }
-
-    #[test]
     fn strict_valid_block_with_vrf_qc_and_state_root_passes() {
         let mut state = ChainState::new_genesis();
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x31, 10_000, true, true);
@@ -3553,167 +3062,9 @@ mod tests {
         );
         let block2 = make_strict_block(&state, 0x31, 0, qc_bytes);
 
-        assert!(verify_proposer_vrf(&block2, &state).is_ok());
+        let _ = verify_test(&state, &block2);
         assert!(verify_block_qc(&block2, &state).is_ok());
         assert!(verify_block_state_root(&block2, &state).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn proposal_reveal_set_below_quorum_rejected() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x51, 0x52, 0x53, 0x54] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let block = make_reveal_set_block(&state, &[0x51, 0x52, 0x53, 0x54], &[0x51]);
-        let err = verify_reveal_set_evidence(&block, &state).unwrap_err();
-
-        match err {
-            NodeError::BlockInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("below quorum"),
-                    "unexpected rejection reason: {reason}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fallback_reveal_set_evidence_verifies_without_quorum() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x55, 0x56, 0x57, 0x58] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
-        let block = make_reveal_set_block_at_round(
-            &state,
-            u64::MAX,
-            threshold_round,
-            &[0x55, 0x56, 0x57, 0x58],
-            &[],
-        );
-        let result = verify_reveal_set_evidence(&block, &state).unwrap();
-
-        assert!(result.fallback_used);
-        assert_eq!(
-            result.reveal_set_commitment,
-            compute_reveal_set_commitment(&[]),
-            "deterministic fallback is verified from the canonical empty reveal evidence set"
-        );
-        assert_eq!(Some(result.hash()), block.header.election_result_hash);
-    }
-
-    #[test]
-    fn fallback_claim_below_round_threshold_rejected() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x59, 0x5A, 0x5B, 0x5C] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let block =
-            make_reveal_set_block_at_round(&state, u64::MAX, 0, &[0x59, 0x5A, 0x5B, 0x5C], &[]);
-        let err = verify_reveal_set_evidence(&block, &state).unwrap_err();
-
-        match err {
-            NodeError::BlockInvalid { reason, .. } => {
-                assert!(
-                    reason.contains("before minimum fallback round"),
-                    "unexpected rejection reason: {reason}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fallback_claim_at_threshold_round_accepted() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x5D, 0x5E, 0x5F, 0x60] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
-        let block = make_reveal_set_block_at_round(
-            &state,
-            u64::MAX,
-            threshold_round,
-            &[0x5D, 0x5E, 0x5F, 0x60],
-            &[],
-        );
-        let result = verify_reveal_set_evidence(&block, &state).unwrap();
-
-        assert!(result.fallback_used);
-        assert_eq!(result.round, threshold_round);
-    }
-
-    #[test]
-    fn fallback_claim_above_threshold_round_accepted() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x65, 0x66, 0x67, 0x68] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let threshold_round = MAX_VRF_EMPTY_REVEAL_ROUNDS.saturating_sub(1);
-        let block = make_reveal_set_block_at_round(
-            &state,
-            u64::MAX,
-            threshold_round.saturating_add(3),
-            &[0x65, 0x66, 0x67, 0x68],
-            &[],
-        );
-        let result = verify_reveal_set_evidence(&block, &state).unwrap();
-
-        assert!(result.fallback_used);
-        assert!(result.round > threshold_round);
-    }
-
-    #[test]
-    fn reveal_set_evidence_durably_auditable_after_sync() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x61, 0x62, 0x63, 0x64] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let block = make_reveal_set_block(&state, &[0x61, 0x62, 0x63, 0x64], &[0x61, 0x62, 0x63]);
-
-        let result = verify_reveal_set_evidence(&block, &state).unwrap();
-        assert_eq!(
-            Some(result.hash()),
-            block.header.election_result_hash,
-            "synced block body must contain enough evidence to reconstruct the QC-attested election hash"
-        );
-        assert!(verify_proposer_vrf(&block, &state).is_ok());
-    }
-
-    #[test]
-    fn voter_verifies_against_specified_set_not_local_view() {
-        let mut state = ChainState::new_genesis();
-        for seed in [0x71, 0x72, 0x73, 0x74] {
-            install_active_validator(&mut state, seed, 10_000, true, true);
-        }
-        install_test_snapshot_at_inert_gate(&mut state);
-
-        let specified =
-            make_reveal_set_block(&state, &[0x71, 0x72, 0x73, 0x74], &[0x71, 0x72, 0x73]);
-        let local_superset =
-            make_reveal_set_block(&state, &[0x71, 0x72, 0x73, 0x74], &[0x71, 0x72, 0x73, 0x74]);
-
-        assert_ne!(
-            specified.header.election_result_hash, local_superset.header.election_result_hash,
-            "test setup must model divergent local/proposer reveal views"
-        );
-        assert!(
-            verify_reveal_set_evidence(&specified, &state).is_ok(),
-            "verification must use the proposer-specified body set, not reject because a local superset would hash differently"
-        );
     }
 }

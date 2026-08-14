@@ -21,7 +21,7 @@
 //!   [u32 length LE] [u8 message_type] [payload bytes]
 //!
 //! Message types:
-//!   0x01 = Block      — a complete BlockV1
+//!   0x01 = Block      — a complete BlockVNext
 //!   0x02 = Vote       — a VoteV1 (prevote or precommit)
 //!   0x03 = Tx         — a TransactionV1 (mempool gossip)
 //!   0x04 = PeerList   — list of known peer addresses

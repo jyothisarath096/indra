@@ -346,12 +346,14 @@ mod tests {
             public.classical.0,
             public.pq.0,
             vrf.public_key(),
+            crate::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            0,
         )
         .unwrap()
     }
 
     fn snapshot(count: u8) -> ConsensusSnapshot {
-        ConsensusSnapshot::new(301, 300, (1..=count).map(entry).collect()).unwrap()
+        ConsensusSnapshot::new(301, 300, (1..=count).map(entry).collect(), 1).unwrap()
     }
 
     #[test]

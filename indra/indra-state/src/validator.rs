@@ -14,7 +14,7 @@ use indra_core::types::primitives::{
 
 use crate::error::{StateError, StateResult};
 
-const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 1;
+const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 2;
 /// Consensus ceiling for active delegator entries under one validator.
 ///
 /// This is intentionally far above expected 200-validator mainnet operating
@@ -94,6 +94,12 @@ pub struct ValidatorEntry {
     pub hybrid_pq_pk: Option<Vec<u8>>,
     /// VRF public key bytes for proposer verification.
     pub vrf_pk: Option<[u8; 32]>,
+    /// Epoch in which the current VRF key first became snapshot-active.
+    pub vrf_key_activation_epoch: u64,
+    /// Finalized replacement key waiting for its snapshot epoch.
+    pub pending_vrf_pk: Option<[u8; 32]>,
+    /// Epoch at which `pending_vrf_pk` becomes authoritative.
+    pub pending_vrf_activation_epoch: Option<u64>,
     /// Staked amount in Spark.
     pub stake_spark: u64,
     /// Current lifecycle status.
@@ -156,6 +162,15 @@ impl Encode for ValidatorEntry {
         if let Some(pk) = self.vrf_pk {
             buf.extend_from_slice(&pk);
         }
+        self.vrf_key_activation_epoch.encode(buf);
+        self.pending_vrf_pk.is_some().encode(buf);
+        if let Some(pk) = self.pending_vrf_pk {
+            buf.extend_from_slice(&pk);
+        }
+        self.pending_vrf_activation_epoch.is_some().encode(buf);
+        if let Some(epoch) = self.pending_vrf_activation_epoch {
+            epoch.encode(buf);
+        }
         self.stake_spark.encode(buf);
         self.status.encode(buf);
         self.registered_epoch.encode(buf);
@@ -216,6 +231,11 @@ impl Encode for ValidatorEntry {
                 .unwrap_or(0)
             + 1
             + self.vrf_pk.map(|_| 32).unwrap_or(0)
+            + 8
+            + 1
+            + self.pending_vrf_pk.map(|_| 32).unwrap_or(0)
+            + 1
+            + self.pending_vrf_activation_epoch.map(|_| 8).unwrap_or(0)
             + 8
             + self.status.encoded_len()
             + 8
@@ -307,6 +327,36 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
     } else {
         None
     };
+    let vrf_key_activation_epoch = u64::decode(r)?;
+    let pending_vrf_pk = if bool::decode(r)? {
+        Some(
+            r.read_bytes(32)?
+                .try_into()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "invalid pending VRF pk length in snapshot",
+                })?,
+        )
+    } else {
+        None
+    };
+    let pending_vrf_activation_epoch = if bool::decode(r)? {
+        Some(u64::decode(r)?)
+    } else {
+        None
+    };
+    if pending_vrf_pk.is_some() != pending_vrf_activation_epoch.is_some() {
+        return Err(IndraError::InvalidStakingOp(
+            "pending VRF key and activation epoch must be present together".into(),
+        ));
+    }
+    if let Some(key) = vrf_pk {
+        indra_crypto::validate_vrf_public_key(&key)
+            .map_err(|error| IndraError::InvalidStakingOp(error.to_string()))?;
+    }
+    if let Some(key) = pending_vrf_pk {
+        indra_crypto::validate_vrf_public_key(&key)
+            .map_err(|error| IndraError::InvalidStakingOp(error.to_string()))?;
+    }
 
     let stake_spark = u64::decode(r)?;
     let status = ValidatorStatus::decode(r)?;
@@ -388,6 +438,9 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
         hybrid_classical_pk,
         hybrid_pq_pk,
         vrf_pk,
+        vrf_key_activation_epoch,
+        pending_vrf_pk,
+        pending_vrf_activation_epoch,
         stake_spark,
         status,
         registered_epoch,
@@ -704,6 +757,18 @@ impl ValidatorSet {
     /// Returns an error if adding this validator would exceed MAX_VALIDATORS
     /// and the validator is not already registered.
     pub fn upsert(&mut self, entry: ValidatorEntry) -> crate::error::StateResult<()> {
+        if entry.pending_vrf_pk.is_some() != entry.pending_vrf_activation_epoch.is_some() {
+            return Err(crate::error::StateError::InvalidStakingOp(
+                "pending VRF key and activation epoch must be present together".into(),
+            ));
+        }
+        if let Some(pending) = entry.pending_vrf_pk {
+            indra_crypto::validate_vrf_public_key(&pending).map_err(|error| {
+                crate::error::StateError::InvalidStakingOp(format!(
+                    "malformed pending VRF key: {error}"
+                ))
+            })?;
+        }
         let id = entry.validator_id;
         if !self.validators.contains_key(&id) && self.validators.len() >= MAX_VALIDATORS {
             return Err(crate::error::StateError::InvariantViolation {
@@ -802,6 +867,9 @@ mod tests {
             hybrid_classical_pk: None,
             hybrid_pq_pk: None,
             vrf_pk: None,
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: epoch,

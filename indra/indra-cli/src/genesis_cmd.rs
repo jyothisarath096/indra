@@ -10,6 +10,17 @@
 //! ```toml
 //! [genesis]
 //! chain_id     = "indra-testnet-1"
+//! active_slot_coefficient_numerator = "9223372036854775808"
+//! bitcoin_pow_entropy_header = "<160 lowercase hex chars>"
+//!
+//! [genesis.bitcoin_pow_entropy_source]
+//! scheme = 1
+//! network_genesis_hash = "<64 lowercase hex chars>"
+//! announced_height = 840000
+//! header_codec = 1
+//! extraction_algorithm = 1
+//! minimum_confirmations = 100
+//! reorg_policy = 1
 //!
 //! [[validators]]
 //! name                = "alice"
@@ -56,6 +67,12 @@ pub struct GenesisEntry {
 pub struct GenesisConfig {
     /// Human-readable chain identifier.
     pub chain_id: String,
+    /// Immutable numerator `F` in `f = F / 2^64`.
+    pub active_slot_coefficient_numerator: u64,
+    /// Canonical external-entropy source descriptor.
+    pub bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
+    /// Exact Bitcoin 80-byte header, lowercase hexadecimal.
+    pub bitcoin_pow_entropy_header: String,
     /// All initial validators.
     pub validators: Vec<GenesisEntry>,
 }
@@ -67,6 +84,32 @@ impl GenesisConfig {
 
         out.push_str("[genesis]\n");
         out.push_str(&format!("chain_id     = {}\n", toml_string(&self.chain_id)));
+        out.push_str(&format!(
+            "active_slot_coefficient_numerator = \"{}\"\n",
+            self.active_slot_coefficient_numerator
+        ));
+        out.push_str(&format!(
+            "bitcoin_pow_entropy_header = \"{}\"\n\n",
+            self.bitcoin_pow_entropy_header
+        ));
+        let source = &self.bitcoin_pow_entropy_source;
+        out.push_str("[genesis.bitcoin_pow_entropy_source]\n");
+        out.push_str(&format!("scheme = {}\n", source.scheme));
+        out.push_str(&format!(
+            "network_genesis_hash = \"{}\"\n",
+            source.network_genesis_hash
+        ));
+        out.push_str(&format!("announced_height = {}\n", source.announced_height));
+        out.push_str(&format!("header_codec = {}\n", source.header_codec));
+        out.push_str(&format!(
+            "extraction_algorithm = {}\n",
+            source.extraction_algorithm
+        ));
+        out.push_str(&format!(
+            "minimum_confirmations = {}\n",
+            source.minimum_confirmations
+        ));
+        out.push_str(&format!("reorg_policy = {}\n", source.reorg_policy));
         out.push_str(&format!(
             "# {} validators, total stake = {} Spark\n\n",
             self.validators.len(),
@@ -149,10 +192,16 @@ fn toml_string(value: &str) -> String {
 /// Build a genesis config from a list of entries.
 pub fn build_genesis_config(
     chain_id: &str,
+    active_slot_coefficient_numerator: u64,
+    bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
+    bitcoin_pow_entropy_header: String,
     validators: Vec<GenesisEntry>,
 ) -> CliResult<GenesisConfig> {
     let config = GenesisConfig {
         chain_id: chain_id.to_string(),
+        active_slot_coefficient_numerator,
+        bitcoin_pow_entropy_source,
+        bitcoin_pow_entropy_header,
         validators,
     };
     config.validate()?;
@@ -277,6 +326,27 @@ mod tests {
     use crate::keygen::generate_from_master_seed;
     use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
+    fn entropy() -> (u64, indra_node::genesis::BitcoinPowEntropySourceV1, String) {
+        (
+            1u64 << 63,
+            indra_node::genesis::BitcoinPowEntropySourceV1 {
+                scheme: 1,
+                network_genesis_hash: hex::encode([0x11; 32]),
+                announced_height: 1,
+                header_codec: 1,
+                extraction_algorithm: 1,
+                minimum_confirmations: 100,
+                reorg_policy: 1,
+            },
+            hex::encode([0x22; 80]),
+        )
+    }
+
+    fn build(chain_id: &str, validators: Vec<GenesisEntry>) -> CliResult<GenesisConfig> {
+        let (f, source, header) = entropy();
+        build_genesis_config(chain_id, f, source, header, validators)
+    }
+
     fn test_validators(count: usize) -> Vec<GenesisEntry> {
         (0..count)
             .map(|i| {
@@ -301,7 +371,7 @@ mod tests {
     #[test]
     fn build_valid_genesis() {
         let validators = test_validators(4);
-        let config = build_genesis_config("indra-testnet-1", validators).unwrap();
+        let config = build("indra-testnet-1", validators).unwrap();
         assert_eq!(config.validators.len(), 4);
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
         assert_eq!(parsed.genesis.chain_id, config.chain_id);
@@ -321,7 +391,7 @@ mod tests {
     #[test]
     fn toml_renderer_escapes_operator_text() {
         let validators = test_validators(4);
-        let config = build_genesis_config("indra-\"test\\chain", validators).unwrap();
+        let config = build("indra-\"test\\chain", validators).unwrap();
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
         assert_eq!(parsed.genesis.chain_id, "indra-\"test\\chain");
     }
@@ -329,7 +399,7 @@ mod tests {
     #[test]
     fn too_few_validators_rejected() {
         let validators = test_validators(3);
-        let result = build_genesis_config("test", validators);
+        let result = build("test", validators);
         assert!(result.is_err());
     }
 
@@ -337,7 +407,7 @@ mod tests {
     fn below_dust_stake_rejected() {
         let mut validators = test_validators(4);
         validators[0].stake = 1; // below DUST_LIMIT_SPARK
-        let result = build_genesis_config("test", validators);
+        let result = build("test", validators);
         assert!(result.is_err());
     }
 
@@ -345,14 +415,14 @@ mod tests {
     fn duplicate_validator_id_rejected() {
         let mut validators = test_validators(4);
         validators[1].validator_id = validators[0].validator_id.clone();
-        let result = build_genesis_config("test", validators);
+        let result = build("test", validators);
         assert!(result.is_err());
     }
 
     #[test]
     fn toml_output_has_all_fields() {
         let validators = test_validators(4);
-        let config = build_genesis_config("indra-testnet-1", validators).unwrap();
+        let config = build("indra-testnet-1", validators).unwrap();
         let toml = config.to_toml();
         assert!(toml.contains("[genesis]"));
         assert!(toml.contains("[[validators]]"));

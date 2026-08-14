@@ -220,7 +220,6 @@ pub fn verify_vote_authority(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
-        vote.election_result_hash.as_ref(),
         chain_id,
     );
     let sig_classical: [u8; 64] =
@@ -260,7 +259,7 @@ pub fn verify_vote_authority(
     })
 }
 
-/// Produce a signed vote.
+/// Produce a signed vote over the canonical full block identity.
 pub fn produce_vote(
     height: u64,
     round: u32,
@@ -270,62 +269,26 @@ pub fn produce_vote(
     chain_id: &str,
     keypair: &HybridKeypair,
 ) -> ConsensusResult<VoteV1> {
-    produce_vote_with_election_result(
-        height,
-        round,
-        step,
-        block_hash,
-        validator_id,
-        None,
-        chain_id,
-        keypair,
-    )
-}
-
-/// Produce a signed vote that optionally binds a commit-reveal election result.
-pub fn produce_vote_with_election_result(
-    height: u64,
-    round: u32,
-    step: VoteStep,
-    block_hash: Bytes32,
-    validator_id: Bytes32,
-    election_result_hash: Option<Bytes32>,
-    chain_id: &str,
-    keypair: &HybridKeypair,
-) -> ConsensusResult<VoteV1> {
     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
-
-    let signing_bytes = vote_signing_bytes(
-        height,
-        round,
-        step,
-        &block_hash,
-        &validator_id,
-        election_result_hash.as_ref(),
-        chain_id,
-    );
+    let signing_bytes =
+        vote_signing_bytes(height, round, step, &block_hash, &validator_id, chain_id);
     let sig = keypair.sign(&signing_bytes)?;
-
-    let classical_sig = VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
-        .map_err(|_| ConsensusError::CryptoError {
-            detail: "classical sig too large".to_string(),
-        })?;
-    let pq_sig = VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&sig.pq.0).map_err(|_| {
-        ConsensusError::CryptoError {
-            detail: "PQ sig too large".to_string(),
-        }
-    })?;
-
     Ok(VoteV1 {
         height,
         round,
         step,
         block_hash,
         validator_id,
-        election_result_hash,
         signature: CoreHybridSignature {
-            classical_sig,
-            pq_sig,
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
+                .map_err(|_| ConsensusError::CryptoError {
+                detail: "classical sig too large".into(),
+            })?,
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&sig.pq.0).map_err(|_| {
+                ConsensusError::CryptoError {
+                    detail: "PQ sig too large".into(),
+                }
+            })?,
         },
     })
 }
@@ -337,7 +300,6 @@ pub fn vote_signing_bytes(
     step: VoteStep,
     block_hash: &Bytes32,
     validator_id: &Bytes32,
-    election_result_hash: Option<&Bytes32>,
     chain_id: &str,
 ) -> Vec<u8> {
     indra_core::types::vote_signing::vote_signing_bytes(
@@ -346,7 +308,6 @@ pub fn vote_signing_bytes(
         step,
         block_hash,
         validator_id,
-        election_result_hash,
         chain_id,
     )
 }
@@ -370,42 +331,6 @@ mod tests {
             stake,
         };
         (voter, kp)
-    }
-
-    #[test]
-    fn precommit_vote_carries_election_result_hash() {
-        let (v, kp) = voter(0x31, 10_000);
-        let election_hash = Bytes32::from([0xE1; 32]);
-        let vote = produce_vote_with_election_result(
-            9,
-            2,
-            VoteStep::Precommit,
-            Bytes32::from([0xBB; 32]),
-            v.validator_id,
-            Some(election_hash),
-            DEFAULT_CHAIN_ID,
-            &kp,
-        )
-        .unwrap();
-
-        assert_eq!(vote.election_result_hash, Some(election_hash));
-    }
-
-    #[test]
-    fn legacy_prevote_vote_carries_no_election_result_hash() {
-        let (v, kp) = voter(0x32, 10_000);
-        let vote = produce_vote(
-            9,
-            2,
-            VoteStep::Prevote,
-            Bytes32::from([0xBB; 32]),
-            v.validator_id,
-            DEFAULT_CHAIN_ID,
-            &kp,
-        )
-        .unwrap();
-
-        assert_eq!(vote.election_result_hash, None);
     }
 
     #[test]

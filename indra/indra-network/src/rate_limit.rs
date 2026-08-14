@@ -97,8 +97,6 @@ pub enum MessageClass {
     BlockResponse,
     /// QC sync responses.
     QCResponse,
-    /// Commit-reveal VRF election gossip.
-    VrfElection,
 }
 
 impl MessageClass {
@@ -111,15 +109,13 @@ impl MessageClass {
             Message::PeerList(_) => Self::PeerList,
             Message::RequestBlocks { .. }
             | Message::RequestProposal { .. }
-            | Message::RequestQC { .. }
-            | Message::RequestVrfReveals { .. } => Self::BlockRequest,
+            | Message::RequestQC { .. } => Self::BlockRequest,
             Message::Tx(_) => Self::Tx,
             Message::StakingOp(_) => Self::StakingOp,
             Message::GovernanceOp(_) => Self::GovernanceOp,
             Message::Ping(_) | Message::Pong(_) => Self::PingPong,
             Message::BlockResponse { .. } => Self::BlockResponse,
-            Message::QCResponse { .. } | Message::VrfRevealsResponse { .. } => Self::QCResponse,
-            Message::VrfCommit(_) | Message::VrfReveal(_) => Self::VrfElection,
+            Message::QCResponse { .. } => Self::QCResponse,
         }
     }
 
@@ -129,12 +125,7 @@ impl MessageClass {
     pub fn is_protocol_necessary_for_validators(self) -> bool {
         matches!(
             self,
-            Self::Vote
-                | Self::VrfElection
-                | Self::Status
-                | Self::BlockRequest
-                | Self::BlockResponse
-                | Self::QCResponse
+            Self::Vote | Self::Status | Self::BlockRequest | Self::BlockResponse | Self::QCResponse
         )
     }
 
@@ -144,11 +135,8 @@ impl MessageClass {
             msg,
             Message::Block(_)
                 | Message::BlockResponse { .. }
-                | Message::VrfRevealsResponse { .. }
                 | Message::QCResponse { .. }
                 | Message::Vote(_)
-                | Message::VrfCommit(_)
-                | Message::VrfReveal(_)
                 | Message::Tx(_)
                 | Message::StakingOp(_)
                 | Message::GovernanceOp(_)
@@ -157,10 +145,7 @@ impl MessageClass {
 
     /// True when a global byte bucket applies.
     pub fn needs_global_byte_limit(msg: &Message) -> bool {
-        matches!(
-            msg,
-            Message::Block(_) | Message::BlockResponse { .. } | Message::VrfRevealsResponse { .. }
-        )
+        matches!(msg, Message::Block(_) | Message::BlockResponse { .. })
     }
 }
 
@@ -263,7 +248,6 @@ impl PeerRateLimiter {
         // payloads.
         count_buckets.insert(MessageClass::BlockResponse, TokenBucket::new(20, 64));
         count_buckets.insert(MessageClass::QCResponse, TokenBucket::new(5, 10));
-        count_buckets.insert(MessageClass::VrfElection, TokenBucket::new(8, 16));
 
         Self {
             count_buckets,
@@ -337,7 +321,6 @@ mod tests {
         primitives::{Bytes32, VariableBytes},
         staking::{StakingOp, StakingOpBody},
         vote::{VoteStep, VoteV1},
-        vrf_election::{VrfCommit, VrfReveal},
     };
 
     fn dummy_signature() -> HybridSignature {
@@ -354,33 +337,6 @@ mod tests {
             step: VoteStep::Prevote,
             block_hash: Bytes32::ZERO,
             validator_id: Bytes32::ZERO,
-            election_result_hash: None,
-            signature: dummy_signature(),
-        })
-    }
-
-    fn dummy_vrf_commit() -> Message {
-        Message::VrfCommit(VrfCommit {
-            chain_id_hash: Bytes32::from([0x01; 32]),
-            height: 1,
-            round: 0,
-            validator_id: Bytes32::from([0x02; 32]),
-            vrf_pubkey: [0x03; 32],
-            commit_hash: Bytes32::from([0x04; 32]),
-            signature: dummy_signature(),
-        })
-    }
-
-    fn dummy_vrf_reveal() -> Message {
-        Message::VrfReveal(VrfReveal {
-            chain_id_hash: Bytes32::from([0x01; 32]),
-            height: 1,
-            round: 0,
-            validator_id: Bytes32::from([0x02; 32]),
-            vrf_pubkey: [0x03; 32],
-            vrf_output: Bytes32::from([0x04; 32]),
-            vrf_proof: VariableBytes::from_slice(&[0x05; 80]).unwrap(),
-            commit_hash: Bytes32::from([0x06; 32]),
             signature: dummy_signature(),
         })
     }
@@ -516,36 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_vrf_commit_flood_is_finitely_limited() {
-        let mut limiter = PeerRateLimiter::new();
-        let msg = dummy_vrf_commit();
-        for _ in 0..16 {
-            assert_eq!(limiter.check(&msg, 512), None);
-        }
-        assert!(limiter.check(&msg, 512).is_some());
-    }
-
-    #[test]
-    fn authenticated_vrf_reveal_flood_is_finitely_limited() {
-        let mut limiter = PeerRateLimiter::new();
-        let msg = dummy_vrf_reveal();
-        for _ in 0..16 {
-            assert_eq!(limiter.check(&msg, 512), None);
-        }
-        assert!(limiter.check(&msg, 512).is_some());
-    }
-
-    #[test]
-    fn authenticated_vrf_commit_and_reveal_share_one_finite_bucket() {
-        let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
-        for _ in 0..8 {
-            assert_eq!(limiter.check(&dummy_vrf_commit(), 512), None);
-            assert_eq!(limiter.check(&dummy_vrf_reveal(), 512), None);
-        }
-        assert!(limiter.check(&dummy_vrf_commit(), 512).is_some());
-    }
-
-    #[test]
     fn authenticated_qc_response_flood_is_finitely_limited() {
         let mut limiter = PeerRateLimiter::new_for_authenticated_validator();
         let msg = Message::QCResponse {
@@ -669,8 +595,6 @@ mod tests {
         let messages = [
             dummy_vote(),
             dummy_vote(),
-            dummy_vrf_commit(),
-            dummy_vrf_reveal(),
             Message::QCResponse {
                 height: 1,
                 qc_bytes: vec![0u8; 1_000_000],

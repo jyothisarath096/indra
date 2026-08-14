@@ -434,6 +434,9 @@ mod tests {
             vrf_pk: Some(
                 indra_crypto::VrfKeypair::from_seed(&[byte.wrapping_add(2); 32]).public_key(),
             ),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000 + byte as u64,
             status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 1,
@@ -473,8 +476,11 @@ mod tests {
                 public.classical.0,
                 public.pq.0,
                 vrf.public_key(),
+                indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                0,
             )
             .unwrap()],
+            1,
         )
         .unwrap()
     }

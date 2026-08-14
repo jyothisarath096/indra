@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use indra_core::{types::block::BlockV1, Bytes32, EpochRecord};
+use indra_core::{types::block::BlockVNext, Bytes32, EpochRecord};
 use indra_rpc::{
     handlers::{dispatch_with_mode, DispatchResult, NodeState, RpcEngineView, RpcMode},
     server::{
@@ -36,7 +36,7 @@ const MIN_PROGRESS_PER_SEC: usize = 1024;
 
 struct PublishedView {
     read: Arc<RpcReadSnapshot>,
-    blocks: HashMap<u64, BlockV1>,
+    blocks: HashMap<u64, BlockVNext>,
     epochs: HashMap<u64, EpochRecord>,
     latest_epoch: Option<u64>,
 }
@@ -60,7 +60,7 @@ impl RpcEngineView for PublishedView {
     fn state_root(&self) -> Bytes32 {
         self.read.state_root()
     }
-    fn get_block_by_height(&self, height: u64) -> Result<Option<BlockV1>, String> {
+    fn get_block_by_height(&self, height: u64) -> Result<Option<BlockVNext>, String> {
         Ok(self.blocks.get(&height).cloned())
     }
     fn get_epoch_record(&self, epoch: u64) -> Result<Option<EpochRecord>, String> {
@@ -422,8 +422,8 @@ fn build_view(
     let mut latest_epoch = None;
     if !heights.is_empty() || needs_epochs {
         for height in heights {
-            if let Ok(block) = storage.blocks.get(height) {
-                blocks.insert(height, block);
+            if let Ok(proposal) = storage.blocks.get(height) {
+                blocks.insert(height, proposal.block);
             }
         }
         latest_epoch = storage.epochs.latest_epoch();

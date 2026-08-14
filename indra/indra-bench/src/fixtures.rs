@@ -2,11 +2,12 @@
 
 use indra_core::{
     types::{
-        block::{BlockHeaderV1, BlockV1},
+        block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         crypto::HybridSignature,
         primitives::{
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-            MAX_VRF_PROOF_BYTES, TRANSACTION_PROTOCOL_VERSION,
+            Bytes64, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
+            MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+            TRANSACTION_PROTOCOL_VERSION,
         },
         transaction::{InputV1, OutputV1, TransactionV1},
     },
@@ -43,13 +44,15 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
 }
 
 /// A block with N transactions.
-pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 {
+pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockVNext {
     let txs: Vec<TransactionV1> = (0..tx_count)
         .map(|i| dummy_tx(i as u8, INITIAL_BASE_FEE_SPARK_PER_KB * 10))
         .collect();
 
-    BlockV1 {
-        header: BlockHeaderV1 {
+    let vrf = VrfKeypair::from_seed(&[0x42; 32]);
+    let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, b"INDRA-BENCH-VRF-FIXTURE-v1");
+    BlockVNext {
+        header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height,
             prev_hash,
@@ -61,16 +64,36 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockV1 
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round: 0,
             polc_round: indra_core::types::block::NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+            proposer_id: Bytes32::ZERO,
+            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: Bytes64([0; 64]),
+            proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+                &vrf_output.0,
+            )
+            .unwrap(),
+            proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+                &vrf_proof.0,
+            )
+            .unwrap(),
+            sortition_claim: SortitionClaimV1::PraosThreshold,
+            proposer_priority: Bytes64([0; 64]),
             quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-            election_result_hash: None,
         },
         transactions: txs,
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
+    }
+}
+
+/// A canonical envelope for storage-only benchmarks.
+pub fn dummy_proposal(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockProposalVNext {
+    BlockProposalVNext {
+        block: dummy_block(height, prev_hash, tx_count),
+        proposer_authorization: HybridSignature {
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::default(),
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::default(),
+        },
     }
 }
 

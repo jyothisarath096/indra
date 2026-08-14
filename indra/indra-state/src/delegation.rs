@@ -222,6 +222,37 @@ fn apply_staking_op_mode(
                 })?;
                 verify_staking_sig(&signing_bytes, &op.signature, &classical_pk, pq_pk)?;
             }
+            StakingOpBody::RegisterVrfKey {
+                validator_id,
+                vrf_pubkey,
+                activation_epoch_id,
+                proof_of_possession,
+                ..
+            } => {
+                let validator = state
+                    .validators
+                    .get(validator_id)
+                    .ok_or(StateError::ValidatorNotFound)?;
+                let classical = validator.hybrid_classical_pk.ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no classical key registered".into(),
+                    }
+                })?;
+                let pq = validator.hybrid_pq_pk.as_deref().ok_or_else(|| {
+                    StateError::StakingOpSignatureInvalid {
+                        reason: "validator has no PQ key registered".into(),
+                    }
+                })?;
+                verify_staking_sig(&signing_bytes, &op.signature, &classical, pq)?;
+                let pop = StakingOp::vrf_pop_signing_bytes(
+                    chain_id,
+                    validator_id,
+                    vrf_pubkey,
+                    *activation_epoch_id,
+                )
+                .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+                verify_staking_sig(&pop, proof_of_possession, &classical, pq)?;
+            }
             StakingOpBody::Delegate {
                 delegator_pubkey, ..
             } => {
@@ -368,6 +399,50 @@ fn apply_staking_op_mode(
             network_addr,
         } => {
             apply_update_network_address(state, *validator_id, network_addr.clone(), current_height)
+        }
+        StakingOpBody::RegisterVrfKey {
+            validator_id,
+            vrf_pubkey,
+            activation_epoch_id,
+            ..
+        } => {
+            let expected = epoch_for_height(current_height)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StateError::InvalidStakingOp("VRF activation epoch overflow".into())
+                })?;
+            if *activation_epoch_id != expected {
+                return Err(StateError::InvalidStakingOp(format!(
+                    "VRF key must activate in next snapshot epoch {expected}"
+                )));
+            }
+            indra_crypto::validate_vrf_public_key(&vrf_pubkey.0)
+                .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+            if state
+                .validators
+                .all_validators()
+                .any(|v| v.vrf_pk == Some(vrf_pubkey.0) || v.pending_vrf_pk == Some(vrf_pubkey.0))
+            {
+                return Err(StateError::InvalidStakingOp(
+                    "VRF public key is already registered".into(),
+                ));
+            }
+            let validator = state
+                .validators
+                .get_mut(validator_id)
+                .ok_or(StateError::ValidatorNotFound)?;
+            if let (Some(pending), Some(activation)) = (
+                validator.pending_vrf_pk,
+                validator.pending_vrf_activation_epoch,
+            ) {
+                if activation <= epoch_for_height(current_height) {
+                    validator.vrf_pk = Some(pending);
+                    validator.vrf_key_activation_epoch = activation;
+                }
+            }
+            validator.pending_vrf_pk = Some(vrf_pubkey.0);
+            validator.pending_vrf_activation_epoch = Some(*activation_epoch_id);
+            Ok(())
         }
         StakingOpBody::SelfStake {
             deposit_utxo_id,
@@ -711,6 +786,9 @@ fn apply_register_validator(
         hybrid_classical_pk: Some(validator_pubkey.classical_pk.0),
         hybrid_pq_pk: Some(validator_pubkey.pq_pk.as_slice().to_vec()),
         vrf_pk: Some(vrf_pk),
+        vrf_key_activation_epoch: 0,
+        pending_vrf_pk: None,
+        pending_vrf_activation_epoch: None,
         stake_spark: amount_spark,
         status: ValidatorStatus::Registered,
         registered_epoch: current_epoch,
@@ -797,9 +875,16 @@ fn build_evicted_validator_tombstone(
     let pq: [u8; indra_crypto::PQ_PK_BYTES] = pq_bytes
         .try_into()
         .map_err(|_| StateError::TombstoneCapacityExceeded)?;
-    let vrf = validator
-        .vrf_pk
-        .ok_or(StateError::TombstoneCapacityExceeded)?;
+    let current_epoch = epoch_for_height(current_height);
+    let vrf = match (
+        validator.pending_vrf_pk,
+        validator.pending_vrf_activation_epoch,
+    ) {
+        (Some(pending), Some(activation)) if activation <= current_epoch => pending,
+        _ => validator
+            .vrf_pk
+            .ok_or(StateError::TombstoneCapacityExceeded)?,
+    };
     indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(classical))
         .map_err(|_| StateError::TombstoneCapacityExceeded)?;
     indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(pq))
@@ -1771,6 +1856,9 @@ mod tests {
             hybrid_classical_pk: Some(pubkey.classical_pk.0),
             hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
             vrf_pk: Some([seed; 32]),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 10_000_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -1791,6 +1879,85 @@ mod tests {
             cold_nonce: 0,
         };
         state.validators.upsert(entry).unwrap();
+    }
+
+    fn vrf_registration_op(
+        validator_id: Bytes32,
+        vrf_pubkey: Bytes32,
+        activation_epoch_id: u64,
+        signer: &HybridKeypair,
+        pop_signer: &HybridKeypair,
+        chain_id: &str,
+    ) -> StakingOp {
+        let pop = StakingOp::vrf_pop_signing_bytes(
+            chain_id,
+            &validator_id,
+            &vrf_pubkey,
+            activation_epoch_id,
+        )
+        .unwrap();
+        let proof = wire_signature(&pop_signer.sign(&pop).unwrap());
+        signed_op(
+            StakingOpBody::RegisterVrfKey {
+                validator_id,
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                vrf_pubkey,
+                activation_epoch_id,
+                proof_of_possession: proof,
+            },
+            1,
+            signer,
+            chain_id,
+        )
+    }
+
+    #[test]
+    fn vrf_rotation_is_snapshot_delayed_and_mixed_key_pop_is_rejected() {
+        let mut state = ChainState::new_genesis();
+        state.active_slot_coefficient_numerator = 1u64 << 63;
+        let (validator_id, signer) = make_active_validator(&mut state, 31);
+        let old_vrf = indra_crypto::VrfKeypair::from_seed(&[31; 32]).public_key();
+        state.validators.get_mut(&validator_id).unwrap().vrf_pk = Some(old_vrf);
+        state.finalize_genesis().unwrap();
+        let genesis_snapshot = state.snapshot_for_consensus_height(1).unwrap().clone();
+
+        let new_vrf = Bytes32::from(indra_crypto::VrfKeypair::from_seed(&[99; 32]).public_key());
+        let op = vrf_registration_op(validator_id, new_vrf, 1, &signer, &signer, &state.chain_id);
+        let chain_id = state.chain_id.clone();
+        apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
+        assert_eq!(
+            state.snapshot_for_consensus_height(1).unwrap(),
+            &genesis_snapshot
+        );
+        let next = state.build_consensus_snapshot(301, 300).unwrap();
+        let (_, activated) = next.entry_with_position(&validator_id).unwrap();
+        assert_eq!(activated.vrf_pk, new_vrf.0);
+        assert_eq!(activated.vrf_key_activation_epoch, 1);
+
+        let attacker = keypair(77);
+        let replacement =
+            Bytes32::from(indra_crypto::VrfKeypair::from_seed(&[100; 32]).public_key());
+        let pop =
+            StakingOp::vrf_pop_signing_bytes(&chain_id, &validator_id, &replacement, 1).unwrap();
+        let victim_sig = signer.sign(&pop).unwrap();
+        let attacker_sig = attacker.sign(&pop).unwrap();
+        let mixed = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&victim_sig.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&attacker_sig.pq.0).unwrap(),
+        };
+        let bad = signed_op(
+            StakingOpBody::RegisterVrfKey {
+                validator_id,
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                vrf_pubkey: replacement,
+                activation_epoch_id: 1,
+                proof_of_possession: mixed,
+            },
+            2,
+            &signer,
+            &chain_id,
+        );
+        assert!(apply_staking_op(&mut state, &bad, &chain_id, 1).is_err());
     }
 
     fn delegate_op(

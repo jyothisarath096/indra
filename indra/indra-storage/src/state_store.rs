@@ -538,13 +538,13 @@ mod tests {
         assert_eq!(StateStore::cleanup_failure_count(), before + 1);
     }
     use indra_core::{
-        types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
-        types::primitives::{DUST_LIMIT_SPARK, MAX_VRF_PROOF_BYTES},
+        types::block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
+        types::primitives::DUST_LIMIT_SPARK,
         Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
-        apply_block, compute_state_root, compute_validator_set_root, ValidatorEntry,
-        ValidatorStatus,
+        apply_block_for_test as apply_block, compute_state_root, compute_validator_set_root,
+        ValidatorEntry, ValidatorStatus,
     };
     use std::io::Write;
 
@@ -579,6 +579,9 @@ mod tests {
             hybrid_classical_pk: Some(public.classical.0),
             hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0x43; 32]).public_key()),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 7,
@@ -602,6 +605,7 @@ mod tests {
 
     fn finalized_test_state() -> ChainState {
         let mut state = ChainState::new_genesis();
+        state.active_slot_coefficient_numerator = 1u64 << 63;
         state.validators.upsert(test_validator()).unwrap();
         state.finalize_genesis().unwrap();
         state
@@ -770,7 +774,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn make_block(state: &ChainState) -> BlockV1 {
+    fn make_block(state: &ChainState) -> BlockVNext {
         let quorum_certificate = if state.height == 0 {
             VariableBytes::from_slice(&[]).unwrap()
         } else {
@@ -786,7 +790,6 @@ mod tests {
                 indra_core::types::vote::VoteStep::Precommit,
                 &state.tip_hash,
                 &entry.validator_id,
-                None,
                 &state.chain_id,
             );
             let signature = keypair.sign(&bytes).unwrap();
@@ -794,7 +797,6 @@ mod tests {
                 height: state.height,
                 round: 0,
                 block_hash: state.tip_hash,
-                election_result_hash: None,
                 signer_bitfield: {
                     let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                     bits[0] = 1;
@@ -811,8 +813,8 @@ mod tests {
             };
             VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
         };
-        let mut block = BlockV1 {
-            header: BlockHeaderV1 {
+        let mut block = BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion::CURRENT,
                 height: state.height + 1,
                 prev_hash: state.tip_hash,
@@ -824,16 +826,19 @@ mod tests {
                 base_fee: state.base_fee,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+                proposer_id: Bytes32::from([0x84; 32]),
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: state.election_seed,
+                proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
                 quorum_certificate,
-                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
         };
 
         let mut projected = state.clone();

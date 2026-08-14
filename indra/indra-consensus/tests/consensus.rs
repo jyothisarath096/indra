@@ -5,7 +5,7 @@
 use indra_consensus::{
     mempool::Mempool,
     producer::{produce_block, BlockTemplate},
-    proposer::{ProposerCandidate, ProposerElection},
+    proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection},
     qc::{verify_qc, verify_qc_strict, QcBuilder, QcValidator},
     vote::{produce_vote, RegisteredVoter, VoteCollector, VoteDecision},
 };
@@ -15,7 +15,6 @@ use indra_core::{
         primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
-        vrf_election::{compute_reveal_set_commitment, VrfElectionResult, VrfRevealEvidence},
     },
     Bytes32, HybridPubKey, ProtocolVersion, VariableBytes,
 };
@@ -122,6 +121,8 @@ impl TestValidator {
 #[test]
 fn mempool_to_block_pipeline() {
     let mut state = ChainState::new_genesis();
+    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
     let mut mempool = Mempool::default_config();
     let (owner_pubkey, owner_keypair) = make_user_keypair(0x55);
 
@@ -148,6 +149,9 @@ fn mempool_to_block_pipeline() {
             hybrid_classical_pk: Some(hot_public.classical.0),
             hybrid_pq_pk: Some(hot_public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pubkey),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -199,41 +203,27 @@ fn mempool_to_block_pipeline() {
     assert_eq!(mempool.len(), 5);
 
     // Set up election with single validator
-    let election = ProposerElection {
-        epoch_seed: Bytes32::from(seed),
-        height: 1,
-        round: 0,
-        candidates: vec![ProposerCandidate {
-            validator_id,
-            vrf_pubkey,
-            stake: 1_000_000,
-        }],
-    };
-    let slot = indra_consensus::proposer::compute_proposer_vrf(
-        validator_id,
-        &vrf_keypair,
-        &election.epoch_seed,
-        election.height,
-        election.round,
-    );
-    let vrf_reveals = vec![VrfRevealEvidence {
-        validator_id,
-        vrf_output: Bytes32::from(slot.vrf_output.0),
-        vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
-    }];
-    let election_result = VrfElectionResult {
-        height: election.height,
-        round: election.round,
-        elected_validator_id: validator_id,
-        elected_vrf_output: Bytes32::from(slot.vrf_output.0),
-        fallback_used: false,
-        reveal_set_commitment: compute_reveal_set_commitment(&vrf_reveals),
-    };
-    let election_result_hash = election_result.hash();
-
+    let election = (0..4_096)
+        .map(|round| ProposerElection {
+            chain_id: state.chain_id.as_bytes().to_vec(),
+            election_seed: state.election_seed,
+            snapshot_root: state.consensus_snapshots[0].snapshot_root,
+            active_slot_coefficient_numerator: 1u64 << 63,
+            height: 1,
+            round,
+            candidates: vec![ProposerCandidate {
+                validator_id,
+                vrf_pubkey,
+                stake: 1_000_000,
+            }],
+        })
+        .find(|election| {
+            compute_proposer_vrf(validator_id, &vrf_keypair, election)
+                .is_ok_and(|result| result.eligible)
+        })
+        .expect("single validator must become eligible in bounded test rounds");
     let template = BlockTemplate {
         proposer_vrf_keypair: vrf_keypair,
-        epoch_seed: Bytes32::from(seed),
         prev_qc_bytes: vec![],
         timestamp: 1_700_000_001,
         polc_round: None,
@@ -248,9 +238,6 @@ fn mempool_to_block_pipeline() {
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        election_result_hash: Some(election_result_hash),
-        election_result: Some(election_result),
-        vrf_reveals,
     };
 
     let block = produce_block(&template, &mut state, &election).unwrap();
@@ -462,7 +449,6 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         height,
         round,
         block_hash,
-        election_result_hash: None,
         signer_bitfield,
         pq_signatures,
         classical_signatures,

@@ -10,17 +10,19 @@
 //! `ChainState::new_genesis()` use is only an intermediate builder state.
 
 use indra_core::types::{
-    block::{BlockHeaderV1, BlockV1},
-    crypto::HybridPubKey,
+    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+    crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
-        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
+        Bytes32, Bytes64, ProtocolVersion, VariableBytes, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
+        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
+        MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
     },
     transaction::OutputV1,
 };
 use indra_crypto::sha256;
 use indra_state::ChainState;
-use serde::Deserialize;
+use serde::{de::Error as _, Deserialize, Deserializer};
+use sha2::{Digest, Sha512};
 
 const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
 
@@ -43,6 +45,97 @@ pub struct GenesisManifest {
 pub struct GenesisSettings {
     /// Replay-protection domain for the new chain.
     pub chain_id: String,
+    /// Immutable numerator `F` in `f = F / 2^64`.
+    #[serde(deserialize_with = "deserialize_canonical_decimal_u64")]
+    pub active_slot_coefficient_numerator: u64,
+    /// Precommitted Bitcoin proof-of-work entropy source.
+    pub bitcoin_pow_entropy_source: BitcoinPowEntropySourceV1,
+    /// Exact consensus-serialized 80-byte source header, lowercase hex.
+    pub bitcoin_pow_entropy_header: String,
+}
+
+fn deserialize_canonical_decimal_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    if encoded.is_empty()
+        || !encoded.bytes().all(|byte| byte.is_ascii_digit())
+        || (encoded.len() > 1 && encoded.starts_with('0'))
+    {
+        return Err(D::Error::custom(
+            "active_slot_coefficient_numerator must be canonical ASCII decimal without sign, whitespace, or leading zeroes",
+        ));
+    }
+    encoded.parse::<u64>().map_err(D::Error::custom)
+}
+
+/// Canonical protocol-v2 external entropy descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinPowEntropySourceV1 {
+    /// Descriptor scheme; protocol v2 requires 1.
+    pub scheme: u8,
+    /// Raw, non-display-reversed source-network genesis digest.
+    pub network_genesis_hash: String,
+    /// Precommitted future source-chain height.
+    pub announced_height: u64,
+    /// Header codec; 1 means the Bitcoin 80-byte header.
+    pub header_codec: u8,
+    /// Extraction algorithm; 1 means double SHA-256.
+    pub extraction_algorithm: u8,
+    /// Required canonical-chain confirmations, at least 100.
+    pub minimum_confirmations: u32,
+    /// Reorganization policy; 1 restarts at the same height.
+    pub reorg_policy: u8,
+}
+
+impl BitcoinPowEntropySourceV1 {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.scheme != 1
+            || self.header_codec != 1
+            || self.extraction_algorithm != 1
+            || self.reorg_policy != 1
+        {
+            return Err("unsupported Bitcoin entropy descriptor enum value".into());
+        }
+        if self.minimum_confirmations < 100 {
+            return Err("Bitcoin entropy source requires at least 100 confirmations".into());
+        }
+        let genesis = decode_hex_exact::<32>(&self.network_genesis_hash, "network_genesis_hash")?;
+        let mut out = Vec::with_capacity(48);
+        out.push(self.scheme);
+        out.extend_from_slice(&genesis);
+        out.extend_from_slice(&self.announced_height.to_le_bytes());
+        out.push(self.header_codec);
+        out.push(self.extraction_algorithm);
+        out.extend_from_slice(&self.minimum_confirmations.to_le_bytes());
+        out.push(self.reorg_policy);
+        Ok(out)
+    }
+}
+
+/// Deterministically derive the signed genesis election seed.
+pub fn derive_genesis_election_seed(settings: &GenesisSettings) -> Result<Bytes64, String> {
+    indra_core::sortition::validate_f(settings.active_slot_coefficient_numerator)
+        .map_err(|e| e.to_string())?;
+    let descriptor = settings.bitcoin_pow_entropy_source.canonical_bytes()?;
+    let header = decode_hex_exact::<80>(
+        &settings.bitcoin_pow_entropy_header,
+        "bitcoin_pow_entropy_header",
+    )?;
+    let mut source_material = b"INDRA-EXTERNAL-ENTROPY-SOURCE-ID-v1".to_vec();
+    source_material.extend_from_slice(&descriptor);
+    let source_id = sha256(&source_material);
+    let external = sha256(&sha256(&header));
+    let mut seed_material = b"INDRA-GENESIS-ELECTION-SEED-v1".to_vec();
+    seed_material.extend_from_slice(settings.chain_id.as_bytes());
+    seed_material.extend_from_slice(&source_id);
+    seed_material.extend_from_slice(&external);
+    let digest = Sha512::digest(&seed_material);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&digest);
+    Ok(Bytes64(out))
 }
 
 /// One initial validator in the canonical genesis manifest.
@@ -51,7 +144,7 @@ pub struct GenesisSettings {
 pub struct GenesisValidator {
     /// Human-readable operator label.
     pub name: String,
-    /// SHA-256 identity derived from the classical hot key.
+    /// Domain-separated SHA-256 identity derived from the complete hybrid hot key.
     pub validator_id: String,
     /// Ed25519 hot public key.
     pub hybrid_classical_pk: String,
@@ -126,6 +219,7 @@ fn validate_genesis_manifest_with_minimum(
             "genesis requires at least {minimum_validators} validators for BFT safety"
         ));
     }
+    derive_genesis_election_seed(&manifest.genesis)?;
     let mut validator_ids = HashSet::new();
     let mut classical_keys = HashSet::new();
     let mut pq_keys = HashSet::new();
@@ -212,9 +306,9 @@ fn decode_hex_len(value: &str, expected: usize, field: &str) -> Result<Vec<u8>, 
 /// Build the genesis block.
 ///
 /// The genesis block hash is SHA-256(encode(genesis_header)).
-pub fn build_genesis_block() -> BlockV1 {
-    BlockV1 {
-        header: BlockHeaderV1 {
+pub fn build_genesis_block() -> BlockVNext {
+    BlockVNext {
+        header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height: 0,
             prev_hash: Bytes32::ZERO,
@@ -226,16 +320,30 @@ pub fn build_genesis_block() -> BlockV1 {
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round: 0,
             polc_round: indra_core::types::block::NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::default(),
+            proposer_id: Bytes32::ZERO,
+            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: Bytes64([0; 64]),
+            proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::default(),
+            proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::default(),
+            sortition_claim: SortitionClaimV1::PraosThreshold,
+            proposer_priority: Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
-            election_result_hash: None,
         },
         transactions: vec![],
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
+    }
+}
+
+/// Canonical storage envelope for the unsigned genesis exception.
+pub fn build_genesis_proposal() -> BlockProposalVNext {
+    BlockProposalVNext {
+        block: build_genesis_block(),
+        proposer_authorization: HybridSignature {
+            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::default(),
+            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::default(),
+        },
     }
 }
 
@@ -255,6 +363,8 @@ pub fn build_genesis_state() -> ChainState {
     use indra_state::{ValidatorEntry, ValidatorStatus};
 
     let mut state = ChainState::new_genesis();
+    state.active_slot_coefficient_numerator = 1;
+    state.election_seed = Bytes64([0xA5; 64]);
     let hot = HybridKeypair::new(
         ClassicalKeypair::from_seed(&[0xD1; 32]),
         PqKeypair::from_seed(&[0xD2; 32]).unwrap(),
@@ -278,6 +388,9 @@ pub fn build_genesis_state() -> ChainState {
             hybrid_classical_pk: Some(hot_public.classical.0),
             hybrid_pq_pk: Some(hot_public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pk),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -310,6 +423,7 @@ pub fn build_genesis_state() -> ChainState {
 #[cfg(test)]
 pub(crate) fn finalize_test_genesis(state: &mut ChainState) {
     assert_eq!(state.height, 0, "test genesis must remain at height zero");
+    state.active_slot_coefficient_numerator = 1u64 << 63;
     state.consensus_snapshots.clear();
     state.reward_economic_snapshot = None;
     state.slash_membership_roots.clear();
@@ -320,7 +434,17 @@ pub(crate) fn finalize_test_genesis(state: &mut ChainState) {
 /// a particular authority identity but still exercise canonical state logic.
 #[cfg(test)]
 pub(crate) fn canonical_test_genesis() -> ChainState {
-    build_genesis_state()
+    let mut state = build_genesis_state();
+    // Consensus tests need a practical chance of electing their sole
+    // validator. The release manifest deliberately leaves F uncalibrated at
+    // its conservative minimum; test fixtures exercise both protocol
+    // endpoints explicitly and use the admitted maximum for liveness tests.
+    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.consensus_snapshots.clear();
+    state.reward_economic_snapshot = None;
+    state.slash_membership_roots.clear();
+    state.finalize_genesis().unwrap();
+    state
 }
 
 /// Load validator entries from a genesis.toml file.
@@ -346,6 +470,9 @@ fn load_genesis_validators_with_minimum(
         .map_err(|error| format!("cannot read {genesis_path}: {error}"))?;
     let manifest = parse_genesis_manifest_str_with_minimum(&content, minimum_validators)?;
     state.chain_id = manifest.genesis.chain_id.clone();
+    state.active_slot_coefficient_numerator = manifest.genesis.active_slot_coefficient_numerator;
+    state.election_seed = derive_genesis_election_seed(&manifest.genesis)?;
+    state.election_seed_height = 1;
     let validators = manifest.validators;
 
     // NOTE: startup logging for node bootstrap; replace with structured tracing later.
@@ -375,6 +502,9 @@ fn load_genesis_validators_with_minimum(
                 "hybrid_pq_pk",
             )?),
             vrf_pk: Some(decode_hex_exact::<32>(&v.vrf_pk, "vrf_pk")?),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: stake,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -516,6 +646,17 @@ mod tests {
         GenesisManifest {
             genesis: GenesisSettings {
                 chain_id: "indra-testnet-new".into(),
+                active_slot_coefficient_numerator: 1,
+                bitcoin_pow_entropy_source: BitcoinPowEntropySourceV1 {
+                    scheme: 1,
+                    network_genesis_hash: hex::encode([0x11; 32]),
+                    announced_height: 1,
+                    header_codec: 1,
+                    extraction_algorithm: 1,
+                    minimum_confirmations: 100,
+                    reorg_policy: 1,
+                },
+                bitcoin_pow_entropy_header: hex::encode([0x22; 80]),
             },
             validators,
             seeds: vec![],
@@ -523,7 +664,8 @@ mod tests {
     }
 
     fn render_manifest(manifest: &GenesisManifest, omit_cold: bool) -> String {
-        let mut rendered = format!("[genesis]\nchain_id = \"{}\"\n", manifest.genesis.chain_id);
+        let s = &manifest.genesis.bitcoin_pow_entropy_source;
+        let mut rendered = format!("[genesis]\nchain_id = \"{}\"\nactive_slot_coefficient_numerator = \"{}\"\nbitcoin_pow_entropy_header = \"{}\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = {}\nnetwork_genesis_hash = \"{}\"\nannounced_height = {}\nheader_codec = {}\nextraction_algorithm = {}\nminimum_confirmations = {}\nreorg_policy = {}\n", manifest.genesis.chain_id,manifest.genesis.active_slot_coefficient_numerator,manifest.genesis.bitcoin_pow_entropy_header,s.scheme,s.network_genesis_hash,s.announced_height,s.header_codec,s.extraction_algorithm,s.minimum_confirmations,s.reorg_policy);
         for validator in &manifest.validators {
             rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk));
             if !omit_cold {
@@ -551,6 +693,83 @@ mod tests {
         oversized.genesis.chain_id =
             "x".repeat(indra_core::types::primitives::MAX_CHAIN_ID_BYTES + 1);
         assert!(validate_genesis_manifest(&oversized).is_err());
+    }
+
+    #[test]
+    fn active_slot_coefficient_uses_strict_canonical_decimal_string() {
+        let manifest = valid_manifest();
+        let canonical = render_manifest(&manifest, false);
+        for invalid in ["0", "01", "+1", "-1", " 1", "1 ", "1_0", "١"] {
+            let malformed = canonical.replace(
+                "active_slot_coefficient_numerator = \"1\"",
+                &format!("active_slot_coefficient_numerator = \"{invalid}\""),
+            );
+            assert!(
+                parse_genesis_manifest_str(&malformed).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        let numeric = canonical.replace(
+            "active_slot_coefficient_numerator = \"1\"",
+            "active_slot_coefficient_numerator = 1",
+        );
+        assert!(parse_genesis_manifest_str(&numeric).is_err());
+
+        let upper = canonical.replace(
+            "active_slot_coefficient_numerator = \"1\"",
+            "active_slot_coefficient_numerator = \"9223372036854775808\"",
+        );
+        assert_eq!(
+            parse_genesis_manifest_str(&upper)
+                .unwrap()
+                .genesis
+                .active_slot_coefficient_numerator,
+            1u64 << 63
+        );
+    }
+
+    #[test]
+    fn genesis_entropy_is_reproducible_context_bound_and_is_height_one_seed() {
+        let manifest = valid_manifest();
+        let seed = derive_genesis_election_seed(&manifest.genesis).unwrap();
+        assert_eq!(
+            seed,
+            derive_genesis_election_seed(&manifest.genesis).unwrap()
+        );
+
+        let mut other_chain = manifest.genesis.clone();
+        other_chain.chain_id.push_str("-other");
+        assert_ne!(seed, derive_genesis_election_seed(&other_chain).unwrap());
+
+        let mut other_source = manifest.genesis.clone();
+        other_source.bitcoin_pow_entropy_source.announced_height += 1;
+        assert_ne!(seed, derive_genesis_election_seed(&other_source).unwrap());
+
+        let mut other_header = manifest.genesis.clone();
+        other_header.bitcoin_pow_entropy_header = hex::encode([0x23; 80]);
+        assert_ne!(seed, derive_genesis_election_seed(&other_header).unwrap());
+
+        let mut state = ChainState::new_genesis();
+        let path = std::env::temp_dir().join(format!(
+            "indra-genesis-entropy-test-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, render_manifest(&manifest, false)).unwrap();
+        load_genesis_validators(path.to_str().unwrap(), &mut state).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(state.election_seed, seed);
+        assert_eq!(state.election_seed_height, 1);
+        state.finalize_genesis().unwrap();
+        let snapshot = state.snapshot_for_consensus_height(1).unwrap();
+        assert!(snapshot
+            .entries()
+            .iter()
+            .all(|entry| entry.vrf_key_activation_epoch == 0));
+        assert!(state.validators.active_validators().all(|validator| {
+            validator.vrf_pk.is_some()
+                && validator.pending_vrf_pk.is_none()
+                && validator.pending_vrf_activation_epoch.is_none()
+        }));
     }
 
     #[test]
@@ -637,7 +856,7 @@ mod tests {
             std::process::id()
         ));
         let mut contents = format!(
-            "[genesis]\nchain_id = \"test\"\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"1\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
             hex::encode(validator_id.0),
             hex::encode(classical_pk),
             hex::encode(&pq_pk),

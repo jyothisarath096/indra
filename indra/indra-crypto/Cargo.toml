@@ -13,6 +13,8 @@ hex.workspace                = true
 bip39.workspace              = true
 ed25519-dalek.workspace      = true
 curve25519-dalek.workspace   = true
+curve25519-dalek-v5.workspace = true
+sha2-11.workspace            = true
 zeroize                      = { version = "1", features = ["derive"] }
 ml-dsa.workspace             = true
 subtle.workspace             = true

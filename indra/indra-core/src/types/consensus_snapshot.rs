@@ -3,7 +3,11 @@
 use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    types::primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
+    sortition::{certified_log, validate_f},
+    types::{
+        block::VrfSuiteV1,
+        primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
+    },
 };
 use indra_crypto::{
     sha256, validate_classical_public_key, validate_pq_public_key, validate_vrf_public_key,
@@ -11,7 +15,7 @@ use indra_crypto::{
 };
 
 /// Consensus snapshot wire and root format version.
-pub const CONSENSUS_SNAPSHOT_FORMAT_VERSION: u8 = 1;
+pub const CONSENSUS_SNAPSHOT_FORMAT_VERSION: u8 = 2;
 /// Domain separator for the canonical snapshot root.
 pub const CONSENSUS_SNAPSHOT_ROOT_DOMAIN: &[u8] = b"INDRA-CONSENSUS-SNAPSHOT-v1";
 
@@ -29,8 +33,12 @@ pub struct ConsensusSnapshotEntry {
     pub classical_vote_pk: [u8; 32],
     /// ML-DSA-87 vote verification key.
     pub pq_vote_pk: [u8; PQ_PK_BYTES],
-    /// Ristretto VRF verification key.
+    /// Canonical RFC 9381 Edwards25519 VRF verification key.
     pub vrf_pk: [u8; 32],
+    /// VRF suite active for this snapshot.
+    pub vrf_suite: VrfSuiteV1,
+    /// Epoch at which this VRF key first became active.
+    pub vrf_key_activation_epoch: u64,
 }
 
 impl ConsensusSnapshotEntry {
@@ -41,6 +49,8 @@ impl ConsensusSnapshotEntry {
         classical_vote_pk: [u8; 32],
         pq_vote_pk: [u8; PQ_PK_BYTES],
         vrf_pk: [u8; 32],
+        vrf_suite: VrfSuiteV1,
+        vrf_key_activation_epoch: u64,
     ) -> IndraResult<Self> {
         let entry = Self {
             validator_id,
@@ -48,6 +58,8 @@ impl ConsensusSnapshotEntry {
             classical_vote_pk,
             pq_vote_pk,
             vrf_pk,
+            vrf_suite,
+            vrf_key_activation_epoch,
         };
         entry.validate()?;
         Ok(entry)
@@ -75,10 +87,12 @@ impl Encode for ConsensusSnapshotEntry {
         buf.extend_from_slice(&self.classical_vote_pk);
         buf.extend_from_slice(&self.pq_vote_pk);
         buf.extend_from_slice(&self.vrf_pk);
+        self.vrf_suite.encode(buf);
+        self.vrf_key_activation_epoch.encode(buf);
     }
 
     fn encoded_len(&self) -> usize {
-        32 + 8 + 32 + PQ_PK_BYTES + 32
+        32 + 8 + 32 + PQ_PK_BYTES + 32 + 1 + 8
     }
 }
 
@@ -90,6 +104,8 @@ impl Decode for ConsensusSnapshotEntry {
             classical_vote_pk: read_array::<32>(reader)?,
             pq_vote_pk: read_array::<PQ_PK_BYTES>(reader)?,
             vrf_pk: read_array::<32>(reader)?,
+            vrf_suite: VrfSuiteV1::decode(reader)?,
+            vrf_key_activation_epoch: u64::decode(reader)?,
         };
         entry.validate()?;
         Ok(entry)
@@ -108,6 +124,12 @@ pub struct ConsensusSnapshot {
     entries: Vec<ConsensusSnapshotEntry>,
     /// Canonical sum of all member weights.
     pub total_weight_spark: u64,
+    /// Immutable genesis-selected `F` in `f=F/2^64`.
+    pub active_slot_coefficient_numerator: u64,
+    /// Certified Q768 lower endpoint for `-ln(1-f)`, big-endian padded.
+    pub sortition_log_lo: [u8; 128],
+    /// Certified Q768 upper endpoint for `-ln(1-f)`, big-endian padded.
+    pub sortition_log_hi: [u8; 128],
     /// Domain-separated commitment to all snapshot content except this field.
     pub snapshot_root: Bytes32,
 }
@@ -118,7 +140,12 @@ impl ConsensusSnapshot {
         activation_height: u64,
         source_boundary_height: u64,
         entries: Vec<ConsensusSnapshotEntry>,
+        active_slot_coefficient_numerator: u64,
     ) -> IndraResult<Self> {
+        validate_f(active_slot_coefficient_numerator)?;
+        let log = certified_log(active_slot_coefficient_numerator)?;
+        let sortition_log_lo = encode_q768(&log.lo)?;
+        let sortition_log_hi = encode_q768(&log.hi)?;
         let total_weight_spark = recompute_total(&entries)?;
         let snapshot_root = compute_snapshot_root(
             CONSENSUS_SNAPSHOT_FORMAT_VERSION,
@@ -126,6 +153,9 @@ impl ConsensusSnapshot {
             source_boundary_height,
             &entries,
             total_weight_spark,
+            active_slot_coefficient_numerator,
+            sortition_log_lo,
+            sortition_log_hi,
         );
         let snapshot = Self {
             format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
@@ -133,6 +163,9 @@ impl ConsensusSnapshot {
             source_boundary_height,
             entries,
             total_weight_spark,
+            active_slot_coefficient_numerator,
+            sortition_log_lo,
+            sortition_log_hi,
             snapshot_root,
         };
         snapshot.validate()?;
@@ -163,6 +196,13 @@ impl ConsensusSnapshot {
         if self.entries.is_empty() {
             return invalid("snapshot is empty");
         }
+        validate_f(self.active_slot_coefficient_numerator)?;
+        let log = certified_log(self.active_slot_coefficient_numerator)?;
+        if self.sortition_log_lo != encode_q768(&log.lo)?
+            || self.sortition_log_hi != encode_q768(&log.hi)?
+        {
+            return invalid("stored sortition logarithm certificate does not match F");
+        }
         if self.entries.len() > MAX_ACTIVE_VALIDATORS {
             return Err(IndraError::LengthExceeded {
                 field: "consensus_snapshot.entries",
@@ -186,6 +226,9 @@ impl ConsensusSnapshot {
             self.source_boundary_height,
             &self.entries,
             self.total_weight_spark,
+            self.active_slot_coefficient_numerator,
+            self.sortition_log_lo,
+            self.sortition_log_hi,
         );
         if self.snapshot_root != recomputed_root {
             return invalid("stored snapshot root does not match recomputation");
@@ -201,11 +244,14 @@ impl Encode for ConsensusSnapshot {
         self.source_boundary_height.encode(buf);
         encode_list(&self.entries, buf);
         self.total_weight_spark.encode(buf);
+        self.active_slot_coefficient_numerator.encode(buf);
+        buf.extend_from_slice(&self.sortition_log_lo);
+        buf.extend_from_slice(&self.sortition_log_hi);
         self.snapshot_root.encode(buf);
     }
 
     fn encoded_len(&self) -> usize {
-        1 + 8 + 8 + list_encoded_len(&self.entries) + 8 + 32
+        1 + 8 + 8 + list_encoded_len(&self.entries) + 8 + 8 + 128 + 128 + 32
     }
 }
 
@@ -217,11 +263,24 @@ impl Decode for ConsensusSnapshot {
             source_boundary_height: u64::decode(reader)?,
             entries: decode_list(reader, MAX_ACTIVE_VALIDATORS, "consensus_snapshot.entries")?,
             total_weight_spark: u64::decode(reader)?,
+            active_slot_coefficient_numerator: u64::decode(reader)?,
+            sortition_log_lo: read_array::<128>(reader)?,
+            sortition_log_hi: read_array::<128>(reader)?,
             snapshot_root: Bytes32::decode(reader)?,
         };
         snapshot.validate()?;
         Ok(snapshot)
     }
+}
+
+fn encode_q768(value: &num_bigint::BigUint) -> IndraResult<[u8; 128]> {
+    let bytes = value.to_bytes_be();
+    if bytes.len() > 128 {
+        return invalid("Q768 endpoint exceeds 1024 bits");
+    }
+    let mut out = [0; 128];
+    out[128 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(out)
 }
 
 fn recompute_total(entries: &[ConsensusSnapshotEntry]) -> IndraResult<u64> {
@@ -240,6 +299,9 @@ fn compute_snapshot_root(
     source_boundary_height: u64,
     entries: &[ConsensusSnapshotEntry],
     total_weight_spark: u64,
+    active_slot_coefficient_numerator: u64,
+    sortition_log_lo: [u8; 128],
+    sortition_log_hi: [u8; 128],
 ) -> Bytes32 {
     let mut material = Vec::with_capacity(
         CONSENSUS_SNAPSHOT_ROOT_DOMAIN.len() + 1 + 8 + 8 + list_encoded_len(entries) + 8,
@@ -250,6 +312,9 @@ fn compute_snapshot_root(
     source_boundary_height.encode(&mut material);
     encode_list(entries, &mut material);
     total_weight_spark.encode(&mut material);
+    active_slot_coefficient_numerator.encode(&mut material);
+    material.extend_from_slice(&sortition_log_lo);
+    material.extend_from_slice(&sortition_log_hi);
     Bytes32::from(sha256(&material))
 }
 
@@ -273,6 +338,14 @@ mod tests {
     use super::*;
     use indra_crypto::{ClassicalKeypair, PqKeypair, VrfKeypair};
 
+    fn test_snapshot(
+        activation_height: u64,
+        source_boundary_height: u64,
+        entries: Vec<ConsensusSnapshotEntry>,
+    ) -> IndraResult<ConsensusSnapshot> {
+        ConsensusSnapshot::new(activation_height, source_boundary_height, entries, 1)
+    }
+
     fn entry(id: u8, weight: u64, key_seed: u8) -> ConsensusSnapshotEntry {
         let classical = ClassicalKeypair::from_seed(&[key_seed; 32]);
         let pq = PqKeypair::from_seed(&[key_seed; 32]).unwrap();
@@ -284,12 +357,14 @@ mod tests {
             public.classical.0,
             public.pq.0,
             vrf.public_key(),
+            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            0,
         )
         .unwrap()
     }
 
     fn snapshot() -> ConsensusSnapshot {
-        ConsensusSnapshot::new(301, 300, vec![entry(1, 1_000, 11), entry(2, 2_000, 12)]).unwrap()
+        test_snapshot(301, 300, vec![entry(1, 1_000, 11), entry(2, 2_000, 12)]).unwrap()
     }
 
     fn raw_snapshot(entries: Vec<ConsensusSnapshotEntry>) -> ConsensusSnapshot {
@@ -303,6 +378,9 @@ mod tests {
             300,
             &entries,
             total_weight_spark,
+            1,
+            encode_q768(&certified_log(1).unwrap().lo).unwrap(),
+            encode_q768(&certified_log(1).unwrap().hi).unwrap(),
         );
         ConsensusSnapshot {
             format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
@@ -310,6 +388,9 @@ mod tests {
             source_boundary_height: 300,
             entries,
             total_weight_spark,
+            active_slot_coefficient_numerator: 1,
+            sortition_log_lo: encode_q768(&certified_log(1).unwrap().lo).unwrap(),
+            sortition_log_hi: encode_q768(&certified_log(1).unwrap().hi).unwrap(),
             snapshot_root,
         }
     }
@@ -334,36 +415,32 @@ mod tests {
 
     #[test]
     fn rejects_empty_snapshot() {
-        assert!(ConsensusSnapshot::new(301, 300, vec![]).is_err());
+        assert!(test_snapshot(301, 300, vec![]).is_err());
     }
 
     #[test]
     fn rejects_duplicate_validator_ids() {
-        assert!(
-            ConsensusSnapshot::new(301, 300, vec![entry(1, 1_000, 11), entry(1, 2_000, 12)])
-                .is_err()
-        );
+        assert!(test_snapshot(301, 300, vec![entry(1, 1_000, 11), entry(1, 2_000, 12)]).is_err());
     }
 
     #[test]
     fn rejects_non_strict_validator_order() {
-        assert!(
-            ConsensusSnapshot::new(301, 300, vec![entry(2, 2_000, 12), entry(1, 1_000, 11)])
-                .is_err()
-        );
+        assert!(test_snapshot(301, 300, vec![entry(2, 2_000, 12), entry(1, 1_000, 11)]).is_err());
     }
 
     #[test]
     fn rejects_zero_weight() {
         let mut zero = entry(1, 1_000, 11);
         zero.consensus_weight_spark = 0;
-        assert!(ConsensusSnapshot::new(301, 300, vec![zero]).is_err());
+        assert!(test_snapshot(301, 300, vec![zero]).is_err());
         assert!(ConsensusSnapshotEntry::new(
             Bytes32::from([1; 32]),
             0,
             entry(2, 1, 12).classical_vote_pk,
             entry(2, 1, 12).pq_vote_pk,
             entry(2, 1, 12).vrf_pk,
+            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            0,
         )
         .is_err());
     }
@@ -372,21 +449,21 @@ mod tests {
     fn rejects_malformed_or_missing_ed25519_key() {
         let mut malformed = entry(1, 1_000, 11);
         malformed.classical_vote_pk = [0; 32];
-        assert!(ConsensusSnapshot::new(301, 300, vec![malformed]).is_err());
+        assert!(test_snapshot(301, 300, vec![malformed]).is_err());
     }
 
     #[test]
     fn rejects_malformed_or_missing_ml_dsa_key() {
         let mut malformed = entry(1, 1_000, 11);
         malformed.pq_vote_pk = [0; PQ_PK_BYTES];
-        assert!(ConsensusSnapshot::new(301, 300, vec![malformed]).is_err());
+        assert!(test_snapshot(301, 300, vec![malformed]).is_err());
     }
 
     #[test]
     fn rejects_malformed_or_missing_vrf_key() {
         let mut malformed = entry(1, 1_000, 11);
         malformed.vrf_pk = [0; 32];
-        assert!(ConsensusSnapshot::new(301, 300, vec![malformed]).is_err());
+        assert!(test_snapshot(301, 300, vec![malformed]).is_err());
     }
 
     #[test]
@@ -408,7 +485,7 @@ mod tests {
                 candidate
             })
             .collect();
-        assert!(ConsensusSnapshot::new(301, 300, entries).is_err());
+        assert!(test_snapshot(301, 300, entries).is_err());
     }
 
     #[test]
@@ -429,17 +506,14 @@ mod tests {
 
     #[test]
     fn rejects_total_weight_overflow() {
-        assert!(
-            ConsensusSnapshot::new(301, 300, vec![entry(1, u64::MAX, 11), entry(2, 1, 12)])
-                .is_err()
-        );
+        assert!(test_snapshot(301, 300, vec![entry(1, u64::MAX, 11), entry(2, 1, 12)]).is_err());
     }
 
     #[test]
     fn snapshot_root_matches_independent_domain_separated_oracle() {
         let snapshot = snapshot();
         let mut oracle = b"INDRA-CONSENSUS-SNAPSHOT-v1".to_vec();
-        oracle.push(1);
+        oracle.push(CONSENSUS_SNAPSHOT_FORMAT_VERSION);
         oracle.extend_from_slice(&301u64.to_le_bytes());
         oracle.extend_from_slice(&300u64.to_le_bytes());
         oracle.extend_from_slice(&(snapshot.entries().len() as u32).to_le_bytes());
@@ -449,8 +523,13 @@ mod tests {
             oracle.extend_from_slice(&entry.classical_vote_pk);
             oracle.extend_from_slice(&entry.pq_vote_pk);
             oracle.extend_from_slice(&entry.vrf_pk);
+            oracle.push(entry.vrf_suite as u8);
+            oracle.extend_from_slice(&entry.vrf_key_activation_epoch.to_le_bytes());
         }
         oracle.extend_from_slice(&3_000u64.to_le_bytes());
+        oracle.extend_from_slice(&snapshot.active_slot_coefficient_numerator.to_le_bytes());
+        oracle.extend_from_slice(&snapshot.sortition_log_lo);
+        oracle.extend_from_slice(&snapshot.sortition_log_hi);
         assert_eq!(snapshot.snapshot_root, Bytes32::from(sha256(&oracle)));
     }
 
@@ -460,31 +539,34 @@ mod tests {
         let replacement_keys = entry(1, 1_000, 13);
         let mut roots = vec![baseline.snapshot_root];
         roots.push(compute_snapshot_root(
-            2,
+            3,
             301,
             300,
             baseline.entries(),
             3_000,
+            baseline.active_slot_coefficient_numerator,
+            baseline.sortition_log_lo,
+            baseline.sortition_log_hi,
         ));
         roots.push(
-            ConsensusSnapshot::new(601, 300, baseline.entries().to_vec())
+            test_snapshot(601, 300, baseline.entries().to_vec())
                 .unwrap()
                 .snapshot_root,
         );
         roots.push(
-            ConsensusSnapshot::new(301, 0, baseline.entries().to_vec())
+            test_snapshot(301, 0, baseline.entries().to_vec())
                 .unwrap()
                 .snapshot_root,
         );
         roots.push(
-            ConsensusSnapshot::new(301, 300, vec![entry(1, 1_001, 11), entry(2, 2_000, 12)])
+            test_snapshot(301, 300, vec![entry(1, 1_001, 11), entry(2, 2_000, 12)])
                 .unwrap()
                 .snapshot_root,
         );
         let mut changed_classical = baseline.entries()[0].clone();
         changed_classical.classical_vote_pk = replacement_keys.classical_vote_pk;
         roots.push(
-            ConsensusSnapshot::new(
+            test_snapshot(
                 301,
                 300,
                 vec![changed_classical, baseline.entries()[1].clone()],
@@ -495,19 +577,19 @@ mod tests {
         let mut changed_pq = baseline.entries()[0].clone();
         changed_pq.pq_vote_pk = replacement_keys.pq_vote_pk;
         roots.push(
-            ConsensusSnapshot::new(301, 300, vec![changed_pq, baseline.entries()[1].clone()])
+            test_snapshot(301, 300, vec![changed_pq, baseline.entries()[1].clone()])
                 .unwrap()
                 .snapshot_root,
         );
         let mut changed_vrf = baseline.entries()[0].clone();
         changed_vrf.vrf_pk = replacement_keys.vrf_pk;
         roots.push(
-            ConsensusSnapshot::new(301, 300, vec![changed_vrf, baseline.entries()[1].clone()])
+            test_snapshot(301, 300, vec![changed_vrf, baseline.entries()[1].clone()])
                 .unwrap()
                 .snapshot_root,
         );
         roots.push(
-            ConsensusSnapshot::new(
+            test_snapshot(
                 301,
                 300,
                 vec![
@@ -526,7 +608,7 @@ mod tests {
 
     #[test]
     fn bitfield_position_is_always_canonical_list_index() {
-        let snapshot = ConsensusSnapshot::new(
+        let snapshot = test_snapshot(
             301,
             300,
             vec![
@@ -546,7 +628,7 @@ mod tests {
         // writable position field; position is derived only by lookup/index.
         assert_eq!(
             snapshot.entries()[0].encoded_len(),
-            32 + 8 + 32 + PQ_PK_BYTES + 32
+            32 + 8 + 32 + PQ_PK_BYTES + 32 + 1 + 8
         );
     }
 

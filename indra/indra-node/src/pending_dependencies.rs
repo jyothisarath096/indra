@@ -345,6 +345,16 @@ pub(crate) fn staking_footprint(
                 DependencyKey::EpochDeadline(current_epoch.saturating_add(1), 1),
             ]);
         }
+        StakingOpBody::RegisterVrfKey {
+            validator_id,
+            activation_epoch_id,
+            ..
+        } => {
+            keys.extend([
+                DependencyKey::Validator(*validator_id),
+                DependencyKey::EpochDeadline(*activation_epoch_id, 2),
+            ]);
+        }
     }
     keys
 }

@@ -12,7 +12,11 @@ fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutput {
     let mut data = Vec::with_capacity(vrf_pubkey.len() + vrf_input.len());
     data.extend_from_slice(vrf_pubkey);
     data.extend_from_slice(vrf_input);
-    VrfOutput(sha256(&data))
+    let digest = sha256(&data);
+    let mut output = [0u8; 64];
+    output[..32].copy_from_slice(&digest);
+    output[32..].copy_from_slice(&digest);
+    VrfOutput(output)
 }
 
 #[test]

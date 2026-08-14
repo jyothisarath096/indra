@@ -171,7 +171,6 @@ mod tests {
             step,
             block_hash: Bytes32::from(block_hash),
             validator_id: Bytes32::from(validator_id),
-            election_result_hash: None,
             signature: HybridSignature {
                 classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0u8; 64])
                     .unwrap(),

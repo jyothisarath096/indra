@@ -6,7 +6,7 @@
 use indra_core::{
     codec::{Decode, Encode},
     types::{
-        block::{BlockHeaderV1, BlockV1},
+        block::{BlockHeaderVNext, BlockVNext},
         crypto::PQVoteSig,
         primitives::{
             DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
@@ -21,13 +21,19 @@ use indra_core::{
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{
-    apply_block, compute_state_root,
+    apply_block_for_test as apply_block, compute_state_root,
     epoch::{apply_epoch_transition, EpochTransitionContext},
     utxo::UtxoSet,
     ChainState, ValidatorEntry, ValidatorStatus,
 };
 
 const TEST_INPUT_VALUE: u64 = 1_000_000;
+
+fn new_test_state() -> ChainState {
+    let mut state = ChainState::new_genesis();
+    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -115,6 +121,9 @@ fn install_validator(
             hybrid_classical_pk: Some(pubkey.classical_pk.0),
             hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
             vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 0,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -139,7 +148,7 @@ fn install_validator(
 }
 
 fn finalized_genesis() -> ChainState {
-    let mut state = ChainState::new_genesis();
+    let mut state = new_test_state();
     let (validator_id, _, _) = install_validator(&mut state, [0xF0; 32]);
     state.validators.get_mut(&validator_id).unwrap().stake_spark = TEST_INPUT_VALUE;
     state.finalize_genesis().unwrap();
@@ -196,7 +205,7 @@ fn make_tx(
     tx
 }
 
-fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
+fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockVNext {
     let height = state.height + 1;
     let quorum_certificate = if height > 1 {
         let signer_ids: Vec<_> = state
@@ -208,8 +217,8 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
     } else {
         VariableBytes::from_slice(&[]).unwrap()
     };
-    BlockV1 {
-        header: BlockHeaderV1 {
+    BlockVNext {
+        header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height,
             prev_hash: state.tip_hash,
@@ -221,16 +230,19 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockV1 {
             base_fee: state.base_fee,
             proposer_round: 0,
             polc_round: indra_core::types::block::NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+            proposer_id: Bytes32::from([0x82; 32]),
+            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: state.election_seed,
+            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+            proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
             quorum_certificate,
-            election_result_hash: None,
         },
         transactions: txs,
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
     }
 }
 
@@ -248,6 +260,9 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
                     hybrid_classical_pk: Some(pubkey.classical_pk.0),
                     hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
                     vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+                    vrf_key_activation_epoch: 0,
+                    pending_vrf_pk: None,
+                    pending_vrf_activation_epoch: None,
                     stake_spark: 100_000_000_000,
                     status: ValidatorStatus::Active,
                     registered_epoch: 0,
@@ -304,7 +319,6 @@ fn qc_bytes_for_signers(
                 VoteStep::Precommit,
                 &state.tip_hash,
                 validator_id,
-                None,
                 &state.chain_id,
             );
             (*validator_id, keypair.sign(&bytes).unwrap())
@@ -314,7 +328,6 @@ fn qc_bytes_for_signers(
         height: certified_height,
         round: 0,
         block_hash: state.tip_hash,
-        election_result_hash: None,
         signer_bitfield,
         pq_signatures: signed
             .iter()
@@ -334,7 +347,7 @@ fn qc_bytes_for_signers(
     VariableBytes::from_slice(&qc.encode_to_vec()).unwrap()
 }
 
-fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockV1 {
+fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockVNext {
     let mut block = make_block(state, vec![]);
     block.header.quorum_certificate =
         qc_bytes_for_signers(state, signer_ids, block.header.height.saturating_sub(1));
@@ -345,7 +358,7 @@ fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockV1 {
 
 #[test]
 fn genesis_state_constants() {
-    let state = ChainState::new_genesis();
+    let state = new_test_state();
     assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
     assert_eq!(state.height, 0);
     assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
@@ -353,7 +366,7 @@ fn genesis_state_constants() {
 
 #[test]
 fn last_active_epoch_updated_identically_live_and_replay() {
-    let mut live_state = ChainState::new_genesis();
+    let mut live_state = new_test_state();
     let signer_ids = install_test_validators_for_qc(&mut live_state);
     live_state.height = EPOCH_DURATION_BLOCKS;
 
@@ -403,7 +416,7 @@ fn last_active_epoch_updated_identically_live_and_replay() {
 
 #[test]
 fn apply_block_updates_last_active_epoch_for_qc_signers() {
-    let mut state = ChainState::new_genesis();
+    let mut state = new_test_state();
     let signer_ids = install_test_validators_for_qc(&mut state);
     state.height = EPOCH_DURATION_BLOCKS;
 
@@ -458,8 +471,8 @@ fn apply_block_updates_last_active_epoch_for_qc_signers() {
 
 #[test]
 fn timestamp_does_not_affect_state_root() {
-    let mut state_t0 = ChainState::new_genesis();
-    let mut state_t1 = ChainState::new_genesis();
+    let mut state_t0 = new_test_state();
+    let mut state_t1 = new_test_state();
     install_test_validators_for_qc(&mut state_t0);
     install_test_validators_for_qc(&mut state_t1);
 
@@ -477,8 +490,8 @@ fn timestamp_does_not_affect_state_root() {
 
 #[test]
 fn epoch_record_timestamp_differs_but_state_root_matches() {
-    let mut state_live = ChainState::new_genesis();
-    let mut state_replay = ChainState::new_genesis();
+    let mut state_live = new_test_state();
+    let mut state_replay = new_test_state();
     install_test_validators_for_qc(&mut state_live);
     install_test_validators_for_qc(&mut state_replay);
 
@@ -685,7 +698,7 @@ fn chain_is_deterministic() {
 
 #[test]
 fn test_auto_delegate_full_lifecycle() {
-    let mut state = ChainState::new_genesis();
+    let mut state = new_test_state();
     let mut validators = Vec::new();
     for i in 1..=21u8 {
         let (id, pubkey, keypair) = install_validator(&mut state, [i; 32]);
@@ -783,7 +796,7 @@ fn test_auto_delegate_full_lifecycle() {
 
 #[test]
 fn epoch_transition_produces_identical_state_on_replay() {
-    let mut original = ChainState::new_genesis();
+    let mut original = new_test_state();
     for seed in 1..=4 {
         let (id, _, _) = install_validator(&mut original, [seed; 32]);
         original.validators.get_mut(&id).unwrap().stake_spark = 1_000_000;
@@ -828,7 +841,7 @@ fn corrected_arithmetic_differs_from_saturating_multiply_then_divide() {
     // This is the persisted snapshot before the 300th (epoch-boundary) block.
     // The transition below models the reward mutation caused by those 300
     // blocks; all other blocks in this minimal replay are empty.
-    let mut snapshot = ChainState::new_genesis();
+    let mut snapshot = new_test_state();
     let mut validator_ids = Vec::new();
     for seed in 1..=4 {
         let (id, _, _) = install_validator(&mut snapshot, [seed; 32]);
@@ -881,8 +894,8 @@ fn corrected_arithmetic_is_deterministic_across_restarts() {
 
 #[test]
 fn governance_state_encoding_is_deterministic() {
-    let mut first = ChainState::new_genesis();
-    let mut second = ChainState::new_genesis();
+    let mut first = new_test_state();
+    let mut second = new_test_state();
     let a = Bytes32::from([1; 32]);
     let b = Bytes32::from([2; 32]);
     first.governance.gov_nonces.insert(b, 2);

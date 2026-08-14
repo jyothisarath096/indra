@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
-    types::{block::BlockV1, primitives::Bytes32, vote::VoteV1},
+    types::{block::BlockProposalVNext, primitives::Bytes32, vote::VoteV1},
 };
 
 use crate::atomic::{crc32, write_atomic_synced};
@@ -32,8 +32,8 @@ pub struct PersistedConsensusLock {
     pub block_hash: Bytes32,
     /// Stable value identity used for justified reproposals.
     pub value_hash: Bytes32,
-    /// Canonical block whose full hash and stable value hash are named above.
-    pub block: BlockV1,
+    /// Independently verifiable proposal envelope for the locked block.
+    pub proposal: BlockProposalVNext,
     /// Signed prevotes sufficient to independently reconstruct the PoLC.
     pub polc_votes: Vec<VoteV1>,
 }
@@ -166,9 +166,9 @@ fn encode_record(record: &VoteSafetyRecord) -> Vec<u8> {
             lock.round.encode(&mut bytes);
             lock.block_hash.encode(&mut bytes);
             lock.value_hash.encode(&mut bytes);
-            let block = lock.block.encode_to_vec();
-            (block.len() as u32).encode(&mut bytes);
-            bytes.extend_from_slice(&block);
+            let proposal = lock.proposal.encode_to_vec();
+            (proposal.len() as u32).encode(&mut bytes);
+            bytes.extend_from_slice(&proposal);
             (lock.polc_votes.len() as u32).encode(&mut bytes);
             for vote in &lock.polc_votes {
                 let encoded = vote.encode_to_vec();
@@ -200,7 +200,7 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
             let block_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
             let value_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
             let block_len = u32::decode(&mut reader).map_err(|error| error.to_string())? as usize;
-            let block = BlockV1::decode_exact(
+            let proposal = BlockProposalVNext::decode_exact(
                 reader
                     .read_bytes(block_len)
                     .map_err(|error| error.to_string())?,
@@ -222,7 +222,7 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
                 round: lock_round,
                 block_hash,
                 value_hash,
-                block,
+                proposal,
                 polc_votes,
             })
         }

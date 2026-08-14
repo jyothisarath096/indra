@@ -17,9 +17,9 @@ pub fn message_to_event(
     validator_id: indra_core::Bytes32,
 ) -> Option<DriverEvent> {
     match msg {
-        Message::Block(block) => Some(DriverEvent::InboundBlock {
+        Message::Block(proposal) => Some(DriverEvent::InboundBlock {
             from: Some(from),
-            block,
+            proposal,
         }),
         Message::Vote(vote) => Some(DriverEvent::InboundVote { from, vote }),
         // Transactions use the node's single authoritative path, which wraps
@@ -42,28 +42,6 @@ pub fn message_to_event(
             height,
             qc_bytes,
         }),
-        Message::VrfCommit(commit) => Some(DriverEvent::InboundVrfCommit { from, commit }),
-        Message::VrfReveal(reveal) => Some(DriverEvent::InboundVrfReveal { from, reveal }),
-        Message::RequestVrfReveals {
-            height,
-            round,
-            validator_ids,
-        } => Some(DriverEvent::VrfRevealsRequest {
-            from,
-            height,
-            round,
-            missing_validator_ids: validator_ids,
-        }),
-        Message::VrfRevealsResponse {
-            height,
-            round,
-            reveals,
-        } => Some(DriverEvent::VrfRevealsResponse {
-            from,
-            height,
-            round,
-            reveals,
-        }),
         _ => None, // Ping, Pong, PeerList, RequestBlocks, BlockResponse, RequestProposal handled elsewhere
     }
 }
@@ -73,11 +51,7 @@ pub fn action_to_message(action: &DriverAction) -> Option<Message> {
     match action {
         DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
         DriverAction::BroadcastVote(vote) => Some(Message::Vote(vote.clone())),
-        DriverAction::BroadcastVrfCommit(commit) => Some(Message::VrfCommit(commit.clone())),
-        DriverAction::BroadcastVrfReveal(reveal) => Some(Message::VrfReveal(reveal.clone())),
         DriverAction::RequestQC { .. } => None,
-        DriverAction::RequestVrfReveals { .. } => None,
-        DriverAction::SendVrfRevealsResponse { .. } => None,
         _ => None,
     }
 }

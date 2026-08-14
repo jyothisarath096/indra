@@ -13,7 +13,7 @@ use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use indra_core::types::vote::VoteStep;
 use indra_core::IndraError;
 use indra_core::{
-    BlockHeaderV1, BlockV1, Bytes32, CheckpointV1, HybridPubKey, HybridSignature, InputV1,
+    BlockHeaderVNext, BlockVNext, Bytes32, CheckpointV1, HybridPubKey, HybridSignature, InputV1,
     OutputV1, ProtocolVersion, QuorumCertificateV1, TransactionV1, VariableBytes, VoteV1,
 };
 
@@ -58,8 +58,8 @@ fn minimal_tx() -> TransactionV1 {
     }
 }
 
-fn dummy_header() -> BlockHeaderV1 {
-    BlockHeaderV1 {
+fn dummy_header() -> BlockHeaderVNext {
+    BlockHeaderVNext {
         protocol_version: ProtocolVersion::CURRENT,
         height: 1,
         prev_hash: Bytes32::ZERO,
@@ -71,10 +71,14 @@ fn dummy_header() -> BlockHeaderV1 {
         base_fee: 100,
         proposer_round: 0,
         polc_round: indra_core::types::block::NO_POLC_ROUND,
-        proposer_vrf_output: Bytes32::from([0x44u8; 32]),
+        proposer_id: Bytes32::from([0x43u8; 32]),
+        vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+        election_seed: indra_core::types::primitives::Bytes64([0x45; 64]),
+        proposer_vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
         proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+        sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+        proposer_priority: indra_core::types::primitives::Bytes64([0x46; 64]),
         quorum_certificate: VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),
-        election_result_hash: None,
     }
 }
 
@@ -131,7 +135,6 @@ fn vote_round_trip() {
         step: VoteStep::Prevote,
         block_hash: Bytes32::from([0x77u8; 32]),
         validator_id: Bytes32::from([0x88u8; 32]),
-        election_result_hash: None,
         signature: sig(),
     };
     assert_eq!(v, VoteV1::decode_exact(&v.encode_to_vec()).unwrap());
@@ -140,20 +143,22 @@ fn vote_round_trip() {
 #[test]
 fn block_header_round_trip() {
     let h = dummy_header();
-    assert_eq!(h, BlockHeaderV1::decode_exact(&h.encode_to_vec()).unwrap());
+    assert_eq!(
+        h,
+        BlockHeaderVNext::decode_exact(&h.encode_to_vec()).unwrap()
+    );
 }
 
 #[test]
 fn block_with_transactions_round_trip() {
-    let b = BlockV1 {
+    let b = BlockVNext {
         header: dummy_header(),
         transactions: vec![minimal_tx(), minimal_tx()],
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
     };
-    assert_eq!(b, BlockV1::decode_exact(&b.encode_to_vec()).unwrap());
+    assert_eq!(b, BlockVNext::decode_exact(&b.encode_to_vec()).unwrap());
 }
 
 #[test]
@@ -162,7 +167,6 @@ fn quorum_certificate_round_trip() {
         height: 42,
         round: 0,
         block_hash: Bytes32::from([0xFFu8; 32]),
-        election_result_hash: None,
         signer_bitfield: [0b10101010u8; SIGNER_BITFIELD_BYTES],
         pq_signatures: vec![],
         classical_signatures: vec![],

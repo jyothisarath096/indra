@@ -14,7 +14,7 @@ use std::sync::{
 
 use indra_core::{
     codec::{Decode, Encode},
-    types::{block::BlockV1, primitives::MIN_PRUNE_KEEP_BLOCKS},
+    types::{block::BlockProposalVNext, primitives::MIN_PRUNE_KEEP_BLOCKS},
 };
 
 use crate::{
@@ -75,7 +75,7 @@ pub struct BlockStoreReadHandle {
 
 impl BlockStoreReadHandle {
     /// Read a retained block by height.
-    pub fn get(&self, height: u64) -> StorageResult<BlockV1> {
+    pub fn get(&self, height: u64) -> StorageResult<BlockProposalVNext> {
         let location = lookup(&self.index, &self.lowest_height, height)?;
         read_location(height, &location)
     }
@@ -108,8 +108,8 @@ impl BlockStore {
     }
 
     /// Append and fsync one sequential block.
-    pub fn append(&mut self, block: &BlockV1) -> StorageResult<()> {
-        let height = block.header.height;
+    pub fn append(&mut self, block: &BlockProposalVNext) -> StorageResult<()> {
+        let height = block.block.header.height;
         if height != self.next_height {
             return Err(StorageError::NonSequential {
                 expected: self.next_height,
@@ -148,11 +148,11 @@ impl BlockStore {
     }
 
     /// Read a block by height.
-    pub fn get(&mut self, height: u64) -> StorageResult<BlockV1> {
+    pub fn get(&mut self, height: u64) -> StorageResult<BlockProposalVNext> {
         self.get_read_only(height)
     }
     /// Read a block without mutably borrowing the writer.
-    pub fn get_read_only(&self, height: u64) -> StorageResult<BlockV1> {
+    pub fn get_read_only(&self, height: u64) -> StorageResult<BlockProposalVNext> {
         let location = lookup(&self.index, &self.lowest_height, height)?;
         read_location(height, &location)
     }
@@ -430,11 +430,12 @@ fn scan_segments(dir: &Path) -> StorageResult<(BTreeMap<u64, Location>, u64, u64
                     actual,
                 });
             }
-            let block = BlockV1::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
-                height,
-                detail: e.to_string(),
-            })?;
-            if block.header.height != height {
+            let block =
+                BlockProposalVNext::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
+                    height,
+                    detail: e.to_string(),
+                })?;
+            if block.block.header.height != height {
                 return Err(StorageError::Corruption {
                     height,
                     detail: "encoded block height mismatch".into(),
@@ -480,7 +481,7 @@ fn lookup(
         .cloned()
         .ok_or(StorageError::BlockNotFound { height })
 }
-fn read_location(height: u64, location: &Location) -> StorageResult<BlockV1> {
+fn read_location(height: u64, location: &Location) -> StorageResult<BlockProposalVNext> {
     let mut f = File::open(&location.path)?;
     f.seek(SeekFrom::Start(location.offset))?;
     let mut h = [0; 12];
@@ -512,7 +513,7 @@ fn read_location(height: u64, location: &Location) -> StorageResult<BlockV1> {
             actual,
         });
     }
-    BlockV1::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
+    BlockProposalVNext::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
         height,
         detail: e.to_string(),
     })
@@ -523,8 +524,8 @@ mod tests {
     use super::*;
     use indra_core::{
         types::{
-            block::{BlockHeaderV1, NO_POLC_ROUND},
-            primitives::MAX_VRF_PROOF_BYTES,
+            block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+            primitives::{Bytes64, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES},
         },
         ProtocolVersion, VariableBytes,
     };
@@ -536,30 +537,44 @@ mod tests {
         ))
     }
 
-    fn block(height: u64) -> BlockV1 {
-        BlockV1 {
-            header: BlockHeaderV1 {
-                protocol_version: ProtocolVersion::CURRENT,
-                height,
-                prev_hash: indra_core::Bytes32::ZERO,
-                timestamp: height,
-                state_root: indra_core::Bytes32::ZERO,
-                validator_set_root: indra_core::Bytes32::ZERO,
-                mempool_set_root: indra_core::Bytes32::ZERO,
-                value_hash: indra_core::Bytes32::ZERO,
-                base_fee: 1,
-                proposer_round: 0,
-                polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: indra_core::Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
-                quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: None,
+    fn block(height: u64) -> BlockProposalVNext {
+        BlockProposalVNext {
+            block: BlockVNext {
+                header: BlockHeaderVNext {
+                    protocol_version: ProtocolVersion::CURRENT,
+                    height,
+                    prev_hash: indra_core::Bytes32::ZERO,
+                    timestamp: height,
+                    state_root: indra_core::Bytes32::ZERO,
+                    validator_set_root: indra_core::Bytes32::ZERO,
+                    mempool_set_root: indra_core::Bytes32::ZERO,
+                    value_hash: indra_core::Bytes32::ZERO,
+                    base_fee: 1,
+                    proposer_round: 0,
+                    polc_round: NO_POLC_ROUND,
+                    proposer_id: indra_core::Bytes32::from([0x77; 32]),
+                    vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                    election_seed: Bytes64([0x78; 64]),
+                    proposer_vrf_output:
+                        VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(&[0; 64])
+                            .unwrap(),
+                    proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+                        &[0; 80],
+                    )
+                    .unwrap(),
+                    sortition_claim: SortitionClaimV1::PraosThreshold,
+                    proposer_priority: Bytes64([0x79; 64]),
+                    quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+                },
+                transactions: vec![],
+                slashing_evidence: vec![],
+                governance_ops: vec![],
+                staking_ops: vec![],
             },
-            transactions: vec![],
-            slashing_evidence: vec![],
-            governance_ops: vec![],
-            staking_ops: vec![],
-            vrf_reveals: vec![],
+            proposer_authorization: indra_core::HybridSignature {
+                classical_sig: VariableBytes::default(),
+                pq_sig: VariableBytes::default(),
+            },
         }
     }
 

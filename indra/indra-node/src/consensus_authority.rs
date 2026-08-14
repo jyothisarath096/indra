@@ -1,18 +1,15 @@
-use std::collections::BTreeMap;
-
 use indra_consensus::proposer::{ProposerCandidate, ProposerElection};
-use indra_core::{types::consensus_snapshot::ConsensusSnapshot, Bytes32};
+use indra_core::types::{consensus_snapshot::ConsensusSnapshot, primitives::Bytes64};
 
 pub(crate) struct VrfConsensusAuthority {
     pub(crate) election: ProposerElection,
-    pub(crate) weights: BTreeMap<Bytes32, u64>,
-    pub(crate) total_weight: u64,
 }
 
 pub(crate) fn vrf_authority_from_snapshot(
+    chain_id: &[u8],
     height: u64,
     round: u32,
-    epoch_seed: Bytes32,
+    election_seed: Bytes64,
     snapshot: &ConsensusSnapshot,
 ) -> VrfConsensusAuthority {
     let candidates = snapshot
@@ -24,19 +21,15 @@ pub(crate) fn vrf_authority_from_snapshot(
             stake: entry.consensus_weight_spark,
         })
         .collect();
-    let weights = snapshot
-        .entries()
-        .iter()
-        .map(|entry| (entry.validator_id, entry.consensus_weight_spark))
-        .collect();
     VrfConsensusAuthority {
         election: ProposerElection {
-            epoch_seed,
+            chain_id: chain_id.to_vec(),
+            election_seed,
+            snapshot_root: snapshot.snapshot_root,
+            active_slot_coefficient_numerator: snapshot.active_slot_coefficient_numerator,
             height,
             round,
             candidates,
         },
-        weights,
-        total_weight: snapshot.total_weight_spark,
     }
 }

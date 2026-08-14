@@ -395,26 +395,27 @@ async fn request_blocks(
 
 fn import_observer_block(
     engine: &Arc<Mutex<NodeEngine>>,
-    block: indra_core::types::block::BlockV1,
+    proposal: indra_core::types::block::BlockProposalVNext,
     metrics_state: &MetricsState,
     last_block_timestamp: &AtomicU64,
 ) -> Result<(), String> {
     let mut engine = engine
         .lock()
         .map_err(|_| "engine lock poisoned".to_string())?;
-    if block.header.height <= engine.height() {
+    let height = proposal.block.header.height;
+    if height <= engine.height() {
         return Ok(());
     }
-    if block.header.height != engine.height().saturating_add(1) {
+    if height != engine.height().saturating_add(1) {
         return Ok(());
     }
     engine
-        .commit_block(&block)
-        .map_err(|e| format!("import block {}: {}", block.header.height, e))?;
+        .commit_proposal(&proposal)
+        .map_err(|e| format!("import block {}: {}", height, e))?;
     record_block_commit(metrics_state, last_block_timestamp);
     eprintln!(
         "[observer] imported block {} (epoch {})",
-        block.header.height,
+        height,
         engine.state.current_epoch()
     );
     Ok(())

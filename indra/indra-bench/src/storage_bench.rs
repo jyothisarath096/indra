@@ -5,7 +5,7 @@ use std::time::Duration;
 use indra_core::Bytes32;
 use indra_storage::{BlockStore, PruneConfig};
 
-use crate::{fixtures::dummy_block, timer::bench};
+use crate::{fixtures::dummy_proposal, timer::bench};
 
 /// Benchmark appending blocks to the block store.
 pub fn bench_block_store_append(n: u64, iterations: u64) {
@@ -16,10 +16,10 @@ pub fn bench_block_store_append(n: u64, iterations: u64) {
         let path = iteration.path().join("blocks.log");
         let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
         // Store the genesis block first (height 0)
-        let genesis = dummy_block(0, Bytes32::ZERO, 0);
+        let genesis = dummy_proposal(0, Bytes32::ZERO, 0);
         let _ = store.append(&genesis);
         for i in 1..n {
-            let block = dummy_block(i, Bytes32::ZERO, 10);
+            let block = dummy_proposal(i, Bytes32::ZERO, 10);
             let _ = store.append(&block);
         }
     });
@@ -34,7 +34,7 @@ pub fn bench_block_store_read(iterations: u64) {
     {
         let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
         for i in 0..10u64 {
-            let block = dummy_block(i, Bytes32::ZERO, 10);
+            let block = dummy_proposal(i, Bytes32::ZERO, 10);
             store.append(&block).unwrap();
         }
     }

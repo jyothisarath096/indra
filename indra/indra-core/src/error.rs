@@ -158,6 +158,9 @@ pub enum IndraError {
     /// VRF proof failed.
     #[error("VRF proof verification failed")]
     VrfProofInvalid,
+    /// Praos sortition parameter or certified-arithmetic failure.
+    #[error("invalid proposer sortition: {0}")]
+    InvalidSortition(String),
 
     /// QC below the required quorum threshold.
     #[error("QC below 2/3 threshold: {weight_bps} bps")]

@@ -60,30 +60,6 @@ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 /// `(height, round)` and is not a runtime cap on retries.
 pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
 
-/// Close VRF commit window after this duration or when quorum stake committed.
-pub const VRF_COMMIT_WINDOW_MS: u64 = 1_500;
-
-/// Close VRF reveal window after this duration or when quorum stake revealed.
-pub const VRF_REVEAL_WINDOW_MS: u64 = 1_500;
-
-/// Delay nil precommit up to this long while waiting for the local
-/// commit-reveal election result to settle.
-///
-/// This is intentionally longer than `VRF_REVEAL_WINDOW_MS` so a fast prevote
-/// quorum does not force a nil precommit just before the reveal timeout
-/// computes the election result.
-pub const VRF_ELECTION_SETTLE_MS: u64 = 2_500;
-
-/// Use public deterministic fallback only after this many consecutive
-/// zero-reveal rounds at the same height.
-///
-/// Before this threshold is reached, an empty reveal round produces no
-/// election result and must advance to the next consensus round.
-pub const MAX_VRF_EMPTY_REVEAL_ROUNDS: u32 = 3;
-
-/// Memory cap for commit/reveal entries retained for one election round.
-pub const MAX_VRF_ROUND_ENTRIES: usize = MAX_VALIDATORS;
-
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
 /// Double precommit slash: 5% of stake.
@@ -169,6 +145,10 @@ pub const MAX_AUTHORIZATION_PAYLOAD_BYTES: usize = MAX_BLOCK_SIZE_BYTES;
 
 /// Maximum VRF proof size (bytes).
 pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
+/// Standard RFC 9381 output length.
+pub const MAX_STANDARD_VRF_OUTPUT_BYTES: usize = 64;
+/// Standard RFC 9381 ELL2 proof length.
+pub const MAX_STANDARD_VRF_PROOF_BYTES: usize = 80;
 
 /// Maximum Bulletproof range proof per output (bytes).
 pub const MAX_RANGE_PROOF_BYTES: usize = 674;
@@ -512,7 +492,7 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 pub const TRANSACTION_PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed discriminator for the sole genesis-native block format.
-pub const BLOCK_FORMAT_VERSION: u16 = 1;
+pub const BLOCK_FORMAT_VERSION: u16 = 2;
 
 /// Current schema version for all persisted structs.
 ///
@@ -587,6 +567,34 @@ impl core::fmt::Display for Bytes32 {
             write!(f, "{b:02x}")?;
         }
         Ok(())
+    }
+}
+
+/// A fixed 64-byte consensus value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bytes64(pub [u8; 64]);
+impl Bytes64 {
+    /// All-zero value.
+    pub const ZERO: Self = Self([0; 64]);
+}
+impl Encode for Bytes64 {
+    fn encode(&self, b: &mut Vec<u8>) {
+        b.extend_from_slice(&self.0)
+    }
+    fn encoded_len(&self) -> usize {
+        64
+    }
+}
+impl Decode for Bytes64 {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let mut b = [0; 64];
+        b.copy_from_slice(r.read_bytes(64)?);
+        Ok(Self(b))
+    }
+}
+impl From<[u8; 64]> for Bytes64 {
+    fn from(b: [u8; 64]) -> Self {
+        Self(b)
     }
 }
 
@@ -806,5 +814,16 @@ mod tests {
             assert_eq!(transaction_dust_limit_spark(occupancy), floor);
             assert_eq!(transaction_dust_tier(occupancy), tier);
         }
+    }
+
+    #[test]
+    fn proposer_v2_wire_constants_are_pinned() {
+        assert_eq!(BLOCK_FORMAT_VERSION, 2);
+        assert_eq!(MAX_STANDARD_VRF_OUTPUT_BYTES, 64);
+        assert_eq!(MAX_STANDARD_VRF_PROOF_BYTES, 80);
+        assert_eq!(
+            crate::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 as u8,
+            1
+        );
     }
 }

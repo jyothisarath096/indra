@@ -7,17 +7,18 @@
 //!   cargo test -p indra-state --test audit_phase2 -- --ignored
 
 use indra_core::types::{
-    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
-        MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-        TRANSACTION_PROTOCOL_VERSION,
+        MAX_QC_SIZE_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
-use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
+use indra_state::{
+    apply_block_for_test as apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus,
+};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
     let classical = ClassicalKeypair::from_seed(&seed);
@@ -35,6 +36,7 @@ fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
 
 fn finalized_genesis() -> ChainState {
     let mut state = ChainState::new_genesis();
+    state.active_slot_coefficient_numerator = 1u64 << 63;
     let seed = [0xF0; 32];
     let (public, _) = keypair(seed);
     let validator_id = public.identity_id();
@@ -46,6 +48,9 @@ fn finalized_genesis() -> ChainState {
             hybrid_classical_pk: Some(public.classical_pk.0),
             hybrid_pq_pk: Some(public.pq_pk.as_slice().to_vec()),
             vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             status: ValidatorStatus::Active,
             registered_epoch: 0,
@@ -157,9 +162,9 @@ fn tx_spending_same_utxo_twice(
     tx
 }
 
-fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>) -> BlockV1 {
-    BlockV1 {
-        header: BlockHeaderV1 {
+fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>) -> BlockVNext {
+    BlockVNext {
+        header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height: state.height + 1,
             prev_hash: state.tip_hash,
@@ -171,22 +176,25 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             base_fee: state.base_fee,
             proposer_round: 0,
             polc_round: NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+            proposer_id: Bytes32::from([0x81; 32]),
+            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: state.election_seed,
+            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+            proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
-            election_result_hash: None,
         },
         transactions,
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
     }
 }
 
 #[test]
 fn transaction_with_overflowing_input_sum_is_rejected() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, _owner_keypair) = keypair([0x45; 32]);
     let huge_output_a = OutputV1 {
         value_spark: u64::MAX,
@@ -230,7 +238,7 @@ fn transaction_with_overflowing_input_sum_is_rejected() {
 
 #[test]
 fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, owner_keypair) = keypair([0x42; 32]);
     let input_value = 10_000_000_000u64;
     let input_blinding = [0x11; 32];
@@ -276,7 +284,7 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
 
 #[test]
 fn t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected() {
-    let mut state = ChainState::new_genesis();
+    let mut state = finalized_genesis();
     let (owner_pubkey, owner_keypair) = keypair([0x43; 32]);
     let input_value = 10_000_000_000u64;
     let input_blinding = [0x12; 32];

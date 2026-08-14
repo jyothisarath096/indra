@@ -11,7 +11,7 @@ use indra_core::{
         SLASH_REWARD_TX_IDX, STAKING_REWARD_TX_IDX, STAKING_TX_IDX,
     },
     types::{
-        block::{BlockV1, NO_POLC_ROUND},
+        block::{BlockVNext, NO_POLC_ROUND},
         epoch_record::EpochRecord,
         governance::{compute_proposal_id, GovernanceOpV2, GovernancePayload},
         staking::{StakingOp, StakingOpBody},
@@ -224,7 +224,7 @@ pub trait RpcEngineView {
         None
     }
     /// Return a retained block by height, if this RPC context has block-store access.
-    fn get_block_by_height(&self, _height: u64) -> Result<Option<BlockV1>, String> {
+    fn get_block_by_height(&self, _height: u64) -> Result<Option<BlockVNext>, String> {
         Ok(None)
     }
     /// Return a stored epoch record, if available.
@@ -817,12 +817,6 @@ fn get_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String
     }
 }
 
-fn optional_hex_json(value: Option<Bytes32>) -> String {
-    value
-        .map(|bytes| format!(r#""{}""#, hex::encode(bytes.0)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
 fn polc_round_json(polc_round: u32) -> String {
     if polc_round == NO_POLC_ROUND {
         "null".to_string()
@@ -831,15 +825,15 @@ fn polc_round_json(polc_round: u32) -> String {
     }
 }
 
-fn block_rpc_json(block: &BlockV1) -> String {
+fn block_rpc_json(block: &BlockVNext) -> String {
     let header = &block.header;
     format!(
         concat!(
             r#"{{"height":{},"block_hash":"{}","protocol_version":{},"prev_hash":"{}","#,
             r#""timestamp":{},"state_root":"{}","validator_set_root":"{}","#,
             r#""mempool_set_root":"{}","value_hash":"{}","base_fee":{},"proposer_round":{},"polc_round":{},"#,
-            r#""proposer_vrf_output":"{}","proposer_vrf_proof_len":{},"quorum_certificate_len":{},"election_result_hash":{},"#,
-            r#""tx_count":{},"slash_evidence_count":{},"governance_op_count":{},"staking_op_count":{},"vrf_reveal_count":{}}}"#
+            r#""proposer_id":"{}","vrf_suite":{},"election_seed":"{}","proposer_vrf_output":"{}","proposer_vrf_proof_len":{},"proposer_priority":"{}","quorum_certificate_len":{},"#,
+            r#""tx_count":{},"slash_evidence_count":{},"governance_op_count":{},"staking_op_count":{}}}"#
         ),
         header.height,
         hex::encode(header.block_hash().0),
@@ -853,15 +847,17 @@ fn block_rpc_json(block: &BlockV1) -> String {
         header.base_fee,
         header.proposer_round,
         polc_round_json(header.polc_round),
-        hex::encode(header.proposer_vrf_output.0),
+        hex::encode(header.proposer_id.0),
+        header.vrf_suite as u8,
+        hex::encode(header.election_seed.0),
+        hex::encode(header.proposer_vrf_output.as_slice()),
         header.proposer_vrf_proof.len(),
+        hex::encode(header.proposer_priority.0),
         header.quorum_certificate.len(),
-        optional_hex_json(header.election_result_hash),
         block.transactions.len(),
         block.slashing_evidence.len(),
         block.governance_ops.len(),
         block.staking_ops.len(),
-        block.vrf_reveals.len(),
     )
 }
 
@@ -1148,7 +1144,7 @@ fn classify_staking_provenance(
 fn retained_protocol_block(
     entry: &indra_state::utxo::UtxoEntry,
     state: &NodeState<'_>,
-) -> Result<BlockV1, UtxoProvenanceExplanation> {
+) -> Result<BlockVNext, UtxoProvenanceExplanation> {
     match retained_block(entry.created_height, state) {
         Ok(Some(block)) => Ok(block),
         Ok(None) => {
@@ -1329,7 +1325,7 @@ fn classify_governance_refund(
     )
 }
 
-fn retained_block(height: u64, state: &NodeState<'_>) -> Result<Option<BlockV1>, String> {
+fn retained_block(height: u64, state: &NodeState<'_>) -> Result<Option<BlockVNext>, String> {
     state.engine.get_block_by_height(height)
 }
 
@@ -2764,14 +2760,13 @@ mod tests {
     use super::*;
     use indra_core::{
         types::{
-            block::{BlockHeaderV1, BlockV1},
+            block::{BlockHeaderVNext, BlockVNext},
             consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
             crypto::{HybridPubKey, HybridSignature},
             governance::{
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
                 ProposalTier,
             },
-            primitives::MAX_VRF_PROOF_BYTES,
             stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
             staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
@@ -2792,7 +2787,7 @@ mod tests {
     struct BlockBackedEngine {
         chain: ChainState,
         lowest_block: u64,
-        blocks: BTreeMap<u64, BlockV1>,
+        blocks: BTreeMap<u64, BlockVNext>,
     }
 
     impl RpcEngineView for BlockBackedEngine {
@@ -2816,14 +2811,14 @@ mod tests {
             self.blocks.len()
         }
 
-        fn get_block_by_height(&self, height: u64) -> Result<Option<BlockV1>, String> {
+        fn get_block_by_height(&self, height: u64) -> Result<Option<BlockVNext>, String> {
             Ok(self.blocks.get(&height).cloned())
         }
     }
 
-    fn dummy_block(height: u64, byte: u8) -> BlockV1 {
-        BlockV1 {
-            header: BlockHeaderV1 {
+    fn dummy_block(height: u64, byte: u8) -> BlockVNext {
+        BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion::CURRENT,
                 height,
                 prev_hash: Bytes32::from([byte.wrapping_sub(1); 32]),
@@ -2835,17 +2830,22 @@ mod tests {
                 base_fee: 100 + height,
                 proposer_round: byte as u32,
                 polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::from([byte.wrapping_add(4); 32]),
-                proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[byte; 64])
+                proposer_id: Bytes32::from([byte.wrapping_add(3); 32]),
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: indra_core::types::primitives::Bytes64([byte; 64]),
+                proposer_vrf_output: VariableBytes::from_slice(&[byte.wrapping_add(4); 64])
                     .unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[byte; 80]).unwrap(),
+                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64(
+                    [byte.wrapping_add(5); 64],
+                ),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: Some(Bytes32::from([byte.wrapping_add(5); 32])),
             },
             transactions: Vec::new(),
             slashing_evidence: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
-            vrf_reveals: Vec::new(),
         }
     }
 
@@ -3536,11 +3536,13 @@ mod tests {
                 public.classical.0,
                 public.pq.0,
                 vrf.public_key(),
+                indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                0,
             )
             .unwrap()
         };
-        let previous = ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)]).unwrap();
-        let current = ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)]).unwrap();
+        let previous = ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)], 1).unwrap();
+        let current = ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)], 1).unwrap();
         let previous_root = hex::encode(previous.snapshot_root.0);
         let current_root = hex::encode(current.snapshot_root.0);
         engine.height = 950;
@@ -3603,6 +3605,9 @@ mod tests {
                 hybrid_classical_pk: None,
                 hybrid_pq_pk: None,
                 vrf_pk: None,
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: 1_000_000,
                 status: indra_state::ValidatorStatus::Registered,
                 registered_epoch: 0,
@@ -3631,6 +3636,9 @@ mod tests {
                 hybrid_classical_pk: None,
                 hybrid_pq_pk: None,
                 vrf_pk: None,
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: 2_000_000,
                 status: indra_state::ValidatorStatus::Active,
                 registered_epoch: 0,

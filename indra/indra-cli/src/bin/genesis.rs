@@ -38,6 +38,24 @@ fn repeated(args: &[String], flag: &str) -> Vec<String> {
 
 fn build(args: &[String]) -> Result<(), String> {
     let chain_id = required(args, "--chain-id")?;
+    let f_text = required(args, "--active-slot-coefficient-numerator")?;
+    if f_text.is_empty()
+        || !f_text.bytes().all(|byte| byte.is_ascii_digit())
+        || (f_text.len() > 1 && f_text.starts_with('0'))
+    {
+        return Err("--active-slot-coefficient-numerator must be canonical ASCII decimal".into());
+    }
+    let active_slot_coefficient_numerator = f_text
+        .parse::<u64>()
+        .map_err(|_| "--active-slot-coefficient-numerator is outside u64")?;
+    let network_genesis_hash = required(args, "--bitcoin-network-genesis-hash")?;
+    let announced_height = required(args, "--bitcoin-height")?
+        .parse::<u64>()
+        .map_err(|_| "--bitcoin-height must be a u64")?;
+    let bitcoin_pow_entropy_header = required(args, "--bitcoin-header")?;
+    let minimum_confirmations = required(args, "--bitcoin-minimum-confirmations")?
+        .parse::<u32>()
+        .map_err(|_| "--bitcoin-minimum-confirmations must be a u32")?;
     let output = required(args, "--output")?;
     let specs = repeated(args, "--validator");
     let mut validators = Vec::with_capacity(specs.len());
@@ -60,7 +78,23 @@ fn build(args: &[String]) -> Result<(), String> {
                 .map_err(|error| format!("invalid cold file {}: {error}", parts[3]))?,
         );
     }
-    let config = build_genesis_config(&chain_id, validators).map_err(|error| error.to_string())?;
+    let source = indra_node::genesis::BitcoinPowEntropySourceV1 {
+        scheme: 1,
+        network_genesis_hash,
+        announced_height,
+        header_codec: 1,
+        extraction_algorithm: 1,
+        minimum_confirmations,
+        reorg_policy: 1,
+    };
+    let config = build_genesis_config(
+        &chain_id,
+        active_slot_coefficient_numerator,
+        source,
+        bitcoin_pow_entropy_header,
+        validators,
+    )
+    .map_err(|error| error.to_string())?;
     let rendered = config.to_toml();
     indra_node::parse_genesis_manifest_str(&rendered)?;
     if Path::new(&output).exists() {
@@ -123,6 +157,6 @@ fn print_artifacts(file_bytes: &[u8], state: &ChainState) -> Result<(), String> 
 
 fn print_help() {
     println!(
-        "Usage:\n  indra-genesis build --chain-id ID --output genesis.toml \\\n    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON [--validator ...]\n  indra-genesis validate --genesis genesis.toml\n  indra-genesis inspect --genesis genesis.toml"
+        "Usage:\n  indra-genesis build --chain-id ID --active-slot-coefficient-numerator F \\\n+    --bitcoin-network-genesis-hash HEX32 --bitcoin-height HEIGHT \\\n+    --bitcoin-header HEX80 --bitcoin-minimum-confirmations N --output genesis.toml \\\n+    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON [--validator ...]\n  indra-genesis validate --genesis genesis.toml\n  indra-genesis inspect --genesis genesis.toml"
     );
 }

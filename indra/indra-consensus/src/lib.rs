@@ -17,7 +17,7 @@
 //!   validator with the smallest output (weighted by stake) wins the slot.
 //!
 //! - **Block production**: given a proposer keypair and mempool, assembles
-//!   a structurally valid `BlockV1` ready for broadcast and voting.
+//!   a structurally valid `BlockVNext` ready for broadcast and voting.
 //!
 //! - **Vote handling**: produces signed prevotes and precommits for a given
 //!   block hash. Tracks received votes and detects when quorum is reached.
@@ -55,9 +55,6 @@ pub mod vote;
 pub use error::{ConsensusError, ConsensusResult};
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry};
 pub use producer::{produce_block, BlockTemplate};
-pub use proposer::{
-    compute_fallback_election_result, elect_proposer, elect_proposer_from_reveals,
-    ProposerElection, SlotResult, VRF_FALLBACK_OUTPUT,
-};
+pub use proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection, SlotResult};
 pub use qc::{build_qc, verify_qc, verify_qc_strict, QcBuilder};
 pub use vote::{produce_vote, VoteCollector, VoteDecision};

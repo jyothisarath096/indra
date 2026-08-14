@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod epoch_record;
 pub mod governance;
 pub mod primitives;
+pub mod proposal;
 pub mod qc;
 pub mod reward_economic_snapshot;
 pub mod slash_detector;
@@ -18,7 +19,6 @@ pub mod staking;
 pub mod transaction;
 pub mod vote;
 pub mod vote_signing;
-pub mod vrf_election;
 
 pub use consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry};
 pub use epoch_record::EpochRecord;

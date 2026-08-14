@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use indra_core::{
     codec::{Decode, Encode},
-    types::block::BlockV1,
+    types::block::BlockProposalVNext,
 };
 use indra_storage::{BlockStore, PruneConfig};
 
@@ -35,22 +35,14 @@ fn main() {
     let inspect_block = store
         .get(inspect_height)
         .unwrap_or_else(|e| panic!("failed to read inspect block {inspect_height}: {e}"));
-    println!("inspect.height={}", inspect_block.header.height);
+    println!("inspect.height={}", inspect_block.block.header.height);
     println!(
         "inspect.protocol_version={}",
-        inspect_block.header.protocol_version.0
+        inspect_block.block.header.protocol_version.0
     );
     println!(
-        "inspect.election_result_hash={}",
-        inspect_block
-            .header
-            .election_result_hash
-            .map(|h| hex::encode(h.0))
-            .unwrap_or_else(|| "None".to_string())
-    );
-    println!(
-        "inspect.vrf_reveals_len={}",
-        inspect_block.vrf_reveals.len()
+        "inspect.proposer_authorization_bytes={}",
+        inspect_block.proposer_authorization.encoded_len()
     );
 
     if block_count <= 2 {
@@ -60,8 +52,8 @@ fn main() {
 
     let block1 = store.get(1).expect("failed to read block 1");
     let block2 = store.get(2).expect("failed to read block 2");
-    let block1_hash = block1.header.block_hash();
-    let block2_prev = block2.header.prev_hash;
+    let block1_hash = block1.block.header.block_hash();
+    let block2_prev = block2.block.header.prev_hash;
 
     println!("block1.hash={}", hex::encode(block1_hash.0));
     println!("block2.prev_hash={}", hex::encode(block2_prev.0));
@@ -69,14 +61,14 @@ fn main() {
 
     let mut roundtrip_failures = 0usize;
     let mut linkage_failures = 0usize;
-    let mut previous: Option<BlockV1> = None;
+    let mut previous: Option<BlockProposalVNext> = None;
 
     for height in 0..block_count {
         let block = store
             .get(height)
             .unwrap_or_else(|e| panic!("failed to read block {height}: {e}"));
         let encoded = block.encode_to_vec();
-        let decoded = BlockV1::decode_exact(&encoded)
+        let decoded = BlockProposalVNext::decode_exact(&encoded)
             .unwrap_or_else(|e| panic!("failed to decode re-encoded block {height}: {e}"));
         if decoded != block {
             roundtrip_failures += 1;
@@ -84,14 +76,14 @@ fn main() {
         }
 
         if let Some(prev) = &previous {
-            let expected_prev_hash = prev.header.block_hash();
-            if block.header.prev_hash != expected_prev_hash {
+            let expected_prev_hash = prev.block.header.block_hash();
+            if block.block.header.prev_hash != expected_prev_hash {
                 linkage_failures += 1;
                 println!(
                     "hash_link_mismatch_at_height={} expected_prev={} got_prev={}",
                     height,
                     hex::encode(expected_prev_hash.0),
-                    hex::encode(block.header.prev_hash.0),
+                    hex::encode(block.block.header.prev_hash.0),
                 );
             }
         }

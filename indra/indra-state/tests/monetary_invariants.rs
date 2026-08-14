@@ -1,16 +1,17 @@
 //! Consensus monetary invariants for the transparent-value transaction format.
 
 use indra_core::types::{
-    block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+    block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, MAX_VRF_PROOF_BYTES,
-        TRANSACTION_PROTOCOL_VERSION,
+        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
-use indra_state::{apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus};
+use indra_state::{
+    apply_block_for_test as apply_block, ChainState, StateError, ValidatorEntry, ValidatorStatus,
+};
 use indra_state::{apply_epoch_transition, EpochTransitionContext};
 
 fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
@@ -50,6 +51,9 @@ fn validator(owner: &HybridPubKey) -> ValidatorEntry {
         hybrid_classical_pk: Some(owner.classical_pk.0),
         hybrid_pq_pk: Some(owner.pq_pk.as_slice().to_vec()),
         vrf_pk: Some(VrfKeypair::from_seed(&[7; 32]).public_key()),
+        vrf_key_activation_epoch: 0,
+        pending_vrf_pk: None,
+        pending_vrf_activation_epoch: None,
         stake_spark: 1_000_000,
         status: ValidatorStatus::Active,
         registered_epoch: 0,
@@ -74,6 +78,7 @@ fn validator(owner: &HybridPubKey) -> ValidatorEntry {
 fn state() -> (ChainState, HybridPubKey, HybridKeypair) {
     let (owner, pair) = keypair([9; 32]);
     let mut state = ChainState::new_genesis();
+    state.active_slot_coefficient_numerator = 1u64 << 63;
     state.validators.upsert(validator(&owner)).unwrap();
     state.finalize_genesis().unwrap();
     // Isolate value conservation and dust from fee-market policy.
@@ -108,9 +113,9 @@ fn signed_tx(
     tx
 }
 
-fn block(state: &ChainState, tx: TransactionV1) -> BlockV1 {
-    BlockV1 {
-        header: BlockHeaderV1 {
+fn block(state: &ChainState, tx: TransactionV1) -> BlockVNext {
+    BlockVNext {
+        header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height: state.height + 1,
             prev_hash: state.tip_hash,
@@ -122,16 +127,19 @@ fn block(state: &ChainState, tx: TransactionV1) -> BlockV1 {
             base_fee: state.base_fee,
             proposer_round: 0,
             polc_round: NO_POLC_ROUND,
-            proposer_vrf_output: Bytes32::ZERO,
-            proposer_vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[]).unwrap(),
+            proposer_id: Bytes32::from([0x83; 32]),
+            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            election_seed: state.election_seed,
+            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+            proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),
-            election_result_hash: None,
         },
         transactions: vec![tx],
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        vrf_reveals: vec![],
     }
 }
 

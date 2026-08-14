@@ -87,9 +87,9 @@ impl indra_rpc::handlers::RpcEngineView for NodeEngine {
     fn get_block_by_height(
         &self,
         height: u64,
-    ) -> Result<Option<indra_core::types::block::BlockV1>, String> {
+    ) -> Result<Option<indra_core::types::block::BlockVNext>, String> {
         match self.block_store.get_read_only(height) {
-            Ok(block) => Ok(Some(block)),
+            Ok(proposal) => Ok(Some(proposal.block)),
             Err(indra_storage::StorageError::BlockNotFound { .. })
             | Err(indra_storage::StorageError::BlockPruned { .. }) => Ok(None),
             Err(error) => Err(error.to_string()),

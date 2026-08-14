@@ -399,6 +399,28 @@ fn cold_share_ceremony_verifies_and_recovers_only_encrypted_keys() {
 
 // ── Genesis tests ─────────────────────────────────────────────────────────────
 
+fn build_test_genesis(
+    chain_id: &str,
+    validators: Vec<indra_cli::GenesisEntry>,
+) -> indra_cli::GenesisConfig {
+    build_genesis_config(
+        chain_id,
+        1u64 << 63,
+        indra_node::genesis::BitcoinPowEntropySourceV1 {
+            scheme: 1,
+            network_genesis_hash: hex::encode([0x11; 32]),
+            announced_height: 1,
+            header_codec: 1,
+            extraction_algorithm: 1,
+            minimum_confirmations: 100,
+            reorg_policy: 1,
+        },
+        hex::encode([0x22; 80]),
+        validators,
+    )
+    .unwrap()
+}
+
 #[test]
 fn genesis_with_4_validators() {
     let stake = DUST_LIMIT_SPARK * 100;
@@ -410,7 +432,7 @@ fn genesis_with_4_validators() {
         })
         .collect();
 
-    let config = build_genesis_config("indra-testnet-1", validators).unwrap();
+    let config = build_test_genesis("indra-testnet-1", validators);
 
     assert_eq!(config.validators.len(), 4);
     let toml = config.to_toml();
@@ -429,7 +451,22 @@ fn genesis_rejects_3_validators() {
         })
         .collect();
 
-    assert!(build_genesis_config("test", validators).is_err());
+    assert!(build_genesis_config(
+        "test",
+        1u64 << 63,
+        indra_node::genesis::BitcoinPowEntropySourceV1 {
+            scheme: 1,
+            network_genesis_hash: hex::encode([0x11; 32]),
+            announced_height: 1,
+            header_codec: 1,
+            extraction_algorithm: 1,
+            minimum_confirmations: 100,
+            reorg_policy: 1,
+        },
+        hex::encode([0x22; 80]),
+        validators,
+    )
+    .is_err());
 }
 
 #[test]
@@ -443,6 +480,16 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "build",
         "--chain-id",
         "indra-testnet-artifact-test",
+        "--active-slot-coefficient-numerator",
+        "9223372036854775808",
+        "--bitcoin-network-genesis-hash",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "--bitcoin-height",
+        "1",
+        "--bitcoin-header",
+        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "--bitcoin-minimum-confirmations",
+        "100",
         "--output",
         path.to_str().unwrap(),
     ]);
@@ -522,6 +569,16 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "build",
         "--chain-id",
         "indra-testnet-artifact-test",
+        "--active-slot-coefficient-numerator",
+        "9223372036854775808",
+        "--bitcoin-network-genesis-hash",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "--bitcoin-height",
+        "1",
+        "--bitcoin-header",
+        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "--bitcoin-minimum-confirmations",
+        "100",
         "--output",
         malformed_genesis.to_str().unwrap(),
     ]);
@@ -648,7 +705,7 @@ fn full_testnet_setup_pipeline() {
         genesis_entry("dave", &dave, stake, 24),
     ];
 
-    let config = build_genesis_config("indra-private-testnet-1", validators).unwrap();
+    let config = build_test_genesis("indra-private-testnet-1", validators);
 
     assert_eq!(config.validators.len(), 4);
 

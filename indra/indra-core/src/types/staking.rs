@@ -3,13 +3,14 @@
 //! Transaction and staking amounts are public so consensus can verify balances
 //! and stake weights directly.
 //!
-//! `StakingOp` is embedded in `BlockV1` alongside transactions and governance ops.
+//! `StakingOp` is embedded in `BlockVNext` alongside transactions and governance ops.
 
 use crate::{
     codec::{ByteReader, Decode, Encode},
     error::IndraResult,
     types::{
         authorization::AuthorizationEnvelope,
+        block::VrfSuiteV1,
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
         primitives::{Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN},
         stake_position::PositionCustodyV1,
@@ -33,6 +34,7 @@ const TAG_COLD_SELF_STAKE: u8 = 10;
 const TAG_HOT_SET_AUTO_DELEGATE: u8 = 11;
 const TAG_COLD_SET_AUTO_DELEGATE: u8 = 12;
 const TAG_UPDATE_NETWORK_ADDRESS: u8 = 13;
+const TAG_REGISTER_VRF_KEY: u8 = 14;
 
 /// Stable operation tag used inside hot/cold registration envelopes.
 pub const AUTH_TAG_REGISTER_VALIDATOR: u16 = TAG_REGISTER_VALIDATOR as u16;
@@ -204,9 +206,44 @@ pub enum StakingOpBody {
         /// Strict IP:port address. `None` clears the advertised address.
         network_addr: Option<String>,
     },
+    /// Rotate the validator's VRF key for the next snapshot epoch.
+    RegisterVrfKey {
+        /// Complete hybrid validator identity.
+        validator_id: Bytes32,
+        /// Sole supported standard suite.
+        vrf_suite: VrfSuiteV1,
+        /// Canonical RFC 9381 public key.
+        vrf_pubkey: Bytes32,
+        /// Required next snapshot epoch.
+        activation_epoch_id: u64,
+        /// Full-hybrid proof binding this key and activation epoch.
+        proof_of_possession: HybridSignature,
+    },
 }
 
 impl StakingOp {
+    /// Canonical full-hybrid proof-of-possession transcript for VRF rotation.
+    pub fn vrf_pop_signing_bytes(
+        chain_id: &str,
+        validator_id: &Bytes32,
+        vrf_pubkey: &Bytes32,
+        activation_epoch_id: u64,
+    ) -> IndraResult<Vec<u8>> {
+        let chain = chain_id.as_bytes();
+        let n =
+            u16::try_from(chain.len()).map_err(|_| crate::error::IndraError::LengthExceeded {
+                field: "chain_id",
+                max: u16::MAX as usize,
+                actual: chain.len(),
+            })?;
+        let mut out = b"INDRA-VRF-POP-v1".to_vec();
+        out.extend_from_slice(&n.to_be_bytes());
+        out.extend_from_slice(chain);
+        validator_id.encode(&mut out);
+        vrf_pubkey.encode(&mut out);
+        activation_epoch_id.encode(&mut out);
+        Ok(out)
+    }
     /// Canonical bytes covered by the signature.
     ///
     /// Format: domain || chain_id_len(2) || chain_id || nonce(8) || body_bytes.
@@ -443,6 +480,7 @@ impl StakingOp {
             StakingOpBody::SetCommission { validator_id, .. }
             | StakingOpBody::SetAutoDelegate { validator_id, .. }
             | StakingOpBody::UpdateNetworkAddress { validator_id, .. }
+            | StakingOpBody::RegisterVrfKey { validator_id, .. }
             | StakingOpBody::RotateValidatorColdKey { validator_id, .. } => *validator_id,
         }
     }
@@ -541,6 +579,10 @@ impl StakingOp {
                 if let Some(addr) = network_addr {
                     validate_network_addr_string(addr)?;
                 }
+            }
+            StakingOpBody::RegisterVrfKey { vrf_pubkey, .. } => {
+                indra_crypto::validate_vrf_public_key(&vrf_pubkey.0)
+                    .map_err(|_| crate::error::IndraError::VrfProofInvalid)?;
             }
         }
         Ok(())
@@ -685,6 +727,20 @@ impl Encode for StakingOpBody {
                 validator_id.encode(buf);
                 encode_optional_network_addr(network_addr, buf);
             }
+            StakingOpBody::RegisterVrfKey {
+                validator_id,
+                vrf_suite,
+                vrf_pubkey,
+                activation_epoch_id,
+                proof_of_possession,
+            } => {
+                buf.push(TAG_REGISTER_VRF_KEY);
+                validator_id.encode(buf);
+                vrf_suite.encode(buf);
+                vrf_pubkey.encode(buf);
+                activation_epoch_id.encode(buf);
+                proof_of_possession.encode(buf);
+            }
         }
     }
 
@@ -779,6 +835,10 @@ impl Encode for StakingOpBody {
                         .map(|addr| 2 + addr.len())
                         .unwrap_or(0)
             }
+            StakingOpBody::RegisterVrfKey {
+                proof_of_possession,
+                ..
+            } => 32 + 1 + 32 + 8 + proof_of_possession.encoded_len(),
         }
     }
 }
@@ -858,6 +918,13 @@ impl Decode for StakingOpBody {
             TAG_UPDATE_NETWORK_ADDRESS => Ok(StakingOpBody::UpdateNetworkAddress {
                 validator_id: Bytes32::decode(r)?,
                 network_addr: decode_optional_network_addr(r)?,
+            }),
+            TAG_REGISTER_VRF_KEY => Ok(StakingOpBody::RegisterVrfKey {
+                validator_id: Bytes32::decode(r)?,
+                vrf_suite: VrfSuiteV1::decode(r)?,
+                vrf_pubkey: Bytes32::decode(r)?,
+                activation_epoch_id: u64::decode(r)?,
+                proof_of_possession: HybridSignature::decode(r)?,
             }),
             TAG_COLD_VALIDATOR_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
                 validator_id: Bytes32::decode(r)?,

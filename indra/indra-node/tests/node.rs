@@ -4,18 +4,16 @@ use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     build_qc,
     producer::{produce_block, BlockTemplate},
-    proposer::{compute_proposer_vrf, elect_proposer_from_reveals, ProposerCandidate},
+    proposer::{compute_proposer_vrf, ProposerCandidate},
     qc::QcValidator,
     vote::produce_vote,
 };
 use indra_core::{
     codec::{Decode, Encode},
     types::{
-        block::BlockV1,
         crypto::HybridSignature,
         primitives::{VariableBytes, DEFAULT_CHAIN_ID},
         vote::{VoteStep, VoteV1},
-        vrf_election::{compute_reveal_set_commitment, VrfRevealEvidence},
     },
     Bytes32,
 };
@@ -67,6 +65,11 @@ fn temp_dir(suffix: &str) -> PathBuf {
 
 fn anchored_genesis_state() -> ChainState {
     let mut state = build_genesis_state();
+    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.consensus_snapshots.clear();
+    state.reward_economic_snapshot = None;
+    state.slash_membership_roots.clear();
+    state.finalize_genesis().unwrap();
     state.tip_hash = genesis_block_hash();
     state
 }
@@ -75,77 +78,69 @@ fn make_strict_block(
     state: &ChainState,
     proposer_seed: [u8; 32],
     prev_qc_bytes: Vec<u8>,
-) -> BlockV1 {
-    let epoch_seed = Bytes32::from(indra_crypto::sha256(&state.tip_hash.0));
-    let mut candidates: Vec<_> = state
-        .validators
-        .active_validators()
-        .filter_map(|validator| {
-            validator.vrf_pk.map(|vrf_pk| ProposerCandidate {
-                validator_id: validator.validator_id,
-                vrf_pubkey: vrf_pk,
-                stake: validator.stake_spark,
-            })
+) -> indra_core::types::block::BlockProposalVNext {
+    let height = state.height + 1;
+    let snapshot = state.snapshot_for_consensus_height(height).unwrap();
+    let vrf = VrfKeypair::from_seed(&proposer_seed);
+    let election = (0..4_096)
+        .map(|round| indra_consensus::proposer::ProposerElection {
+            chain_id: state.chain_id.as_bytes().to_vec(),
+            election_seed: state.election_seed,
+            snapshot_root: snapshot.snapshot_root,
+            active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
+            height,
+            round,
+            candidates: snapshot
+                .entries()
+                .iter()
+                .map(|entry| ProposerCandidate {
+                    validator_id: entry.validator_id,
+                    vrf_pubkey: entry.vrf_pk,
+                    stake: entry.consensus_weight_spark,
+                })
+                .collect(),
         })
-        .collect();
-    candidates.sort_by_key(|candidate| candidate.validator_id.0);
-    let election = indra_consensus::proposer::ProposerElection {
-        epoch_seed,
-        height: state.height + 1,
-        round: 0,
-        candidates,
-    };
-    let preferred = VrfKeypair::from_seed(&proposer_seed);
-    let mut keypairs = std::collections::BTreeMap::new();
-    let mut revealed = std::collections::BTreeMap::new();
-    let mut vrf_reveals = Vec::new();
-    for candidate in &election.candidates {
-        let keypair = if preferred.public_key() == candidate.vrf_pubkey {
-            preferred.clone()
-        } else {
-            (0u8..=u8::MAX)
-                .map(|seed| VrfKeypair::from_seed(&[seed; 32]))
-                .find(|keypair| keypair.public_key() == candidate.vrf_pubkey)
-                .expect("test validator VRF seed must be recoverable")
-        };
-        let slot = compute_proposer_vrf(
-            candidate.validator_id,
-            &keypair,
-            &election.epoch_seed,
-            election.height,
-            election.round,
-        );
-        let output = Bytes32::from(slot.vrf_output.0);
-        revealed.insert(candidate.validator_id, output);
-        vrf_reveals.push(VrfRevealEvidence {
-            validator_id: candidate.validator_id,
-            vrf_output: output,
-            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).unwrap(),
-        });
-        keypairs.insert(candidate.validator_id, keypair);
-    }
-    let mut election_result = elect_proposer_from_reveals(&election, &revealed).unwrap();
-    election_result.reveal_set_commitment = compute_reveal_set_commitment(&vrf_reveals);
-    let proposer_vrf_keypair = keypairs
-        .remove(&election_result.elected_validator_id)
-        .unwrap();
-    let election_result_hash = election_result.hash();
+        .find(|election| {
+            election
+                .candidates
+                .iter()
+                .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+                .is_some_and(|candidate| {
+                    compute_proposer_vrf(candidate.validator_id, &vrf, election)
+                        .is_ok_and(|result| result.eligible)
+                })
+        })
+        .expect("test proposer must become eligible in bounded rounds");
     let template = BlockTemplate {
-        proposer_vrf_keypair,
-        epoch_seed: election.epoch_seed,
+        proposer_vrf_keypair: vrf,
         prev_qc_bytes,
-        timestamp: 1_700_000_000 + state.height + 1,
+        timestamp: 1_700_000_000 + height,
         polc_round: None,
         transactions: vec![],
         slash_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-        election_result_hash: Some(election_result_hash),
-        election_result: Some(election_result),
-        vrf_reveals,
     };
     let mut projection_state = state.clone();
-    produce_block(&template, &mut projection_state, &election).unwrap()
+    let block = produce_block(&template, &mut projection_state, &election).unwrap();
+    let signer = HybridKeypair::new(
+        ClassicalKeypair::from_seed(&proposer_seed),
+        PqKeypair::from_seed(&proposer_seed).unwrap(),
+    );
+    let mut proposal = indra_core::types::block::BlockProposalVNext {
+        block,
+        proposer_authorization: HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[]).unwrap(),
+            pq_sig: VariableBytes::from_slice(&[]).unwrap(),
+        },
+    };
+    let transcript = proposal.signing_bytes(state.chain_id.as_bytes()).unwrap();
+    let signature = signer.sign(&transcript).unwrap();
+    proposal.proposer_authorization = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+        pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+    };
+    proposal
 }
 
 async fn write_plain_msg<W>(writer: &mut W, msg: &Message)
@@ -163,7 +158,6 @@ fn dummy_vote() -> VoteV1 {
         step: VoteStep::Precommit,
         block_hash: Bytes32::from([0xAB; 32]),
         validator_id: Bytes32::from([0xCD; 32]),
-        election_result_hash: None,
         signature: HybridSignature {
             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
@@ -194,6 +188,9 @@ fn install_active_validator(
             hybrid_classical_pk: Some(public.classical.0),
             hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pk),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000,
             status: indra_state::ValidatorStatus::Active,
             registered_epoch: 0,
@@ -248,6 +245,9 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             hybrid_classical_pk: Some(public.classical.0),
             hybrid_pq_pk: Some(public.pq.0.to_vec()),
             vrf_pk: Some(vrf_pk),
+            vrf_key_activation_epoch: 0,
+            pending_vrf_pk: None,
+            pending_vrf_activation_epoch: None,
             stake_spark: 1_000_000,
             status: indra_state::ValidatorStatus::Active,
             registered_epoch: 0,
@@ -293,7 +293,7 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     .0;
     let genesis_path = dir.join("genesis.toml");
     let genesis = format!(
-        "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
         name,
         hex::encode(validator_id),
         hex::encode(classical.public_key().0),
@@ -361,12 +361,12 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
 
 fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
     let mut store = BlockStore::open(log_path, PruneConfig::archive()).unwrap();
-    let mut previous: Option<BlockV1> = None;
+    let mut previous: Option<indra_core::types::block::BlockProposalVNext> = None;
 
     for height in 0..store.next_height() {
         let block = store.get(height).unwrap();
         let encoded = indra_core::codec::Encode::encode_to_vec(&block);
-        let decoded = BlockV1::decode_exact(&encoded).unwrap();
+        let decoded = indra_core::types::block::BlockProposalVNext::decode_exact(&encoded).unwrap();
         assert_eq!(decoded, block, "round-trip mismatch at height {}", height);
 
         if let Some(prev) = &previous {
@@ -402,8 +402,13 @@ fn node_engine_init_and_commit() {
     let mut last_qc = Vec::new();
     for i in 1..=5u64 {
         let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
-        engine.commit_block(&block).unwrap();
-        last_qc = build_single_validator_qc_bytes(i, 0, block.header.block_hash(), [0x42u8; 32]);
+        engine.commit_proposal(&block).unwrap();
+        last_qc = build_single_validator_qc_bytes(
+            i,
+            block.header.proposer_round,
+            block.header.block_hash(),
+            [0x42u8; 32],
+        );
         assert_eq!(engine.height(), i);
     }
 
@@ -437,7 +442,12 @@ fn state_root_changes_after_each_block() {
     .unwrap();
     let root1 = compute_state_root(&state);
 
-    let qc1 = build_single_validator_qc_bytes(1, 0, b1.header.block_hash(), [0x11u8; 32]);
+    let qc1 = build_single_validator_qc_bytes(
+        1,
+        b1.header.proposer_round,
+        b1.header.block_hash(),
+        [0x11u8; 32],
+    );
     let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
     import_unfinalized_block_for_test(
         &b2,
@@ -480,7 +490,12 @@ fn block_store_survives_reopen() {
                 0,
             )
             .unwrap();
-            last_qc = build_single_validator_qc_bytes(i, 0, b.header.block_hash(), [0x12u8; 32]);
+            last_qc = build_single_validator_qc_bytes(
+                i,
+                b.header.proposer_round,
+                b.header.block_hash(),
+                [0x12u8; 32],
+            );
             assert_eq!(state.height, i);
         }
     }
@@ -506,9 +521,13 @@ fn restarted_block_store_preserves_hash_chain() {
         for _ in 0..5u64 {
             let height = engine.state.height + 1;
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
-            engine.commit_block(&block).unwrap();
-            last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
+            engine.commit_proposal(&block).unwrap();
+            last_qc = build_single_validator_qc_bytes(
+                height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                [0x42u8; 32],
+            );
         }
     }
 
@@ -549,8 +568,12 @@ fn sync_state_downloads_full_chain_from_genesis() {
             0,
         )
         .unwrap();
-        source_last_qc =
-            build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x13u8; 32]);
+        source_last_qc = build_single_validator_qc_bytes(
+            height,
+            block.header.proposer_round,
+            block.header.block_hash(),
+            [0x13u8; 32],
+        );
     }
 
     let peer: std::net::SocketAddr = "127.0.0.1:30303".parse().unwrap();
@@ -601,9 +624,13 @@ fn current_binary_hashes_workspace_block_log_consistently() {
         for _ in 0..3u64 {
             let height = engine.state.height + 1;
             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
-            engine.commit_block(&block).unwrap();
-            last_qc =
-                build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x42u8; 32]);
+            engine.commit_proposal(&block).unwrap();
+            last_qc = build_single_validator_qc_bytes(
+                height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                [0x42u8; 32],
+            );
         }
     }
 
@@ -654,8 +681,7 @@ fn full_node_pipeline() {
     let dir = temp_dir("full");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut state = build_genesis_state();
-    state.tip_hash = genesis_block_hash();
+    let mut state = anchored_genesis_state();
     install_state_validator(&mut state, [0x14u8; 32], "local");
     let mut mempool = Mempool::default_config();
     let mut block_store = BlockStore::open(dir.join("blocks.log"), PruneConfig::archive()).unwrap();
@@ -674,7 +700,12 @@ fn full_node_pipeline() {
                 0,
             )
             .unwrap();
-            last_qc = build_single_validator_qc_bytes(i, 0, b.header.block_hash(), [0x14u8; 32]);
+            last_qc = build_single_validator_qc_bytes(
+                i,
+                b.header.proposer_round,
+                b.header.block_hash(),
+                [0x14u8; 32],
+            );
             assert_eq!(state.height, i);
             compute_state_root(&state)
         })
@@ -911,8 +942,12 @@ fn full_restart_recovery_end_to_end() {
             0,
         )
         .unwrap();
-        source_last_qc =
-            build_single_validator_qc_bytes(height, 0, block.header.block_hash(), [0x15u8; 32]);
+        source_last_qc = build_single_validator_qc_bytes(
+            height,
+            block.header.proposer_round,
+            block.header.block_hash(),
+            [0x15u8; 32],
+        );
     }
 
     for (follower_log, follower_state_dir) in [

@@ -2,7 +2,7 @@
 
 use indra_core::{
     codec::Decode,
-    types::{block::BlockV1, crypto::HybridPubKey, primitives::Bytes32},
+    types::{block::BlockVNext, crypto::HybridPubKey, primitives::Bytes32},
 };
 use indra_state::{utxo::UtxoEntry, UtxoSet};
 
@@ -97,7 +97,7 @@ fn scan_tranche_refund(
 /// Apply one canonical block to ordinary-payment wallet discovery.
 pub fn scan_canonical_block(
     wallet: &mut Wallet,
-    block: &BlockV1,
+    block: &BlockVNext,
     owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
     let mut discovered = 0usize;
@@ -138,7 +138,7 @@ fn expected_scan_parent(wallet: &Wallet) -> Bytes32 {
     wallet.scan_tip().map_or(Bytes32::ZERO, |(_, hash)| hash)
 }
 
-fn canonical_blocks_from_rpc(json: &str) -> Result<Vec<BlockV1>, String> {
+fn canonical_blocks_from_rpc(json: &str) -> Result<Vec<BlockVNext>, String> {
     let mut blocks = Vec::new();
     let mut remaining = json;
     let marker = "\"block_hex\":\"";
@@ -149,7 +149,7 @@ fn canonical_blocks_from_rpc(json: &str) -> Result<Vec<BlockV1>, String> {
             .ok_or_else(|| "unterminated block_hex in RPC response".to_string())?;
         let bytes = hex::decode(&encoded[..end]).map_err(|_| "invalid block_hex".to_string())?;
         blocks.push(
-            BlockV1::decode_exact(&bytes)
+            BlockVNext::decode_exact(&bytes)
                 .map_err(|error| format!("invalid canonical block encoding: {error}"))?,
         );
         remaining = &encoded[end + 1..];

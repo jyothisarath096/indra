@@ -11,13 +11,8 @@
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
-        block::BlockV1,
-        governance::GovernanceOpV2,
-        primitives::Bytes32,
-        staking::StakingOp,
-        transaction::TransactionV1,
-        vote::VoteV1,
-        vrf_election::{VrfCommit, VrfReveal},
+        block::BlockProposalVNext, governance::GovernanceOpV2, primitives::Bytes32,
+        staking::StakingOp, transaction::TransactionV1, vote::VoteV1,
     },
 };
 
@@ -69,14 +64,6 @@ pub enum MessageType {
     RequestQC = 0x0B,
     /// Respond with encoded QC bytes for a committed height.
     QCResponse = 0x0C,
-    /// Commit to a validator's per-round VRF output.
-    VrfCommit = 0x0D,
-    /// Reveal a committed per-round VRF output.
-    VrfReveal = 0x0E,
-    /// Request signed VRF reveals needed to verify a proposal.
-    RequestVrfReveals = 0x0F,
-    /// Respond with signed VRF reveals.
-    VrfRevealsResponse = 0x10,
     /// A pending staking operation.
     StakingOp = 0x11,
     /// A pending governance operation.
@@ -99,10 +86,6 @@ impl MessageType {
             0x0A => Ok(Self::RequestProposal),
             0x0B => Ok(Self::RequestQC),
             0x0C => Ok(Self::QCResponse),
-            0x0D => Ok(Self::VrfCommit),
-            0x0E => Ok(Self::VrfReveal),
-            0x0F => Ok(Self::RequestVrfReveals),
-            0x10 => Ok(Self::VrfRevealsResponse),
             0x11 => Ok(Self::StakingOp),
             0x12 => Ok(Self::GovernanceOp),
             other => Err(NetworkError::UnknownMessageType { got: other }),
@@ -145,7 +128,7 @@ impl PeerListEntry {
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A complete block for validation and inclusion.
-    Block(BlockV1),
+    Block(BlockProposalVNext),
     /// A prevote or precommit vote.
     Vote(VoteV1),
     /// A pending transaction for the mempool.
@@ -171,7 +154,7 @@ pub enum Message {
     /// Response containing blocks in ascending height order.
     BlockResponse {
         /// Blocks returned to the requester.
-        blocks: Vec<BlockV1>,
+        blocks: Vec<BlockProposalVNext>,
         /// Lowest height this peer can currently serve, when known.
         lowest_available: Option<u64>,
         /// Highest height this peer can currently serve, when known.
@@ -207,28 +190,6 @@ pub enum Message {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
-    /// Commit to a validator's per-round VRF output.
-    VrfCommit(VrfCommit),
-    /// Reveal a committed per-round VRF output.
-    VrfReveal(VrfReveal),
-    /// Request signed VRF reveals by validator ID.
-    RequestVrfReveals {
-        /// Election height.
-        height: u64,
-        /// Election round.
-        round: u32,
-        /// Validator IDs requested.
-        validator_ids: Vec<Bytes32>,
-    },
-    /// Return signed VRF reveals for an election.
-    VrfRevealsResponse {
-        /// Election height.
-        height: u64,
-        /// Election round.
-        round: u32,
-        /// Signed reveals.
-        reveals: Vec<VrfReveal>,
-    },
 }
 
 impl Message {
@@ -249,10 +210,6 @@ impl Message {
             Self::RequestProposal { .. } => MessageType::RequestProposal,
             Self::RequestQC { .. } => MessageType::RequestQC,
             Self::QCResponse { .. } => MessageType::QCResponse,
-            Self::VrfCommit(_) => MessageType::VrfCommit,
-            Self::VrfReveal(_) => MessageType::VrfReveal,
-            Self::RequestVrfReveals { .. } => MessageType::RequestVrfReveals,
-            Self::VrfRevealsResponse { .. } => MessageType::VrfRevealsResponse,
         }
     }
 
@@ -381,38 +338,6 @@ impl Message {
                 buf.extend_from_slice(qc_bytes);
                 buf
             }
-            Self::VrfCommit(commit) => commit.encode_to_vec(),
-            Self::VrfReveal(reveal) => reveal.encode_to_vec(),
-            Self::RequestVrfReveals {
-                height,
-                round,
-                validator_ids,
-            } => {
-                let mut buf = Vec::with_capacity(16 + validator_ids.len() * 32);
-                height.encode(&mut buf);
-                round.encode(&mut buf);
-                (validator_ids.len() as u32).encode(&mut buf);
-                for validator_id in validator_ids {
-                    validator_id.encode(&mut buf);
-                }
-                buf
-            }
-            Self::VrfRevealsResponse {
-                height,
-                round,
-                reveals,
-            } => {
-                let mut buf = Vec::new();
-                height.encode(&mut buf);
-                round.encode(&mut buf);
-                (reveals.len() as u32).encode(&mut buf);
-                for reveal in reveals {
-                    let bytes = reveal.encode_to_vec();
-                    (bytes.len() as u32).encode(&mut buf);
-                    buf.extend_from_slice(&bytes);
-                }
-                buf
-            }
         }
     }
 
@@ -420,10 +345,11 @@ impl Message {
     fn decode_payload(msg_type: MessageType, payload: &[u8]) -> NetworkResult<Self> {
         match msg_type {
             MessageType::Block => {
-                let block =
-                    BlockV1::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                let block = BlockProposalVNext::decode_exact(payload).map_err(|e| {
+                    NetworkError::DecodeFailed {
                         reason: e.to_string(),
-                    })?;
+                    }
+                })?;
                 Ok(Self::Block(block))
             }
             MessageType::Vote => {
@@ -607,10 +533,11 @@ impl Message {
                         .map_err(|e| NetworkError::DecodeFailed {
                             reason: e.to_string(),
                         })?;
-                    let block =
-                        BlockV1::decode_exact(bytes).map_err(|e| NetworkError::DecodeFailed {
+                    let block = BlockProposalVNext::decode_exact(bytes).map_err(|e| {
+                        NetworkError::DecodeFailed {
                             reason: e.to_string(),
-                        })?;
+                        }
+                    })?;
                     blocks.push(block);
                 }
                 let flags = u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
@@ -761,102 +688,6 @@ impl Message {
                     qc_bytes,
                 })
             }
-            MessageType::VrfCommit => {
-                let commit =
-                    VrfCommit::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
-                        reason: e.to_string(),
-                    })?;
-                Ok(Self::VrfCommit(commit))
-            }
-            MessageType::VrfReveal => {
-                let reveal =
-                    VrfReveal::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
-                        reason: e.to_string(),
-                    })?;
-                Ok(Self::VrfReveal(reveal))
-            }
-            MessageType::RequestVrfReveals => {
-                let mut r = ByteReader::new(payload);
-                let height = u64::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
-                let round = u32::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
-                let count = u32::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })? as usize;
-                if count > indra_core::types::primitives::MAX_ACTIVE_VALIDATORS {
-                    return Err(NetworkError::DecodeFailed {
-                        reason: format!("RequestVrfReveals count {} exceeds maximum", count),
-                    });
-                }
-                let mut validator_ids = Vec::with_capacity(count);
-                for _ in 0..count {
-                    validator_ids.push(Bytes32::decode(&mut r).map_err(|e| {
-                        NetworkError::DecodeFailed {
-                            reason: e.to_string(),
-                        }
-                    })?);
-                }
-                if r.remaining() != 0 {
-                    return Err(NetworkError::DecodeFailed {
-                        reason: format!(
-                            "RequestVrfReveals contains {} trailing bytes",
-                            r.remaining()
-                        ),
-                    });
-                }
-                Ok(Self::RequestVrfReveals {
-                    height,
-                    round,
-                    validator_ids,
-                })
-            }
-            MessageType::VrfRevealsResponse => {
-                let mut r = ByteReader::new(payload);
-                let height = u64::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
-                let round = u32::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
-                let count = u32::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })? as usize;
-                if count > indra_core::types::primitives::MAX_ACTIVE_VALIDATORS {
-                    return Err(NetworkError::DecodeFailed {
-                        reason: format!("VrfRevealsResponse count {} exceeds maximum", count),
-                    });
-                }
-                let mut reveals = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let len = u32::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                        reason: e.to_string(),
-                    })? as usize;
-                    let bytes = r.read_bytes(len).map_err(|e| NetworkError::DecodeFailed {
-                        reason: e.to_string(),
-                    })?;
-                    reveals.push(VrfReveal::decode_exact(bytes).map_err(|e| {
-                        NetworkError::DecodeFailed {
-                            reason: e.to_string(),
-                        }
-                    })?);
-                }
-                if r.remaining() != 0 {
-                    return Err(NetworkError::DecodeFailed {
-                        reason: format!(
-                            "VrfRevealsResponse contains {} trailing bytes",
-                            r.remaining()
-                        ),
-                    });
-                }
-                Ok(Self::VrfRevealsResponse {
-                    height,
-                    round,
-                    reveals,
-                })
-            }
         }
     }
 }
@@ -865,20 +696,19 @@ impl Message {
 mod tests {
     use super::*;
     use indra_core::types::{
-        block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND},
+        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
         crypto::HybridSignature,
         governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
         primitives::{
-            Bytes32, ProtocolVersion, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-            MAX_VRF_PROOF_BYTES,
+            Bytes32, Bytes64, ProtocolVersion, VariableBytes, MAX_CLASSICAL_SIG_BYTES,
+            MAX_PQ_SIG_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
         },
         staking::{StakingOp, StakingOpBody},
-        vrf_election::{VrfCommit, VrfReveal},
     };
 
-    fn test_block(height: u64) -> BlockV1 {
-        BlockV1 {
-            header: BlockHeaderV1 {
+    fn test_block(height: u64) -> BlockVNext {
+        BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion::CURRENT,
                 height,
                 prev_hash: Bytes32::ZERO,
@@ -890,16 +720,32 @@ mod tests {
                 base_fee: 1,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
-                election_result_hash: Some(Bytes32::ZERO),
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                proposer_id: Bytes32::from([0x45; 32]),
+                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: Bytes64([0x46; 64]),
+                proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+                    &[0x47; 64],
+                )
+                .unwrap(),
+                proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+                    &[0x48; 80],
+                )
+                .unwrap(),
+                sortition_claim: SortitionClaimV1::PraosThreshold,
+                proposer_priority: Bytes64([0x49; 64]),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
             },
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
+        }
+    }
+
+    fn test_proposal(height: u64) -> indra_core::types::block::BlockProposalVNext {
+        indra_core::types::block::BlockProposalVNext {
+            block: test_block(height),
+            proposer_authorization: dummy_sig(),
         }
     }
 
@@ -908,32 +754,6 @@ mod tests {
             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0xAA; 64])
                 .unwrap(),
             pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&[0xBB; 4627]).unwrap(),
-        }
-    }
-
-    fn test_vrf_reveal() -> VrfReveal {
-        VrfReveal {
-            chain_id_hash: Bytes32::from([0x01; 32]),
-            height: 42,
-            round: 3,
-            validator_id: Bytes32::from([0x02; 32]),
-            vrf_pubkey: [0x03; 32],
-            vrf_output: Bytes32::from([0x04; 32]),
-            vrf_proof: VariableBytes::<MAX_VRF_PROOF_BYTES>::from_slice(&[0x05; 80]).unwrap(),
-            commit_hash: Bytes32::from([0x06; 32]),
-            signature: dummy_sig(),
-        }
-    }
-
-    fn test_vrf_commit() -> VrfCommit {
-        VrfCommit {
-            chain_id_hash: Bytes32::from([0x01; 32]),
-            height: 42,
-            round: 3,
-            validator_id: Bytes32::from([0x02; 32]),
-            vrf_pubkey: [0x03; 32],
-            commit_hash: Bytes32::from([0x06; 32]),
-            signature: dummy_sig(),
         }
     }
 
@@ -1060,77 +880,8 @@ mod tests {
     }
 
     #[test]
-    fn vrf_reveals_request_response_round_trip() {
-        let requested = vec![Bytes32::from([0x11; 32]), Bytes32::from([0x22; 32])];
-        let request = Message::RequestVrfReveals {
-            height: 42,
-            round: 3,
-            validator_ids: requested.clone(),
-        };
-        let request_wire = request.encode_wire().unwrap();
-        let decoded_request = Message::decode_wire(&request_wire[4..]).unwrap();
-        assert!(matches!(
-            decoded_request,
-            Message::RequestVrfReveals { height: 42, round: 3, validator_ids }
-                if validator_ids == requested
-        ));
-
-        let reveal = test_vrf_reveal();
-        let response = Message::VrfRevealsResponse {
-            height: 42,
-            round: 3,
-            reveals: vec![reveal.clone()],
-        };
-        let response_wire = response.encode_wire().unwrap();
-        let decoded_response = Message::decode_wire(&response_wire[4..]).unwrap();
-        assert!(matches!(
-            decoded_response,
-            Message::VrfRevealsResponse { height: 42, round: 3, reveals }
-                if reveals == vec![reveal]
-        ));
-    }
-
-    #[test]
-    fn vrf_wire_decoding_rejects_truncation_and_trailing_bytes_at_every_boundary() {
-        for message in [
-            Message::VrfCommit(test_vrf_commit()),
-            Message::VrfReveal(test_vrf_reveal()),
-        ] {
-            let canonical = message.encode_wire().unwrap()[4..].to_vec();
-            assert!(Message::decode_wire(&canonical[..canonical.len() - 1]).is_err());
-            let mut trailing = canonical;
-            trailing.push(0xA5);
-            assert!(Message::decode_wire(&trailing).is_err());
-        }
-
-        let response = Message::VrfRevealsResponse {
-            height: 42,
-            round: 3,
-            reveals: vec![test_vrf_reveal()],
-        };
-        let canonical = response.encode_wire().unwrap()[4..].to_vec();
-        assert!(Message::decode_wire(&canonical[..canonical.len() - 1]).is_err());
-
-        let mut nested_trailing = canonical.clone();
-        let nested_len_offset = 1 + 8 + 4 + 4;
-        let old_len = u32::from_le_bytes(
-            nested_trailing[nested_len_offset..nested_len_offset + 4]
-                .try_into()
-                .unwrap(),
-        );
-        nested_trailing[nested_len_offset..nested_len_offset + 4]
-            .copy_from_slice(&(old_len + 1).to_le_bytes());
-        nested_trailing.push(0xA5);
-        assert!(Message::decode_wire(&nested_trailing).is_err());
-
-        let mut outer_trailing = canonical;
-        outer_trailing.push(0xA5);
-        assert!(Message::decode_wire(&outer_trailing).is_err());
-    }
-
-    #[test]
     fn block_wire_decoding_rejects_trailing_bytes() {
-        let mut encoded = Message::Block(test_block(1)).encode_wire().unwrap()[4..].to_vec();
+        let mut encoded = Message::Block(test_proposal(1)).encode_wire().unwrap()[4..].to_vec();
         encoded.push(0xA5);
         assert!(Message::decode_wire(&encoded).is_err());
     }
@@ -1245,8 +996,9 @@ mod tests {
 
     #[test]
     fn block_response_count_at_maximum_is_accepted() {
-        let blocks: Vec<BlockV1> = (0..MAX_BLOCK_RESPONSE_ENTRIES)
-            .map(|idx| test_block(idx as u64 + 1))
+        let blocks: Vec<indra_core::types::block::BlockProposalVNext> = (0
+            ..MAX_BLOCK_RESPONSE_ENTRIES)
+            .map(|idx| test_proposal(idx as u64 + 1))
             .collect();
         let wire = Message::BlockResponse {
             blocks: blocks.clone(),
@@ -1269,7 +1021,7 @@ mod tests {
 
     #[test]
     fn block_response_availability_metadata_round_trip() {
-        let blocks = vec![test_block(1000)];
+        let blocks = vec![test_proposal(1000)];
         let wire = Message::BlockResponse {
             blocks: blocks.clone(),
             lowest_available: Some(1000),

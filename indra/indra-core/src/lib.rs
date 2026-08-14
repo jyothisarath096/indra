@@ -20,20 +20,21 @@
 
 pub mod codec;
 pub mod error;
+pub mod sortition;
 pub mod ssz;
 pub mod types;
 
 pub use error::{IndraError, IndraResult};
 pub use types::{
-    block::{BlockHeaderV1, BlockV1},
+    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
     checkpoint::CheckpointV1,
     crypto::{HybridPubKey, HybridSignature, PQVoteSig},
     epoch_record::EpochRecord,
     governance::GovernanceOpV2,
-    primitives::{Bytes32, ProtocolVersion, VariableBytes},
+    primitives::{Bytes32, Bytes64, ProtocolVersion, VariableBytes},
+    proposal::{verify_proposal, VerifiedProposal},
     qc::QuorumCertificateV1,
     slashing::{SlashEvidenceV1, SlashEvidenceV2},
     transaction::{InputV1, OutputV1, TransactionV1, TxId},
     vote::VoteV1,
-    vrf_election::{VrfCommit, VrfElectionResult, VrfReveal},
 };

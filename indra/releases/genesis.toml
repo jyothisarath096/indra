@@ -1,5 +1,16 @@
 [genesis]
 chain_id     = "indra-testnet-1"
+active_slot_coefficient_numerator = "1"
+bitcoin_pow_entropy_header = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+[genesis.bitcoin_pow_entropy_source]
+scheme = 1
+network_genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+announced_height = 1
+header_codec = 1
+extraction_algorithm = 1
+minimum_confirmations = 100
+reorg_policy = 1
 
 [[validators]]
 name                = "buddhi"

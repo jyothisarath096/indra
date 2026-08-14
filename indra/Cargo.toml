@@ -29,6 +29,10 @@ hex                = { version = "0.4", default-features = false, features = ["a
 bip39              = { version = "2.0", default-features = false, features = ["rand"] }
 ed25519-dalek      = { version = "2.1", default-features = false, features = ["alloc"] }
 curve25519-dalek   = { version = "4.1", default-features = false, features = ["alloc", "digest"] }
+curve25519-dalek-v5 = { package = "curve25519-dalek", version = "5.0", default-features = false, features = ["alloc", "digest", "group", "legacy_compatibility"] }
+sha2-11            = { package = "sha2", version = "0.11", default-features = false }
+num-bigint         = "0.4"
+num-traits         = "0.2"
 ml-dsa             = { version = "0.1.1", features = ["alloc", "getrandom"] }
 proptest           = { version = "1.4", default-features = false, features = ["std"] }
 subtle             = { version = "2.5", default-features = false }

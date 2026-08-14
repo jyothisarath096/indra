@@ -51,10 +51,6 @@ pub struct VoteV1 {
     pub block_hash: Bytes32,
     /// Validator's identity.
     pub validator_id: Bytes32,
-    /// Hash of the commit-reveal election result observed by this validator.
-    ///
-    /// Present on non-nil precommit votes and absent on prevotes or nil votes.
-    pub election_result_hash: Option<Bytes32>,
     /// Hybrid signature over the canonical vote signing bytes.
     pub signature: HybridSignature,
 }
@@ -66,22 +62,10 @@ impl Encode for VoteV1 {
         self.step.encode(buf);
         self.block_hash.encode(buf);
         self.validator_id.encode(buf);
-        if let Some(hash) = self.election_result_hash {
-            1u8.encode(buf);
-            hash.encode(buf);
-        } else {
-            0u8.encode(buf);
-        }
         self.signature.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        8 + 4
-            + 1
-            + 32
-            + 32
-            + 1
-            + self.election_result_hash.map(|_| 32).unwrap_or(0)
-            + self.signature.encoded_len()
+        8 + 4 + 1 + 32 + 32 + self.signature.encoded_len()
     }
 }
 
@@ -92,19 +76,12 @@ impl Decode for VoteV1 {
         let step = VoteStep::decode(r)?;
         let block_hash = Bytes32::decode(r)?;
         let validator_id = Bytes32::decode(r)?;
-        let flag = u8::decode(r)?;
-        let election_result_hash = match flag {
-            0 => None,
-            1 => Some(Bytes32::decode(r)?),
-            b => return Err(IndraError::InvalidBool { byte: b }),
-        };
         Ok(Self {
             height,
             round,
             step,
             block_hash,
             validator_id,
-            election_result_hash,
             signature: HybridSignature::decode(r)?,
         })
     }
@@ -130,7 +107,6 @@ mod tests {
             step: VoteStep::Precommit,
             block_hash: Bytes32::from([0xAAu8; 32]),
             validator_id: Bytes32::from([0xBBu8; 32]),
-            election_result_hash: Some(Bytes32::from([0xCCu8; 32])),
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),

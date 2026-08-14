@@ -147,16 +147,6 @@ fn build_qc_from_votes(
     let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
     let mut pq_sigs = Vec::new();
     let mut classical_sigs = Vec::new();
-    let election_result_hash = votes.iter().find_map(|vote| vote.election_result_hash);
-    if votes
-        .iter()
-        .any(|vote| vote.election_result_hash != election_result_hash)
-    {
-        return Err(ConsensusError::CryptoError {
-            detail: "QC votes disagree on election_result_hash".to_string(),
-        });
-    }
-
     for vote in &votes {
         let Some(validator) = by_id.get(&vote.validator_id) else {
             continue;
@@ -196,7 +186,6 @@ fn build_qc_from_votes(
         height,
         round,
         block_hash,
-        election_result_hash,
         signer_bitfield,
         pq_signatures: pq_sigs,
         classical_signatures: classical_sigs,
@@ -250,7 +239,7 @@ fn signer_validators<'a>(
 /// appear in both A and B.
 ///
 /// Each per-signer signature is verified here over the exact (height,
-/// round, block_hash, election_result_hash, validator_id, chain_id)
+/// round, block_hash, validator_id, chain_id)
 /// tuple it signs. For A and B to disagree while both containing that
 /// honest validator's valid signature, the honest validator would have
 /// had to sign two different values for the same (height, round) — which
@@ -263,7 +252,7 @@ fn signer_validators<'a>(
 /// This is reinforced by independent defense-in-depth at the driver
 /// layer: `ConsensusDriver`'s QC-caching logic explicitly rejects a
 /// second QC arriving for an already-cached height if its round,
-/// block_hash, or election_result_hash disagrees with what's cached
+/// or block_hash disagrees with what's cached
 /// (see driver.rs, "conflicting last_qc_bytes").
 
 pub fn verify_qc(
@@ -327,7 +316,6 @@ pub fn verify_qc(
             VoteStep::Precommit,
             &qc.block_hash,
             &validator.validator_id,
-            qc.election_result_hash.as_ref(),
             chain_id,
         );
         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
@@ -400,7 +388,7 @@ pub fn verify_qc_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vote::{produce_vote, produce_vote_with_election_result};
+    use crate::vote::produce_vote;
     use indra_core::types::primitives::DEFAULT_CHAIN_ID;
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
@@ -446,131 +434,6 @@ mod tests {
         assert_eq!(qc.height, 1);
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.signer_count(), 1);
-    }
-
-    #[test]
-    fn qc_build_fails_loudly_on_election_result_hash_disagreement() {
-        let (v1, kp1) = make_validator(0x21, 0, 5_000);
-        let (v2, kp2) = make_validator(0x22, 1, 5_000);
-        let block_hash = Bytes32::from([0x21u8; 32]);
-        let election_hash = Bytes32::from([0xE1u8; 32]);
-        let vote_with_hash = produce_vote_with_election_result(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v1.validator_id,
-            Some(election_hash),
-            DEFAULT_CHAIN_ID,
-            &kp1,
-        )
-        .unwrap();
-        let vote_without_hash = produce_vote(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v2.validator_id,
-            DEFAULT_CHAIN_ID,
-            &kp2,
-        )
-        .unwrap();
-
-        let err = build_qc(
-            1,
-            0,
-            block_hash,
-            DEFAULT_CHAIN_ID,
-            &[v1, v2],
-            vec![&vote_with_hash, &vote_without_hash],
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            ConsensusError::CryptoError { detail } if detail.contains("QC votes disagree")
-        ));
-    }
-
-    #[test]
-    fn qc_build_succeeds_when_all_votes_agree_on_election_result_hash() {
-        let (v1, kp1) = make_validator(0x23, 0, 5_000);
-        let (v2, kp2) = make_validator(0x24, 1, 5_000);
-        let block_hash = Bytes32::from([0x23u8; 32]);
-        let election_hash = Bytes32::from([0xE2u8; 32]);
-        let vote1 = produce_vote_with_election_result(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v1.validator_id,
-            Some(election_hash),
-            DEFAULT_CHAIN_ID,
-            &kp1,
-        )
-        .unwrap();
-        let vote2 = produce_vote_with_election_result(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v2.validator_id,
-            Some(election_hash),
-            DEFAULT_CHAIN_ID,
-            &kp2,
-        )
-        .unwrap();
-
-        let qc = build_qc(
-            1,
-            0,
-            block_hash,
-            DEFAULT_CHAIN_ID,
-            &[v1, v2],
-            vec![&vote1, &vote2],
-        )
-        .unwrap();
-
-        assert_eq!(qc.election_result_hash, Some(election_hash));
-    }
-
-    #[test]
-    fn qc_build_succeeds_when_all_votes_have_none_election_result_hash() {
-        let (v1, kp1) = make_validator(0x25, 0, 5_000);
-        let (v2, kp2) = make_validator(0x26, 1, 5_000);
-        let block_hash = Bytes32::from([0x25u8; 32]);
-        let vote1 = produce_vote(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v1.validator_id,
-            DEFAULT_CHAIN_ID,
-            &kp1,
-        )
-        .unwrap();
-        let vote2 = produce_vote(
-            1,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            v2.validator_id,
-            DEFAULT_CHAIN_ID,
-            &kp2,
-        )
-        .unwrap();
-
-        let qc = build_qc(
-            1,
-            0,
-            block_hash,
-            DEFAULT_CHAIN_ID,
-            &[v1, v2],
-            vec![&vote1, &vote2],
-        )
-        .unwrap();
-
-        assert_eq!(qc.election_result_hash, None);
     }
 
     #[test]
@@ -620,7 +483,6 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
-            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -769,7 +631,6 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
-            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -795,7 +656,6 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x11u8; 32]),
-            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -830,7 +690,6 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
-            election_result_hash: None,
             signer_bitfield,
             pq_signatures: vec![
                 PQVoteSig {

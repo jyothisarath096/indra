@@ -795,14 +795,14 @@ fn is_address_acceptable_for_discovery(addr: &SocketAddr) -> bool {
 }
 
 fn proposal_matches_request(
-    block: &indra_core::types::block::BlockV1,
+    proposal: &indra_core::types::block::BlockProposalVNext,
     height: u64,
     round: u32,
     hash: &indra_core::Bytes32,
 ) -> bool {
-    block.header.height == height
-        && block.header.proposer_round == round
-        && block.header.block_hash() == *hash
+    proposal.block.header.height == height
+        && proposal.block.header.proposer_round == round
+        && proposal.block.header.block_hash() == *hash
 }
 
 fn record_peer_connected_event(
@@ -1734,7 +1734,7 @@ fn start_observer_runtime(
             eprintln!("[observer] listening on {}", observer_addr);
 
             let (block_tx, _) =
-                tokio::sync::broadcast::channel::<indra_core::types::block::BlockV1>(64);
+                tokio::sync::broadcast::channel::<indra_core::types::block::BlockProposalVNext>(64);
             tokio::spawn(observer_block_poller(Arc::clone(&driver), block_tx.clone()));
 
             loop {
@@ -1768,7 +1768,7 @@ fn start_observer_runtime(
 
 async fn observer_block_poller(
     driver: Arc<Mutex<ConsensusDriver>>,
-    block_tx: tokio::sync::broadcast::Sender<indra_core::types::block::BlockV1>,
+    block_tx: tokio::sync::broadcast::Sender<indra_core::types::block::BlockProposalVNext>,
 ) {
     let mut last_height = driver.lock().unwrap().height();
     loop {
@@ -1798,7 +1798,7 @@ async fn handle_observer_connection(
     addr: SocketAddr,
     driver: Arc<Mutex<ConsensusDriver>>,
     observer_count: Arc<AtomicUsize>,
-    block_rx: &mut tokio::sync::broadcast::Receiver<indra_core::types::block::BlockV1>,
+    block_rx: &mut tokio::sync::broadcast::Receiver<indra_core::types::block::BlockProposalVNext>,
 ) -> indra_network::NetworkResult<()> {
     let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL).await?;
     let mut stream = result.stream;
@@ -1868,13 +1868,9 @@ async fn handle_observer_connection(
                     }
                     Message::Pong(_) | Message::PeerList(_) => {}
                     Message::Vote(_)
-                    | Message::VrfCommit(_)
-                    | Message::VrfReveal(_)
                     | Message::RequestProposal { .. }
                     | Message::RequestQC { .. }
-                    | Message::QCResponse { .. }
-                    | Message::RequestVrfReveals { .. }
-                    | Message::VrfRevealsResponse { .. } => {
+                    | Message::QCResponse { .. } => {
                         eprintln!("[observer] consensus message from {}, closing", addr);
                         break;
                     }
@@ -1927,7 +1923,7 @@ fn observer_blocks_for_range(
     from_height: u64,
     to_height: u64,
 ) -> (
-    Vec<indra_core::types::block::BlockV1>,
+    Vec<indra_core::types::block::BlockProposalVNext>,
     Option<u64>,
     Option<u64>,
 ) {
@@ -1940,7 +1936,7 @@ fn blocks_for_range_with_availability(
     from_height: u64,
     to_height: u64,
 ) -> (
-    Vec<indra_core::types::block::BlockV1>,
+    Vec<indra_core::types::block::BlockProposalVNext>,
     Option<u64>,
     Option<u64>,
 ) {
@@ -2478,7 +2474,7 @@ fn main() {
                             Message::QCResponse { height, qc_bytes } => {
                                 let pending = driver.lock().unwrap().sync().provisional().cloned();
                                 if let Some(pending) = pending {
-                                    if pending.block.header.height != *height {
+                                    if pending.block.block.header.height != *height {
                                         gossip.score_peer(
                                             validator_id,
                                             indra_network::peer::ScoreEvent::InvalidMessage,
@@ -2538,7 +2534,7 @@ fn main() {
                                                     );
                                                     write_sync_recovery_diagnostic(
                                                         &sync_diagnostic_dir,
-                                                        finalized.block.header.height,
+                                                        finalized.block.block.header.height,
                                                         d.engine.state.tip_hash,
                                                     );
                                                 }
@@ -2767,7 +2763,7 @@ fn main() {
                             } => {
                                 let proposal = {
                                     let mut d = driver.lock().unwrap();
-                                    d.pending_block(hash)
+                                    d.pending_proposal(hash)
                                         .or_else(|| d.engine.block_store.get(*height).ok())
                                         .filter(|block| {
                                             proposal_matches_request(block, *height, *round, hash)
@@ -2831,10 +2827,10 @@ fn main() {
                                             .sync()
                                             .provisional()
                                             .map(|pending| {
-                                                pending.block.header.height.saturating_add(1)
+                                                pending.block.block.header.height.saturating_add(1)
                                             })
                                             .unwrap_or_else(|| d.height().saturating_add(1));
-                                        if block.header.height != expected_height {
+                                        if block.block.header.height != expected_height {
                                             scored_failures.push((
                                                 validator_id,
                                                 indra_network::peer::ScoreEvent::InvalidMessage,
@@ -2863,11 +2859,11 @@ fn main() {
                                                     {
                                                         eprintln!(
                                                             "[sync] finalized block {} failed durable commit: {}",
-                                                            finalized.block.header.height, error
+                                                            finalized.block.block.header.height, error
                                                         );
                                                         write_sync_recovery_diagnostic(
                                                             &sync_diagnostic_dir,
-                                                            finalized.block.header.height,
+                                                            finalized.block.block.header.height,
                                                             d.engine.state.tip_hash,
                                                         );
                                                         break;
@@ -2875,22 +2871,22 @@ fn main() {
                                                     imported_any = true;
                                                     request_provisional_qc = None;
                                                     if let Err(error) = d.promote_block_header_qc(
-                                                        &block,
+                                                        &block.block,
                                                         "sync-buffer",
                                                     ) {
                                                         eprintln!(
                                                             "[sync] finalized block {} but failed to persist its QC: {}",
-                                                            finalized.block.header.height, error
+                                                            finalized.block.block.header.height, error
                                                         );
                                                         write_sync_recovery_diagnostic(
                                                             &sync_diagnostic_dir,
-                                                            finalized.block.header.height,
+                                                            finalized.block.block.header.height,
                                                             d.engine.state.tip_hash,
                                                         );
                                                         break;
                                                     }
                                                     d.sync_mut().on_block_imported(
-                                                        finalized.block.header.height,
+                                                        finalized.block.block.header.height,
                                                     );
                                                     d.refresh_registered_voters();
                                                     d.reset_round();
@@ -2910,7 +2906,7 @@ fn main() {
                                                         "[sync] valid QC from {} certifies {}, not provisional {}; attributing fault to earlier source {}",
                                                         addr,
                                                         hex::encode(&certified_hash.0[..8]),
-                                                        hex::encode(&pending.block.header.block_hash().0[..8]),
+                                                        hex::encode(&pending.block.block.header.block_hash().0[..8]),
                                                         pending.source,
                                                     );
                                                     scored_failures.push((
@@ -2928,6 +2924,22 @@ fn main() {
                                                     );
                                                     break;
                                                 }
+                                                Err(PairVerificationError::ProvisionalProposalWrong(error)) => {
+                                                    eprintln!(
+                                                        "[sync] provisional proposal from {} failed independent authorization: {}",
+                                                        pending.source, error
+                                                    );
+                                                    scored_failures.push((
+                                                        pending.source_validator_id,
+                                                        indra_network::peer::ScoreEvent::InvalidMessage,
+                                                    ));
+                                                    d.sync_mut().clear_provisional();
+                                                    d.sync_mut().source_failed(
+                                                        pending.source_validator_id,
+                                                        pending.source,
+                                                    );
+                                                    break;
+                                                }
                                                 Err(
                                                     PairVerificationError::CertificateCarrierWrong(
                                                         error,
@@ -2935,7 +2947,7 @@ fn main() {
                                                 ) => {
                                                     eprintln!(
                                                         "[sync] invalid certificate carrier {} from {}: {}",
-                                                        block.header.height, addr, error
+                                                        block.block.header.height, addr, error
                                                     );
                                                     scored_failures.push((
                                                         validator_id,
@@ -2945,14 +2957,14 @@ fn main() {
                                                         .record_failure_at(validator_id, now);
                                                     let breaker_open =
                                                         d.sync_mut().note_expensive_failure(
-                                                            block.header.height,
+                                                            block.block.header.height,
                                                             validator_id,
                                                             now,
                                                         );
                                                     if breaker_open {
                                                         write_sync_recovery_diagnostic(
                                                             &sync_diagnostic_dir,
-                                                            block.header.height,
+                                                            block.block.header.height,
                                                             d.engine.state.tip_hash,
                                                         );
                                                     }
@@ -2962,10 +2974,11 @@ fn main() {
                                             }
                                         }
 
-                                        if d.sync_mut().circuit_open(block.header.height, now) {
+                                        if d.sync_mut().circuit_open(block.block.header.height, now)
+                                        {
                                             eprintln!(
                                                 "[sync] expensive-validation breaker open at height {}",
-                                                block.header.height
+                                                block.block.header.height
                                             );
                                             break;
                                         }
@@ -2976,7 +2989,7 @@ fn main() {
                                             d.engine.network_qc_verifier(),
                                         ) {
                                             Ok(prepared) => {
-                                                let staged_height = block.header.height;
+                                                let staged_height = block.block.header.height;
                                                 d.sync_mut().stage_provisional(
                                                     block.clone(),
                                                     prepared,
@@ -2990,7 +3003,7 @@ fn main() {
                                             Err(error) => {
                                                 eprintln!(
                                                     "[sync] failed to validate provisional block {} from {}: {}",
-                                                    block.header.height, addr, error
+                                                    block.block.header.height, addr, error
                                                 );
                                                 scored_failures.push((
                                                     validator_id,
@@ -2999,14 +3012,14 @@ fn main() {
                                                 sync_cooldowns.record_failure_at(validator_id, now);
                                                 let breaker_open =
                                                     d.sync_mut().note_expensive_failure(
-                                                        block.header.height,
+                                                        block.block.header.height,
                                                         validator_id,
                                                         now,
                                                     );
                                                 if breaker_open {
                                                     write_sync_recovery_diagnostic(
                                                         &sync_diagnostic_dir,
-                                                        block.header.height,
+                                                        block.block.header.height,
                                                         d.engine.state.tip_hash,
                                                     );
                                                 }
@@ -3226,8 +3239,8 @@ fn main() {
                 if sync_target.is_none() {
                     match phase {
                         RoundPhase::Propose => {
-                            let (should_propose, next_height, proposal_round, vrf_actions) = {
-                                let mut d = driver.lock().unwrap();
+                            let (should_propose, next_height, proposal_round) = {
+                                let d = driver.lock().unwrap();
                                 let height = d.engine.state.height + 1;
                                 let round = d.current_round();
                                 match proposer_election_for_slot(&d, height, round) {
@@ -3236,48 +3249,27 @@ fn main() {
                                             "[consensus] proposal eligibility unavailable at height={} round={}: {}",
                                             height, round, error,
                                         );
-                                        (false, height, round, Vec::new())
+                                        (false, height, round)
                                     }
                                     Ok(election) if election.candidates.is_empty() => (
                                         d.can_propose()
                                             && d.engine.config.bootstrap_peers.is_empty(),
                                         height,
                                         round,
-                                        Vec::new(),
                                     ),
                                     Ok(election) => {
-                                        let vrf_actions =
-                                            d.ensure_vrf_election_for_round(&election);
-                                        let election_result = d.vrf_election_result(height, round);
-                                        let should = d.can_propose()
-                                            && election_result.is_some_and(|result| {
-                                                Some(result.elected_validator_id)
-                                                    == d.engine.validator_id()
-                                            });
-                                        (should, height, round, vrf_actions)
+                                        let should =
+                                            d.can_propose() && d.engine.is_proposer(&election);
+                                        (should, height, round)
                                     }
                                 }
                             };
-                            if !vrf_actions.is_empty() {
-                                let previous_height = driver.lock().unwrap().height();
-                                process_driver_actions(
-                                    &driver,
-                                    &gossip,
-                                    &height_tx,
-                                    &handshake_config,
-                                    previous_height,
-                                    vrf_actions,
-                                    &metrics_state,
-                                    &last_block_timestamp,
-                                );
-                            }
 
-                            let already_have_proposal = proposed_at_slot
-                                == Some((next_height, proposal_round))
-                                || driver
-                                    .lock()
-                                    .unwrap()
-                                    .has_accepted_proposal_for_height(next_height);
+                            // Observing another eligible proposal does not cancel our own
+                            // eligibility. Multiple proposals are collected until the
+                            // propose timeout and resolved by full-width priority.
+                            let already_have_proposal =
+                                proposed_at_slot == Some((next_height, proposal_round));
                             let valid_reproposal = if should_propose {
                                 driver.lock().unwrap().take_valid_block_for_reproposal()
                             } else {
@@ -3354,18 +3346,13 @@ fn main() {
                                                 continue;
                                             }
                                         };
-                                        let election_result = d.vrf_election_result(height, round);
-                                        if !election_result.is_some_and(|result| {
-                                            Some(result.elected_validator_id)
-                                                == d.engine.validator_id()
-                                        }) {
+                                        if !d.engine.is_proposer(&election) {
                                             eprintln!(
                                                 "[consensus] proposal skipped at height={} round={}: no current quorum-backed local election result for this validator",
                                                 height, round,
                                             );
                                             None
                                         } else {
-                                            let vrf_reveals = d.vrf_reveal_evidence(height, round);
                                             let timestamp = std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
@@ -3387,8 +3374,6 @@ fn main() {
                                                     &election,
                                                     valid_block.header.timestamp,
                                                     last_qc_bytes,
-                                                    election_result,
-                                                    vrf_reveals.clone(),
                                                 )
                                             } else {
                                                 d.engine.propose(
@@ -3396,18 +3381,16 @@ fn main() {
                                                     timestamp,
                                                     last_qc_bytes,
                                                     polc_round,
-                                                    election_result,
-                                                    vrf_reveals.clone(),
                                                 )
                                             };
                                             match proposal_result {
-                                                Ok(block) => {
+                                                Ok(proposal) => {
                                                     let actions =
                                                         d.process(DriverEvent::InboundBlock {
                                                             from: None,
-                                                            block: block.clone(),
+                                                            proposal: proposal.clone(),
                                                         });
-                                                    Some((block, actions))
+                                                    Some((proposal, actions))
                                                 }
                                                 Err(indra_node::error::NodeError::MissingQc {
                                                     height,
@@ -3430,8 +3413,10 @@ fn main() {
                                 };
 
                                 if let Some((block, actions)) = proposal {
-                                    proposed_at_slot =
-                                        Some((block.header.height, block.header.proposer_round));
+                                    proposed_at_slot = Some((
+                                        block.block.header.height,
+                                        block.block.header.proposer_round,
+                                    ));
                                     process_driver_actions(
                                         &driver,
                                         &gossip,
@@ -3734,10 +3719,10 @@ fn process_driver_actions(
     let mut recorded_commit = false;
     for action in actions {
         if let DriverAction::ActivateBufferedProposal(block) = action {
-            let actions2 = driver
-                .lock()
-                .unwrap()
-                .process(DriverEvent::InboundBlock { from: None, block });
+            let actions2 = driver.lock().unwrap().process(DriverEvent::InboundBlock {
+                from: None,
+                proposal: block,
+            });
             process_driver_actions(
                 driver,
                 gossip,
@@ -3773,33 +3758,6 @@ fn process_driver_actions(
                 peers.len()
             );
             let msg = Message::RequestQC { height: *height };
-            for peer in &peers {
-                if let Some(peer_validator_id) = gossip.validator_for_addr(peer) {
-                    gossip.send_to_validator(peer_validator_id, &msg);
-                }
-            }
-            continue;
-        }
-
-        if let DriverAction::RequestVrfReveals {
-            height,
-            round,
-            missing_validator_ids,
-        } = &action
-        {
-            let peers: Vec<SocketAddr> = gossip.connected_addrs();
-            eprintln!(
-                "[vrf] requesting {} reveal(s) for height={} round={} from {} peers",
-                missing_validator_ids.len(),
-                height,
-                round,
-                peers.len()
-            );
-            let msg = Message::RequestVrfReveals {
-                height: *height,
-                round: *round,
-                validator_ids: missing_validator_ids.clone(),
-            };
             for peer in &peers {
                 if let Some(peer_validator_id) = gossip.validator_for_addr(peer) {
                     gossip.send_to_validator(peer_validator_id, &msg);
@@ -3910,23 +3868,6 @@ fn process_driver_actions(
             let msg = Message::QCResponse {
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
-            };
-            if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
-                gossip.send_to_validator(peer_validator_id, &msg);
-            }
-        }
-
-        if let DriverAction::SendVrfRevealsResponse {
-            to,
-            height,
-            round,
-            reveals,
-        } = &action
-        {
-            let msg = Message::VrfRevealsResponse {
-                height: *height,
-                round: *round,
-                reveals: reveals.clone(),
             };
             if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
                 gossip.send_to_validator(peer_validator_id, &msg);
@@ -4441,7 +4382,7 @@ fn reserve_rpc_ip_connection(counts: &mut HashMap<IpAddr, u64>, ip: IpAddr, cap:
 
 struct RpcSnapshot {
     read: Arc<indra_node::rpc_snapshot::RpcReadSnapshot>,
-    requested_blocks: HashMap<u64, indra_core::types::block::BlockV1>,
+    requested_blocks: HashMap<u64, indra_core::types::block::BlockVNext>,
     latest_epoch: Option<u64>,
     epoch_records: HashMap<u64, indra_core::EpochRecord>,
 }
@@ -4517,7 +4458,7 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
     fn get_block_by_height(
         &self,
         height: u64,
-    ) -> Result<Option<indra_core::types::block::BlockV1>, String> {
+    ) -> Result<Option<indra_core::types::block::BlockVNext>, String> {
         Ok(self.requested_blocks.get(&height).cloned())
     }
 
@@ -4567,7 +4508,7 @@ fn snapshot_rpc_state(
         for height in block_heights {
             match storage.blocks.get(height) {
                 Ok(block) => {
-                    requested_blocks.insert(height, block);
+                    requested_blocks.insert(height, block.block);
                 }
                 Err(indra_storage::StorageError::BlockNotFound { .. })
                 | Err(indra_storage::StorageError::BlockPruned { .. }) => {}
@@ -5592,7 +5533,7 @@ mod tests {
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
                 hex::encode(
                     indra_core::types::crypto::hybrid_identity_id(
                         &classical.public_key().0,
@@ -5636,6 +5577,9 @@ mod tests {
                 hybrid_classical_pk: Some(public.classical.0),
                 hybrid_pq_pk: Some(public.pq.0.to_vec()),
                 vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
                 stake_spark: 9_000_000,
                 status: indra_state::ValidatorStatus::Active,
                 registered_epoch: 0,
@@ -5663,7 +5607,7 @@ mod tests {
         left: &indra_consensus::proposer::ProposerElection,
         right: &indra_consensus::proposer::ProposerElection,
     ) {
-        assert_eq!(left.epoch_seed, right.epoch_seed);
+        assert_eq!(left.election_seed, right.election_seed);
         assert_eq!(left.height, right.height);
         assert_eq!(left.round, right.round);
         assert_eq!(left.candidates.len(), right.candidates.len());
@@ -7037,7 +6981,7 @@ mod tests {
                 &chain, 0, true, 126_677, 50_000,
             )
             .load(),
-            requested_blocks: HashMap::from([(height, block)]),
+            requested_blocks: HashMap::from([(height, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
         };
@@ -7061,8 +7005,8 @@ mod tests {
     fn rpc_snapshot_serves_requested_block_without_tip_stub() {
         let mut chain = indra_state::ChainState::new_genesis();
         chain.height = 2;
-        let block = indra_core::types::block::BlockV1 {
-            header: indra_core::types::block::BlockHeaderV1 {
+        let unsigned = indra_core::types::block::BlockVNext {
+            header: indra_core::types::block::BlockHeaderVNext {
                 protocol_version: indra_core::ProtocolVersion::CURRENT,
                 height: 1,
                 prev_hash: indra_core::Bytes32::from([0x10; 32]),
@@ -7074,24 +7018,34 @@ mod tests {
                 base_fee: 101,
                 proposer_round: 0,
                 polc_round: indra_core::types::block::NO_POLC_ROUND,
-                proposer_vrf_output: indra_core::Bytes32::from([0x15; 32]),
+                proposer_id: indra_core::Bytes32::from([0x15; 32]),
+                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: indra_core::types::primitives::Bytes64([0x15; 64]),
+                proposer_vrf_output: indra_core::VariableBytes::from_slice(&[0x15; 64]).unwrap(),
                 proposer_vrf_proof: indra_core::VariableBytes::<
-                    { indra_core::types::primitives::MAX_VRF_PROOF_BYTES },
-                >::from_slice(&[0x16; 64])
+                    { indra_core::types::primitives::MAX_STANDARD_VRF_PROOF_BYTES },
+                >::from_slice(&[0x16; 80])
                 .unwrap(),
+                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64([0x17; 64]),
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: None,
             },
             transactions: Vec::new(),
             slashing_evidence: Vec::new(),
             governance_ops: Vec::new(),
             staking_ops: Vec::new(),
-            vrf_reveals: Vec::new(),
+        };
+        let block = indra_core::types::block::BlockProposalVNext {
+            block: unsigned,
+            proposer_authorization: indra_core::types::crypto::HybridSignature {
+                classical_sig: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+                pq_sig: indra_core::VariableBytes::from_slice(&[]).unwrap(),
+            },
         };
         let expected_hash = hex::encode(block.header.block_hash().0);
         let snapshot = RpcSnapshot {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).load(),
-            requested_blocks: HashMap::from([(1, block)]),
+            requested_blocks: HashMap::from([(1, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
         };
@@ -7437,12 +7391,15 @@ mod tests {
         assert!(is_address_acceptable_for_discovery(&addr));
     }
 
-    fn request_proposal_test_block() -> indra_core::types::block::BlockV1 {
-        use indra_core::types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND};
+    fn request_proposal_test_block() -> indra_core::types::block::BlockProposalVNext {
+        use indra_core::types::block::{
+            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+            NO_POLC_ROUND,
+        };
         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
 
-        BlockV1 {
-            header: BlockHeaderV1 {
+        let block = BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion::CURRENT,
                 height: 7,
                 prev_hash: Bytes32::from([0x01; 32]),
@@ -7454,25 +7411,38 @@ mod tests {
                 base_fee: 1,
                 proposer_round: 3,
                 polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::from([0x05; 32]),
-                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                proposer_id: Bytes32::from([0x05; 32]),
+                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: indra_core::types::primitives::Bytes64([0x05; 64]),
+                proposer_vrf_output: VariableBytes::from_slice(&[0x05; 64]).unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[0x06; 80]).unwrap(),
+                sortition_claim: SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64([0x07; 64]),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
+        };
+        BlockProposalVNext {
+            block,
+            proposer_authorization: indra_core::types::crypto::HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[]).unwrap(),
+            },
         }
     }
 
-    fn block_response_test_block(height: u64) -> indra_core::types::block::BlockV1 {
-        use indra_core::types::block::{BlockHeaderV1, BlockV1, NO_POLC_ROUND};
+    fn block_response_test_block(height: u64) -> indra_core::types::block::BlockProposalVNext {
+        use indra_core::types::block::{
+            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+            NO_POLC_ROUND,
+        };
         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
 
-        BlockV1 {
-            header: BlockHeaderV1 {
+        let block = BlockVNext {
+            header: BlockHeaderVNext {
                 protocol_version: ProtocolVersion::CURRENT,
                 height,
                 prev_hash: Bytes32::from([0x01; 32]),
@@ -7484,16 +7454,26 @@ mod tests {
                 base_fee: 1,
                 proposer_round: 0,
                 polc_round: NO_POLC_ROUND,
-                proposer_vrf_output: Bytes32::ZERO,
-                proposer_vrf_proof: VariableBytes::from_slice(&[]).unwrap(),
+                proposer_id: Bytes32::ZERO,
+                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                election_seed: indra_core::types::primitives::Bytes64::ZERO,
+                proposer_vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+                proposer_vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                sortition_claim: SortitionClaimV1::PraosThreshold,
+                proposer_priority: indra_core::types::primitives::Bytes64::ZERO,
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
-                election_result_hash: None,
             },
             transactions: vec![],
             slashing_evidence: vec![],
             governance_ops: vec![],
             staking_ops: vec![],
-            vrf_reveals: vec![],
+        };
+        BlockProposalVNext {
+            block,
+            proposer_authorization: indra_core::types::crypto::HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[]).unwrap(),
+            },
         }
     }
 

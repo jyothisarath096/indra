@@ -52,7 +52,7 @@ pub fn bench_block_decode(iterations: u64) {
 
     let r = bench("block_decode_200tx", iterations, || {
         let mut reader = ByteReader::new(&encoded);
-        let _ = indra_core::types::block::BlockV1::decode(&mut reader);
+        let _ = indra_core::types::block::BlockVNext::decode(&mut reader);
     });
     r.print();
     r.assert_faster_than(Duration::from_millis(5));

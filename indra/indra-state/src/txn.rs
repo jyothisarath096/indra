@@ -29,7 +29,7 @@ use crate::{
     utxo::{UtxoEntry, UtxoSet},
     validator::{EvictedValidatorTombstoneV2, ValidatorSet},
 };
-use indra_core::types::crypto::HybridPubKey;
+use indra_core::types::{crypto::HybridPubKey, primitives::Bytes64};
 
 #[derive(Clone)]
 struct ScalarSnapshot {
@@ -43,6 +43,8 @@ struct ScalarSnapshot {
     epoch_fees_burned: u64,
     epoch_slashed_spark: u64,
     epoch_slash_event_count: u32,
+    election_seed: Bytes64,
+    election_seed_height: u64,
 }
 
 enum UndoEntry {
@@ -407,6 +409,8 @@ impl<'a> StateTxn<'a> {
             epoch_fees_burned: self.state.epoch_fees_burned,
             epoch_slashed_spark: self.state.epoch_slashed_spark,
             epoch_slash_event_count: self.state.epoch_slash_event_count,
+            election_seed: self.state.election_seed,
+            election_seed_height: self.state.election_seed_height,
         });
         self.undo.push(UndoEntry::Scalars(snapshot));
         self.scalars_recorded = true;
@@ -610,6 +614,14 @@ impl<'a> StateTxn<'a> {
         self.after_mutation()
     }
 
+    /// Publish the deterministic seed used for the next consensus height.
+    pub(crate) fn set_election_seed(&mut self, seed: Bytes64, height: u64) -> StateResult<()> {
+        self.record_scalars();
+        self.state.election_seed = seed;
+        self.state.election_seed_height = height;
+        self.after_mutation()
+    }
+
     /// Add fee accounting.
     pub(crate) fn apply_fee_accounting(
         &mut self,
@@ -775,6 +787,8 @@ impl<'a> StateTxn<'a> {
                     self.state.epoch_fees_burned = snapshot.epoch_fees_burned;
                     self.state.epoch_slashed_spark = snapshot.epoch_slashed_spark;
                     self.state.epoch_slash_event_count = snapshot.epoch_slash_event_count;
+                    self.state.election_seed = snapshot.election_seed;
+                    self.state.election_seed_height = snapshot.election_seed_height;
                 }
                 UndoEntry::UtxoSpent(entry) => self
                     .state
@@ -987,8 +1001,11 @@ mod tests {
                     public.classical.0,
                     public.pq.0,
                     vrf.public_key(),
+                    indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                    0,
                 )
                 .unwrap()],
+                1,
             )
             .unwrap()
         };
