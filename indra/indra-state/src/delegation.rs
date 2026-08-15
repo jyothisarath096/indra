@@ -173,7 +173,13 @@ fn apply_staking_op_mode(
                 "cold authorization is valid only for an Active validator".into(),
             ));
         }
-        let expected_nonce = state.staking_nonces.get(&signer_id).copied().unwrap_or(0) + 1;
+        let expected_nonce = state
+            .staking_nonces
+            .get(&signer_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| StateError::InvalidStakingOp("staking nonce exhausted".into()))?;
         if op.nonce != expected_nonce {
             return Err(StateError::StakingNonceInvalid {
                 expected: expected_nonce,
@@ -226,7 +232,8 @@ fn apply_staking_op_mode(
                 validator_id,
                 vrf_pubkey,
                 activation_epoch_id,
-                proof_of_possession,
+                vrf_possession_output,
+                vrf_possession_proof,
                 ..
             } => {
                 let validator = state
@@ -244,14 +251,24 @@ fn apply_staking_op_mode(
                     }
                 })?;
                 verify_staking_sig(&signing_bytes, &op.signature, &classical, pq)?;
-                let pop = StakingOp::vrf_pop_signing_bytes(
+                let challenge = StakingOp::vrf_possession_challenge(
                     chain_id,
                     validator_id,
                     vrf_pubkey,
                     *activation_epoch_id,
                 )
                 .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
-                verify_staking_sig(&pop, proof_of_possession, &classical, pq)?;
+                indra_crypto::vrf_verify(
+                    &vrf_pubkey.0,
+                    &challenge,
+                    &indra_crypto::VrfOutput(vrf_possession_output.0),
+                    &indra_crypto::VrfProof(vrf_possession_proof.as_slice().to_vec()),
+                )
+                .map_err(|_| {
+                    StateError::InvalidStakingOp(
+                        "VRF secret-key possession proof is invalid".into(),
+                    )
+                })?;
             }
             StakingOpBody::Delegate {
                 delegator_pubkey, ..
@@ -431,6 +448,12 @@ fn apply_staking_op_mode(
                 .validators
                 .get_mut(validator_id)
                 .ok_or(StateError::ValidatorNotFound)?;
+            if !matches!(
+                validator.status,
+                ValidatorStatus::Active | ValidatorStatus::Registered
+            ) {
+                return Err(StateError::ValidatorNotActive);
+            }
             if let (Some(pending), Some(activation)) = (
                 validator.pending_vrf_pk,
                 validator.pending_vrf_activation_epoch,
@@ -793,8 +816,6 @@ fn apply_register_validator(
         status: ValidatorStatus::Registered,
         registered_epoch: current_epoch,
         last_active_epoch: current_epoch,
-        pending_rewards: 0,
-        rewards_last_epoch: current_epoch,
         slashed_offense_id: None,
         commission_bps,
         pending_commission_bps: None,
@@ -1169,6 +1190,16 @@ fn apply_self_stake(
         )));
     }
 
+    let updated_stake_spark = state
+        .validators
+        .get(&validator_id)
+        .ok_or(StateError::ValidatorNotFound)?
+        .stake_spark
+        .checked_add(amount_spark)
+        .ok_or(StateError::InvariantViolation {
+            message: "validator self-stake cache overflow",
+        })?;
+
     crate::stake_positions::deposit_stake_position(
         state,
         validator_id,
@@ -1182,7 +1213,7 @@ fn apply_self_stake(
     )?;
     let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
-        v.stake_spark = v.stake_spark.saturating_add(amount_spark);
+        v.stake_spark = updated_stake_spark;
         updated_validator = Some(v.clone());
     }
     if let (Some(commitment), Some(validator)) =
@@ -1425,8 +1456,11 @@ fn apply_set_commission(
 
     let pending = u16::try_from(new_commission_bps)
         .map_err(|_| StateError::InvalidStakingOp("commission exceeds u16 range".into()))?;
-    let effective_epoch =
-        epoch_for_height(current_height).saturating_add(COMMISSION_CHANGE_DELAY_EPOCHS);
+    let effective_epoch = epoch_for_height(current_height)
+        .checked_add(COMMISSION_CHANGE_DELAY_EPOCHS)
+        .ok_or_else(|| {
+            StateError::InvalidStakingOp("commission activation epoch overflow".into())
+        })?;
     validator.pending_commission_bps = Some(pending);
     validator.pending_commission_effective_epoch = Some(effective_epoch);
     let updated_validator = validator.clone();
@@ -1658,10 +1692,10 @@ mod tests {
             | StakingOpBody::SetAutoDelegate {
                 cold_authorization, ..
             } => {
-                *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
+                *cold_authorization = indra_core::types::staking::ColdStakingAuthorization {
                     cold_key_version: 1,
                     cold_nonce: nonce,
-                });
+                };
             }
             StakingOpBody::ExitStakePosition {
                 custody:
@@ -1864,8 +1898,6 @@ mod tests {
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,
@@ -1887,24 +1919,25 @@ mod tests {
         vrf_pubkey: Bytes32,
         activation_epoch_id: u64,
         signer: &HybridKeypair,
-        pop_signer: &HybridKeypair,
+        vrf_keypair: &indra_crypto::VrfKeypair,
         chain_id: &str,
     ) -> StakingOp {
-        let pop = StakingOp::vrf_pop_signing_bytes(
+        let challenge = StakingOp::vrf_possession_challenge(
             chain_id,
             &validator_id,
             &vrf_pubkey,
             activation_epoch_id,
         )
         .unwrap();
-        let proof = wire_signature(&pop_signer.sign(&pop).unwrap());
+        let (output, proof) = indra_crypto::vrf_prove(vrf_keypair, &challenge);
         signed_op(
             StakingOpBody::RegisterVrfKey {
                 validator_id,
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 vrf_pubkey,
                 activation_epoch_id,
-                proof_of_possession: proof,
+                vrf_possession_output: indra_core::types::primitives::Bytes64(output.0),
+                vrf_possession_proof: VariableBytes::from_slice(&proof.0).unwrap(),
             },
             1,
             signer,
@@ -1913,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn vrf_rotation_is_snapshot_delayed_and_mixed_key_pop_is_rejected() {
+    fn vrf_rotation_is_snapshot_delayed_and_public_key_squatting_is_rejected() {
         let mut state = ChainState::new_genesis();
         state.active_slot_coefficient_numerator = 1u64 << 63;
         let (validator_id, signer) = make_active_validator(&mut state, 31);
@@ -1922,8 +1955,16 @@ mod tests {
         state.finalize_genesis().unwrap();
         let genesis_snapshot = state.snapshot_for_consensus_height(1).unwrap().clone();
 
-        let new_vrf = Bytes32::from(indra_crypto::VrfKeypair::from_seed(&[99; 32]).public_key());
-        let op = vrf_registration_op(validator_id, new_vrf, 1, &signer, &signer, &state.chain_id);
+        let new_vrf_keypair = indra_crypto::VrfKeypair::from_seed(&[99; 32]);
+        let new_vrf = Bytes32::from(new_vrf_keypair.public_key());
+        let op = vrf_registration_op(
+            validator_id,
+            new_vrf,
+            1,
+            &signer,
+            &new_vrf_keypair,
+            &state.chain_id,
+        );
         let chain_id = state.chain_id.clone();
         apply_staking_op(&mut state, &op, &chain_id, 1).unwrap();
         assert_eq!(
@@ -1935,30 +1976,87 @@ mod tests {
         assert_eq!(activated.vrf_pk, new_vrf.0);
         assert_eq!(activated.vrf_key_activation_epoch, 1);
 
-        let attacker = keypair(77);
-        let replacement =
-            Bytes32::from(indra_crypto::VrfKeypair::from_seed(&[100; 32]).public_key());
-        let pop =
-            StakingOp::vrf_pop_signing_bytes(&chain_id, &validator_id, &replacement, 1).unwrap();
-        let victim_sig = signer.sign(&pop).unwrap();
-        let attacker_sig = attacker.sign(&pop).unwrap();
-        let mixed = HybridSignature {
-            classical_sig: VariableBytes::from_slice(&victim_sig.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&attacker_sig.pq.0).unwrap(),
-        };
+        let victim_vrf = indra_crypto::VrfKeypair::from_seed(&[100; 32]);
+        let replacement = Bytes32::from(victim_vrf.public_key());
+        let attacker_vrf = indra_crypto::VrfKeypair::from_seed(&[101; 32]);
+        let challenge =
+            StakingOp::vrf_possession_challenge(&chain_id, &validator_id, &replacement, 1).unwrap();
+        let (attacker_output, attacker_proof) = indra_crypto::vrf_prove(&attacker_vrf, &challenge);
         let bad = signed_op(
             StakingOpBody::RegisterVrfKey {
                 validator_id,
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 vrf_pubkey: replacement,
                 activation_epoch_id: 1,
-                proof_of_possession: mixed,
+                vrf_possession_output: indra_core::types::primitives::Bytes64(attacker_output.0),
+                vrf_possession_proof: VariableBytes::from_slice(&attacker_proof.0).unwrap(),
             },
             2,
             &signer,
             &chain_id,
         );
         assert!(apply_staking_op(&mut state, &bad, &chain_id, 1).is_err());
+    }
+
+    #[test]
+    fn vrf_registration_rejects_slashed_and_exited_validators() {
+        for status in [ValidatorStatus::Slashed, ValidatorStatus::Exited] {
+            let mut state = ChainState::new_genesis();
+            let (validator_id, signer) = make_active_validator(&mut state, 0x6A);
+            state.validators.get_mut(&validator_id).unwrap().status = status;
+            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x6B; 32]);
+            let op = vrf_registration_op(
+                validator_id,
+                Bytes32::from(vrf.public_key()),
+                1,
+                &signer,
+                &vrf,
+                &state.chain_id,
+            );
+            let chain_id = state.chain_id.clone();
+            assert!(matches!(
+                apply_staking_op(&mut state, &op, &chain_id, 1),
+                Err(StateError::ValidatorNotActive)
+            ));
+        }
+    }
+
+    #[test]
+    fn hot_staking_nonce_exhaustion_fails_closed() {
+        let mut state = ChainState::new_genesis();
+        let signer = keypair(0x6C);
+        let signer_id = pubkey_from_keypair(&signer).identity_id();
+        state.staking_nonces.insert(signer_id, u64::MAX);
+        let op = delegate_op(&state, Bytes32::from([0x6D; 32]), Bytes32::ZERO, &signer, 0);
+        let chain_id = state.chain_id.clone();
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(reason)) if reason == "staking nonce exhausted"
+        ));
+    }
+
+    #[test]
+    fn self_stake_cache_overflow_fails_before_consuming_utxo() {
+        let mut state = ChainState::new_genesis();
+        let (validator_id, hot) = make_active_validator(&mut state, 0x6E);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = u64::MAX;
+        let cold_owner = resolve_active_validator_cold_pubkey(&state, &validator_id).unwrap();
+        let deposit = insert_delegator_utxo(
+            &mut state,
+            cold_owner,
+            indra_core::types::primitives::DUST_LIMIT_SPARK,
+            0x6F,
+        );
+        let before = state.clone();
+        let result = apply_self_stake(
+            &mut state,
+            deposit,
+            &pubkey_from_keypair(&hot),
+            1,
+            Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
+        );
+        assert!(matches!(result, Err(StateError::InvariantViolation { .. })));
+        assert_eq!(state, before);
     }
 
     fn delegate_op(
@@ -1990,7 +2088,10 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(validator_keypair),
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                },
             },
             nonce,
             validator_keypair,
@@ -2009,7 +2110,10 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id,
                 target_validator_id,
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                },
             },
             nonce,
             validator_keypair,
@@ -2028,7 +2132,10 @@ mod tests {
             StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps,
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                },
             },
             nonce,
             validator_keypair,
@@ -2155,7 +2262,10 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: attacker_pubkey,
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                },
             },
             1,
             &attacker_keypair,
@@ -2309,7 +2419,10 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey,
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                },
             },
             1,
             &wrong_keypair,
@@ -2803,10 +2916,10 @@ mod tests {
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey: pubkey_from_keypair(hot),
-                cold_authorization: Some(indra_core::types::staking::ColdStakingAuthorization {
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
                     cold_key_version,
                     cold_nonce,
-                }),
+                },
             },
             cold,
             &state.chain_id,

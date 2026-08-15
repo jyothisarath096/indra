@@ -323,10 +323,8 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> 
     let mut value = Vec::new();
     value.extend_from_slice(&validator.validator_id.0);
     value.extend_from_slice(&validator.stake_spark.to_le_bytes());
-    value.extend_from_slice(&validator.pending_rewards.to_le_bytes());
     value.extend_from_slice(&validator.registered_epoch.to_le_bytes());
     value.extend_from_slice(&validator.last_active_epoch.to_le_bytes());
-    value.extend_from_slice(&validator.rewards_last_epoch.to_le_bytes());
     value.push(u8::from(validator.slashed_offense_id.is_some()));
     if let Some(offense_id) = validator.slashed_offense_id {
         value.extend_from_slice(offense_id.as_ref());
@@ -340,12 +338,6 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> 
     match validator.status {
         crate::validator::ValidatorStatus::Registered => value.push(0),
         crate::validator::ValidatorStatus::Active => value.push(1),
-        crate::validator::ValidatorStatus::Unbonding {
-            unbonding_end_epoch,
-        } => {
-            value.push(2);
-            value.extend_from_slice(&unbonding_end_epoch.to_le_bytes());
-        }
         crate::validator::ValidatorStatus::Slashed => value.push(3),
         crate::validator::ValidatorStatus::Exited => value.push(4),
     }
@@ -428,8 +420,6 @@ mod tests {
             status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 1,
             last_active_epoch: 1,
-            pending_rewards: 0,
-            rewards_last_epoch: 1,
             slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,

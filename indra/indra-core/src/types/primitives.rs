@@ -48,9 +48,6 @@ pub const SLASH_EVIDENCE_WINDOW_EPOCHS: u64 = 500;
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
 pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
 
-/// Epochs within which a validator must claim rewards before expiry.
-pub const CLAIM_WINDOW_EPOCHS: u64 = 175_200; // ~10 years — rewards rarely expire in practice
-
 /// Hard floor on total round time — immutable, not governable.
 pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 

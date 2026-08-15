@@ -12,7 +12,10 @@ use crate::{
         authorization::AuthorizationEnvelope,
         block::VrfSuiteV1,
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
-        primitives::{Bytes32, MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN},
+        primitives::{
+            Bytes32, Bytes64, VariableBytes, MAX_STANDARD_VRF_PROOF_BYTES,
+            MAX_VALIDATOR_NETWORK_ADDR_LEN, STAKING_OP_DOMAIN,
+        },
         stake_position::PositionCustodyV1,
     },
 };
@@ -27,11 +30,8 @@ const TAG_DELEGATOR_CLAIM_REWARDS: u8 = 3;
 const TAG_COLD_VALIDATOR_CLAIM_REWARDS: u8 = 4;
 const TAG_REGISTER_VALIDATOR: u8 = 5;
 const TAG_ROTATE_VALIDATOR_COLD_KEY: u8 = 6;
-const TAG_HOT_SET_COMMISSION: u8 = 7;
 const TAG_COLD_SET_COMMISSION: u8 = 8;
-const TAG_HOT_SELF_STAKE: u8 = 9;
 const TAG_COLD_SELF_STAKE: u8 = 10;
-const TAG_HOT_SET_AUTO_DELEGATE: u8 = 11;
 const TAG_COLD_SET_AUTO_DELEGATE: u8 = 12;
 const TAG_UPDATE_NETWORK_ADDRESS: u8 = 13;
 const TAG_REGISTER_VRF_KEY: u8 = 14;
@@ -175,8 +175,8 @@ pub enum StakingOpBody {
         validator_id: Bytes32,
         /// New commission rate in basis points.
         new_commission_bps: u32,
-        /// Present only for an enrolled validator.
-        cold_authorization: Option<ColdStakingAuthorization>,
+        /// Mandatory validator-cold authorization.
+        cold_authorization: ColdStakingAuthorization,
     },
 
     /// Bond a validator-owned UTXO as validator self-stake.
@@ -185,8 +185,8 @@ pub enum StakingOpBody {
         deposit_utxo_id: Bytes32,
         /// Validator's public key.
         validator_pubkey: HybridPubKey,
-        /// Present only for an enrolled validator.
-        cold_authorization: Option<ColdStakingAuthorization>,
+        /// Mandatory validator-cold authorization.
+        cold_authorization: ColdStakingAuthorization,
     },
 
     /// Set or clear the auto-delegation target for this validator.
@@ -195,8 +195,8 @@ pub enum StakingOpBody {
         validator_id: Bytes32,
         /// Target validator to soft-delegate to. Bytes32::ZERO clears.
         target_validator_id: Bytes32,
-        /// Present only for an enrolled validator.
-        cold_authorization: Option<ColdStakingAuthorization>,
+        /// Mandatory validator-cold authorization.
+        cold_authorization: ColdStakingAuthorization,
     },
 
     /// Set or clear the validator's advertised P2P dial address.
@@ -216,14 +216,16 @@ pub enum StakingOpBody {
         vrf_pubkey: Bytes32,
         /// Required next snapshot epoch.
         activation_epoch_id: u64,
-        /// Full-hybrid proof binding this key and activation epoch.
-        proof_of_possession: HybridSignature,
+        /// RFC 9381 output proving possession of the registered VRF secret key.
+        vrf_possession_output: Bytes64,
+        /// RFC 9381 proof over the canonical possession challenge.
+        vrf_possession_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
     },
 }
 
 impl StakingOp {
-    /// Canonical full-hybrid proof-of-possession transcript for VRF rotation.
-    pub fn vrf_pop_signing_bytes(
+    /// Canonical challenge proved with the VRF secret key during registration.
+    pub fn vrf_possession_challenge(
         chain_id: &str,
         validator_id: &Bytes32,
         vrf_pubkey: &Bytes32,
@@ -236,7 +238,7 @@ impl StakingOp {
                 max: u16::MAX as usize,
                 actual: chain.len(),
             })?;
-        let mut out = b"INDRA-VRF-POP-v1".to_vec();
+        let mut out = b"INDRA-VRF-KEY-POSSESSION-v1".to_vec();
         out.extend_from_slice(&n.to_be_bytes());
         out.extend_from_slice(chain);
         validator_id.encode(&mut out);
@@ -274,12 +276,12 @@ impl StakingOp {
             ),
             StakingOpBody::SetCommission {
                 validator_id,
-                cold_authorization: Some(authorization),
+                cold_authorization: authorization,
                 ..
             } => (AUTH_TAG_COLD_SET_COMMISSION, *validator_id, authorization),
             StakingOpBody::SelfStake {
                 validator_pubkey,
-                cold_authorization: Some(authorization),
+                cold_authorization: authorization,
                 ..
             } => (
                 AUTH_TAG_COLD_SELF_STAKE,
@@ -297,7 +299,7 @@ impl StakingOp {
             ),
             StakingOpBody::SetAutoDelegate {
                 validator_id,
-                cold_authorization: Some(authorization),
+                cold_authorization: authorization,
                 ..
             } => (
                 AUTH_TAG_COLD_SET_AUTO_DELEGATE,
@@ -326,8 +328,8 @@ impl StakingOp {
         match &self.body {
             StakingOpBody::ClaimRewards {
                 cold_authorization, ..
-            }
-            | StakingOpBody::SetCommission {
+            } => *cold_authorization,
+            StakingOpBody::SetCommission {
                 cold_authorization, ..
             }
             | StakingOpBody::SelfStake {
@@ -335,7 +337,7 @@ impl StakingOp {
             }
             | StakingOpBody::SetAutoDelegate {
                 cold_authorization, ..
-            } => *cold_authorization,
+            } => Some(*cold_authorization),
             StakingOpBody::ExitStakePosition {
                 cold_authorization, ..
             } => *cold_authorization,
@@ -676,48 +678,30 @@ impl Encode for StakingOpBody {
                 new_commission_bps,
                 cold_authorization,
             } => {
-                buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_SET_COMMISSION
-                } else {
-                    TAG_HOT_SET_COMMISSION
-                });
+                buf.push(TAG_COLD_SET_COMMISSION);
                 validator_id.encode(buf);
                 new_commission_bps.encode(buf);
-                if let Some(authorization) = cold_authorization {
-                    authorization.encode(buf);
-                }
+                cold_authorization.encode(buf);
             }
             StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey,
                 cold_authorization,
             } => {
-                buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_SELF_STAKE
-                } else {
-                    TAG_HOT_SELF_STAKE
-                });
+                buf.push(TAG_COLD_SELF_STAKE);
                 deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
-                if let Some(authorization) = cold_authorization {
-                    authorization.encode(buf);
-                }
+                cold_authorization.encode(buf);
             }
             StakingOpBody::SetAutoDelegate {
                 validator_id,
                 target_validator_id,
                 cold_authorization,
             } => {
-                buf.push(if cold_authorization.is_some() {
-                    TAG_COLD_SET_AUTO_DELEGATE
-                } else {
-                    TAG_HOT_SET_AUTO_DELEGATE
-                });
+                buf.push(TAG_COLD_SET_AUTO_DELEGATE);
                 validator_id.encode(buf);
                 target_validator_id.encode(buf);
-                if let Some(authorization) = cold_authorization {
-                    authorization.encode(buf);
-                }
+                cold_authorization.encode(buf);
             }
             StakingOpBody::UpdateNetworkAddress {
                 validator_id,
@@ -732,14 +716,16 @@ impl Encode for StakingOpBody {
                 vrf_suite,
                 vrf_pubkey,
                 activation_epoch_id,
-                proof_of_possession,
+                vrf_possession_output,
+                vrf_possession_proof,
             } => {
                 buf.push(TAG_REGISTER_VRF_KEY);
                 validator_id.encode(buf);
                 vrf_suite.encode(buf);
                 vrf_pubkey.encode(buf);
                 activation_epoch_id.encode(buf);
-                proof_of_possession.encode(buf);
+                vrf_possession_output.encode(buf);
+                vrf_possession_proof.encode(buf);
             }
         }
     }
@@ -801,33 +787,15 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::SetCommission {
                 cold_authorization, ..
-            } => {
-                32 + 4
-                    + cold_authorization
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
-            }
+            } => 32 + 4 + cold_authorization.encoded_len(),
             StakingOpBody::SelfStake {
                 validator_pubkey,
                 cold_authorization,
                 ..
-            } => {
-                32 + validator_pubkey.encoded_len()
-                    + cold_authorization
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
-            }
+            } => 32 + validator_pubkey.encoded_len() + cold_authorization.encoded_len(),
             StakingOpBody::SetAutoDelegate {
                 cold_authorization, ..
-            } => {
-                32 + 32
-                    + cold_authorization
-                        .as_ref()
-                        .map(Encode::encoded_len)
-                        .unwrap_or(0)
-            }
+            } => 32 + 32 + cold_authorization.encoded_len(),
             StakingOpBody::UpdateNetworkAddress { network_addr, .. } => {
                 32 + 1
                     + network_addr
@@ -836,9 +804,16 @@ impl Encode for StakingOpBody {
                         .unwrap_or(0)
             }
             StakingOpBody::RegisterVrfKey {
-                proof_of_possession,
+                vrf_possession_output,
+                vrf_possession_proof,
                 ..
-            } => 32 + 1 + 32 + 8 + proof_of_possession.encoded_len(),
+            } => {
+                32 + 1
+                    + 32
+                    + 8
+                    + vrf_possession_output.encoded_len()
+                    + vrf_possession_proof.encoded_len()
+            }
         }
     }
 }
@@ -900,21 +875,6 @@ impl Decode for StakingOpBody {
                     new_cold_signature,
                 })
             }
-            TAG_HOT_SET_COMMISSION => Ok(StakingOpBody::SetCommission {
-                validator_id: Bytes32::decode(r)?,
-                new_commission_bps: u32::decode(r)?,
-                cold_authorization: None,
-            }),
-            TAG_HOT_SELF_STAKE => Ok(StakingOpBody::SelfStake {
-                deposit_utxo_id: Bytes32::decode(r)?,
-                validator_pubkey: HybridPubKey::decode(r)?,
-                cold_authorization: None,
-            }),
-            TAG_HOT_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
-                validator_id: Bytes32::decode(r)?,
-                target_validator_id: Bytes32::decode(r)?,
-                cold_authorization: None,
-            }),
             TAG_UPDATE_NETWORK_ADDRESS => Ok(StakingOpBody::UpdateNetworkAddress {
                 validator_id: Bytes32::decode(r)?,
                 network_addr: decode_optional_network_addr(r)?,
@@ -924,7 +884,8 @@ impl Decode for StakingOpBody {
                 vrf_suite: VrfSuiteV1::decode(r)?,
                 vrf_pubkey: Bytes32::decode(r)?,
                 activation_epoch_id: u64::decode(r)?,
-                proof_of_possession: HybridSignature::decode(r)?,
+                vrf_possession_output: Bytes64::decode(r)?,
+                vrf_possession_proof: VariableBytes::decode(r)?,
             }),
             TAG_COLD_VALIDATOR_CLAIM_REWARDS => Ok(StakingOpBody::ClaimRewards {
                 validator_id: Bytes32::decode(r)?,
@@ -934,12 +895,12 @@ impl Decode for StakingOpBody {
             TAG_COLD_SET_COMMISSION => Ok(StakingOpBody::SetCommission {
                 validator_id: Bytes32::decode(r)?,
                 new_commission_bps: u32::decode(r)?,
-                cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
+                cold_authorization: ColdStakingAuthorization::decode(r)?,
             }),
             TAG_COLD_SELF_STAKE => Ok(StakingOpBody::SelfStake {
                 deposit_utxo_id: Bytes32::decode(r)?,
                 validator_pubkey: HybridPubKey::decode(r)?,
-                cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
+                cold_authorization: ColdStakingAuthorization::decode(r)?,
             }),
             TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION => Ok(StakingOpBody::ExitStakePosition {
                 position_id: Bytes32::decode(r)?,
@@ -950,7 +911,7 @@ impl Decode for StakingOpBody {
             TAG_COLD_SET_AUTO_DELEGATE => Ok(StakingOpBody::SetAutoDelegate {
                 validator_id: Bytes32::decode(r)?,
                 target_validator_id: Bytes32::decode(r)?,
-                cold_authorization: Some(ColdStakingAuthorization::decode(r)?),
+                cold_authorization: ColdStakingAuthorization::decode(r)?,
             }),
             _ => Err(IndraError::InvalidStakingOp(format!(
                 "unknown staking op tag: {}",
@@ -1079,6 +1040,13 @@ mod tests {
         }
     }
 
+    fn cold_authorization() -> ColdStakingAuthorization {
+        ColdStakingAuthorization {
+            cold_key_version: 1,
+            cold_nonce: 1,
+        }
+    }
+
     #[test]
     fn staking_op_encode_decode_round_trip() {
         let cases = vec![
@@ -1111,17 +1079,17 @@ mod tests {
             op(StakingOpBody::SetCommission {
                 validator_id: Bytes32::from([5u8; 32]),
                 new_commission_bps: 1_500,
-                cold_authorization: None,
+                cold_authorization: cold_authorization(),
             }),
             op(StakingOpBody::SelfStake {
                 deposit_utxo_id: Bytes32::from([0x66u8; 32]),
                 validator_pubkey: dummy_pubkey(),
-                cold_authorization: None,
+                cold_authorization: cold_authorization(),
             }),
             op(StakingOpBody::SetAutoDelegate {
                 validator_id: Bytes32::from([0x88u8; 32]),
                 target_validator_id: Bytes32::from([0x99u8; 32]),
-                cold_authorization: None,
+                cold_authorization: cold_authorization(),
             }),
             op(StakingOpBody::UpdateNetworkAddress {
                 validator_id: Bytes32::from([0xAAu8; 32]),
@@ -1147,7 +1115,7 @@ mod tests {
             cold_key_version: 7,
             cold_nonce: 9,
         };
-        let hot_or_delegator_and_cold = vec![
+        let delegator_and_cold = vec![
             (
                 StakingOpBody::ClaimRewards {
                     validator_id,
@@ -1161,34 +1129,6 @@ mod tests {
                 },
                 TAG_DELEGATOR_CLAIM_REWARDS,
                 TAG_COLD_VALIDATOR_CLAIM_REWARDS,
-            ),
-            (
-                StakingOpBody::SetCommission {
-                    validator_id,
-                    new_commission_bps: 1_234,
-                    cold_authorization: None,
-                },
-                StakingOpBody::SetCommission {
-                    validator_id,
-                    new_commission_bps: 1_234,
-                    cold_authorization: Some(authorization),
-                },
-                TAG_HOT_SET_COMMISSION,
-                TAG_COLD_SET_COMMISSION,
-            ),
-            (
-                StakingOpBody::SelfStake {
-                    deposit_utxo_id: Bytes32::from([0xD3; 32]),
-                    validator_pubkey: validator_pubkey.clone(),
-                    cold_authorization: None,
-                },
-                StakingOpBody::SelfStake {
-                    deposit_utxo_id: Bytes32::from([0xD3; 32]),
-                    validator_pubkey: validator_pubkey.clone(),
-                    cold_authorization: Some(authorization),
-                },
-                TAG_HOT_SELF_STAKE,
-                TAG_COLD_SELF_STAKE,
             ),
             (
                 StakingOpBody::ExitStakePosition {
@@ -1208,23 +1148,9 @@ mod tests {
                 TAG_DELEGATOR_EXIT_STAKE_POSITION,
                 TAG_COLD_VALIDATOR_EXIT_STAKE_POSITION,
             ),
-            (
-                StakingOpBody::SetAutoDelegate {
-                    validator_id,
-                    target_validator_id: Bytes32::ZERO,
-                    cold_authorization: None,
-                },
-                StakingOpBody::SetAutoDelegate {
-                    validator_id,
-                    target_validator_id: Bytes32::ZERO,
-                    cold_authorization: Some(authorization),
-                },
-                TAG_HOT_SET_AUTO_DELEGATE,
-                TAG_COLD_SET_AUTO_DELEGATE,
-            ),
         ];
 
-        for (hot_or_delegator, cold, hot_or_delegator_tag, cold_tag) in hot_or_delegator_and_cold {
+        for (hot_or_delegator, cold, hot_or_delegator_tag, cold_tag) in delegator_and_cold {
             let hot_or_delegator_bytes = hot_or_delegator.encode_to_vec();
             assert_eq!(hot_or_delegator_bytes[0], hot_or_delegator_tag);
             assert_eq!(hot_or_delegator_bytes.len(), hot_or_delegator.encoded_len());
@@ -1237,6 +1163,40 @@ mod tests {
             assert_eq!(cold_bytes[0], cold_tag);
             assert_eq!(StakingOpBody::decode_exact(&cold_bytes).unwrap(), cold);
             assert_ne!(hot_or_delegator_bytes, cold_bytes);
+        }
+
+        for body in [
+            StakingOpBody::SetCommission {
+                validator_id,
+                new_commission_bps: 1_234,
+                cold_authorization: authorization,
+            },
+            StakingOpBody::SelfStake {
+                deposit_utxo_id: Bytes32::from([0xD3; 32]),
+                validator_pubkey: validator_pubkey.clone(),
+                cold_authorization: authorization,
+            },
+            StakingOpBody::SetAutoDelegate {
+                validator_id,
+                target_validator_id: Bytes32::ZERO,
+                cold_authorization: authorization,
+            },
+        ] {
+            assert!(matches!(
+                body.encode_to_vec()[0],
+                TAG_COLD_SET_COMMISSION | TAG_COLD_SELF_STAKE | TAG_COLD_SET_AUTO_DELEGATE
+            ));
+            assert_eq!(
+                StakingOpBody::decode_exact(&body.encode_to_vec()).unwrap(),
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn removed_hot_validator_action_tags_are_rejected() {
+        for tag in [7u8, 9u8, 11u8] {
+            assert!(StakingOpBody::decode_exact(&[tag]).is_err());
         }
     }
 
@@ -1338,7 +1298,7 @@ mod tests {
         let bad_set = op(StakingOpBody::SetCommission {
             validator_id: Bytes32::ZERO,
             new_commission_bps: 10_001,
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         assert!(bad_set.validate_structure().is_err());
     }
@@ -1377,7 +1337,7 @@ mod tests {
         let op = op(StakingOpBody::SelfStake {
             deposit_utxo_id: Bytes32::from([0xA1; 32]),
             validator_pubkey: dummy_pubkey(),
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         let encoded = op.encode_to_vec();
         assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
@@ -1462,7 +1422,7 @@ mod tests {
         let op = op(StakingOpBody::SelfStake {
             deposit_utxo_id: Bytes32::from([0xA3; 32]),
             validator_pubkey: pubkey,
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         assert_eq!(op.signer_id(), expected);
     }
@@ -1474,7 +1434,7 @@ mod tests {
         let self_stake = op(StakingOpBody::SelfStake {
             deposit_utxo_id,
             validator_pubkey: pubkey.clone(),
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         let delegate = op(StakingOpBody::Delegate {
             validator_id: pubkey.identity_id(),
@@ -1492,7 +1452,7 @@ mod tests {
         let op = op(StakingOpBody::SetAutoDelegate {
             validator_id: Bytes32::from([0x31; 32]),
             target_validator_id: Bytes32::from([0x32; 32]),
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         let encoded = op.encode_to_vec();
         assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
@@ -1504,18 +1464,22 @@ mod tests {
         let op = op(StakingOpBody::SetAutoDelegate {
             validator_id,
             target_validator_id: Bytes32::from([0x34; 32]),
-            cold_authorization: None,
+            cold_authorization: cold_authorization(),
         });
         assert_eq!(op.signer_id(), validator_id);
     }
 
     #[test]
     fn staking_op_clear_auto_delegate_zero_target() {
-        let op = op(StakingOpBody::SetAutoDelegate {
-            validator_id: Bytes32::from([0x35; 32]),
-            target_validator_id: Bytes32::ZERO,
-            cold_authorization: None,
-        });
+        let op = StakingOp {
+            body: StakingOpBody::SetAutoDelegate {
+                validator_id: Bytes32::from([0x35; 32]),
+                target_validator_id: Bytes32::ZERO,
+                cold_authorization: cold_authorization(),
+            },
+            nonce: 0,
+            signature: dummy_signature(),
+        };
         assert!(op.validate_structure().is_ok());
         let encoded = op.encode_to_vec();
         assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);

@@ -1535,7 +1535,6 @@ fn get_validator(params: &[String], state: &NodeState<'_>) -> RpcResult<String> 
     let status = match validator.status {
         indra_state::ValidatorStatus::Registered => "registered",
         indra_state::ValidatorStatus::Active => "active",
-        indra_state::ValidatorStatus::Unbonding { .. } => "unbonding",
         indra_state::ValidatorStatus::Slashed => "slashed",
         indra_state::ValidatorStatus::Exited => "exited",
     };
@@ -2500,11 +2499,18 @@ fn json_escape(value: &str) -> String {
 fn get_validator_rewards(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
     let validator_hex = first_param(params, "validator_id")?;
     let validator_id = parse_hex32_value(&validator_hex, "validator_id")?;
+    let validator_position_id = indra_core::types::stake_position::derive_position_id(
+        validator_id,
+        validator_id,
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        },
+    );
     let validator_rewards = state
         .chain
-        .validators
-        .get(&validator_id)
-        .map(|v| v.pending_rewards)
+        .stake_positions
+        .get(&validator_position_id)
+        .map(|position| position.pending_rewards_spark)
         .unwrap_or(0);
     let (offset, limit) = pagination(params, 1)?;
     let matches = |position: &&indra_core::types::stake_position::StakePositionV1| {
@@ -2587,7 +2593,15 @@ fn get_validator_set(params: &[String], state: &NodeState<'_>) -> RpcResult<Stri
             json_escape(&v.name),
             v.stake_spark,
             v.commission_bps,
-            v.pending_rewards,
+            state.chain.stake_positions.get(
+                &indra_core::types::stake_position::derive_position_id(
+                    v.validator_id,
+                    v.validator_id,
+                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                        validator_id: v.validator_id,
+                    },
+                ),
+            ).map(|position| position.pending_rewards_spark).unwrap_or(0),
             v.registered_epoch,
             v.hybrid_classical_pk.map(hex::encode).unwrap_or_default(),
             v.hybrid_pq_pk.as_ref().map(hex::encode).unwrap_or_default(),
@@ -3612,8 +3626,6 @@ mod tests {
                 status: indra_state::ValidatorStatus::Registered,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
@@ -3643,8 +3655,6 @@ mod tests {
                 status: indra_state::ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,

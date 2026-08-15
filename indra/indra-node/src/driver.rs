@@ -2473,8 +2473,6 @@ mod tests {
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
@@ -4439,15 +4437,25 @@ mod tests {
             driver.request_qc_if_needed().is_empty(),
             "driver must stop requesting QC after current-tip QC recovery"
         );
+        let local_vrf = VrfKeypair::from_seed(&[0xB5; 32]);
+        let election = (0..4_096)
+            .map(|round| driver.proposer_election_for_height(3, round).unwrap())
+            .find(|election| {
+                indra_consensus::proposer::compute_proposer_vrf(
+                    validator_id_for(&source_local),
+                    &local_vrf,
+                    election,
+                )
+                .is_ok_and(|result| result.eligible)
+            })
+            .expect("local validator must become eligible within the bounded round search");
+        let proposal_result =
+            driver
+                .engine
+                .propose(&election, 1_700_000_003, driver.last_qc_bytes(), None);
         assert!(
-            {
-                let election = driver.proposer_election_for_height(3, 0).unwrap();
-                driver
-                    .engine
-                    .propose(&election, 1_700_000_003, driver.last_qc_bytes(), None)
-                    .is_ok()
-            },
-            "recovered current-tip QC should allow height-3 proposal construction"
+            proposal_result.is_ok(),
+            "recovered current-tip QC should allow height-3 proposal construction: {proposal_result:?}"
         );
 
         drop(local);

@@ -1,6 +1,6 @@
 //! Validator set — the active set of staked validators.
 //!
-//! Tracks each validator's stake, status, and accumulated reward.
+//! Tracks each validator's self-stake, lifecycle status, and authorization keys.
 //! The validator set is snapshotted at each epoch boundary.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use indra_core::types::primitives::{
 
 use crate::error::{StateError, StateResult};
 
-const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 3;
+const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 4;
 /// Consensus ceiling for active delegator entries under one validator.
 ///
 /// This is intentionally far above expected 200-validator mainnet operating
@@ -29,11 +29,6 @@ pub enum ValidatorStatus {
     Registered,
     /// Active: eligible to propose and vote.
     Active,
-    /// Unbonding: initiated exit, stake locked until unbonding_end_epoch.
-    Unbonding {
-        /// Epoch at which the stake is released.
-        unbonding_end_epoch: u64,
-    },
     /// Slashed: permanently removed, stake partially or fully burned.
     Slashed,
     /// Exited: completed voluntary unbonding, no longer in active set.
@@ -45,22 +40,13 @@ impl Encode for ValidatorStatus {
         match self {
             Self::Registered => 0u8.encode(buf),
             Self::Active => 1u8.encode(buf),
-            Self::Unbonding {
-                unbonding_end_epoch,
-            } => {
-                2u8.encode(buf);
-                unbonding_end_epoch.encode(buf);
-            }
             Self::Slashed => 3u8.encode(buf),
             Self::Exited => 4u8.encode(buf),
         }
     }
 
     fn encoded_len(&self) -> usize {
-        match self {
-            Self::Unbonding { .. } => 1 + 8,
-            _ => 1,
-        }
+        1
     }
 }
 
@@ -69,9 +55,6 @@ impl Decode for ValidatorStatus {
         match u8::decode(r)? {
             0 => Ok(Self::Registered),
             1 => Ok(Self::Active),
-            2 => Ok(Self::Unbonding {
-                unbonding_end_epoch: u64::decode(r)?,
-            }),
             3 => Ok(Self::Slashed),
             4 => Ok(Self::Exited),
             _ => Err(IndraError::InvariantViolation {
@@ -108,10 +91,6 @@ pub struct ValidatorEntry {
     pub registered_epoch: u64,
     /// Epoch in which this validator last cast a vote (for liveness tracking).
     pub last_active_epoch: u64,
-    /// Accumulated unclaimed rewards in Spark.
-    pub pending_rewards: u64,
-    /// Epoch at which pending_rewards was last updated.
-    pub rewards_last_epoch: u64,
     /// Canonical identity of the one slashable offense already applied.
     pub slashed_offense_id: Option<Bytes32>,
     /// Commission rate in basis points (e.g. 1000 = 10%).
@@ -175,8 +154,6 @@ impl Encode for ValidatorEntry {
         self.status.encode(buf);
         self.registered_epoch.encode(buf);
         self.last_active_epoch.encode(buf);
-        self.pending_rewards.encode(buf);
-        self.rewards_last_epoch.encode(buf);
         self.slashed_offense_id.is_some().encode(buf);
         if let Some(offense_id) = self.slashed_offense_id {
             offense_id.encode(buf);
@@ -241,8 +218,6 @@ impl Encode for ValidatorEntry {
             + self.pending_vrf_activation_epoch.map(|_| 8).unwrap_or(0)
             + 8
             + self.status.encoded_len()
-            + 8
-            + 8
             + 8
             + 8
             + 1
@@ -366,8 +341,6 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
     let status = ValidatorStatus::decode(r)?;
     let registered_epoch = u64::decode(r)?;
     let last_active_epoch = u64::decode(r)?;
-    let pending_rewards = u64::decode(r)?;
-    let rewards_last_epoch = u64::decode(r)?;
     let slashed_offense_id = if bool::decode(r)? {
         Some(Bytes32::decode(r)?)
     } else {
@@ -453,8 +426,6 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
         status,
         registered_epoch,
         last_active_epoch,
-        pending_rewards,
-        rewards_last_epoch,
         slashed_offense_id,
         commission_bps,
         pending_commission_bps,
@@ -489,14 +460,6 @@ impl ValidatorEntry {
     /// True if this validator is currently active.
     pub fn is_active(&self) -> bool {
         matches!(self.status, ValidatorStatus::Active)
-    }
-
-    /// True if this validator's rewards have expired.
-    ///
-    /// Rewards expire if unclaimed after CLAIM_WINDOW_EPOCHS epochs.
-    pub fn rewards_expired(&self, current_epoch: u64) -> bool {
-        use indra_core::types::primitives::CLAIM_WINDOW_EPOCHS;
-        current_epoch.saturating_sub(self.rewards_last_epoch) > CLAIM_WINDOW_EPOCHS
     }
 }
 
@@ -802,18 +765,6 @@ impl ValidatorSet {
         self.validators.values()
     }
 
-    /// Expire rewards for validators who have not claimed within CLAIM_WINDOW.
-    ///
-    /// Called at epoch transition. Expired rewards are simply zeroed —
-    /// they do not return to treasury (they are effectively burned).
-    pub fn expire_stale_rewards(&mut self, current_epoch: u64) {
-        for entry in self.validators.values_mut() {
-            if entry.pending_rewards > 0 && entry.rewards_expired(current_epoch) {
-                entry.pending_rewards = 0;
-            }
-        }
-    }
-
     /// Reselect the active validator set by self-stake ranking.
     ///
     /// Consensus voting weight and epoch reward weights are based on
@@ -882,8 +833,6 @@ mod tests {
             status: ValidatorStatus::Active,
             registered_epoch: epoch,
             last_active_epoch: epoch,
-            pending_rewards: 0,
-            rewards_last_epoch: epoch,
             slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,
@@ -1080,49 +1029,6 @@ mod tests {
         vs.upsert(make_validator(0x02, 2_000, 0)).unwrap();
         vs.upsert(make_validator(0x03, 3_000, 0)).unwrap();
         assert_eq!(vs.total_active_stake(), 6_000);
-    }
-
-    #[test]
-    fn unbonding_validator_not_counted_as_active() {
-        let mut vs = ValidatorSet::new();
-        let mut v = make_validator(0x01, 5_000, 0);
-        v.status = ValidatorStatus::Unbonding {
-            unbonding_end_epoch: 10,
-        };
-        vs.upsert(v).unwrap();
-        assert_eq!(vs.active_count(), 0);
-        assert_eq!(vs.total_active_stake(), 0);
-    }
-
-    #[test]
-    fn reward_expiry_zeroes_stale_rewards() {
-        let mut vs = ValidatorSet::new();
-        let mut v = make_validator(0x01, 5_000, 0);
-        v.pending_rewards = 999;
-        v.rewards_last_epoch = 0;
-        vs.upsert(v).unwrap();
-
-        use indra_core::types::primitives::CLAIM_WINDOW_EPOCHS;
-        // Expire at exactly CLAIM_WINDOW + 1 epochs later
-        vs.expire_stale_rewards(CLAIM_WINDOW_EPOCHS + 1);
-
-        let id = Bytes32::from([0x01u8; 32]);
-        assert_eq!(vs.get(&id).unwrap().pending_rewards, 0);
-    }
-
-    #[test]
-    fn rewards_not_expired_within_window() {
-        let mut vs = ValidatorSet::new();
-        let mut v = make_validator(0x01, 5_000, 0);
-        v.pending_rewards = 500;
-        v.rewards_last_epoch = 0;
-        vs.upsert(v).unwrap();
-
-        // Still within the window
-        vs.expire_stale_rewards(100);
-
-        let id = Bytes32::from([0x01u8; 32]);
-        assert_eq!(vs.get(&id).unwrap().pending_rewards, 500);
     }
 }
 

@@ -14,7 +14,7 @@ The staking state consists of:
   `(validator_id, principal_owner_id, custody)` tuple;
 - `ActiveStakeAggregateV1`, the active amount and reward-accounting state;
 - `UnbondingTrancheV1`, one immutable exit fragment with explicit timing,
-  source commitment, refund provenance, and custody; and
+  source UTXO, refund provenance, and custody; and
 - bounded eviction tombstones retaining exactly the position/tranche
   references needed for refunds, rewards, and slash processing.
 

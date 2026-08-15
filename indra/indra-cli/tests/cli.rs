@@ -1,18 +1,22 @@
 //! Integration tests for the CLI tools.
 
 use indra_cli::{
-    build_claim_rewards_op, build_delegate_op, build_exit_stake_position_op,
-    build_register_validator_op_with_cold, build_set_commission_op, generate_from_master_seed,
+    build_claim_rewards_op, build_cold_authorized_staking_op, build_delegate_op,
+    build_exit_stake_position_op, build_register_validator_op_with_cold, generate_from_master_seed,
     generate_from_passphrase,
     genesis_cmd::{build_genesis_config, entry_from_keys},
     load_cold_keys,
     query::rpc_call,
-    tx_builder::build_self_stake_op,
-    PasswordSource, StakePositionExitSigner,
+    ColdAuthorizedStakingAction, PasswordSource, StakePositionExitSigner,
 };
 use indra_core::{
     codec::Decode,
-    types::{primitives::DUST_LIMIT_SPARK, stake_position::PositionCustodyV1, staking::StakingOp},
+    types::{
+        crypto::HybridPubKey,
+        primitives::{VariableBytes, DUST_LIMIT_SPARK},
+        stake_position::PositionCustodyV1,
+        staking::StakingOp,
+    },
     Bytes32,
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
@@ -739,19 +743,35 @@ fn test_build_and_decode_all_staking_ops() {
     let validator_id = Bytes32::from([0xA1; 32]);
     let deposit_utxo_id = Bytes32::from([0xB2; 32]);
     let chain_id = "indra-testnet-1";
+    let cold =
+        indra_crypto::ColdHybridKeypair::from_independent_seeds([0x91; 32], [0x92; 32]).unwrap();
+    let public = keypair.public_key();
+    let validator_pubkey = HybridPubKey {
+        classical_pk: Bytes32::from(public.classical.0),
+        pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
+    };
     let built = vec![
         build_register_validator_op_with_cold(
             1_000,
             deposit_utxo_id,
             &keypair,
-            &indra_crypto::ColdHybridKeypair::from_independent_seeds([0x91; 32], [0x92; 32])
-                .unwrap(),
+            &cold,
             [0xC3; 32],
             1,
             chain_id,
         )
         .unwrap(),
-        build_self_stake_op(deposit_utxo_id, &keypair, 2, chain_id).unwrap(),
+        build_cold_authorized_staking_op(
+            ColdAuthorizedStakingAction::SelfStake {
+                deposit_utxo_id,
+                validator_pubkey,
+            },
+            &cold,
+            1,
+            2,
+            chain_id,
+        )
+        .unwrap(),
         build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, chain_id).unwrap(),
         build_exit_stake_position_op(
             Bytes32::from([0xD4; 32]),
@@ -767,13 +787,23 @@ fn test_build_and_decode_all_staking_ops() {
         )
         .unwrap(),
         build_claim_rewards_op(validator_id, &keypair, 6, chain_id).unwrap(),
-        build_set_commission_op(validator_id, 1_250, &keypair, 7, chain_id).unwrap(),
+        build_cold_authorized_staking_op(
+            ColdAuthorizedStakingAction::SetCommission {
+                validator_id,
+                new_commission_bps: 1_250,
+            },
+            &cold,
+            1,
+            7,
+            chain_id,
+        )
+        .unwrap(),
     ];
 
     for (idx, op) in built.iter().enumerate() {
         let bytes = hex::decode(&op.op_hex).unwrap();
         let decoded = StakingOp::decode_exact(&bytes).unwrap();
-        assert_eq!(decoded.nonce, [1, 2, 4, 5, 6, 7][idx]);
+        assert_eq!(decoded.nonce, [1, 0, 4, 5, 6, 0][idx]);
         assert!(decoded
             .signature
             .classical_sig

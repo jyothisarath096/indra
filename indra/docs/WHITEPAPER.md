@@ -469,19 +469,18 @@ implemented.
 
 ### 5.1 Open participation
 
-Any entity can register as a validator. There is no permission process,
-no identity verification, and no hard minimum stake requirement.
-Admission to the active consensus set is determined purely by stake
-ranking — the top N validators by total backing (own stake plus
-delegations) are active at each epoch boundary.
+Any entity can register as a validator. There is no permission process or
+external identity verification, but registration requires at least
+1,000,000,000 Spark of validator-owned self-stake. Admission to the active
+consensus set is determined by validator self-stake only; delegated stake
+does not increase consensus authority or active-set rank.
 
 **Active set admission:**
-1. Register by self-staking any amount above the dust limit
-2. Attract delegation from INDRA holders to boost total backing
-3. At the next epoch boundary (~30 minutes): if total backing ranks
+1. Register with at least 1,000,000,000 Spark of validator-owned self-stake
+2. At the next epoch boundary (~30 minutes): if self-stake ranks
    in the top N, the validator enters the active set
 
-**Displacement:** If another validator accumulates more total backing,
+**Displacement:** If another validator accumulates more self-stake,
 they may displace an incumbent at the next epoch reselection. The
 displaced validator remains registered — stake is not burned. They
 can re-enter by gaining more delegation.
@@ -491,21 +490,23 @@ at 1,500 total registered validators. On the current testnet this
 replacement rule activates at block height 97,000. Before activation,
 a full registry rejects additional registrations. At or after activation,
 a new registration is accepted into a full registry only if its self-bond
-exceeds the lowest-ranked registered validator's total stake; in that
+exceeds the lowest-ranked registered validator's self-stake; in that
 case the lowest-ranked registered validator is synchronously evicted
-from the registry and all associated stake bonds are returned as UTXOs.
+from the live registry. Its retained stake positions exit through the
+ordinary immutable tranche lifecycle and become UTXOs only at maturity.
 This prevents unbounded permanent validator-state growth without turning
 registration into a first-come-first-served race.
 
 ### 5.2 Validator lifecycle
 
 ```
-REGISTERED → ACTIVE → UNBONDING → EXITED
-                    ↘ SLASHED
+REGISTERED ↔ ACTIVE
+      ↘       ↙
+       SLASHED
 ```
 
-**Unbonding period:** 60 epochs (~30 hours). Stake cannot be
-redirected during unbonding.
+**Unbonding period:** 1,008 epochs (~21 days). Each exit becomes an immutable
+height-precise tranche; stake cannot be redirected during unbonding.
 
 ### 5.3 Auto-delegation for validators outside the active set
 
@@ -560,7 +561,7 @@ with no economic consequence.
 ```
 Minimum delegation:    Dust limit (0.001 INDRA protocol floor)
                        Each validator sets their own minimum above this
-Unbonding period:      60 epochs (~30 hours)
+Unbonding period:      1,008 epochs (~21 days)
 Commission range:      0–20% (maximum governable, can only decrease)
 Reward frequency:      Each epoch (~30 minutes)
 Key custody:           Delegator retains full custody always
@@ -568,7 +569,8 @@ Key custody:           Delegator retains full custody always
 
 Delegation is non-custodial. The validator cannot spend, redirect,
 or access delegated funds. Commission is deducted automatically by
-the protocol. Rewards accumulate in `pending_rewards` each epoch
+the protocol. Rewards accumulate in each stake position's
+`pending_rewards_spark` each epoch
 and are claimable at any time.
 
 **Delegator reward query:** The `indra_getDelegatorPositions` and
@@ -972,7 +974,7 @@ Blocks per year:             5,256,000
 Epoch duration:              300 blocks (~30 minutes)
 Consensus quorum:            66.67% of total stake
 BFT safety threshold:        <33.33% Byzantine stake
-Unbonding period:            60 epochs (~30 hours)
+Unbonding period:            1,008 epochs (~21 days)
 Default prune window:        50,000 blocks
 Snapshot interval:           300 blocks (each epoch)
 

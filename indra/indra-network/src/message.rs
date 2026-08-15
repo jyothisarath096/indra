@@ -367,10 +367,10 @@ impl Message {
                 Ok(Self::Tx(tx))
             }
             MessageType::StakingOp => {
-                let mut r = ByteReader::new(payload);
-                let op = StakingOp::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
+                let op =
+                    StakingOp::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
                 Ok(Self::StakingOp(op))
             }
             MessageType::GovernanceOp => {
@@ -800,6 +800,18 @@ mod tests {
         let wire = Message::StakingOp(op.clone()).encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         assert!(matches!(decoded, Message::StakingOp(got) if got == op));
+    }
+
+    #[test]
+    fn staking_op_wire_rejects_trailing_bytes() {
+        let mut payload = test_staking_op().encode_to_vec();
+        payload.extend_from_slice(&[0xAA, 0x55]);
+        let mut wire = vec![MessageType::StakingOp as u8];
+        wire.extend_from_slice(&payload);
+        assert!(matches!(
+            Message::decode_wire(&wire),
+            Err(NetworkError::DecodeFailed { .. })
+        ));
     }
 
     #[test]

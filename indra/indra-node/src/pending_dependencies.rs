@@ -545,10 +545,10 @@ mod tests {
             classical_pk: Bytes32::from([0x44; 32]),
             pq_pk: VariableBytes::from_slice(&[0x44; 2592]).unwrap(),
         };
-        let cold_auth = Some(ColdStakingAuthorization {
+        let cold_auth = ColdStakingAuthorization {
             cold_key_version: 1,
             cold_nonce: 1,
-        });
+        };
 
         let staking_cases = [
             staking(StakingOpBody::Delegate {

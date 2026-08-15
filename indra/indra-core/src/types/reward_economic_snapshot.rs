@@ -21,7 +21,7 @@ pub struct RewardEconomicDelegatorEntry {
     pub delegator_id: Bytes32,
     /// Real bonded principal credited to the delegator's canonical stake position.
     pub bonded_active_principal_spark: u64,
-    /// Virtual auto-delegated principal credited to `ValidatorEntry.pending_rewards`.
+    /// Virtual auto-delegated principal credited to the source stake position.
     pub auto_delegated_principal_spark: u64,
 }
 

@@ -55,8 +55,6 @@ fn finalized_genesis() -> ChainState {
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: 0,
             pending_commission_bps: None,

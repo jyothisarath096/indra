@@ -1120,8 +1120,6 @@ mod tests {
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
@@ -1603,10 +1601,10 @@ mod tests {
             body: StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps: 900,
-                cold_authorization: Some(ColdStakingAuthorization {
+                cold_authorization: ColdStakingAuthorization {
                     cold_key_version: 1,
                     cold_nonce: 1,
-                }),
+                },
             },
             nonce: 0,
             signature: dummy_sig(),
@@ -1656,10 +1654,10 @@ mod tests {
             body: StakingOpBody::SetCommission {
                 validator_id,
                 new_commission_bps: 950,
-                cold_authorization: Some(ColdStakingAuthorization {
+                cold_authorization: ColdStakingAuthorization {
                     cold_key_version: 2,
                     cold_nonce: 2,
-                }),
+                },
             },
             nonce: 0,
             signature: dummy_sig(),
@@ -1804,10 +1802,10 @@ mod tests {
             body: StakingOpBody::SetCommission {
                 validator_id: active_id,
                 new_commission_bps: 900,
-                cold_authorization: Some(ColdStakingAuthorization {
+                cold_authorization: ColdStakingAuthorization {
                     cold_key_version: 1,
                     cold_nonce: 2,
-                }),
+                },
             },
             nonce: 0,
             signature: dummy_sig(),

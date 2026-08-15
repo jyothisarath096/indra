@@ -156,8 +156,6 @@ fn mempool_to_block_pipeline() {
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,

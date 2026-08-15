@@ -485,8 +485,6 @@ mod tests {
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: 1_000,
                 pending_commission_bps: None,
@@ -795,7 +793,10 @@ mod tests {
             body: StakingOpBody::SelfStake {
                 deposit_utxo_id,
                 validator_pubkey,
-                cold_authorization: None,
+                cold_authorization: indra_core::types::staking::ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: nonce,
+                },
             },
             nonce,
             signature: dummy_sig(),
@@ -827,8 +828,6 @@ mod tests {
                 status: ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: 1_000,
                 pending_commission_bps: None,
@@ -1089,19 +1088,19 @@ mod tests {
             cold_authorization, ..
         } = &mut self_stake.body
         {
-            *cold_authorization = Some(indra_core::types::staking::ColdStakingAuthorization {
+            *cold_authorization = indra_core::types::staking::ColdStakingAuthorization {
                 cold_key_version: 1,
                 cold_nonce: 1,
-            });
+            };
         }
         self_stake.nonce = 0;
         sign_staking_op(&validator_hot, &state.chain_id, &mut self_stake);
         assert_verified_staking_matches_full("self-stake", &state, &self_stake, height);
 
-        let cold_auth = Some(indra_core::types::staking::ColdStakingAuthorization {
+        let cold_auth = indra_core::types::staking::ColdStakingAuthorization {
             cold_key_version: 1,
             cold_nonce: 1,
-        });
+        };
         let mut commission = StakingOp {
             body: StakingOpBody::SetCommission {
                 validator_id,

@@ -5584,8 +5584,6 @@ mod tests {
                 status: indra_state::ValidatorStatus::Active,
                 registered_epoch: 0,
                 last_active_epoch: 0,
-                pending_rewards: 0,
-                rewards_last_epoch: 0,
                 slashed_offense_id: None,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,

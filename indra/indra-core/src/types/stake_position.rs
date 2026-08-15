@@ -673,7 +673,7 @@ mod tests {
         codec::{Decode, Encode},
         types::{
             crypto::{HybridPubKey, HybridSignature},
-            staking::StakingOpBody,
+            staking::{ColdStakingAuthorization, StakingOpBody},
         },
         VariableBytes,
     };
@@ -884,7 +884,10 @@ mod tests {
             StakingOpBody::SetAutoDelegate {
                 validator_id: id(1),
                 target_validator_id: id(2),
-                cold_authorization: None,
+                cold_authorization: ColdStakingAuthorization {
+                    cold_key_version: 1,
+                    cold_nonce: 1,
+                },
             },
             7,
             1,

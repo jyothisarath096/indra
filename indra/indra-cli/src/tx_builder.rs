@@ -234,25 +234,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     })
 }
 
-/// Build and sign a validator self-stake operation.
-pub fn build_self_stake_op(
-    deposit_utxo_id: Bytes32,
-    validator_keypair: &HybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::SelfStake {
-            deposit_utxo_id,
-            validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
-            cold_authorization: None,
-        },
-        validator_keypair,
-        nonce,
-        chain_id,
-    )
-}
-
 /// Payload fields for an active-validator cold-authorized staking operation.
 pub enum ColdAuthorizedStakingAction {
     /// Bond another validator-cold-owned UTXO.
@@ -293,10 +274,10 @@ pub fn build_cold_authorized_staking_op(
     cold_nonce: u64,
     chain_id: &str,
 ) -> CliResult<BuiltStakingOp> {
-    let authorization = Some(ColdStakingAuthorization {
+    let authorization = ColdStakingAuthorization {
         cold_key_version,
         cold_nonce,
-    });
+    };
     let body = match action {
         ColdAuthorizedStakingAction::SelfStake {
             deposit_utxo_id,
@@ -312,7 +293,7 @@ pub fn build_cold_authorized_staking_op(
         } => StakingOpBody::ClaimRewards {
             validator_id,
             delegator_pubkey: validator_pubkey,
-            cold_authorization: authorization,
+            cold_authorization: Some(authorization),
         },
         ColdAuthorizedStakingAction::SetCommission {
             validator_id,
@@ -510,47 +491,6 @@ pub fn build_claim_rewards_op(
     )
 }
 
-/// Build and sign a set-commission staking operation.
-pub fn build_set_commission_op(
-    validator_id: Bytes32,
-    new_commission_bps: u32,
-    keypair: &HybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::SetCommission {
-            validator_id,
-            new_commission_bps,
-            cold_authorization: None,
-        },
-        keypair,
-        nonce,
-        chain_id,
-    )
-}
-
-/// Build and sign a SetAutoDelegate staking op.
-/// Pass target_validator_id = Bytes32::ZERO to clear.
-pub fn build_set_auto_delegate_op(
-    validator_id: Bytes32,
-    target_validator_id: Bytes32,
-    keypair: &HybridKeypair,
-    nonce: u64,
-    chain_id: &str,
-) -> CliResult<BuiltStakingOp> {
-    build_signed_staking_op(
-        StakingOpBody::SetAutoDelegate {
-            validator_id,
-            target_validator_id,
-            cold_authorization: None,
-        },
-        keypair,
-        nonce,
-        chain_id,
-    )
-}
-
 /// Build and sign a validator network-address update staking op.
 pub fn build_update_network_address_op(
     validator_id: Bytes32,
@@ -672,6 +612,62 @@ mod tests {
 
     fn test_cold_keypair(seed: u8) -> ColdHybridKeypair {
         ColdHybridKeypair::from_independent_seeds([seed; 32], [seed.wrapping_add(1); 32]).unwrap()
+    }
+
+    fn build_self_stake_op(
+        deposit_utxo_id: Bytes32,
+        validator_keypair: &HybridKeypair,
+        cold_nonce: u64,
+        chain_id: &str,
+    ) -> CliResult<BuiltStakingOp> {
+        build_cold_authorized_staking_op(
+            ColdAuthorizedStakingAction::SelfStake {
+                deposit_utxo_id,
+                validator_pubkey: hybrid_pubkey_from_keypair(validator_keypair)?,
+            },
+            &test_cold_keypair(0xE1),
+            1,
+            cold_nonce,
+            chain_id,
+        )
+    }
+
+    fn build_set_commission_op(
+        validator_id: Bytes32,
+        new_commission_bps: u32,
+        _validator_keypair: &HybridKeypair,
+        cold_nonce: u64,
+        chain_id: &str,
+    ) -> CliResult<BuiltStakingOp> {
+        build_cold_authorized_staking_op(
+            ColdAuthorizedStakingAction::SetCommission {
+                validator_id,
+                new_commission_bps,
+            },
+            &test_cold_keypair(0xE2),
+            1,
+            cold_nonce,
+            chain_id,
+        )
+    }
+
+    fn build_set_auto_delegate_op(
+        validator_id: Bytes32,
+        target_validator_id: Bytes32,
+        _validator_keypair: &HybridKeypair,
+        cold_nonce: u64,
+        chain_id: &str,
+    ) -> CliResult<BuiltStakingOp> {
+        build_cold_authorized_staking_op(
+            ColdAuthorizedStakingAction::SetAutoDelegate {
+                validator_id,
+                target_validator_id,
+            },
+            &test_cold_keypair(0xE3),
+            1,
+            cold_nonce,
+            chain_id,
+        )
     }
 
     fn decode_built(built: &BuiltStakingOp) -> StakingOp {
@@ -813,7 +809,7 @@ mod tests {
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
         assert_eq!(built.op_id.len(), 64);
-        assert_eq!(op.nonce, 7);
+        assert_eq!(op.nonce, 0);
         assert!(matches!(
             op.body,
             StakingOpBody::SelfStake {
@@ -983,7 +979,8 @@ mod tests {
         )
         .unwrap();
         let op = decode_built(&built);
-        assert_eq!(op.nonce, 14);
+        assert_eq!(op.nonce, 0);
+        assert_eq!(op.cold_authorization().unwrap().cold_nonce, 14);
         assert!(matches!(
             op.body,
             StakingOpBody::SetAutoDelegate {
@@ -1067,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn all_ops_have_correct_nonce() {
+    fn all_ops_have_correct_replay_nonce_namespace() {
         let keypair = test_keypair(0x76);
         let validator_id = Bytes32::from([0x07; 32]);
         let deposit_utxo_id = Bytes32::from([0x08; 32]);
@@ -1123,8 +1120,14 @@ mod tests {
             )
             .unwrap(),
         ];
-        for built in ops {
-            assert_eq!(decode_built(&built).nonce, 42);
+        for (index, built) in ops.into_iter().enumerate() {
+            let op = decode_built(&built);
+            if matches!(index, 1 | 5 | 6) {
+                assert_eq!(op.nonce, 0);
+                assert_eq!(op.cold_authorization().unwrap().cold_nonce, 42);
+            } else {
+                assert_eq!(op.nonce, 42);
+            }
         }
     }
 

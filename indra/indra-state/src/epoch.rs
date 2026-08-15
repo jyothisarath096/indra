@@ -195,8 +195,6 @@ fn apply_epoch_transition_final(
     // commission only after both reward sources and virtual auto-delegation
     // accounting have used the rate that governed that elapsed epoch.
     apply_pending_commission_changes(state, current_epoch);
-    state.validators.expire_stale_rewards(current_epoch);
-    release_unbonded_validators(state, current_epoch);
     crate::stake_positions::release_matured_position_tranches(state, height)?;
     let liveness_epoch = context.closing_epoch;
     let closing_members = closing_snapshot
@@ -701,8 +699,6 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
             status: crate::validator::ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
             pending_commission_bps: None,
@@ -843,12 +839,22 @@ fn distribute_snapshot_rewards(
                 validator_pool,
                 current_epoch,
             )?;
-            distributed = distributed.saturating_add(validator_pool);
+            distributed =
+                distributed
+                    .checked_add(validator_pool)
+                    .ok_or(StateError::InvariantViolation {
+                        message: "reward distribution total overflow",
+                    })?;
             continue;
         }
 
         let commission = bps_of(validator_pool, economic_entry.commission_bps);
-        let delegator_pool = validator_pool.saturating_sub(commission);
+        let delegator_pool =
+            validator_pool
+                .checked_sub(commission)
+                .ok_or(StateError::InvariantViolation {
+                    message: "commission exceeds validator reward pool",
+                })?;
         credit_position_reward(
             state,
             member.validator_id,
@@ -859,7 +865,12 @@ fn distribute_snapshot_rewards(
             commission,
             current_epoch,
         )?;
-        distributed = distributed.saturating_add(commission);
+        distributed =
+            distributed
+                .checked_add(commission)
+                .ok_or(StateError::InvariantViolation {
+                    message: "reward distribution total overflow",
+                })?;
 
         let mut delegated_distributed = 0u64;
         for delegator in economic_entry.delegators() {
@@ -876,7 +887,12 @@ fn distribute_snapshot_rewards(
                     combined,
                 )
             };
-            let bonded_reward = identity_reward.saturating_sub(auto_reward);
+            let bonded_reward =
+                identity_reward
+                    .checked_sub(auto_reward)
+                    .ok_or(StateError::InvariantViolation {
+                        message: "auto-delegation reward exceeds identity reward",
+                    })?;
 
             if bonded_reward > 0 {
                 credit_position_reward(
@@ -902,18 +918,38 @@ fn distribute_snapshot_rewards(
                     current_epoch,
                 )?;
             }
-            delegated_distributed = delegated_distributed.saturating_add(identity_reward);
+            delegated_distributed = delegated_distributed.checked_add(identity_reward).ok_or(
+                StateError::InvariantViolation {
+                    message: "delegator reward distribution total overflow",
+                },
+            )?;
         }
-        distributed = distributed.saturating_add(delegated_distributed);
+        distributed = distributed.checked_add(delegated_distributed).ok_or(
+            StateError::InvariantViolation {
+                message: "reward distribution total overflow",
+            },
+        )?;
     }
 
-    let remainder = pool.saturating_sub(distributed);
+    let remainder = pool
+        .checked_sub(distributed)
+        .ok_or(StateError::InvariantViolation {
+            message: "distributed rewards exceed source pool",
+        })?;
     match source {
         SnapshotRewardSource::Block => {
-            state.treasury_balance = state.treasury_balance.saturating_add(remainder)
+            state.treasury_balance = state.treasury_balance.checked_add(remainder).ok_or(
+                StateError::InvariantViolation {
+                    message: "treasury reward remainder overflow",
+                },
+            )?
         }
         SnapshotRewardSource::Fee => {
-            state.fee_reward_pool = state.fee_reward_pool.saturating_add(remainder)
+            state.fee_reward_pool = state.fee_reward_pool.checked_add(remainder).ok_or(
+                StateError::InvariantViolation {
+                    message: "fee reward remainder overflow",
+                },
+            )?
         }
     }
     crate::txn::complex_mutation_checkpoint()?;
@@ -945,7 +981,11 @@ fn credit_position_reward(
                 "frozen reward position destination is missing".into(),
             )
         })?;
-    position.pending_rewards_spark = position.pending_rewards_spark.saturating_add(amount);
+    position.pending_rewards_spark = position.pending_rewards_spark.checked_add(amount).ok_or(
+        crate::error::StateError::InvariantViolation {
+            message: "position pending reward overflow",
+        },
+    )?;
     position.rewards_last_epoch = current_epoch;
     state.stake_positions.insert(position_id, position.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
@@ -953,29 +993,6 @@ fn credit_position_reward(
     }
     crate::txn::complex_mutation_checkpoint()?;
     Ok(())
-}
-
-fn release_unbonded_validators(state: &mut ChainState, current_epoch: u64) {
-    let mut ids: Vec<indra_core::types::primitives::Bytes32> = state
-        .validators
-        .all_validators()
-        .filter(|v| {
-            matches!(
-                v.status,
-                ValidatorStatus::Unbonding { unbonding_end_epoch }
-                if unbonding_end_epoch <= current_epoch
-            )
-        })
-        .map(|v| v.validator_id)
-        .collect();
-    ids.sort_by_key(|id| id.0);
-
-    for id in ids {
-        if let Some(entry) = state.validators.get_mut(&id) {
-            entry.stake_spark = 0;
-            entry.status = ValidatorStatus::Exited;
-        }
-    }
 }
 
 fn apply_liveness_penalties(
@@ -1079,6 +1096,49 @@ mod tests {
         state
     }
 
+    fn validator_position_rewards(state: &ChainState, validator_id: Bytes32) -> u64 {
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            validator_id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id,
+            },
+        );
+        state
+            .stake_positions
+            .get(&position_id)
+            .map(|position| position.pending_rewards_spark)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn position_reward_overflow_fails_closed() {
+        let mut state = new_test_state();
+        let validator_id = Bytes32::from([0xF1; 32]);
+        let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        };
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            validator_id,
+            validator_id,
+            custody,
+            None,
+            u64::MAX,
+            7,
+        )
+        .unwrap();
+        state.stake_positions.insert(position.position_id, position);
+        let before = state.clone();
+
+        assert!(matches!(
+            credit_position_reward(&mut state, validator_id, validator_id, custody, 1, 8),
+            Err(crate::error::StateError::InvariantViolation {
+                message: "position pending reward overflow"
+            })
+        ));
+        assert_eq!(state, before);
+    }
+
     fn governance_test_pubkey(byte: u8) -> HybridPubKey {
         HybridPubKey {
             classical_pk: Bytes32::from([byte; 32]),
@@ -1156,8 +1216,6 @@ mod tests {
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: DEFAULT_COMMISSION_BPS,
             pending_commission_bps: None,
@@ -1930,16 +1988,8 @@ mod tests {
         distribute_block_rewards(&mut full_block_state, 1_000, 1, 1).unwrap();
 
         assert_eq!(
-            empty_block_state
-                .validators
-                .get(&validator_id)
-                .unwrap()
-                .pending_rewards,
-            full_block_state
-                .validators
-                .get(&validator_id)
-                .unwrap()
-                .pending_rewards,
+            validator_position_rewards(&empty_block_state, validator_id),
+            validator_position_rewards(&full_block_state, validator_id),
             "base block reward is epoch/stake based, not transaction-count based"
         );
     }
@@ -2207,8 +2257,8 @@ mod tests {
         for validator in validators {
             let id = validator.validator_id;
             assert_eq!(
-                s1.validators.get(&id).unwrap().pending_rewards,
-                s2.validators.get(&id).unwrap().pending_rewards
+                validator_position_rewards(&s1, id),
+                validator_position_rewards(&s2, id)
             );
             assert_eq!(
                 s1.validators.get(&id).unwrap().status,
@@ -2326,10 +2376,7 @@ mod tests {
             state.validators.get(&target_id).unwrap().status,
             ValidatorStatus::Registered
         );
-        assert_eq!(
-            state.validators.get(&inactive_id).unwrap().pending_rewards,
-            0
-        );
+        assert_eq!(validator_position_rewards(&state, inactive_id), 0);
     }
 
     #[test]

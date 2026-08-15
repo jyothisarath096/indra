@@ -71,15 +71,12 @@ fn signed_staking_op(
             | StakingOpBody::ClaimRewards { .. }
     );
     if cold_designated {
-        let authorization = Some(ColdStakingAuthorization {
+        let authorization = ColdStakingAuthorization {
             cold_key_version: 1,
             cold_nonce: nonce,
-        });
+        };
         match &mut body {
             StakingOpBody::SelfStake {
-                cold_authorization, ..
-            }
-            | StakingOpBody::ClaimRewards {
                 cold_authorization, ..
             }
             | StakingOpBody::SetAutoDelegate {
@@ -87,6 +84,9 @@ fn signed_staking_op(
             } => {
                 *cold_authorization = authorization;
             }
+            StakingOpBody::ClaimRewards {
+                cold_authorization, ..
+            } => *cold_authorization = Some(authorization),
             _ => unreachable!(),
         }
     }
@@ -128,8 +128,6 @@ fn install_validator(
             status: ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
-            pending_rewards: 0,
-            rewards_last_epoch: 0,
             slashed_offense_id: None,
             commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
             pending_commission_bps: None,
@@ -267,8 +265,6 @@ fn install_test_validators_for_qc(state: &mut ChainState) -> Vec<Bytes32> {
                     status: ValidatorStatus::Active,
                     registered_epoch: 0,
                     last_active_epoch: 0,
-                    pending_rewards: 0,
-                    rewards_last_epoch: 0,
                     slashed_offense_id: None,
                     commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                     pending_commission_bps: None,
@@ -724,7 +720,10 @@ fn test_auto_delegate_full_lifecycle() {
         StakingOpBody::SetAutoDelegate {
             validator_id: inactive_id,
             target_validator_id: target_id,
-            cold_authorization: None,
+            cold_authorization: ColdStakingAuthorization {
+                cold_key_version: 1,
+                cold_nonce: 1,
+            },
         },
         1,
         &inactive_keypair,
@@ -846,6 +845,24 @@ fn corrected_arithmetic_differs_from_saturating_multiply_then_divide() {
     for seed in 1..=4 {
         let (id, _, _) = install_validator(&mut snapshot, [seed; 32]);
         snapshot.validators.get_mut(&id).unwrap().stake_spark = STAKE;
+        let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id: id,
+        };
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            id,
+            id,
+            custody,
+            Some(
+                indra_core::types::stake_position::ActiveStakeAggregateV1::new(STAKE, 1, 1)
+                    .unwrap(),
+            ),
+            0,
+            0,
+        )
+        .unwrap();
+        snapshot
+            .stake_positions
+            .insert(position.position_id, position);
         validator_ids.push(id);
     }
 
@@ -859,7 +876,16 @@ fn corrected_arithmetic_differs_from_saturating_multiply_then_divide() {
     let mut reference = snapshot.clone();
     reference.height = EPOCH_DURATION_BLOCKS;
     for id in &validator_ids {
-        reference.validators.get_mut(id).unwrap().pending_rewards = old_reward;
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            *id,
+            *id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id: *id,
+            },
+        );
+        let mut position = reference.stake_positions.get(&position_id).unwrap().clone();
+        position.pending_rewards_spark = old_reward;
+        reference.stake_positions.insert(position_id, position);
     }
     let committed_root = compute_state_root(&reference);
 
@@ -868,11 +894,20 @@ fn corrected_arithmetic_differs_from_saturating_multiply_then_divide() {
     let mut ungated_replay = snapshot.clone();
     ungated_replay.height = EPOCH_DURATION_BLOCKS;
     for id in &validator_ids {
-        ungated_replay
-            .validators
-            .get_mut(id)
+        let position_id = indra_core::types::stake_position::derive_position_id(
+            *id,
+            *id,
+            indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                validator_id: *id,
+            },
+        );
+        let mut position = ungated_replay
+            .stake_positions
+            .get(&position_id)
             .unwrap()
-            .pending_rewards = new_reward;
+            .clone();
+        position.pending_rewards_spark = new_reward;
+        ungated_replay.stake_positions.insert(position_id, position);
     }
     assert_ne!(committed_root, compute_state_root(&ungated_replay));
 }
