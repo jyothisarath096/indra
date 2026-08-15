@@ -3232,6 +3232,124 @@ mod tests {
         assert_eq!(allocations.values().copied().sum::<u64>(), whole_slash);
     }
 
+    fn apply_reporter_reward_case(
+        stake: u64,
+        expected_potential_reward: u64,
+        expected_paid_reward: u64,
+        expect_reward_utxo: bool,
+    ) {
+        let (mut state, validator_id, validator_keypair) = slash_validator_state([0xDA; 32], stake);
+        let (reporter_pubkey, _) = make_test_keypair([0xDB; 32]);
+        let snapshot = state.snapshot_for_consensus_height(1).unwrap();
+        let (position, _) = snapshot.entry_with_position(&validator_id).unwrap();
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &validator_keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xA1; 32]),
+            ),
+            vote_2: signed_vote(
+                &validator_keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xB1; 32]),
+            ),
+            membership_proof: build_slash_membership_proof(snapshot, position).unwrap(),
+        };
+        let supply_before = state.total_supply;
+        let stake_before = state.validators.get(&validator_id).unwrap().stake_spark;
+        let chain_id = state.chain_id.clone();
+        let accounting = apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            1,
+            Some(&reporter_pubkey),
+        )
+        .unwrap();
+        let expected_slash = u64::try_from(
+            (stake as u128)
+                .checked_mul(indra_core::types::primitives::SLASH_DOUBLE_PRECOMMIT_BPS as u128)
+                .unwrap()
+                / 10_000,
+        )
+        .unwrap();
+        let calculated_potential_reward = u64::try_from(
+            (expected_slash as u128)
+                .checked_mul(indra_core::types::primitives::SLASH_REPORTER_REWARD_BPS as u128)
+                .unwrap()
+                / 10_000,
+        )
+        .unwrap();
+
+        assert_eq!(accounting.slash_amount, expected_slash);
+        assert_eq!(accounting.self_principal_slashed, expected_slash);
+        assert_eq!(calculated_potential_reward, expected_potential_reward);
+        assert_eq!(accounting.reporter_reward, expected_paid_reward);
+        assert_eq!(
+            accounting.burned + accounting.reporter_reward,
+            expected_slash
+        );
+        assert_eq!(supply_before - state.total_supply, accounting.burned);
+        assert_eq!(
+            stake_before - state.validators.get(&validator_id).unwrap().stake_spark,
+            expected_slash
+        );
+
+        let rewards = state
+            .utxos
+            .all_entries()
+            .filter(|entry| entry.tx_index == SLASH_REWARD_TX_IDX)
+            .collect::<Vec<_>>();
+        assert_eq!(rewards.len(), usize::from(expect_reward_utxo));
+        if let Some(reward) = rewards.first() {
+            assert_eq!(reward.output.value_spark, expected_paid_reward);
+            assert_eq!(reward.output.owner_pubkey, reporter_pubkey);
+        }
+
+        // Re-presenting the same offense cannot mint a second reward or alter
+        // supply after the canonical offense has been applied once.
+        let after_first = state.encode_to_vec();
+        assert!(matches!(
+            apply_slash_v2_at_height_with_accounting(
+                &mut state,
+                &evidence,
+                &chain_id,
+                1,
+                Some(&reporter_pubkey),
+            ),
+            Err(StateError::SlashAlreadyApplied)
+        ));
+        assert_eq!(state.encode_to_vec(), after_first);
+    }
+
+    #[test]
+    fn reporter_reward_pays_exact_five_percent_and_conserves_full_slash_flow() {
+        // 100,000,000 stake -> 5,000,000 slash -> 250,000 reporter reward.
+        apply_reporter_reward_case(100_000_000, 250_000, 250_000, true);
+    }
+
+    #[test]
+    fn reporter_reward_dust_boundary_is_exact_and_sub_dust_share_is_burned() {
+        let dust = indra_core::types::primitives::DUST_LIMIT_SPARK;
+        // A slash of exactly 20*dust yields an exact-dust 5% reward and pays.
+        apply_reporter_reward_case(dust.checked_mul(400).unwrap(), dust, dust, true);
+        // One Spark less slash yields dust-1 after the reporter-share floor;
+        // no reward UTXO is created and the entire slash is burned.
+        apply_reporter_reward_case(
+            dust.checked_mul(400).unwrap().checked_sub(20).unwrap(),
+            dust - 1,
+            0,
+            false,
+        );
+    }
+
     #[test]
     fn verified_slash_capability_is_bound_to_offense_and_inclusion_height() {
         let (state, validator_id, keypair) = slash_validator_state([0xD9; 32], 1_000_000);
