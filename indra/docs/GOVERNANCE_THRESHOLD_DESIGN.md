@@ -19,6 +19,10 @@ The comparison is exclusive: exactly reaching the threshold is not
 enough. A 50% standard threshold requires strictly more than 50% YES
 stake.
 
+The applicable standard or critical threshold is copied into the
+proposal record at creation. A later governance parameter change cannot
+retroactively change the rule used to tally an already-open proposal.
+
 `snapshot_total_stake` comes from the proposal's governance snapshot,
 not from current live stake at tally time. Snapshot 2 may move weight
 between revealed validators through governance redelegation, but its

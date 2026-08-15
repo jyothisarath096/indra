@@ -27,6 +27,8 @@ pub struct EpochRecord {
     pub fee_rewards_distributed: u64,
     /// Total Spark burned via fee burn this epoch.
     pub fees_burned: u64,
+    /// Total Spark burned from governance proposal deposits this epoch.
+    pub governance_deposits_burned: u64,
     /// Total Spark slashed this epoch.
     pub total_slashed_spark: u64,
     /// Number of slash events this epoch.
@@ -65,6 +67,7 @@ impl Encode for EpochRecord {
         self.block_rewards_distributed.encode(buf);
         self.fee_rewards_distributed.encode(buf);
         self.fees_burned.encode(buf);
+        self.governance_deposits_burned.encode(buf);
         self.total_slashed_spark.encode(buf);
         self.slash_event_count.encode(buf);
         self.liveness_penalty_count.encode(buf);
@@ -78,7 +81,7 @@ impl Encode for EpochRecord {
     }
 
     fn encoded_len(&self) -> usize {
-        1 + 14 * 8
+        1 + 15 * 8
             + 3 * 4
             + list_encoded_len(&self.validators_joined)
             + list_encoded_len(&self.validators_left)
@@ -110,6 +113,7 @@ fn decode_epoch_record(r: &mut ByteReader<'_>) -> IndraResult<EpochRecord> {
         block_rewards_distributed: u64::decode(r)?,
         fee_rewards_distributed: u64::decode(r)?,
         fees_burned: u64::decode(r)?,
+        governance_deposits_burned: u64::decode(r)?,
         total_slashed_spark: u64::decode(r)?,
         slash_event_count: u32::decode(r)?,
         liveness_penalty_count: u32::decode(r)?,
@@ -138,6 +142,7 @@ mod tests {
             block_rewards_distributed: 356_760_000_000,
             fee_rewards_distributed: 123,
             fees_burned: 456,
+            governance_deposits_burned: 123,
             total_slashed_spark: 789,
             slash_event_count: 2,
             liveness_penalty_count: 1,

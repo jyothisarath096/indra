@@ -42,6 +42,7 @@ struct ScalarSnapshot {
     fee_reward_pool: u64,
     epoch_fees_burned: u64,
     epoch_slashed_spark: u64,
+    epoch_governance_burned_spark: u64,
     epoch_slash_event_count: u32,
     election_seed: Bytes64,
     election_seed_height: u64,
@@ -171,6 +172,8 @@ impl<'a> StateTxn<'a> {
                     effects.epoch_summary_changed |= before.epoch_fees_burned
                         != state.epoch_fees_burned
                         || before.epoch_slashed_spark != state.epoch_slashed_spark
+                        || before.epoch_governance_burned_spark
+                            != state.epoch_governance_burned_spark
                         || before.epoch_slash_event_count != state.epoch_slash_event_count;
                     effects.epoch_changed |= before.height
                         / indra_core::types::primitives::EPOCH_DURATION_BLOCKS
@@ -396,6 +399,7 @@ impl<'a> StateTxn<'a> {
             fee_reward_pool: self.state.fee_reward_pool,
             epoch_fees_burned: self.state.epoch_fees_burned,
             epoch_slashed_spark: self.state.epoch_slashed_spark,
+            epoch_governance_burned_spark: self.state.epoch_governance_burned_spark,
             epoch_slash_event_count: self.state.epoch_slash_event_count,
             election_seed: self.state.election_seed,
             election_seed_height: self.state.election_seed_height,
@@ -770,6 +774,8 @@ impl<'a> StateTxn<'a> {
                     self.state.fee_reward_pool = snapshot.fee_reward_pool;
                     self.state.epoch_fees_burned = snapshot.epoch_fees_burned;
                     self.state.epoch_slashed_spark = snapshot.epoch_slashed_spark;
+                    self.state.epoch_governance_burned_spark =
+                        snapshot.epoch_governance_burned_spark;
                     self.state.epoch_slash_event_count = snapshot.epoch_slash_event_count;
                     self.state.election_seed = snapshot.election_seed;
                     self.state.election_seed_height = snapshot.election_seed_height;

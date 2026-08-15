@@ -167,6 +167,10 @@ pub struct ChainState {
     /// Not encoded and not included in consensus state roots.
     pub epoch_slashed_spark: u64,
 
+    /// Transient governance-deposit burns accumulated for the current epoch summary.
+    /// Not encoded and not included in consensus state roots.
+    pub epoch_governance_burned_spark: u64,
+
     /// Transient slash event count accumulated for the current epoch summary.
     /// Not encoded and not included in consensus state roots.
     pub epoch_slash_event_count: u32,
@@ -210,6 +214,7 @@ impl ChainState {
             state_commitment_v2: _,
             epoch_fees_burned: _,
             epoch_slashed_spark: _,
+            epoch_governance_burned_spark: _,
             epoch_slash_event_count: _,
             ..
         } = before;
@@ -249,6 +254,7 @@ impl ChainState {
         changed!(state_commitment_v2, F::StateCommitmentV2);
         changed!(epoch_fees_burned, F::EpochFeesBurned);
         changed!(epoch_slashed_spark, F::EpochSlashedSpark);
+        changed!(epoch_governance_burned_spark, F::EpochGovernanceBurnedSpark);
         changed!(epoch_slash_event_count, F::EpochSlashEventCount);
         changed
     }
@@ -446,6 +452,7 @@ impl Decode for ChainState {
             state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
+            epoch_governance_burned_spark: 0,
             epoch_slash_event_count: 0,
         })
     }
@@ -497,6 +504,7 @@ impl ChainState {
             state_commitment_v2: None,
             epoch_fees_burned: 0,
             epoch_slashed_spark: 0,
+            epoch_governance_burned_spark: 0,
             epoch_slash_event_count: 0,
         }
     }

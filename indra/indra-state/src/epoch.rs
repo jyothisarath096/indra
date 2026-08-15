@@ -33,7 +33,10 @@ use crate::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
         GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS, MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS,
     },
-    governance_apply::{return_governance_deposit, revalidate_queued_governance_action_or_fail},
+    governance_apply::{
+        burn_governance_deposit, return_governance_deposit,
+        revalidate_queued_governance_action_or_fail,
+    },
     validator::ValidatorStatus,
 };
 
@@ -159,6 +162,7 @@ fn apply_epoch_transition_final(
     let fee_pool_before = state.fee_reward_pool;
     let fees_burned_this_epoch = state.epoch_fees_burned;
     let explicit_slashed_this_epoch = state.epoch_slashed_spark;
+    let governance_burned_this_epoch = state.epoch_governance_burned_spark;
     let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
     let record_epoch = context.closing_epoch;
     let record_start_height = context.closing_start_height;
@@ -235,6 +239,7 @@ fn apply_epoch_transition_final(
         },
         fee_rewards_distributed,
         fees_burned: fees_burned_this_epoch,
+        governance_deposits_burned: governance_burned_this_epoch,
         total_slashed_spark: explicit_slashed_this_epoch.saturating_add(liveness_slashed),
         slash_event_count: explicit_slash_count_this_epoch.saturating_add(liveness_penalty_count),
         liveness_penalty_count,
@@ -253,6 +258,7 @@ fn apply_epoch_transition_final(
     );
     state.epoch_fees_burned = 0;
     state.epoch_slashed_spark = 0;
+    state.epoch_governance_burned_spark = 0;
     state.epoch_slash_event_count = 0;
     state.rebuild_state_commitment_v2(height);
     Ok(record)
@@ -401,6 +407,7 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
         compute_snapshot2(proposal)
     };
     let mut should_return_deposit = false;
+    let mut should_burn_deposit = false;
     let mut should_queue = None;
     if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
         proposal.snapshot2 = Some(snapshot2);
@@ -416,15 +423,7 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
         // Governance "quorum" fields are intentionally YES-stake thresholds
         // over total proposal snapshot stake, not participation thresholds.
         // See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
-        let quorum_bps = match proposal.tier {
-            indra_core::types::governance::ProposalTier::Standard => {
-                state.governance.params.governance_quorum_bps
-            }
-            indra_core::types::governance::ProposalTier::Critical => {
-                state.governance.params.governance_critical_quorum_bps
-            }
-        };
-        let passed = snap2.quorum_met_at_height(yes, quorum_bps, height);
+        let passed = snap2.quorum_met_at_height(yes, proposal.quorum_bps, height);
         proposal.passed = Some(passed);
         if passed {
             proposal.phase = ProposalPhase::ExecDelay;
@@ -439,8 +438,8 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
             let support_bps = snap2.support_bps_at_height(yes, height);
             if support_bps >= GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS && !proposal.deposit_burned {
                 should_return_deposit = true;
-            } else {
-                proposal.deposit_burned = true;
+            } else if !proposal.deposit_burned && proposal.deposit_spark > 0 {
+                should_burn_deposit = true;
             }
             proposal.phase = ProposalPhase::Failed;
         }
@@ -450,6 +449,8 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
     }
     if should_return_deposit {
         return_governance_deposit(state, proposal_id, height)?;
+    } else if should_burn_deposit {
+        burn_governance_deposit(state, proposal_id)?;
     }
     Ok(())
 }
@@ -1116,6 +1117,7 @@ mod tests {
             reveal_start_epoch: proposed_epoch.saturating_add(50),
             tally_epoch: proposed_epoch.saturating_add(60),
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: proposed_epoch.saturating_add(60),
             phase,
             snapshot1: None,
@@ -1490,6 +1492,7 @@ mod tests {
             reveal_start_epoch: 0,
             tally_epoch: 0,
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: 0,
             phase: ProposalPhase::Reveal,
             snapshot1: Some(snapshot1),
@@ -1544,6 +1547,96 @@ mod tests {
     }
 
     #[test]
+    fn sub_ten_percent_support_burns_exact_deposit_and_clears_escrow() {
+        let mut state = new_test_state();
+        let proposal_id = Bytes32::from([0x43; 32]);
+        let yes_voter = Bytes32::from([0xA2; 32]);
+        let no_voter = Bytes32::from([0xB2; 32]);
+        let action = GovernableAction::SetMinDelegationSpark {
+            value: DUST_LIMIT_SPARK,
+        };
+        let mut proposal = governance_pruning_test_proposal(43, ProposalPhase::Reveal, 0);
+        proposal.proposal_id = proposal_id;
+        proposal.action = action.clone();
+        proposal.tier = action.tier();
+        proposal.deposit_spark = 1_000;
+        proposal.tally_epoch = 0;
+        proposal.quorum_bps = 5_000;
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights: [(yes_voter, 9), (no_voter, 91)].into_iter().collect(),
+            total_stake: 100,
+        });
+        proposal.reveals.insert(
+            yes_voter,
+            VoteReveal {
+                validator_id: yes_voter,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            no_voter,
+            VoteReveal {
+                validator_id: no_voter,
+                vote: false,
+                revealed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+        let supply_before = state.total_supply;
+
+        apply_governance_phase_transitions(&mut state, 0, 1).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(state.total_supply, supply_before - 1_000);
+        assert_eq!(state.epoch_governance_burned_spark, 1_000);
+        assert_eq!(proposal.deposit_spark, 0);
+        assert!(proposal.deposit_burned);
+    }
+
+    #[test]
+    fn tally_uses_threshold_frozen_at_proposal_creation() {
+        let mut state = new_test_state();
+        let proposal_id = Bytes32::from([0x44; 32]);
+        let yes = Bytes32::from([0xA3; 32]);
+        let no = Bytes32::from([0xB3; 32]);
+        let mut proposal = governance_pruning_test_proposal(44, ProposalPhase::Reveal, 0);
+        proposal.proposal_id = proposal_id;
+        proposal.deposit_spark = 0;
+        proposal.tally_epoch = 0;
+        proposal.quorum_bps = 5_000;
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights: [(yes, 60), (no, 40)].into_iter().collect(),
+            total_stake: 100,
+        });
+        proposal.reveals.insert(
+            yes,
+            VoteReveal {
+                validator_id: yes,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            no,
+            VoteReveal {
+                validator_id: no,
+                vote: false,
+                revealed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+        state.governance.params.governance_quorum_bps = 7_000;
+
+        apply_governance_phase_transitions(&mut state, 0, 1).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.yes_stake, 60);
+        assert_eq!(proposal.passed, Some(true));
+        assert_eq!(proposal.phase, ProposalPhase::ExecDelay);
+    }
+
+    #[test]
     fn snapshot2_never_creates_weight_for_non_snapshot1_validator() {
         let proposal_id = Bytes32::from([0x51; 32]);
         let from_validator = Bytes32::from([0xA1; 32]);
@@ -1570,6 +1663,7 @@ mod tests {
             reveal_start_epoch: 0,
             tally_epoch: 0,
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: 0,
             phase: ProposalPhase::Reveal,
             snapshot1: Some(GovernanceSnapshot {
@@ -1643,6 +1737,7 @@ mod tests {
             reveal_start_epoch: 0,
             tally_epoch: 0,
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: 0,
             phase: ProposalPhase::Reveal,
             snapshot1: Some(GovernanceSnapshot {

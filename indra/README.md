@@ -182,17 +182,20 @@ indra-governance propose \
   --title "Reduce liveness penalty" \
   --description "Reduce from 10 BPS to 8 BPS to be less punitive" \
   --deposit-utxo <utxo_id> \
+  --cold-keys ~/.indra/data/cold-keys.json \
   --keys ~/.indra/data/keys.json
 
 # Commit a hidden vote (Phase 2)
 indra-governance commit \
   --proposal-id <proposal_id> --vote yes \
+  --cold-keys ~/.indra/data/cold-keys.json \
   --keys ~/.indra/data/keys.json --wait
 # Vote nonce is generated automatically and saved beside keys.json by default.
 
 # Reveal your vote (Phase 3)
 indra-governance reveal \
   --proposal-id <proposal_id> --vote yes \
+  --cold-keys ~/.indra/data/cold-keys.json \
   --keys ~/.indra/data/keys.json --wait
 
 # Redelegate vote weight (Phase 3 only, delegators only)

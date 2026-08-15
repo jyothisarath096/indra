@@ -284,6 +284,14 @@ fn apply_propose(
             reveal_start_epoch,
             tally_epoch,
             exec_delay_epochs: state.governance.params.governance_delay_epochs,
+            quorum_bps: match action.tier() {
+                indra_core::types::governance::ProposalTier::Standard => {
+                    state.governance.params.governance_quorum_bps
+                }
+                indra_core::types::governance::ProposalTier::Critical => {
+                    state.governance.params.governance_critical_quorum_bps
+                }
+            },
             executable_after_epoch,
             phase: ProposalPhase::Deliberation,
             snapshot1: None,
@@ -541,7 +549,7 @@ fn apply_cancel(
     let proposal = state
         .governance
         .proposals
-        .get_mut(proposal_id)
+        .get(proposal_id)
         .ok_or(StateError::GovernanceProposalNotFound)?;
     if proposal.phase != ProposalPhase::Deliberation {
         return invalid("proposal can only be cancelled during deliberation");
@@ -549,8 +557,13 @@ fn apply_cancel(
     if op.signer_id != proposal.proposer_id {
         return invalid("only proposer may cancel proposal");
     }
-    proposal.phase = ProposalPhase::Cancelled;
-    proposal.deposit_burned = true;
+    burn_governance_deposit(state, *proposal_id)?;
+    state
+        .governance
+        .proposals
+        .get_mut(proposal_id)
+        .expect("proposal exists after governance deposit burn")
+        .phase = ProposalPhase::Cancelled;
     Ok(())
 }
 
@@ -581,7 +594,10 @@ fn apply_governance_nonce(
         .get(&op.signer_id)
         .copied()
         .unwrap_or(0)
-        .saturating_add(1);
+        .checked_add(1)
+        .ok_or_else(|| StateError::InvalidGovernanceOp {
+            reason: "governance nonce exhausted".into(),
+        })?;
     if op.nonce != expected {
         return Err(StateError::GovernanceNonceInvalid {
             expected,
@@ -809,6 +825,37 @@ pub fn return_governance_deposit(
         proposal.deposit_spark = 0;
     }
     Ok(())
+}
+
+/// Permanently burn one proposal's escrow using checked consensus accounting.
+pub fn burn_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -> StateResult<u64> {
+    let amount = state
+        .governance
+        .proposals
+        .get(&proposal_id)
+        .ok_or(StateError::GovernanceProposalNotFound)?
+        .deposit_spark;
+    if amount == 0 {
+        return Ok(0);
+    }
+    let new_total_supply = state
+        .total_supply
+        .checked_sub(amount)
+        .ok_or(StateError::ValueOverflow)?;
+    let new_epoch_governance_burned_spark = state
+        .epoch_governance_burned_spark
+        .checked_add(amount)
+        .ok_or(StateError::ValueOverflow)?;
+    state.total_supply = new_total_supply;
+    state.epoch_governance_burned_spark = new_epoch_governance_burned_spark;
+    let proposal = state
+        .governance
+        .proposals
+        .get_mut(&proposal_id)
+        .expect("proposal exists after checked governance burn accounting");
+    proposal.deposit_spark = 0;
+    proposal.deposit_burned = true;
+    Ok(amount)
 }
 
 fn governance_refund_output(
@@ -1213,6 +1260,7 @@ mod tests {
             reveal_start_epoch: 0,
             tally_epoch: 0,
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: 0,
             phase,
             snapshot1: None,
@@ -1302,7 +1350,13 @@ mod tests {
             signature: dummy_sig(),
         };
         sign_cold_governance_op(&mut cancel, &cold_keypair, DEFAULT_CHAIN_ID);
+        let supply_before_cancel = state.total_supply;
         apply_governance_op(&mut state, &cancel, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        let cancelled = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(state.total_supply, supply_before_cancel - 1_000);
+        assert_eq!(state.epoch_governance_burned_spark, 1_000);
+        assert_eq!(cancelled.deposit_spark, 0);
+        assert!(cancelled.deposit_burned);
 
         let vote_proposal_id = Bytes32::from([0xD3; 32]);
         let vote_nonce = Bytes32::from([0xD4; 32]);
@@ -1376,6 +1430,66 @@ mod tests {
         assert!(state.governance.proposals[&vote_proposal_id]
             .reveals
             .contains_key(&validator_id));
+    }
+
+    #[test]
+    fn hot_governance_nonce_exhaustion_fails_closed() {
+        let mut state = ChainState::new_genesis();
+        let signer_id = Bytes32::from([0xEF; 32]);
+        state.governance.gov_nonces.insert(signer_id, u64::MAX);
+        let op = GovernanceOpV2 {
+            action_type: GovernanceActionType::ExecuteProposal,
+            signer_id,
+            nonce: u64::MAX,
+            payload: GovernancePayload::Execute {
+                proposal_id: Bytes32::from([0xEE; 32]),
+            },
+            signature: dummy_sig(),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                apply_governance_nonce(&mut state, &op, 1, false),
+                Err(StateError::InvalidGovernanceOp { reason })
+                    if reason == "governance nonce exhausted"
+            ));
+        }
+        assert_eq!(state.governance.gov_nonces.get(&signer_id), Some(&u64::MAX));
+    }
+
+    #[test]
+    fn governance_burn_overflow_is_atomic() {
+        let mut state = ChainState::new_genesis();
+        let proposal_id = Bytes32::from([0xED; 32]);
+        let (proposer_pubkey, _) = keypair(0xED);
+        state.governance.proposals.insert(
+            proposal_id,
+            proposal_record(
+                proposal_id,
+                proposer_pubkey,
+                GovernableAction::SetMinDelegationSpark {
+                    value: DUST_LIMIT_SPARK,
+                },
+                ProposalPhase::Deliberation,
+            ),
+        );
+        state
+            .governance
+            .proposals
+            .get_mut(&proposal_id)
+            .unwrap()
+            .deposit_spark = 1;
+        state.epoch_governance_burned_spark = u64::MAX;
+        let supply_before = state.total_supply;
+
+        assert!(matches!(
+            burn_governance_deposit(&mut state, proposal_id),
+            Err(StateError::ValueOverflow)
+        ));
+        assert_eq!(state.total_supply, supply_before);
+        assert_eq!(state.epoch_governance_burned_spark, u64::MAX);
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.deposit_spark, 1);
+        assert!(!proposal.deposit_burned);
     }
 
     #[test]

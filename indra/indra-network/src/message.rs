@@ -374,11 +374,11 @@ impl Message {
                 Ok(Self::StakingOp(op))
             }
             MessageType::GovernanceOp => {
-                let mut r = ByteReader::new(payload);
-                let op =
-                    GovernanceOpV2::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
+                let op = GovernanceOpV2::decode_exact(payload).map_err(|e| {
+                    NetworkError::DecodeFailed {
                         reason: e.to_string(),
-                    })?;
+                    }
+                })?;
                 Ok(Self::GovernanceOp(op))
             }
             MessageType::PeerList => {
@@ -808,6 +808,19 @@ mod tests {
         let wire = Message::GovernanceOp(op.clone()).encode_wire().unwrap();
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
         assert!(matches!(decoded, Message::GovernanceOp(got) if got == op));
+    }
+
+    #[test]
+    fn governance_op_wire_rejects_trailing_bytes() {
+        let op = test_governance_op();
+        let mut payload = op.encode_to_vec();
+        payload.extend_from_slice(&[0xAA, 0x55]);
+        let mut wire = vec![MessageType::GovernanceOp as u8];
+        wire.extend_from_slice(&payload);
+        assert!(matches!(
+            Message::decode_wire(&wire),
+            Err(NetworkError::DecodeFailed { .. })
+        ));
     }
 
     #[test]

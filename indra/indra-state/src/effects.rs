@@ -102,6 +102,7 @@ pub(crate) enum CanonicalStateField {
     StateCommitmentV2,
     EpochFeesBurned,
     EpochSlashedSpark,
+    EpochGovernanceBurnedSpark,
     EpochSlashEventCount,
 }
 
@@ -166,9 +167,10 @@ impl CanonicalStateEffects {
             }
             F::Governance => self.governance_state_changed,
             F::StateCommitmentV2 => self.state_commitment_cache_changed,
-            F::EpochFeesBurned | F::EpochSlashedSpark | F::EpochSlashEventCount => {
-                self.epoch_summary_changed
-            }
+            F::EpochFeesBurned
+            | F::EpochSlashedSpark
+            | F::EpochGovernanceBurnedSpark
+            | F::EpochSlashEventCount => self.epoch_summary_changed,
         }
     }
 }

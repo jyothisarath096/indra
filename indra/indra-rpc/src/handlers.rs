@@ -2176,7 +2176,7 @@ fn bytes32_vec_json(values: &[Bytes32]) -> String {
 
 fn epoch_record_json(record: &EpochRecord) -> String {
     format!(
-        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"total_slashed_spark":{},"slash_event_count":{},"liveness_penalty_count":{},"avg_base_fee":{},"validators_joined":{},"validators_left":{},"era":{},"block_reward_spark":{},"total_supply":{},"treasury_balance":{}}}"#,
+        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"governance_deposits_burned":{},"total_slashed_spark":{},"slash_event_count":{},"liveness_penalty_count":{},"avg_base_fee":{},"validators_joined":{},"validators_left":{},"era":{},"block_reward_spark":{},"total_supply":{},"treasury_balance":{}}}"#,
         record.epoch,
         record.start_height,
         record.end_height,
@@ -2186,6 +2186,7 @@ fn epoch_record_json(record: &EpochRecord) -> String {
         record.block_rewards_distributed,
         record.fee_rewards_distributed,
         record.fees_burned,
+        record.governance_deposits_burned,
         record.total_slashed_spark,
         record.slash_event_count,
         record.liveness_penalty_count,
@@ -2201,7 +2202,7 @@ fn epoch_record_json(record: &EpochRecord) -> String {
 
 fn epoch_summary_json(record: &EpochRecord) -> String {
     format!(
-        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"total_slashed_spark":{},"slash_event_count":{},"validators_joined":{},"validators_left":{}}}"#,
+        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"governance_deposits_burned":{},"total_slashed_spark":{},"slash_event_count":{},"validators_joined":{},"validators_left":{}}}"#,
         record.epoch,
         record.start_height,
         record.end_height,
@@ -2211,6 +2212,7 @@ fn epoch_summary_json(record: &EpochRecord) -> String {
         record.block_rewards_distributed,
         record.fee_rewards_distributed,
         record.fees_burned,
+        record.governance_deposits_burned,
         record.total_slashed_spark,
         record.slash_event_count,
         bytes32_vec_json(&record.validators_joined),
@@ -2399,7 +2401,7 @@ fn get_proposal_votes(params: &[String], state: &NodeState<'_>) -> RpcResult<Str
 
 fn proposal_summary_json(proposal: &indra_state::governance::ProposalRecord) -> String {
     format!(
-        "{{\"proposal_id\":\"{}\",\"title\":\"{}\",\"tier\":\"{}\",\"phase\":\"{}\",\"action_type\":\"{}\",\"proposer_id\":\"{}\",\"proposed_epoch\":{},\"commit_start_epoch\":{},\"reveal_start_epoch\":{},\"tally_epoch\":{},\"executable_after_epoch\":{},\"yes_stake\":{},\"no_stake\":{},\"abstain_stake\":{},\"passed\":{},\"deposit_burned\":{}}}",
+        "{{\"proposal_id\":\"{}\",\"title\":\"{}\",\"tier\":\"{}\",\"phase\":\"{}\",\"action_type\":\"{}\",\"proposer_id\":\"{}\",\"proposed_epoch\":{},\"commit_start_epoch\":{},\"reveal_start_epoch\":{},\"tally_epoch\":{},\"quorum_bps\":{},\"executable_after_epoch\":{},\"yes_stake\":{},\"no_stake\":{},\"abstain_stake\":{},\"passed\":{},\"deposit_burned\":{}}}",
         hex::encode(proposal.proposal_id.0),
         json_escape(&proposal.title),
         proposal_tier_str(proposal.tier),
@@ -2410,6 +2412,7 @@ fn proposal_summary_json(proposal: &indra_state::governance::ProposalRecord) -> 
         proposal.commit_start_epoch,
         proposal.reveal_start_epoch,
         proposal.tally_epoch,
+        proposal.quorum_bps,
         proposal.executable_after_epoch,
         proposal.yes_stake,
         proposal.no_stake,
@@ -3032,6 +3035,7 @@ mod tests {
                 reveal_start_epoch: proposed_epoch + 1,
                 tally_epoch: proposed_epoch + 2,
                 exec_delay_epochs: 0,
+                quorum_bps: 5_000,
                 executable_after_epoch: proposed_epoch + 2,
                 phase: ProposalPhase::Executed,
                 snapshot1: None,

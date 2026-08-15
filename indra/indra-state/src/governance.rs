@@ -543,6 +543,8 @@ pub struct ProposalRecord {
     pub tally_epoch: u64,
     /// Delay at proposal time.
     pub exec_delay_epochs: u64,
+    /// YES-stake threshold frozen when the proposal is admitted.
+    pub quorum_bps: u32,
     /// Earliest execution epoch.
     pub executable_after_epoch: u64,
     /// Current phase.
@@ -585,6 +587,7 @@ impl Encode for ProposalRecord {
         self.reveal_start_epoch.encode(buf);
         self.tally_epoch.encode(buf);
         self.exec_delay_epochs.encode(buf);
+        self.quorum_bps.encode(buf);
         self.executable_after_epoch.encode(buf);
         self.phase.encode(buf);
         encode_option(&self.snapshot1, buf);
@@ -614,6 +617,7 @@ impl Encode for ProposalRecord {
             + 8
             + 1
             + 6 * 8
+            + 4
             + self.phase.encoded_len()
             + option_len(&self.snapshot1)
             + commit_map_len(&self.commits)
@@ -644,6 +648,7 @@ impl Decode for ProposalRecord {
             reveal_start_epoch: u64::decode(r)?,
             tally_epoch: u64::decode(r)?,
             exec_delay_epochs: u64::decode(r)?,
+            quorum_bps: u32::decode(r)?,
             executable_after_epoch: u64::decode(r)?,
             phase: ProposalPhase::decode(r)?,
             snapshot1: decode_option(r)?,
@@ -1166,6 +1171,7 @@ mod tests {
             reveal_start_epoch: proposed_epoch.saturating_add(50),
             tally_epoch: proposed_epoch.saturating_add(60),
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: proposed_epoch.saturating_add(60),
             phase,
             snapshot1: None,
@@ -1390,6 +1396,7 @@ mod tests {
                 reveal_start_epoch: 2,
                 tally_epoch: 3,
                 exec_delay_epochs: 4,
+                quorum_bps: 5_000,
                 executable_after_epoch: 7,
                 phase: ProposalPhase::Deliberation,
                 snapshot1: None,

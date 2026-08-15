@@ -1640,6 +1640,7 @@ mod tests {
             reveal_start_epoch: 0,
             tally_epoch: 0,
             exec_delay_epochs: 0,
+            quorum_bps: 5_000,
             executable_after_epoch: 0,
             phase,
             snapshot1: None,

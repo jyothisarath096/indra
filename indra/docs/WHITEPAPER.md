@@ -638,6 +638,10 @@ tally epoch is still accepted before the proposal moves to tally.
 to vote and their stake at that point. Prevents late stake manipulation
 to influence validator eligibility.
 
+The proposal also freezes the applicable standard or critical YES-stake
+threshold when it is created. A later governance change cannot retroactively
+change the decision rule for a proposal already in its lifecycle.
+
 **Snapshot 2** (end of Phase 3): After governance redelegation, captures
 the final stake weight applied to each validator's vote. Delegators who
 disagree with their validator's revealed vote can shift their weight to
@@ -711,6 +715,7 @@ that violates a monotonic constraint is rejected at submission.
 Proposal deposit:           1,000 INDRA
 Deposit return:             If proposal passes, or if failed proposal has ≥10% support
 Deposit burned:             If failed proposal has <10% support, or proposer cancels
+Burn accounting:            Checked subtraction from total supply and epoch audit record
 Max active proposals:       3 globally
 Per-proposer limit:         1 active proposal at any time
 Cooldown:                   1 new proposal per proposer per 10 epochs

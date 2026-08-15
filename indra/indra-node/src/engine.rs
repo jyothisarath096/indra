@@ -3735,6 +3735,7 @@ mod tests {
                     block_rewards_distributed: 0,
                     fee_rewards_distributed: 0,
                     fees_burned: 0,
+                    governance_deposits_burned: 0,
                     total_slashed_spark: 0,
                     slash_event_count: 0,
                     liveness_penalty_count: 0,

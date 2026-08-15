@@ -7,15 +7,16 @@ use std::{
 };
 
 use indra_cli::{
-    fetch_chain_id, reconstruct_keypair, staking::http_post, CliError, CliResult, KeysFile, Wallet,
+    fetch_chain_id, fetch_validator_cold_replay, load_cold_keys, reconstruct_keypair,
+    staking::http_post, CliError, CliResult, KeysFile, PasswordSource, Wallet,
 };
 use indra_core::{
     codec::Encode,
     types::{
         crypto::{HybridPubKey, HybridSignature},
         governance::{
-            governance_signing_domain, governance_vote_commit_hash, GovernableAction,
-            GovernanceOpV2, GovernancePayload,
+            governance_signing_domain, governance_vote_commit_hash, ColdGovernanceAuthorization,
+            GovernableAction, GovernanceOpV2, GovernancePayload,
         },
         primitives::{Bytes32, VariableBytes},
     },
@@ -45,9 +46,42 @@ fn run() -> CliResult<()> {
     let node_url = flag_value(&args, "--node").unwrap_or_else(|| "http://127.0.0.1:8545".into());
     let wallet_path = flag_value(&args, "--wallet").unwrap_or_else(|| "wallet.json".into());
     let chain_id = fetch_chain_id(&node_url)?;
-    let nonce = match flag_value(&args, "--nonce") {
-        Some(raw) => parse_u64(&raw, "--nonce")?,
-        None => fetch_governance_nonce(&node_url, signer_id)?,
+    let cold_required = matches!(command, "propose" | "commit" | "reveal" | "cancel");
+    let cold_context = if cold_required {
+        let cold_path = flag_value(&args, "--cold-keys").ok_or_else(|| {
+            CliError::Parse("governance command requires --cold-keys <path>".into())
+        })?;
+        let cold_password_file = flag_value(&args, "--cold-keys-password-file");
+        let cold_password = match cold_password_file.as_deref() {
+            Some(path) => PasswordSource::File {
+                path: Path::new(path),
+                reject_permissive: false,
+            },
+            None => PasswordSource::Prompt,
+        };
+        let cold_keys = load_cold_keys(&cold_path, cold_password)
+            .map_err(|error| CliError::Keystore(error.to_string()))?;
+        let cold_keypair = cold_keys
+            .reconstruct()
+            .map_err(|error| CliError::Keystore(error.to_string()))?;
+        let replay = fetch_validator_cold_replay(&node_url, &hex::encode(signer_id.0))?;
+        Some((cold_keypair, replay.0, replay.1))
+    } else {
+        None
+    };
+    let nonce = if cold_required {
+        if flag_value(&args, "--nonce").is_some() {
+            return Err(CliError::Parse(
+                "--nonce is not valid for cold-authorized governance commands; replay metadata is fetched from consensus"
+                    .into(),
+            ));
+        }
+        0
+    } else {
+        match flag_value(&args, "--nonce") {
+            Some(raw) => parse_u64(&raw, "--nonce")?,
+            None => fetch_governance_nonce(&node_url, signer_id)?,
+        }
     };
 
     let mut proposal_deposit_utxo_id = None;
@@ -58,13 +92,15 @@ fn run() -> CliResult<()> {
             GovernancePayload::Propose {
                 action: parse_governable_action(&args)?,
                 deposit_utxo_id,
-                proposer_pubkey: hybrid_pubkey_from_keypair(&keypair)?,
+                proposer_pubkey: cold_hybrid_pubkey(
+                    &cold_context.as_ref().expect("cold context required").0,
+                )?,
                 title: variable_bytes(&required_flag(&args, "--title")?, "--title")?,
                 description: variable_bytes(
                     &required_flag(&args, "--description")?,
                     "--description",
                 )?,
-                cold_authorization: None,
+                cold_authorization: Some(cold_authorization(&cold_context)),
             }
         }
         "commit" => {
@@ -74,7 +110,7 @@ fn run() -> CliResult<()> {
             GovernancePayload::Commit {
                 proposal_id,
                 commit_hash: governance_vote_commit_hash(proposal_id, signer_id, vote, vote_nonce),
-                cold_authorization: None,
+                cold_authorization: Some(cold_authorization(&cold_context)),
             }
         }
         "reveal" => {
@@ -83,7 +119,7 @@ fn run() -> CliResult<()> {
                 proposal_id,
                 vote: parse_vote(&required_flag(&args, "--vote")?)?,
                 nonce: vote_nonce_for_reveal(&args, &keys_path, proposal_id, signer_id)?,
-                cold_authorization: None,
+                cold_authorization: Some(cold_authorization(&cold_context)),
             }
         }
         "redelegate" => GovernancePayload::Redelegate {
@@ -97,7 +133,7 @@ fn run() -> CliResult<()> {
         },
         "cancel" => GovernancePayload::Cancel {
             proposal_id: parse_hex32_required(&args, "--proposal-id")?,
-            cold_authorization: None,
+            cold_authorization: Some(cold_authorization(&cold_context)),
         },
         _ => {
             print_help();
@@ -107,7 +143,11 @@ fn run() -> CliResult<()> {
         }
     };
 
-    let op = build_governance_op(signer_id, nonce, payload, &keypair, &chain_id)?;
+    let op = if let Some((cold_keypair, _, _)) = cold_context.as_ref() {
+        build_cold_governance_op(signer_id, payload, cold_keypair, &chain_id)?
+    } else {
+        build_governance_op(signer_id, nonce, payload, &keypair, &chain_id)?
+    };
     let op_bytes = op.encode_to_vec();
     let op_hex = hex::encode(&op_bytes);
     let op_id = hex::encode(sha256(&op_bytes));
@@ -178,6 +218,62 @@ fn build_governance_op(
                 .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
         },
     })
+}
+
+fn cold_authorization(
+    context: &Option<(indra_crypto::ColdHybridKeypair, u64, u64)>,
+) -> ColdGovernanceAuthorization {
+    let (_, cold_key_version, cold_nonce) = context.as_ref().expect("cold context required");
+    ColdGovernanceAuthorization {
+        cold_key_version: *cold_key_version,
+        cold_nonce: *cold_nonce,
+    }
+}
+
+fn cold_hybrid_pubkey(keypair: &indra_crypto::ColdHybridKeypair) -> CliResult<HybridPubKey> {
+    let cold_public = keypair.public_key();
+    let public = cold_public.as_complete_hybrid();
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(public.classical.0),
+        pq_pk: VariableBytes::from_slice(&public.pq.0)
+            .map_err(|_| CliError::Crypto("cold PQ public key too large".into()))?,
+    })
+}
+
+fn build_cold_governance_op(
+    signer_id: Bytes32,
+    payload: GovernancePayload,
+    cold_keypair: &indra_crypto::ColdHybridKeypair,
+    chain_id: &str,
+) -> CliResult<GovernanceOpV2> {
+    let mut op = GovernanceOpV2 {
+        action_type: payload.action_type(),
+        signer_id,
+        nonce: 0,
+        payload,
+        signature: HybridSignature {
+            classical_sig: VariableBytes::from_slice(&[0; indra_crypto::CLASSICAL_SIG_BYTES])
+                .map_err(|_| CliError::Crypto("dummy classical signature too large".into()))?,
+            pq_sig: VariableBytes::from_slice(&[0; indra_crypto::PQ_SIG_BYTES])
+                .map_err(|_| CliError::Crypto("dummy PQ signature too large".into()))?,
+        },
+    };
+    op.validate_structure()
+        .map_err(|error| CliError::Crypto(error.to_string()))?;
+    let signing_bytes = op
+        .cold_authorization_signing_bytes(chain_id)
+        .map_err(|error| CliError::Crypto(error.to_string()))?
+        .ok_or_else(|| CliError::Crypto("missing cold authorization envelope".into()))?;
+    let signature = cold_keypair
+        .sign(&signing_bytes)
+        .map_err(|error| CliError::Crypto(error.to_string()))?;
+    op.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&signature.classical.0)
+            .map_err(|_| CliError::Crypto("classical signature too large".into()))?,
+        pq_sig: VariableBytes::from_slice(&signature.pq.0)
+            .map_err(|_| CliError::Crypto("PQ signature too large".into()))?,
+    };
+    Ok(op)
 }
 
 fn parse_governable_action(args: &[String]) -> CliResult<GovernableAction> {
@@ -307,15 +403,6 @@ fn validator_bool_field(json: &str, validator_id: Bytes32, field: &str) -> Optio
 
 fn signer_id_from_keys(keys: &KeysFile) -> Bytes32 {
     Bytes32::from(keys.public.validator_id)
-}
-
-fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> CliResult<HybridPubKey> {
-    let public = keypair.public_key();
-    Ok(HybridPubKey {
-        classical_pk: Bytes32::from(public.classical.0),
-        pq_pk: VariableBytes::from_slice(&public.pq.0)
-            .map_err(|_| CliError::Transaction("pq pubkey too large".into()))?,
-    })
 }
 
 fn vote_nonce_for_commit(
@@ -555,6 +642,8 @@ Commands:\n\
 Common flags:\n\
   --keys <path>    Path to keys.json (default: keys.json)\n\
   --keys-password-file <path>  Password file for encrypted keys.json\n\
+  --cold-keys <path>  Cold key file (required for propose/commit/reveal/cancel)\n\
+  --cold-keys-password-file <path>  Password file for encrypted cold keys\n\
   --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n\
   --wallet <path>  Wallet file for proposal deposit bookkeeping (default: wallet.json)\n\
   --nonce <n>      Governance nonce override\n\
@@ -572,6 +661,91 @@ Vote flags:\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_cold_proposal_is_accepted_by_consensus() {
+        use indra_core::types::{primitives::DEFAULT_CHAIN_ID, transaction::OutputV1};
+        use indra_crypto::hybrid::{ClassicalKeypair, ColdHybridKeypair, PqKeypair};
+        use indra_state::validator::{ValidatorEntry, ValidatorStatus};
+
+        let hot = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x91; 32]),
+            PqKeypair::from_seed(&[0x92; 32]).unwrap(),
+        );
+        let hot_public = hot.public_key();
+        let hot_pubkey = HybridPubKey {
+            classical_pk: Bytes32::from(hot_public.classical.0),
+            pq_pk: VariableBytes::from_slice(&hot_public.pq.0).unwrap(),
+        };
+        let validator_id = hot_pubkey.identity_id();
+        let cold = ColdHybridKeypair::from_independent_seeds([0x93; 32], [0x94; 32]).unwrap();
+        let cold_pubkey = cold_hybrid_pubkey(&cold).unwrap();
+        let mut state = indra_state::ChainState::new_genesis();
+        state.governance.params.proposal_deposit_spark = 1_000;
+        state
+            .validators
+            .upsert(ValidatorEntry {
+                validator_id,
+                name: "cli-governance-test".into(),
+                hybrid_classical_pk: Some(hot_pubkey.classical_pk.0),
+                hybrid_pq_pk: Some(hot_pubkey.pq_pk.as_slice().to_vec()),
+                vrf_pk: Some([0x95; 32]),
+                vrf_key_activation_epoch: 0,
+                pending_vrf_pk: None,
+                pending_vrf_activation_epoch: None,
+                stake_spark: indra_core::types::primitives::MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+                status: ValidatorStatus::Active,
+                registered_epoch: 0,
+                last_active_epoch: 0,
+                pending_rewards: 0,
+                rewards_last_epoch: 0,
+                slashed_offense_id: None,
+                commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
+                pending_commission_bps: None,
+                pending_commission_effective_epoch: None,
+                min_delegation_spark: indra_core::types::primitives::DUST_LIMIT_SPARK,
+                auto_delegate_to: None,
+                network_addr: None,
+                network_addr_last_updated_epoch: None,
+                cold_hybrid_classical_pk: Some(cold_pubkey.classical_pk.0),
+                cold_hybrid_pq_pk: Some(cold_pubkey.pq_pk.as_slice().try_into().unwrap()),
+                cold_key_version: 1,
+                cold_nonce: 0,
+            })
+            .unwrap();
+        let deposit = state
+            .utxos
+            .insert(
+                OutputV1 {
+                    value_spark: 1_000,
+                    owner_pubkey: cold_pubkey.clone(),
+                    lock_height: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        let payload = GovernancePayload::Propose {
+            action: GovernableAction::SetMinDelegationSpark {
+                value: indra_core::types::primitives::DUST_LIMIT_SPARK,
+            },
+            deposit_utxo_id: deposit,
+            proposer_pubkey: cold_pubkey,
+            title: VariableBytes::from_slice(b"CLI proposal").unwrap(),
+            description: VariableBytes::from_slice(b"consensus application test").unwrap(),
+            cold_authorization: Some(ColdGovernanceAuthorization {
+                cold_key_version: 1,
+                cold_nonce: 1,
+            }),
+        };
+        let op = build_cold_governance_op(validator_id, payload, &cold, DEFAULT_CHAIN_ID).unwrap();
+
+        indra_state::governance_apply::apply_governance_op(&mut state, &op, 0, 1, DEFAULT_CHAIN_ID)
+            .unwrap();
+        assert_eq!(state.governance.proposals.len(), 1);
+        assert!(state.utxos.get(&deposit).is_none());
+    }
 
     #[test]
     fn cli_no_vote_encodes_to_state_no_value() {
