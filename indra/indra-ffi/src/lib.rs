@@ -670,7 +670,7 @@ mod handle_tests {
         codec::Decode,
         types::{
             crypto::HybridPubKey,
-            governance::{GovernanceOpV2, GovernancePayload},
+            governance::{governance_vote_commit_hash, GovernanceOpV2, GovernancePayload},
             primitives::{
                 Bytes32, VariableBytes, DEFAULT_CHAIN_ID, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             },
@@ -1514,7 +1514,7 @@ mod handle_tests {
             weights: [(validator_id, MINIMUM_VALIDATOR_SELF_STAKE_SPARK)].into(),
             total_stake: MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
         });
-        let reveal_nonce = [0xA5; 32];
+        let mut reveal_nonce = [0; 32];
         let mut commitment = [0; 32];
         output.fill(0);
         assert_eq!(
@@ -1523,7 +1523,7 @@ mod handle_tests {
                     session,
                     proposal_id.0.as_ptr(),
                     1,
-                    reveal_nonce.as_ptr(),
+                    reveal_nonce.as_mut_ptr(),
                     commitment.as_mut_ptr(),
                     hot,
                     cold,
@@ -1537,6 +1537,37 @@ mod handle_tests {
             },
             OK
         );
+        assert_ne!(reveal_nonce, [0; 32]);
+        assert_eq!(
+            commitment,
+            governance_vote_commit_hash(proposal_id, validator_id, 1, Bytes32::from(reveal_nonce))
+                .0
+        );
+        let mut second_nonce = [0; 32];
+        let mut second_commitment = [0; 32];
+        let mut second_output = vec![0i8; INDRA_OP_HEX_MAX_BYTES];
+        assert_eq!(
+            unsafe {
+                crate::governance::indra_build_governance_commit_with_handle(
+                    session,
+                    proposal_id.0.as_ptr(),
+                    1,
+                    second_nonce.as_mut_ptr(),
+                    second_commitment.as_mut_ptr(),
+                    hot,
+                    cold,
+                    1,
+                    2,
+                    chain.as_ptr(),
+                    chain.as_bytes().len(),
+                    second_output.as_mut_ptr(),
+                    second_output.len(),
+                )
+            },
+            OK
+        );
+        assert_ne!(second_nonce, reveal_nonce);
+        assert_ne!(second_commitment, commitment);
         indra_state::governance_apply::apply_governance_op(
             &mut state,
             &unsafe { decode_governance(&output) },
@@ -1699,7 +1730,7 @@ mod handle_tests {
         let title = CString::new("title").unwrap();
         let description = CString::new("description").unwrap();
         let action = CString::new(r#"{"type":"SetMinDelegationSpark","value":1}"#).unwrap();
-        let nonce = [3u8; 32];
+        let mut nonce = [0u8; 32];
         let mut commitment = [0u8; 32];
         assert_invalid!(
             crate::governance::indra_build_governance_propose_with_handle(
@@ -1726,7 +1757,7 @@ mod handle_tests {
                 session,
                 id.as_ptr(),
                 1,
-                nonce.as_ptr(),
+                nonce.as_mut_ptr(),
                 commitment.as_mut_ptr(),
                 INDRA_KEY_HANDLE_INVALID,
                 INDRA_KEY_HANDLE_INVALID,
@@ -2153,12 +2184,11 @@ CHECK(indra_build_validator_claim_rewards_with_handle, int32_t (*)(IndraSessionH
 CHECK(indra_build_set_commission_with_handle, int32_t (*)(IndraSessionHandle, uint32_t, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_set_auto_delegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_propose_with_handle, int32_t (*)(IndraSessionHandle, const char*, size_t, const char*, size_t, const char*, size_t, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_build_governance_commit_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
+CHECK(indra_build_governance_commit_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, uint8_t*, uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_reveal_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, uint8_t, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_redelegate_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, const uint8_t*, const uint8_t*, uint64_t, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_execute_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, uint64_t, const char*, size_t, char*, size_t));
 CHECK(indra_build_governance_cancel_with_handle, int32_t (*)(IndraSessionHandle, const uint8_t*, IndraKeyHandle, IndraKeyHandle, uint64_t, uint64_t, const char*, size_t, char*, size_t));
-CHECK(indra_compute_vote_commitment, int32_t (*)(const uint8_t*, const uint8_t*, uint8_t, const uint8_t*, uint8_t*));
 CHECK(indra_result_copy_tx_bytes, int32_t (*)(IndraSessionHandle, IndraResultHandle, uint8_t*, size_t));
 CHECK(indra_result_copy_spent_indices, int32_t (*)(IndraSessionHandle, IndraResultHandle, size_t*, size_t));
 CHECK(indra_destroy_result, int32_t (*)(IndraSessionHandle, IndraResultHandle));

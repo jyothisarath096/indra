@@ -695,7 +695,10 @@ any governance action regardless of support level:
 
 - `HARD_CAP_SPARK` — 1,000,000,000 INDRA maximum supply
 - Era block reward schedule — halving schedule
-- `CONSENSUS_QUORUM_BPS` — 66.67% BFT safety threshold
+- Exact strict BFT quorum predicate — `signed_stake * 3 > total_stake * 2`,
+  evaluated with checked `u128` intermediates; it is not a rounded BPS parameter
+- `active_slot_coefficient_numerator` (`F`) — immutable genesis-selected
+  numerator for proposer sortition, constrained to `1..=2^63`
 - `max_active_validators` — automatic per stake phases
 - Cryptographic algorithms (ML-DSA-87, ML-KEM-1024)
 

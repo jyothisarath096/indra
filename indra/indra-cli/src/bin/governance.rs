@@ -1,6 +1,9 @@
 //! `indra-governance` — build and submit governance operations.
 
 use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -37,6 +40,7 @@ fn run() -> CliResult<()> {
         print_help();
         return Ok(());
     }
+    reject_removed_vote_nonce_flag(&args)?;
 
     let command = args[0].as_str();
     let keys_path = flag_value(&args, "--keys").unwrap_or_else(|| "keys.json".into());
@@ -412,11 +416,6 @@ fn vote_nonce_for_commit(
     signer_id: Bytes32,
 ) -> CliResult<Bytes32> {
     let store_path = vote_nonce_store_path(args, keys_path);
-    if let Some(raw) = flag_value(args, "--vote-nonce") {
-        let nonce = parse_hex32(&raw)?;
-        save_vote_nonce(&store_path, proposal_id, signer_id, nonce)?;
-        return Ok(nonce);
-    }
     if let Some(existing) = load_vote_nonce(&store_path, proposal_id, signer_id)? {
         return Ok(existing);
     }
@@ -436,13 +435,10 @@ fn vote_nonce_for_reveal(
     proposal_id: Bytes32,
     signer_id: Bytes32,
 ) -> CliResult<Bytes32> {
-    if let Some(raw) = flag_value(args, "--vote-nonce") {
-        return parse_hex32(&raw);
-    }
     let store_path = vote_nonce_store_path(args, keys_path);
     load_vote_nonce(&store_path, proposal_id, signer_id)?.ok_or_else(|| {
         CliError::MissingArgument(format!(
-            "--vote-nonce (no saved nonce for proposal {} / validator {} in {})",
+            "no saved vote nonce for proposal {} / validator {} in {}",
             hex::encode(proposal_id.0),
             hex::encode(signer_id.0),
             store_path.display()
@@ -529,7 +525,69 @@ fn save_vote_nonce(
     }
     let mut out = lines.join("\n");
     out.push('\n');
-    std::fs::write(path, out).map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))
+    atomic_write_private(path, out.as_bytes())
+}
+
+fn atomic_write_private(path: &Path, contents: &[u8]) -> CliResult<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CliError::Io(format!("{} has no file name", path.display())))?;
+
+    for _ in 0..32 {
+        let temp_path = parent.join(format!(
+            ".{}.tmp-{}-{:016x}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut temp = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(CliError::Io(format!("{}: {}", temp_path.display(), error))),
+        };
+
+        let result = (|| -> std::io::Result<()> {
+            // `set_permissions` makes the final mode exactly 0600 even under a
+            // restrictive process umask; creation itself can never be broader.
+            temp.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            temp.write_all(contents)?;
+            temp.sync_all()?;
+            std::fs::rename(&temp_path, path)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(CliError::Io(format!("{}: {}", path.display(), error)));
+        }
+        return Ok(());
+    }
+    Err(CliError::Io(format!(
+        "could not allocate a private temporary file beside {}",
+        path.display()
+    )))
+}
+
+fn reject_removed_vote_nonce_flag(args: &[String]) -> CliResult<()> {
+    if args
+        .iter()
+        .any(|arg| arg == "--vote-nonce" || arg.starts_with("--vote-nonce="))
+    {
+        return Err(CliError::Parse(
+            "--vote-nonce has been removed; vote nonces are generated internally with the OS CSPRNG"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_vote(raw: &str) -> CliResult<u8> {
@@ -653,14 +711,25 @@ Common flags:\n\
 Propose flags:\n\
   --action <name> --value <n> --deposit-utxo <hex> --title <text> --description <text>\n\n\
 Vote flags:\n\
-  --proposal-id <hex> --vote yes|no [--vote-nonce <32-byte-hex>]\n\
-  Commit auto-generates and saves --vote-nonce by default; reveal reloads it.\n\
+  --proposal-id <hex> --vote yes|no\n\
+  Commit securely generates and saves an internal vote nonce; reveal reloads it.\n\
   Abstain by not submitting a reveal op."
     );
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static UMASK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct UmaskGuard(libc::mode_t);
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
 
     #[test]
     fn cli_cold_proposal_is_accepted_by_consensus() {
@@ -807,6 +876,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vote_nonce_store_is_atomic_and_exactly_private_regardless_of_umask() {
+        let _lock = UMASK_TEST_LOCK.lock().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "indra-governance-private-nonce-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let original_umask = unsafe { libc::umask(0o777) };
+        let _guard = UmaskGuard(original_umask);
+        let path = directory.join("nonces.txt");
+
+        save_vote_nonce(
+            &path,
+            Bytes32::from([0x11; 32]),
+            Bytes32::from([0x22; 32]),
+            Bytes32::from([0x33; 32]),
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "nonce store permissions must ignore umask");
+        let entries: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("nonces.txt")]);
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn caller_supplied_vote_nonce_flag_is_rejected() {
+        let args = vec![
+            "commit".to_string(),
+            "--vote-nonce".to_string(),
+            hex::encode([0x44; 32]),
+        ];
+        let error = reject_removed_vote_nonce_flag(&args).unwrap_err();
+        assert!(error.to_string().contains("--vote-nonce has been removed"));
+        let inline = vec![format!("--vote-nonce={}", hex::encode([0x55; 32]))];
+        assert!(reject_removed_vote_nonce_flag(&inline).is_err());
     }
 
     #[test]

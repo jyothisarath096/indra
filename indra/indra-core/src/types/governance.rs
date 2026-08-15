@@ -903,4 +903,33 @@ mod tests {
             "same vote/nonce must not collide across validators"
         );
     }
+
+    #[test]
+    fn reused_reveal_nonce_exposes_other_committed_vote_after_first_reveal() {
+        let validator = Bytes32::from([0x51; 32]);
+        let proposal_a = Bytes32::from([0x61; 32]);
+        let proposal_b = Bytes32::from([0x62; 32]);
+        let reused_nonce = Bytes32::from([0x71; 32]);
+        let commitment_a = governance_vote_commit_hash(proposal_a, validator, 1, reused_nonce);
+        let commitment_b = governance_vote_commit_hash(proposal_b, validator, 0, reused_nonce);
+
+        // Proposal binding prevents equality/cross-proposal replay.
+        assert_ne!(commitment_a, commitment_b);
+
+        // Once proposal A reveals `reused_nonce`, an observer can test the
+        // complete two-value vote domain for proposal B before B's reveal.
+        let recovered_vote = [0u8, 1u8]
+            .into_iter()
+            .find(|vote| {
+                governance_vote_commit_hash(proposal_b, validator, *vote, reused_nonce)
+                    == commitment_b
+            })
+            .unwrap();
+        assert_eq!(recovered_vote, 0);
+    }
+
+    #[test]
+    fn unknown_parameter_action_tag_is_rejected() {
+        assert!(GovernableAction::decode_exact(&[9]).is_err());
+    }
 }

@@ -1531,6 +1531,8 @@ mod tests {
             },
         );
         state.governance.proposals.insert(proposal_id, proposal);
+        let supply_before = state.total_supply;
+        let utxos_before = state.utxos.len();
 
         apply_governance_phase_transitions(&mut state, 0, 0).unwrap();
 
@@ -1541,9 +1543,88 @@ mod tests {
         assert_eq!(proposal.abstain_stake, 90);
         assert!(!proposal.deposit_burned);
         assert_eq!(proposal.deposit_spark, 0);
-        assert!(state.utxos.all_entries().any(|entry| {
-            entry.output.owner_pubkey == proposer_pubkey && entry.output.value_spark == 1_000
-        }));
+        assert_eq!(state.total_supply, supply_before);
+        assert_eq!(state.utxos.len(), utxos_before + 1);
+        assert_eq!(
+            state
+                .utxos
+                .all_entries()
+                .filter(|entry| {
+                    entry.output.owner_pubkey == proposer_pubkey
+                        && entry.output.value_spark == 1_000
+                })
+                .count(),
+            1
+        );
+
+        // A repeated refund request is a safe idempotent no-op: it cannot
+        // mint a second output or perturb supply.
+        return_governance_deposit(&mut state, proposal_id, 1).unwrap();
+        assert_eq!(state.total_supply, supply_before);
+        assert_eq!(state.utxos.len(), utxos_before + 1);
+    }
+
+    #[test]
+    fn passing_proposal_refunds_exact_deposit_once_without_supply_change() {
+        let mut state = new_test_state();
+        let proposal_id = Bytes32::from([0x41; 32]);
+        let yes_voter = Bytes32::from([0xA0; 32]);
+        let no_voter = Bytes32::from([0xB0; 32]);
+        let proposer_pubkey = governance_test_pubkey(0x41);
+        let mut proposal = governance_pruning_test_proposal(41, ProposalPhase::Reveal, 0);
+        proposal.proposal_id = proposal_id;
+        proposal.proposer_pubkey = proposer_pubkey.clone();
+        proposal.deposit_spark = 1_000;
+        proposal.tally_epoch = 0;
+        proposal.quorum_bps = 5_000;
+        proposal.snapshot1 = Some(GovernanceSnapshot {
+            weights: [(yes_voter, 60), (no_voter, 40)].into_iter().collect(),
+            total_stake: 100,
+        });
+        proposal.reveals.insert(
+            yes_voter,
+            VoteReveal {
+                validator_id: yes_voter,
+                vote: true,
+                revealed_epoch: 0,
+            },
+        );
+        proposal.reveals.insert(
+            no_voter,
+            VoteReveal {
+                validator_id: no_voter,
+                vote: false,
+                revealed_epoch: 0,
+            },
+        );
+        state.governance.proposals.insert(proposal_id, proposal);
+        let supply_before = state.total_supply;
+        let utxos_before = state.utxos.len();
+
+        apply_governance_phase_transitions(&mut state, 0, 1).unwrap();
+
+        let proposal = state.governance.proposals.get(&proposal_id).unwrap();
+        assert_eq!(proposal.phase, ProposalPhase::ExecDelay);
+        assert_eq!(proposal.passed, Some(true));
+        assert_eq!(proposal.deposit_spark, 0);
+        assert!(!proposal.deposit_burned);
+        assert_eq!(state.total_supply, supply_before);
+        assert_eq!(state.utxos.len(), utxos_before + 1);
+        assert_eq!(
+            state
+                .utxos
+                .all_entries()
+                .filter(|entry| {
+                    entry.output.owner_pubkey == proposer_pubkey
+                        && entry.output.value_spark == 1_000
+                })
+                .count(),
+            1
+        );
+
+        return_governance_deposit(&mut state, proposal_id, 2).unwrap();
+        assert_eq!(state.total_supply, supply_before);
+        assert_eq!(state.utxos.len(), utxos_before + 1);
     }
 
     #[test]
@@ -1592,6 +1673,12 @@ mod tests {
         assert_eq!(state.epoch_governance_burned_spark, 1_000);
         assert_eq!(proposal.deposit_spark, 0);
         assert!(proposal.deposit_burned);
+
+        // Burned escrow can never also be refunded.
+        let utxos_after_burn = state.utxos.len();
+        return_governance_deposit(&mut state, proposal_id, 2).unwrap();
+        assert_eq!(state.total_supply, supply_before - 1_000);
+        assert_eq!(state.utxos.len(), utxos_after_burn);
     }
 
     #[test]

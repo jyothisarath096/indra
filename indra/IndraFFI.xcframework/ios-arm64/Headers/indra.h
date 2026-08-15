@@ -262,7 +262,7 @@ int32_t indra_build_governance_commit_with_handle(
     IndraSessionHandle session,
     const uint8_t* proposal_id,
     uint8_t vote,
-    const uint8_t* reveal_nonce,
+    uint8_t* out_reveal_nonce,
     uint8_t* out_commitment,
     IndraKeyHandle hot_handle,
     IndraKeyHandle cold_handle,
@@ -325,14 +325,6 @@ int32_t indra_build_governance_cancel_with_handle(
     size_t chain_id_len,
     char* out_hex,
     size_t out_len
-);
-
-int32_t indra_compute_vote_commitment(
-    const uint8_t* proposal_id,
-    const uint8_t* validator_id,
-    uint8_t vote,
-    const uint8_t* reveal_nonce,
-    uint8_t* out_commitment
 );
 
 int32_t indra_result_copy_tx_bytes(

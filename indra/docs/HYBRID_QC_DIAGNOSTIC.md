@@ -83,15 +83,15 @@ With four equal-stake validators:
 ```text
 total_stake = 400_000_000_000
 3 votes = 300_000_000_000
-CONSENSUS_QUORUM_BPS = 6667
-quorum_stake = bps_of(total_stake, 6667) = 266_680_000_000
-300_000_000_000 >= 266_680_000_000
+signed_stake * 3 = 900_000_000_000
+total_stake * 2 = 800_000_000_000
+900_000_000_000 > 800_000_000_000
 ```
 
 Trace:
 
-- `VoteCollector::current_decision` counts stake per `block_hash` and returns `VoteDecision::QuorumReached` when stake crosses threshold.
-- `QcBuilder::build` recomputes `voted_stake` and compares it to the same threshold before constructing the QC.
+- `VoteCollector::current_decision` counts stake per `block_hash` and returns `VoteDecision::QuorumReached` when the exact strict predicate holds.
+- `QcBuilder::build` recomputes `voted_stake` and applies the same checked-`u128` predicate before constructing the QC.
 
 Conclusion: quorum math should trigger with 3 of 4 equal validators.
 
@@ -223,4 +223,3 @@ After a compatibility fix, invert the assertion for heights below `HYBRID_QC_HEI
 | Q4 — 3/4 quorum triggers? | YES | 75% stake exceeds 66.67% quorum; code uses deterministic threshold math. |
 | Q5 — QC errors swallowed? | NO | Driver logs vote rejection, QC build failure, and commit/import failure paths. |
 | Q6 — chain-id mismatch root cause? | NO | C-02 chain ID was not implemented in this vote/QC path. |
-

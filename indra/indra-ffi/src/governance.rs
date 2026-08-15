@@ -24,7 +24,9 @@ use indra_core::{
     },
 };
 use indra_crypto::{hybrid::HybridKeypair, sha256};
+use rand::RngCore;
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 fn hybrid_pubkey_from_keypair(keypair: &HybridKeypair) -> Result<HybridPubKey, IndraError> {
     let public = keypair.public_key();
@@ -315,51 +317,20 @@ pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
     )
 }
 
-/// Compute the canonical domain-separated governance vote commitment over the
-/// proposal, complete validator identity, vote, and reveal nonce.
+/// Build a commit operation and return the internally generated 32-byte reveal
+/// nonce and its 32-byte commitment. The caller must persist the nonce securely
+/// until reveal; callers cannot supply or influence it.
 ///
 /// # Safety
 ///
-/// Each input pointer must reference 32 readable bytes except `vote`;
-/// `out_commitment` must reference 32 writable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn indra_compute_vote_commitment(
-    proposal_id: *const u8,
-    validator_id: *const u8,
-    vote: u8,
-    reveal_nonce: *const u8,
-    out_commitment: *mut u8,
-) -> i32 {
-    if proposal_id.is_null()
-        || validator_id.is_null()
-        || reveal_nonce.is_null()
-        || out_commitment.is_null()
-    {
-        return IndraError::NullPointer.code();
-    }
-    match catch_unwind(|| {
-        let vote = wire_vote(vote)?;
-        let commitment = governance_vote_commit_hash(
-            Bytes32::from(read_bytes32(proposal_id)),
-            Bytes32::from(read_bytes32(validator_id)),
-            vote,
-            Bytes32::from(read_bytes32(reveal_nonce)),
-        );
-        std::slice::from_raw_parts_mut(out_commitment, 32).copy_from_slice(&commitment.0);
-        Ok::<(), IndraError>(())
-    }) {
-        Ok(Ok(())) => IndraError::Ok.code(),
-        Ok(Err(err)) => err.code(),
-        Err(_) => IndraError::Internal.code(),
-    }
-}
-
+/// `proposal_id` must reference 32 readable bytes. `out_reveal_nonce` and
+/// `out_commitment` must each reference 32 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
     session: IndraSessionHandle,
     proposal_id: *const u8,
     vote: u8,
-    reveal_nonce: *const u8,
+    out_reveal_nonce: *mut u8,
     out_commitment: *mut u8,
     hot_handle: IndraKeyHandle,
     cold_handle: IndraKeyHandle,
@@ -370,10 +341,14 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
     out_hex: *mut c_char,
     out_len: usize,
 ) -> i32 {
-    if proposal_id.is_null() || reveal_nonce.is_null() || out_commitment.is_null() {
+    if proposal_id.is_null() || out_reveal_nonce.is_null() || out_commitment.is_null() {
         return IndraError::NullPointer.code();
     }
-    build_with_cold_payload_handle(
+    std::slice::from_raw_parts_mut(out_reveal_nonce, 32).fill(0);
+    std::slice::from_raw_parts_mut(out_commitment, 32).fill(0);
+    let mut generated_nonce = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *generated_nonce);
+    let result = build_with_cold_payload_handle(
         ColdGovernanceHandleArgs {
             session,
             hot_handle,
@@ -390,8 +365,10 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
                 Bytes32::from(read_bytes32(proposal_id)),
                 signer_id,
                 vote,
-                Bytes32::from(read_bytes32(reveal_nonce)),
+                Bytes32::from(*generated_nonce),
             );
+            std::slice::from_raw_parts_mut(out_reveal_nonce, 32)
+                .copy_from_slice(&generated_nonce[..]);
             std::slice::from_raw_parts_mut(out_commitment, 32).copy_from_slice(&commitment.0);
             Ok(GovernancePayload::Commit {
                 proposal_id: Bytes32::from(read_bytes32(proposal_id)),
@@ -404,7 +381,12 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
                 ),
             })
         },
-    )
+    );
+    if result != IndraError::Ok.code() {
+        std::slice::from_raw_parts_mut(out_reveal_nonce, 32).fill(0);
+        std::slice::from_raw_parts_mut(out_commitment, 32).fill(0);
+    }
+    result
 }
 
 #[no_mangle]
