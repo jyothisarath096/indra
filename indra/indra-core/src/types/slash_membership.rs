@@ -5,7 +5,7 @@ use crate::{
     error::{IndraError, IndraResult},
     types::{
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
-        primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
+        primitives::{Bytes32, MAX_ACTIVE_VALIDATORS, SLASH_EVIDENCE_WINDOW_EPOCHS},
     },
 };
 use indra_crypto::sha256;
@@ -14,8 +14,13 @@ use indra_crypto::sha256;
 pub const SLASH_MEMBERSHIP_ROOT_FORMAT_VERSION_V1: u8 = 1;
 /// Maximum sibling hashes for at most 200 active validators.
 pub const MAX_SLASH_MEMBERSHIP_PROOF_DEPTH: usize = 8;
-/// Maximum retained roots for the inclusive 500-epoch evidence window.
-pub const MAX_SLASH_MEMBERSHIP_ROOT_RECORDS: usize = 502;
+/// Maximum retained roots for the inclusive evidence window.
+///
+/// Each of the at most 200 authorities can be revoked once between regular
+/// epoch rotations, and each rotation itself creates one root. The extra one
+/// retains the predecessor needed to govern the first height in the window.
+pub const MAX_SLASH_MEMBERSHIP_ROOT_RECORDS: usize =
+    (SLASH_EVIDENCE_WINDOW_EPOCHS as usize + 1) * (MAX_ACTIVE_VALIDATORS + 1) + 1;
 
 const D_LEAF: &[u8] = b"INDRA-SLASH-MEMBER-LEAF-v1";
 const D_EMPTY: &[u8] = b"INDRA-SLASH-MEMBER-EMPTY-v1";

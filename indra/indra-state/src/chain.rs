@@ -361,7 +361,7 @@ impl Decode for ChainState {
         let (retired_cold_classical_components, retired_cold_pq_components) =
             decode_retired_cold_components(r)?;
         let consensus_snapshots = {
-            let snapshots = decode_list(r, 2, "chain_state.consensus_snapshots")?;
+            let snapshots = decode_list(r, 3, "chain_state.consensus_snapshots")?;
             validate_consensus_snapshot_collection(&snapshots, height)?;
             snapshots
         };
@@ -724,18 +724,26 @@ impl ChainState {
     /// Resolve exactly paired consensus and reward authority for `height`.
     pub fn reward_economic_snapshot_for_height(
         &self,
-        height: u64,
+        _height: u64,
     ) -> crate::error::StateResult<(&ConsensusSnapshot, &RewardEconomicSnapshot)> {
-        let consensus = self
-            .snapshot_for_consensus_height(height)
-            .map_err(|error| {
-                crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
-            })?;
         let economic = self.reward_economic_snapshot.as_ref().ok_or_else(|| {
             crate::error::StateError::InvalidRewardEconomicSnapshot(
                 "missing reward economic snapshot".to_string(),
             )
         })?;
+        // Slash-triggered consensus snapshots revoke authority immediately but
+        // do not rewrite the epoch-frozen economic basis. Resolve the retained
+        // consensus snapshot paired to that basis, not the newest authority
+        // snapshot governing the queried height.
+        let consensus = self
+            .consensus_snapshots
+            .iter()
+            .find(|snapshot| snapshot.activation_height == economic.activation_height)
+            .ok_or_else(|| {
+                crate::error::StateError::InvalidRewardEconomicSnapshot(
+                    "economic snapshot has no retained consensus anchor".to_string(),
+                )
+            })?;
         validate_reward_economic_membership(consensus, economic).map_err(|error| {
             crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
         })?;
@@ -837,10 +845,78 @@ impl ChainState {
                 crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
             })?,
         };
-        self.install_consensus_snapshot(snapshot)?;
         self.reward_economic_snapshot = Some(economic);
+        self.install_consensus_snapshot(snapshot)?;
         self.append_slash_membership_root(membership_record)?;
         self.prune_slash_membership_roots(boundary_height)?;
+        Ok(())
+    }
+
+    /// Install an intermediate authority snapshot after finalized slashing.
+    ///
+    /// The currently governing snapshot is the immutable input: only the
+    /// explicitly revoked validator IDs are removed. Rebuilding from the live
+    /// registry here would incorrectly activate unrelated stake, registration,
+    /// commission, or VRF-key changes before the next epoch boundary.
+    /// Activation is the protocol's existing source-height-plus-one rule, so a
+    /// slash finalized in block `H` revokes authority beginning at `H + 1`.
+    pub(crate) fn rotate_consensus_snapshot_after_slash(
+        &mut self,
+        slash_height: u64,
+        revoked_validator_ids: &std::collections::BTreeSet<Bytes32>,
+    ) -> crate::error::StateResult<()> {
+        if self.height != slash_height || revoked_validator_ids.is_empty() {
+            return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                "slash snapshot requires finalized slash authority at the current height"
+                    .to_string(),
+            ));
+        }
+        for validator_id in revoked_validator_ids {
+            let finalized = self.validators.get(validator_id).is_some_and(|validator| {
+                matches!(validator.status, crate::validator::ValidatorStatus::Slashed)
+                    && validator.slashed_offense_id.is_some()
+            }) || self
+                .evicted_validator_tombstones
+                .get(validator_id)
+                .is_some_and(|tombstone| tombstone.slashed_offense_id.is_some());
+            if !finalized {
+                return Err(crate::error::StateError::InvalidConsensusSnapshot(
+                    "slash snapshot authority removal is not backed by finalized slash state"
+                        .to_string(),
+                ));
+            }
+        }
+        let governing = self
+            .snapshot_for_consensus_height(slash_height)
+            .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))?
+            .clone();
+        let entries = governing
+            .entries()
+            .iter()
+            .filter(|entry| !revoked_validator_ids.contains(&entry.validator_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let activation_height = slash_height.checked_add(1).ok_or_else(|| {
+            crate::error::StateError::InvalidConsensusSnapshot(
+                "slash snapshot activation height overflow".to_string(),
+            )
+        })?;
+        let snapshot = ConsensusSnapshot::new(
+            activation_height,
+            slash_height,
+            entries,
+            governing.active_slot_coefficient_numerator,
+        )
+        .map_err(|error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()))?;
+        let membership_record = SlashMembershipRootRecord {
+            activation_height,
+            membership_root: compute_slash_membership_root(&snapshot).map_err(|error| {
+                crate::error::StateError::InvalidConsensusSnapshot(error.to_string())
+            })?,
+        };
+        self.install_consensus_snapshot(snapshot)?;
+        self.append_slash_membership_root(membership_record)?;
+        self.prune_slash_membership_roots(slash_height)?;
         Ok(())
     }
 
@@ -890,7 +966,8 @@ impl ChainState {
         }
         if self.slash_membership_roots.len() > MAX_SLASH_MEMBERSHIP_ROOT_RECORDS {
             return Err(crate::error::StateError::InvalidConsensusSnapshot(
-                "slash membership root history exceeds 502 nonexpired records".to_string(),
+                "slash membership root history exceeds the derived nonexpired-record bound"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -934,10 +1011,24 @@ impl ChainState {
         self.consensus_snapshots.push(snapshot);
         self.consensus_snapshots
             .sort_by_key(|snapshot| snapshot.activation_height);
-        let excess = self.consensus_snapshots.len().saturating_sub(2);
-        if excess > 0 {
-            self.consensus_snapshots.drain(0..excess);
-        }
+        // Retain the two newest authority snapshots for adjacent-height QC
+        // verification plus the epoch economic anchor. Slash-triggered
+        // snapshots intentionally do not rewrite frozen epoch economics.
+        let economic_activation = self
+            .reward_economic_snapshot
+            .as_ref()
+            .map(|economic| economic.activation_height);
+        let newest = self
+            .consensus_snapshots
+            .iter()
+            .rev()
+            .take(2)
+            .map(|snapshot| snapshot.activation_height)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.consensus_snapshots.retain(|snapshot| {
+            newest.contains(&snapshot.activation_height)
+                || Some(snapshot.activation_height) == economic_activation
+        });
         Ok(())
     }
 
@@ -1212,10 +1303,10 @@ fn validate_consensus_snapshot_collection(
             "post-gate ChainState has no consensus snapshot".to_string(),
         ));
     }
-    if snapshots.len() > 2 {
+    if snapshots.len() > 3 {
         return Err(IndraError::LengthExceeded {
             field: "chain_state.consensus_snapshots",
-            max: 2,
+            max: 3,
             actual: snapshots.len(),
         });
     }
@@ -1250,9 +1341,9 @@ fn validate_retained_consensus_snapshots_for_lookup(
             reason: "snapshot collection is empty".to_string(),
         });
     }
-    if snapshots.len() > 2 {
+    if snapshots.len() > 3 {
         return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
-            reason: "snapshot collection exceeds the two-snapshot retention bound".to_string(),
+            reason: "snapshot collection exceeds the three-snapshot retention bound".to_string(),
         });
     }
     for (index, snapshot) in snapshots.iter().enumerate() {
@@ -1669,7 +1760,7 @@ mod tests {
         ));
     }
     use crate::ValidatorEntry;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use indra_core::{
         codec::Encode,
@@ -1744,6 +1835,145 @@ mod tests {
         assert!(state.utxos.is_empty());
         assert!(state.validators.is_empty());
         assert!(state.consensus_snapshots.is_empty());
+    }
+
+    #[test]
+    fn finalized_slash_revokes_frozen_qc_and_vrf_authority_at_next_height() {
+        let mut state = ChainState::new_genesis();
+        state
+            .validators
+            .upsert(snapshot_validator(1, 11, 4_000_000_000))
+            .unwrap();
+        state
+            .validators
+            .upsert(snapshot_validator(2, 21, 1_000_000_000))
+            .unwrap();
+        state.finalize_genesis().unwrap();
+        let revoked = Bytes32::from([1; 32]);
+        let survivor = Bytes32::from([2; 32]);
+        let block_hash = Bytes32::from([0xCC; 32]);
+        let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+            10,
+            0,
+            indra_core::types::vote::VoteStep::Precommit,
+            &block_hash,
+            &revoked,
+            &state.chain_id,
+        );
+        let revoked_keypair = indra_crypto::HybridKeypair::new(
+            indra_crypto::ClassicalKeypair::from_seed(&[11; 32]),
+            indra_crypto::PqKeypair::from_seed(&[12; 32]).unwrap(),
+        );
+        let signature = revoked_keypair.sign(&signing_bytes).unwrap();
+        let mut signer_bitfield = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
+        signer_bitfield[0] = 1;
+        let qc = indra_core::types::qc::QuorumCertificateV1 {
+            height: 10,
+            round: 0,
+            block_hash,
+            signer_bitfield,
+            pq_signatures: vec![indra_core::types::crypto::PQVoteSig {
+                validator_id: revoked,
+                pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
+            }],
+            classical_signatures: vec![indra_core::types::qc::ClassicalVoteSig {
+                validator_id: revoked,
+                classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
+            }],
+        };
+        state.height = 10;
+        assert!(indra_core::types::qc::verify_qc_against_snapshot(
+            &qc,
+            state.snapshot_for_consensus_height(10).unwrap(),
+            &state.chain_id,
+        )
+        .is_ok());
+        {
+            let validator = state.validators.get_mut(&revoked).unwrap();
+            validator.status = crate::validator::ValidatorStatus::Slashed;
+            validator.slashed_offense_id = Some(Bytes32::from([0xA5; 32]));
+        }
+        state.rebuild_state_commitment_v2(10);
+        state
+            .rotate_consensus_snapshot_after_slash(10, &BTreeSet::from([revoked]))
+            .unwrap();
+
+        let at_slash_height = state.snapshot_for_consensus_height(10).unwrap();
+        assert!(at_slash_height.entry_with_position(&revoked).is_some());
+        assert_eq!(at_slash_height.total_weight_spark, 5_000_000_000);
+
+        let activated = state.snapshot_for_consensus_height(11).unwrap();
+        assert_eq!(activated.activation_height, 11);
+        assert!(activated.entry_with_position(&revoked).is_none());
+        assert!(activated.entry_with_position(&survivor).is_some());
+        assert_eq!(activated.total_weight_spark, 1_000_000_000);
+        assert!(
+            indra_core::types::qc::verify_qc_against_snapshot(&qc, activated, &state.chain_id,)
+                .is_err()
+        );
+        // Both QC signer resolution and proposer sortition consume this same
+        // entry set. An authority absent here can contribute neither stake nor
+        // a VRF key, even though it was valid at the slash-inclusion height.
+        assert_eq!(activated.entries().len(), 1);
+    }
+
+    #[test]
+    fn slash_snapshot_is_deterministic_and_epoch_rotation_supersedes_it() {
+        fn apply_same_event(mut state: ChainState) -> ChainState {
+            let revoked = Bytes32::from([1; 32]);
+            state.height = 299;
+            let validator = state.validators.get_mut(&revoked).unwrap();
+            validator.status = crate::validator::ValidatorStatus::Slashed;
+            validator.slashed_offense_id = Some(Bytes32::from([0x5A; 32]));
+            state.rebuild_state_commitment_v2(299);
+            state
+                .rotate_consensus_snapshot_after_slash(299, &BTreeSet::from([revoked]))
+                .unwrap();
+            state.rebuild_state_commitment_v2(299);
+            state
+        }
+
+        let mut first = apply_same_event(snapshot_state());
+        let second = apply_same_event(snapshot_state());
+        assert_eq!(first.consensus_snapshots, second.consensus_snapshots);
+        assert_eq!(first.slash_membership_roots, second.slash_membership_roots);
+        assert_eq!(
+            first.state_commitment_v2_root(299),
+            second.state_commitment_v2_root(299)
+        );
+
+        // The slash snapshot is an intermediate authority set. The ordinary
+        // boundary machinery continues normally and replaces it from fully
+        // settled epoch state at the established H+1 activation point.
+        first.height = 300;
+        first.rotate_consensus_snapshot_after_boundary(300).unwrap();
+        let regular = first.snapshot_for_consensus_height(301).unwrap();
+        assert_eq!(regular.source_boundary_height, 300);
+        assert!(regular
+            .entry_with_position(&Bytes32::from([1; 32]))
+            .is_none());
+        assert_eq!(first.consensus_snapshots.len(), 2);
+        assert_eq!(
+            first
+                .reward_economic_snapshot
+                .as_ref()
+                .unwrap()
+                .activation_height,
+            301
+        );
+    }
+
+    #[test]
+    fn slash_snapshot_rejects_unfinalized_authority_removal() {
+        let mut state = snapshot_state();
+        state.height = 10;
+        let error = state
+            .rotate_consensus_snapshot_after_slash(10, &BTreeSet::from([Bytes32::from([1; 32])]))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::StateError::InvalidConsensusSnapshot(_)
+        ));
     }
 
     #[test]
@@ -1874,9 +2104,6 @@ mod tests {
     #[test]
     fn snapshot_lookup_boundary_qc_300_uses_old_and_301_uses_new() {
         let mut state = snapshot_state();
-        state
-            .consensus_snapshots
-            .push(state.build_genesis_consensus_snapshot().unwrap());
         state.rotate_consensus_snapshot_after_boundary(300).unwrap();
 
         assert_eq!(

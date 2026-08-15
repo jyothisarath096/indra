@@ -4609,6 +4609,10 @@ mod tests {
     fn combined_four_pool_conflicts_produce_deterministic_maximal_subset() {
         let dir = temp_dir("combined_four_pool_conflicts");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
+        // A finalized slash must leave a nonempty next-height authority set;
+        // production genesis enforces four validators, so keep this synthetic
+        // cross-pool fixture representative instead of slashing its sole member.
+        let _survivor = install_active_validator(&mut engine, [0x41; 32], "combined-survivor");
         let proposer = install_active_validator(&mut engine, [0x42; 32], "combined-proposer");
         let proposer_id = indra_core::types::crypto::hybrid_identity_id(
             &proposer.public_key().classical.0,

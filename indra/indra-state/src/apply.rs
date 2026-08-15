@@ -4339,6 +4339,7 @@ fn apply_block_inner(
 
     let chain_id_for_slash = txn.state().chain_id.clone();
     let reporter_pubkey = slash_reporter_pubkey_for_block(txn.state(), block)?;
+    let mut revoked_consensus_authorities = std::collections::BTreeSet::new();
     for (evidence_index, evidence) in block.slashing_evidence.iter().enumerate() {
         txn.snapshot_slashing_scope();
         let evidence_index =
@@ -4357,6 +4358,17 @@ fn apply_block_inner(
             message: "slash failed on real state after shadow validation",
         })?;
         txn.add_slash_accounting(accounting.slash_amount)?;
+        if txn
+            .state()
+            .snapshot_for_consensus_height(block.header.height)
+            .is_ok_and(|snapshot| {
+                snapshot
+                    .entry_with_position(&accounting.validator_id)
+                    .is_some()
+            })
+        {
+            revoked_consensus_authorities.insert(accounting.validator_id);
+        }
         txn.record_slash_event(crate::CommittedSlashEvent {
             validator_id: accounting.validator_id,
             slash_bps: accounting.slash_bps,
@@ -4372,6 +4384,20 @@ fn apply_block_inner(
     // Advance height and tip hash
     txn.set_tip(block.header.height, block.header.block_hash())?;
     txn.set_election_seed(next_seed, block.header.height.saturating_add(1))?;
+
+    // A slash finalized at H revokes only the affected frozen authorities at
+    // H+1. Epoch-boundary blocks use the regular post-transition snapshot below,
+    // which observes the same slash plus every scheduled boundary mutation.
+    if transition_context.is_none() && !revoked_consensus_authorities.is_empty() {
+        txn.snapshot_epoch_scope();
+        txn.state_mut().rotate_consensus_snapshot_after_slash(
+            block.header.height,
+            &revoked_consensus_authorities,
+        )?;
+        txn.state_mut()
+            .rebuild_state_commitment_v2(block.header.height);
+        txn.after_mutation()?;
+    }
 
     // Credit the certified parent's activity before the transition
     // so the closing epoch's final QC participates in liveness evaluation.
