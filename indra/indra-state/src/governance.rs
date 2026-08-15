@@ -11,7 +11,7 @@ use indra_core::{
         primitives::{
             bps_of, muldiv, Bytes32, DUST_LIMIT_SPARK, GOVERNANCE_DELAY_EPOCHS, MAX_COMMISSION_BPS,
             MAX_DELEGATION_SPARK, SLASH_DOUBLE_PRECOMMIT_BPS, SLASH_LIVENESS_BPS,
-            SLASH_LIVENESS_THRESHOLD_EPOCHS, SLASH_SURROUND_VOTE_BPS, SPARK_PER_INDRA,
+            SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
         },
     },
 };
@@ -55,8 +55,6 @@ pub struct GovernableParams {
     pub slash_liveness_bps: u32,
     /// Double precommit slash bps.
     pub slash_double_precommit_bps: u32,
-    /// Surround vote slash bps.
-    pub slash_surround_vote_bps: u32,
     /// Maximum commission bps.
     pub max_commission_bps: u32,
     /// Governance delay.
@@ -80,7 +78,6 @@ impl GovernableParams {
             proposal_deposit_spark: 1_000 * SPARK_PER_INDRA,
             slash_liveness_bps: SLASH_LIVENESS_BPS,
             slash_double_precommit_bps: SLASH_DOUBLE_PRECOMMIT_BPS,
-            slash_surround_vote_bps: SLASH_SURROUND_VOTE_BPS,
             max_commission_bps: MAX_COMMISSION_BPS,
             governance_delay_epochs: GOVERNANCE_DELAY_EPOCHS,
             governance_quorum_bps: 5_000,
@@ -128,14 +125,6 @@ impl GovernableParams {
             GovernableAction::SetSlashDoublePrecommitBps { value } => {
                 if *value < 100 {
                     return Err("floor is 100 BPS".into());
-                }
-                if *value > 5_000 {
-                    return Err("ceiling is 5000 BPS".into());
-                }
-            }
-            GovernableAction::SetSlashSurroundVoteBps { value } => {
-                if *value < self.slash_double_precommit_bps {
-                    return Err("must be >= slash_double_precommit_bps".into());
                 }
                 if *value > 5_000 {
                     return Err("ceiling is 5000 BPS".into());
@@ -216,9 +205,6 @@ impl GovernableParams {
             GovernableAction::SetSlashDoublePrecommitBps { value } => {
                 self.slash_double_precommit_bps = *value;
             }
-            GovernableAction::SetSlashSurroundVoteBps { value } => {
-                self.slash_surround_vote_bps = *value;
-            }
             GovernableAction::SetMaxCommissionBps { value } => {
                 self.max_commission_bps = *value;
             }
@@ -248,7 +234,6 @@ impl Encode for GovernableParams {
         self.proposal_deposit_spark.encode(buf);
         self.slash_liveness_bps.encode(buf);
         self.slash_double_precommit_bps.encode(buf);
-        self.slash_surround_vote_bps.encode(buf);
         self.max_commission_bps.encode(buf);
         self.governance_delay_epochs.encode(buf);
         self.governance_quorum_bps.encode(buf);
@@ -256,7 +241,7 @@ impl Encode for GovernableParams {
     }
 
     fn encoded_len(&self) -> usize {
-        3 * 8 + 4 * 4 + 8 + 2 * 4
+        3 * 8 + 3 * 4 + 8 + 2 * 4
     }
 }
 
@@ -268,7 +253,6 @@ impl Decode for GovernableParams {
             proposal_deposit_spark: u64::decode(r)?,
             slash_liveness_bps: u32::decode(r)?,
             slash_double_precommit_bps: u32::decode(r)?,
-            slash_surround_vote_bps: u32::decode(r)?,
             max_commission_bps: u32::decode(r)?,
             governance_delay_epochs: u64::decode(r)?,
             governance_quorum_bps: u32::decode(r)?,
@@ -1143,7 +1127,6 @@ mod tests {
             },
             GovernableAction::SetSlashLivenessBps { value: 25 },
             GovernableAction::SetSlashDoublePrecommitBps { value: 600 },
-            GovernableAction::SetSlashSurroundVoteBps { value: 1_200 },
             GovernableAction::SetMaxCommissionBps { value: 1_500 },
             GovernableAction::SetGovernanceDelayEpochs { value: 200 },
             GovernableAction::SetGovernanceQuorumBps { value: 6_000 },
@@ -1210,7 +1193,6 @@ mod tests {
             | GovernableAction::SetProposalDepositSpark { .. }
             | GovernableAction::SetSlashLivenessBps { .. }
             | GovernableAction::SetSlashDoublePrecommitBps { .. }
-            | GovernableAction::SetSlashSurroundVoteBps { .. }
             | GovernableAction::SetMaxCommissionBps { .. }
             | GovernableAction::SetGovernanceDelayEpochs { .. }
             | GovernableAction::SetGovernanceQuorumBps { .. }
@@ -1275,12 +1257,12 @@ mod tests {
         let mut params = GovernableParams::default_mainnet();
         let actions = current_governable_action_samples();
 
-        // There are exactly ten governable actions today. This count and the
+        // There are exactly nine governable actions today. This count and the
         // exhaustive `is_constitutional_monetary_policy_action` match above are
         // intentional: adding a new `GovernableAction` must force a deliberate
         // monetary-policy classification instead of silently expanding the
         // governance surface.
-        assert_eq!(actions.len(), 10);
+        assert_eq!(actions.len(), 9);
 
         for action in actions {
             assert!(

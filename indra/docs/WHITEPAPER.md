@@ -536,8 +536,6 @@ Brief offline period         No rewards         No evidence-based slash
 Liveness failure (3+ epochs  0.10% per epoch    Stake reduced; amount burned
   without participation)
 Double-precommit             5.00% of stake     Slashed and exited
-Equivocating surround vote   10.00% of stake    Slashed and exited
-Self-reported equivocation   1.00% of stake     Grace period: 5 epochs
 Reporter reward              5.00% of slash     Paid to reporter
 ```
 
@@ -548,14 +546,8 @@ same amount from total supply at each penalised epoch transition.
 
 **Double-signing:** Only intentional equivocation (signing two different
 blocks at the same height and round) results in meaningful stake burn.
-The 5% double-precommit slash and 10% surround-vote slash apply
-immediately upon detection. Evidence must be included in a block by
-another validator.
-
-**Self-reporting:** A validator who discovers their key was compromised
-can self-report within 5 epochs, incurring only a 1% penalty rather
-than the full equivocation slash. This incentivises honest key
-management disclosure.
+The 5% double-precommit slash applies immediately upon detection.
+Evidence must be included in a block by another validator.
 
 **Philosophy:** Brief downtime loses rewards but does not enter the
 explicit malicious-equivocation slashing path. Persistent downtime is
@@ -687,7 +679,6 @@ impractical.
 **Tier 2 — Critical** (YES stake must exceed 67% of Snapshot 1 stake):
 - `slash_liveness_bps` — liveness penalty rate (floor: 1 BPS)
 - `slash_double_precommit_bps` — double-precommit slash rate
-- `slash_surround_vote_bps` — surround-vote slash rate
 - `max_commission_bps` — maximum validator commission (monotonic decrease only)
 - `governance_delay_epochs` — execution delay (monotonic increase only)
 - `governance_quorum_bps` — standard YES-stake threshold over total snapshot stake (monotonic increase only)
@@ -736,7 +727,6 @@ Max commission:             20% (may only decrease via governance)
 Liveness threshold:         3 epochs
 Liveness penalty:           0.10% per epoch
 Double-precommit slash:     5.00%
-Surround-vote slash:        10.00%
 ```
 
 ### 6.10 Proposal history retention
@@ -995,9 +985,6 @@ Slashing (default, governable within bounds):
   Liveness threshold:        3 consecutive epochs
   Liveness penalty:          0.10% per epoch (1 BPS minimum)
   Double-precommit:          5.00% of stake (500 BPS)
-  Surround vote:             10.00% of stake (1,000 BPS)
-  Self-report grace period:  5 epochs
-  Self-report penalty:       1.00% (100 BPS)
   Reporter reward:           5.00% of slash amount (500 BPS)
 
 Commission:

@@ -55,8 +55,6 @@ pub struct CanonicalStateEffects {
     pub governance_params_changed: bool,
     /// Whether any canonical governance state changed.
     pub governance_state_changed: bool,
-    /// Slash evidence hashes newly recorded as applied.
-    pub applied_slash_hashes: BTreeSet<Bytes32>,
     /// Whether retained historical slash authority changed.
     pub slash_membership_history_changed: bool,
     /// Consensus-authority snapshots rotated.
@@ -100,7 +98,6 @@ pub(crate) enum CanonicalStateField {
     DelegatorIdentities,
     RetiredColdClassicalComponents,
     RetiredColdPqComponents,
-    AppliedSlashHashes,
     Governance,
     StateCommitmentV2,
     EpochFeesBurned,
@@ -167,7 +164,6 @@ impl CanonicalStateEffects {
             F::RetiredColdClassicalComponents | F::RetiredColdPqComponents => {
                 self.retired_cold_components_changed
             }
-            F::AppliedSlashHashes => !self.applied_slash_hashes.is_empty(),
             F::Governance => self.governance_state_changed,
             F::StateCommitmentV2 => self.state_commitment_cache_changed,
             F::EpochFeesBurned | F::EpochSlashedSpark | F::EpochSlashEventCount => {

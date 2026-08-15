@@ -2475,7 +2475,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,

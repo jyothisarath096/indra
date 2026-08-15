@@ -46,7 +46,6 @@ pub(crate) enum DependencyKey {
     ProposerProposalCount(Bytes32),
     GovernanceActionTarget(Bytes32),
     GovernanceParam(u8),
-    AppliedSlash(Bytes32),
     SlashAuthorityAtHeight(u64),
     EpochDeadline(u64, u8),
 }
@@ -422,11 +421,9 @@ pub(crate) fn governance_footprint(
 pub(crate) fn slash_footprint(
     state: &ChainState,
     evidence: &indra_core::types::slashing::SlashEvidenceV2,
-    evidence_hash: Bytes32,
     current_epoch: u64,
 ) -> BTreeSet<DependencyKey> {
     let mut keys = BTreeSet::from([
-        DependencyKey::AppliedSlash(evidence_hash),
         DependencyKey::SlashAuthorityAtHeight(evidence.vote_1.height),
         DependencyKey::Validator(evidence.validator_id),
         DependencyKey::Tombstone(evidence.validator_id),

@@ -184,9 +184,6 @@ fn parse_action_json(
         "SetSlashDoublePrecommitBps" => Ok(GovernableAction::SetSlashDoublePrecommitBps {
             value: as_u32(numeric)?,
         }),
-        "SetSlashSurroundVoteBps" => Ok(GovernableAction::SetSlashSurroundVoteBps {
-            value: as_u32(numeric)?,
-        }),
         "SetMaxCommissionBps" => Ok(GovernableAction::SetMaxCommissionBps {
             value: as_u32(numeric)?,
         }),

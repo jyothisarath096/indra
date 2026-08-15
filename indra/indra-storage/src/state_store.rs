@@ -588,7 +588,7 @@ mod tests {
             last_active_epoch: 7,
             pending_rewards: 12,
             rewards_last_epoch: 6,
-            self_report_count: 1,
+            slashed_offense_id: Some(Bytes32::from([1; 32])),
             commission_bps: 900,
             pending_commission_bps: None,
             pending_commission_effective_epoch: None,

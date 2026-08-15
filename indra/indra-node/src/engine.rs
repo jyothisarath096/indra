@@ -185,7 +185,7 @@ impl NodeEngine {
             for evidence in &self.pending_slashes {
                 let id = compute_slash_evidence_v2_hash(evidence);
                 self.slash_dependency_index
-                    .insert(id, slash_footprint(&self.state, evidence, id, epoch));
+                    .insert(id, slash_footprint(&self.state, evidence, epoch));
             }
         }
         self.pending_dependency_epoch = epoch;
@@ -211,7 +211,7 @@ impl NodeEngine {
         self.slash_dependency_index
             .assert_reconstructed(self.pending_slashes.iter().map(|evidence| {
                 let id = compute_slash_evidence_v2_hash(evidence);
-                (id, slash_footprint(&self.state, evidence, id, epoch))
+                (id, slash_footprint(&self.state, evidence, epoch))
             }));
     }
 
@@ -281,13 +281,6 @@ impl NodeEngine {
                 .iter()
                 .copied()
                 .map(DependencyKey::Proposal),
-        );
-        common.extend(
-            effects
-                .applied_slash_hashes
-                .iter()
-                .copied()
-                .map(DependencyKey::AppliedSlash),
         );
         if effects.validator_registry_changed || !effects.validator_keys_changed.is_empty() {
             common.push(DependencyKey::ValidatorRegistry);
@@ -440,17 +433,10 @@ impl NodeEngine {
             if !affected.contains(&id) {
                 return true;
             }
-            let mut scratch = state.clone();
-            let valid = indra_state::try_apply_verified_slash_candidate(
-                &mut scratch,
-                evidence,
-                height,
-                None,
-            )
-            .is_ok();
+            let valid = indra_state::verify_slash_candidate(state, evidence, height).is_ok();
             if valid {
                 self.slash_dependency_index
-                    .insert(id, slash_footprint(state, evidence, id, epoch));
+                    .insert(id, slash_footprint(state, evidence, epoch));
             } else {
                 self.slash_dependency_index.remove(&id);
             }
@@ -919,11 +905,6 @@ impl NodeEngine {
             membership_proof,
         };
         let v2_hash = compute_slash_evidence_v2_hash(&proof_evidence);
-        if self.state.applied_slash_hashes.contains(&v2_hash) {
-            return Err(NodeError::State(
-                indra_state::StateError::SlashAlreadyApplied,
-            ));
-        }
         let mut scratch = self.state.clone();
         try_apply_slash_candidate(
             &mut scratch,
@@ -934,7 +915,6 @@ impl NodeEngine {
         let footprint = slash_footprint(
             &self.state,
             &proof_evidence,
-            v2_hash,
             epoch_for_height(self.state.height.saturating_add(1)),
         );
         self.pending_slashes.push(proof_evidence);
@@ -1905,7 +1885,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,
@@ -3510,8 +3490,15 @@ mod tests {
         let started = Instant::now();
         for _ in 0..1_024 {
             let mut scratch = engine.state.clone();
-            indra_state::try_apply_verified_slash_candidate(&mut scratch, &slash, height, None)
-                .unwrap();
+            let verified = indra_state::verify_slash_candidate(&scratch, &slash, height).unwrap();
+            indra_state::try_apply_verified_slash_candidate(
+                &mut scratch,
+                &slash,
+                &verified,
+                height,
+                None,
+            )
+            .unwrap();
         }
         let slash_1024 = started.elapsed();
 
@@ -3618,8 +3605,10 @@ mod tests {
         };
         engine
             .state
-            .applied_slash_hashes
-            .insert(compute_slash_evidence_v2_hash(&v2));
+            .validators
+            .get_mut(&v2.validator_id)
+            .unwrap()
+            .slashed_offense_id = Some(compute_slash_evidence_v2_hash(&v2));
         assert!(matches!(
             engine.add_slash_evidence(evidence),
             Err(NodeError::State(

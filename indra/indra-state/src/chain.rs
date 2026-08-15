@@ -146,10 +146,6 @@ pub struct ChainState {
     /// Permanently retired cold ML-DSA-87 public-key components.
     pub retired_cold_pq_components: PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
 
-    /// Hashes of applied slash evidence — prevents double-slash.
-    /// Key: SHA-256(encode(SlashEvidenceV1))
-    pub applied_slash_hashes: PersistentOrdSet<Bytes32>,
-
     /// On-chain governance state.
     pub governance: GovernanceState,
 
@@ -210,7 +206,6 @@ impl ChainState {
             delegator_identities: _,
             retired_cold_classical_components: _,
             retired_cold_pq_components: _,
-            applied_slash_hashes: _,
             governance: _,
             state_commitment_v2: _,
             epoch_fees_burned: _,
@@ -250,7 +245,6 @@ impl ChainState {
             F::RetiredColdClassicalComponents
         );
         changed!(retired_cold_pq_components, F::RetiredColdPqComponents);
-        changed!(applied_slash_hashes, F::AppliedSlashHashes);
         changed!(governance, F::Governance);
         changed!(state_commitment_v2, F::StateCommitmentV2);
         changed!(epoch_fees_burned, F::EpochFeesBurned);
@@ -285,7 +279,6 @@ impl Encode for ChainState {
         // Included: validator metadata is needed for proposer election and signature/QC verification.
         self.validators.encode(buf);
         encode_nonce_map(&self.staking_nonces, buf);
-        encode_hash_set(&self.applied_slash_hashes, buf);
         self.governance.encode(buf);
         encode_delegator_identity_registry(&self.delegator_identities, buf);
         encode_retired_cold_components(
@@ -324,7 +317,6 @@ impl Encode for ChainState {
             + self.utxos.encoded_len()
             + self.validators.encoded_len()
             + nonce_map_encoded_len(&self.staking_nonces)
-            + hash_set_encoded_len(&self.applied_slash_hashes)
             + self.governance.encoded_len()
             + delegator_identity_registry_encoded_len(&self.delegator_identities)
             + retired_cold_components_encoded_len(
@@ -364,7 +356,6 @@ impl Decode for ChainState {
         let utxos = UtxoSet::decode_at_height(r, height)?;
         let validators = ValidatorSet::decode(r)?;
         let staking_nonces = decode_nonce_map(r)?;
-        let applied_slash_hashes = decode_hash_set(r, "snapshot.applied_slash_hashes")?;
         let governance = GovernanceState::decode(r)?;
         let delegator_identities = decode_delegator_identity_registry(r)?;
         let (retired_cold_classical_components, retired_cold_pq_components) =
@@ -451,7 +442,6 @@ impl Decode for ChainState {
             delegator_identities,
             retired_cold_classical_components,
             retired_cold_pq_components,
-            applied_slash_hashes,
             governance,
             state_commitment_v2: None,
             epoch_fees_burned: 0,
@@ -503,7 +493,6 @@ impl ChainState {
             delegator_identities: PersistentOrdMap::new(),
             retired_cold_classical_components: PersistentOrdSet::new(),
             retired_cold_pq_components: PersistentOrdSet::new(),
-            applied_slash_hashes: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             state_commitment_v2: None,
             epoch_fees_burned: 0,
@@ -1293,43 +1282,6 @@ fn validate_retained_consensus_snapshots_for_lookup(
     Ok(())
 }
 
-fn encode_hash_set(hashes: &PersistentOrdSet<Bytes32>, buf: &mut Vec<u8>) {
-    (hashes.len() as u32).encode(buf);
-    for hash in hashes {
-        hash.encode(buf);
-    }
-}
-
-fn hash_set_encoded_len(hashes: &PersistentOrdSet<Bytes32>) -> usize {
-    4 + hashes.len() * 32
-}
-
-fn decode_hash_set(
-    r: &mut ByteReader<'_>,
-    field: &'static str,
-) -> IndraResult<PersistentOrdSet<Bytes32>> {
-    use indra_core::error::IndraError;
-    use indra_core::types::primitives::MAX_SLASHES_PER_BLOCK;
-
-    let count = u32::decode(r)? as usize;
-    let max = MAX_SLASHES_PER_BLOCK.saturating_mul(10_000);
-    if count > max {
-        return Err(IndraError::LengthExceeded {
-            field,
-            max,
-            actual: count,
-        });
-    }
-    let mut hashes = PersistentOrdSet::new();
-    for _ in 0..count {
-        let hash = Bytes32::decode(r)?;
-        if !hashes.insert(hash) {
-            return Err(IndraError::DuplicateEntries { field });
-        }
-    }
-    Ok(hashes)
-}
-
 fn encode_stake_positions(
     positions: &PersistentOrdMap<Bytes32, StakePositionV1>,
     buf: &mut Vec<u8>,
@@ -1717,7 +1669,7 @@ mod tests {
         ));
     }
     use crate::ValidatorEntry;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
     use indra_core::{
         codec::Encode,
@@ -1750,7 +1702,7 @@ mod tests {
             last_active_epoch: 0,
             pending_rewards: 0,
             rewards_last_epoch: 0,
-            self_report_count: 0,
+            slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,
             pending_commission_effective_epoch: None,
@@ -1832,6 +1784,7 @@ mod tests {
                 last_pq_vote_pk: tombstone_keys.pq_vote_pk,
                 last_vrf_pk: tombstone_keys.vrf_pk,
                 cold_custody: None,
+                slashed_offense_id: None,
                 // Empty is a valid later lifecycle state after all originally
                 // retained positions and tranches have matured or been slashed.
                 retained_position_ids: Vec::new(),
@@ -2185,15 +2138,6 @@ mod tests {
         }
     }
 
-    fn encode_hash_set_hashset(hashes: &HashSet<Bytes32>, buf: &mut Vec<u8>) {
-        let mut entries: Vec<_> = hashes.iter().copied().collect();
-        entries.sort_by_key(|hash| hash.0);
-        (entries.len() as u32).encode(buf);
-        for hash in entries {
-            hash.encode(buf);
-        }
-    }
-
     #[test]
     fn staking_nonce_decode_cap_is_derived_from_staking_signer_capacity() {
         let old_placeholder_cap = MAX_VALIDATORS.saturating_mul(100);
@@ -2377,47 +2321,5 @@ mod tests {
                 field: "snapshot.delegator_identities"
             }
         ));
-    }
-
-    #[test]
-    fn applied_slash_hash_persistent_encoding_matches_legacy_hashset_encoding() {
-        let mut legacy = HashSet::new();
-        let mut persistent = PersistentOrdSet::new();
-        for byte in [0x03, 0x01, 0x02, 0x04] {
-            let hash = Bytes32::from([byte; 32]);
-            legacy.insert(hash);
-            persistent.insert(hash);
-        }
-
-        let mut legacy_bytes = Vec::new();
-        encode_hash_set_hashset(&legacy, &mut legacy_bytes);
-        let mut persistent_bytes = Vec::new();
-        encode_hash_set(&persistent, &mut persistent_bytes);
-        assert_eq!(persistent_bytes, legacy_bytes);
-
-        let decoded = decode_hash_set(
-            &mut ByteReader::new(&persistent_bytes),
-            "snapshot.applied_slash_hashes",
-        )
-        .unwrap();
-        assert_eq!(decoded, persistent);
-    }
-
-    #[test]
-    fn applied_slash_hash_persistent_encoding_is_insertion_order_independent() {
-        let mut forward = PersistentOrdSet::new();
-        let mut reverse = PersistentOrdSet::new();
-        for byte in [0x01, 0x02, 0x03, 0x04] {
-            forward.insert(Bytes32::from([byte; 32]));
-        }
-        for byte in [0x04, 0x03, 0x02, 0x01] {
-            reverse.insert(Bytes32::from([byte; 32]));
-        }
-
-        let mut forward_bytes = Vec::new();
-        encode_hash_set(&forward, &mut forward_bytes);
-        let mut reverse_bytes = Vec::new();
-        encode_hash_set(&reverse, &mut reverse_bytes);
-        assert_eq!(forward_bytes, reverse_bytes);
     }
 }

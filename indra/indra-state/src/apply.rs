@@ -40,7 +40,7 @@ use indra_core::{
         crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
-            bps_of, Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
@@ -91,6 +91,84 @@ struct SlashAccounting {
     reporter_reward: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SlashTarget {
+    Position(Bytes32),
+    Tranche(Bytes32),
+}
+
+fn checked_slash_allocation(
+    targets: &[(SlashTarget, u64)],
+    slash_bps: u32,
+) -> StateResult<(u64, std::collections::BTreeMap<SlashTarget, u64>)> {
+    let total_principal = targets.iter().try_fold(0u64, |sum, (_, principal)| {
+        sum.checked_add(*principal).ok_or(StateError::ValueOverflow)
+    })?;
+    let aggregate_u128 = (total_principal as u128)
+        .checked_mul(slash_bps as u128)
+        .ok_or(StateError::ValueOverflow)?
+        / 10_000u128;
+    let aggregate = u64::try_from(aggregate_u128).map_err(|_| StateError::ValueOverflow)?;
+
+    let mut ranked = Vec::with_capacity(targets.len());
+    let mut allocations = std::collections::BTreeMap::new();
+    let mut allocated = 0u64;
+    for (target, principal) in targets {
+        let product = (*principal as u128)
+            .checked_mul(slash_bps as u128)
+            .ok_or(StateError::ValueOverflow)?;
+        let floor = u64::try_from(product / 10_000u128).map_err(|_| StateError::ValueOverflow)?;
+        let remainder = (product % 10_000u128) as u16;
+        allocated = allocated
+            .checked_add(floor)
+            .ok_or(StateError::ValueOverflow)?;
+        allocations.insert(*target, floor);
+        ranked.push((std::cmp::Reverse(remainder), *target));
+    }
+    ranked.sort_unstable();
+    let leftover = aggregate
+        .checked_sub(allocated)
+        .ok_or(StateError::InvariantViolation {
+            message: "slash allocation exceeds aggregate",
+        })?;
+    if leftover as usize > ranked.len() {
+        return Err(StateError::InvariantViolation {
+            message: "slash largest-remainder allocation is not representable",
+        });
+    }
+    for (_, target) in ranked.into_iter().take(leftover as usize) {
+        let amount = allocations
+            .get_mut(&target)
+            .ok_or(StateError::InvariantViolation {
+                message: "slash allocation target disappeared",
+            })?;
+        *amount = amount.checked_add(1).ok_or(StateError::ValueOverflow)?;
+    }
+    let exact = allocations.values().try_fold(0u64, |sum, amount| {
+        sum.checked_add(*amount).ok_or(StateError::ValueOverflow)
+    })?;
+    if exact != aggregate {
+        return Err(StateError::InvariantViolation {
+            message: "slash allocation does not equal aggregate",
+        });
+    }
+    Ok((aggregate, allocations))
+}
+
+/// Unforgeable proof that one slash candidate passed full cryptographic validation
+/// against a specific candidate height and canonical offense identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSlashCandidate {
+    offense_id: Bytes32,
+    inclusion_height: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SlashCryptoMode<'a> {
+    Verify,
+    PreviouslyVerified(&'a VerifiedSlashCandidate),
+}
+
 fn apply_slash_v2_at_height_with_accounting_mode(
     state: &mut ChainState,
     evidence: &SlashEvidenceV2,
@@ -98,8 +176,21 @@ fn apply_slash_v2_at_height_with_accounting_mode(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
     synthetic_output_index: u32,
-    verify_vote_crypto: bool,
+    crypto_mode: SlashCryptoMode<'_>,
 ) -> StateResult<SlashAccounting> {
+    if evidence.vote_1.height > height || evidence.vote_2.height > height {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "slash evidence infraction height is in the future".into(),
+        });
+    }
+    let offense_id = compute_slash_evidence_v2_hash(evidence);
+    if let SlashCryptoMode::PreviouslyVerified(verified) = crypto_mode {
+        if verified.offense_id != offense_id || verified.inclusion_height != height {
+            return Err(StateError::InvalidSlashEvidence {
+                reason: "verified slash capability does not match candidate".into(),
+            });
+        }
+    }
     if evidence.membership_proof.entry.validator_id != evidence.validator_id
         || evidence.vote_1.validator_id != evidence.validator_id
         || evidence.vote_2.validator_id != evidence.validator_id
@@ -122,7 +213,7 @@ fn apply_slash_v2_at_height_with_accounting_mode(
     apply_slash_common(
         state,
         &legacy_shape,
-        compute_slash_evidence_v2_hash(evidence),
+        offense_id,
         Some((
             evidence.membership_proof.entry.classical_vote_pk,
             evidence.membership_proof.entry.pq_vote_pk.to_vec(),
@@ -131,7 +222,7 @@ fn apply_slash_v2_at_height_with_accounting_mode(
         height,
         reporter_pubkey,
         synthetic_output_index,
-        verify_vote_crypto,
+        crypto_mode,
     )
 }
 
@@ -168,7 +259,7 @@ fn apply_slash_v2_at_height_with_accounting_at_index(
         height,
         reporter_pubkey,
         synthetic_output_index,
-        true,
+        SlashCryptoMode::Verify,
     )
 }
 
@@ -176,6 +267,7 @@ fn apply_slash_v2_at_height_with_accounting_at_index(
 pub fn try_apply_verified_slash_candidate(
     state: &mut ChainState,
     evidence: &SlashEvidenceV2,
+    verified: &VerifiedSlashCandidate,
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
 ) -> StateResult<()> {
@@ -189,11 +281,25 @@ pub fn try_apply_verified_slash_candidate(
         height,
         reporter_pubkey,
         0,
-        false,
+        SlashCryptoMode::PreviouslyVerified(verified),
     )?;
     txn.add_slash_accounting(accounting.slash_amount)?;
     txn.commit_scratch();
     Ok(())
+}
+
+/// Fully validate a slash candidate and mint a capability for later application.
+pub fn verify_slash_candidate(
+    state: &ChainState,
+    evidence: &SlashEvidenceV2,
+    height: u64,
+) -> StateResult<VerifiedSlashCandidate> {
+    let mut scratch = state.clone();
+    try_apply_slash_candidate(&mut scratch, evidence, height, None)?;
+    Ok(VerifiedSlashCandidate {
+        offense_id: compute_slash_evidence_v2_hash(evidence),
+        inclusion_height: height,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -381,7 +487,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: 1_000,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,
@@ -723,7 +829,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: 1_000,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,
@@ -2580,7 +2686,7 @@ mod tests {
             txn.commit();
         }
         let slash_mutations = crate::txn::mutation_count();
-        assert!(slash_mutations >= 5);
+        assert!(slash_mutations >= 4);
         for failpoint in 1..=slash_mutations {
             crate::txn::set_fail_after_mutation(Some(failpoint));
             let mut candidate = pre_slash.clone();
@@ -2644,6 +2750,7 @@ mod tests {
                     pq_pk: public.pq.0,
                     key_version: 1,
                 }),
+                slashed_offense_id: validator.slashed_offense_id,
             },
             &positions,
             &tranches,
@@ -2761,6 +2868,7 @@ mod tests {
                     pq_pk: public.pq.0,
                     key_version: 1,
                 }),
+                slashed_offense_id: None,
             },
             &positions,
             &tranches,
@@ -2907,6 +3015,7 @@ mod tests {
                     pq_pk: validator.cold_hybrid_pq_pk.unwrap(),
                     key_version: validator.cold_key_version,
                 }),
+                slashed_offense_id: validator.slashed_offense_id,
                 retained_position_ids: vec![position.position_id],
                 retained_tranche_ids: vec![tranche.tranche_id],
             },
@@ -2973,14 +3082,32 @@ mod tests {
             vec![successor.tranche_id]
         );
 
+        let mut swapped = evidence.clone();
+        std::mem::swap(&mut swapped.vote_1, &mut swapped.vote_2);
+        assert_eq!(
+            compute_slash_evidence_v2_hash(&evidence),
+            compute_slash_evidence_v2_hash(&swapped),
+            "presentation order must not change canonical offense identity"
+        );
+        assert!(matches!(
+            apply_slash_v2_at_height_with_accounting(
+                &mut state,
+                &swapped,
+                &chain_id,
+                u64::MAX,
+                None,
+            ),
+            Err(StateError::SlashAlreadyApplied)
+        ));
+
         let mut already_evicted = state.clone();
-        already_evicted.applied_slash_hashes = crate::persistent::PersistentOrdSet::new();
         already_evicted
             .evicted_validator_tombstones
             .get(&validator_id)
             .cloned()
             .map(|mut tombstone| {
                 tombstone.eviction_height = u64::MAX - 1;
+                tombstone.slashed_offense_id = None;
                 already_evicted
                     .evicted_validator_tombstones
                     .insert(validator_id, tombstone);
@@ -3050,6 +3177,123 @@ mod tests {
             None,
         )
         .is_err());
+
+        state.slash_membership_roots = vec![SlashMembershipRootRecord {
+            activation_height: u64::MAX,
+            membership_root: indra_core::types::slash_membership::compute_slash_membership_root(
+                &state.consensus_snapshots[0],
+            )
+            .unwrap(),
+        }];
+        let error = apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            u64::MAX - 1,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::InvalidSlashEvidence { reason }
+                if reason.contains("future")
+        ));
+    }
+
+    #[test]
+    fn largest_remainder_two_ten_spark_records_at_five_percent_is_exact() {
+        let targets = [
+            (SlashTarget::Position(Bytes32::from([1; 32])), 10),
+            (SlashTarget::Position(Bytes32::from([2; 32])), 10),
+        ];
+        let (aggregate, allocations) = checked_slash_allocation(&targets, 500).unwrap();
+        assert_eq!(aggregate, 1);
+        assert_eq!(allocations.values().copied().sum::<u64>(), aggregate);
+        assert_eq!(
+            allocations.values().filter(|amount| **amount == 1).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn largest_remainder_fragmentation_cannot_reduce_effective_slash_rate() {
+        let whole = [(SlashTarget::Position(Bytes32::from([1; 32])), 100)];
+        let fragmented = (0u16..100)
+            .map(|index| {
+                let mut id = [0u8; 32];
+                id[..2].copy_from_slice(&index.to_le_bytes());
+                (SlashTarget::Position(Bytes32::from(id)), 1)
+            })
+            .collect::<Vec<_>>();
+        let (whole_slash, _) = checked_slash_allocation(&whole, 500).unwrap();
+        let (fragmented_slash, allocations) = checked_slash_allocation(&fragmented, 500).unwrap();
+        assert_eq!(whole_slash, 5);
+        assert_eq!(fragmented_slash, whole_slash);
+        assert_eq!(allocations.values().copied().sum::<u64>(), whole_slash);
+    }
+
+    #[test]
+    fn verified_slash_capability_is_bound_to_offense_and_inclusion_height() {
+        let (state, validator_id, keypair) = slash_validator_state([0xD9; 32], 1_000_000);
+        let snapshot = state.snapshot_for_consensus_height(1).unwrap();
+        let (position, _) = snapshot.entry_with_position(&validator_id).unwrap();
+        let proof = build_slash_membership_proof(snapshot, position).unwrap();
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0x11; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0x22; 32]),
+            ),
+            membership_proof: proof,
+        };
+        let verified = verify_slash_candidate(&state, &evidence, 1).unwrap();
+
+        let mut different = evidence.clone();
+        different.vote_2 = signed_vote(
+            &keypair,
+            validator_id,
+            1,
+            0,
+            VoteStep::Precommit,
+            Bytes32::from([0x33; 32]),
+        );
+        let mut candidate = state.clone();
+        assert!(matches!(
+            try_apply_verified_slash_candidate(
+                &mut candidate,
+                &different,
+                &verified,
+                1,
+                None,
+            ),
+            Err(StateError::InvalidSlashEvidence { reason })
+                if reason.contains("capability")
+        ));
+
+        let mut wrong_height = state.clone();
+        assert!(matches!(
+            try_apply_verified_slash_candidate(
+                &mut wrong_height,
+                &evidence,
+                &verified,
+                2,
+                None,
+            ),
+            Err(StateError::InvalidSlashEvidence { reason })
+                if reason.contains("capability")
+        ));
     }
 
     #[test]
@@ -3123,7 +3367,7 @@ fn apply_slash_common(
     height: u64,
     reporter_pubkey: Option<&HybridPubKey>,
     synthetic_output_index: u32,
-    verify_vote_crypto: bool,
+    crypto_mode: SlashCryptoMode<'_>,
 ) -> StateResult<SlashAccounting> {
     use crate::ValidatorStatus;
     use indra_core::types::{
@@ -3131,16 +3375,15 @@ fn apply_slash_common(
         vote::VoteStep,
     };
 
-    if state.applied_slash_hashes.contains(&evidence_hash) {
-        return Err(StateError::SlashAlreadyApplied);
-    }
-
     let validator_id = evidence.validator_id;
 
     let live_validator = state.validators.get(&validator_id);
     let tombstone = state.evicted_validator_tombstones.get(&validator_id);
     if live_validator.is_none() {
         let tombstone = tombstone.ok_or(StateError::ValidatorNotFound)?;
+        if tombstone.slashed_offense_id.is_some() {
+            return Err(StateError::SlashAlreadyApplied);
+        }
         if historical_keys.is_none() || tombstone.eviction_height < evidence.vote_1.height {
             return Err(StateError::InvalidSlashEvidence {
                 reason: "validator was evicted before the alleged infraction height".into(),
@@ -3160,6 +3403,9 @@ fn apply_slash_common(
     };
 
     if let Some(v) = live_validator {
+        if v.slashed_offense_id.is_some() {
+            return Err(StateError::SlashAlreadyApplied);
+        }
         if matches!(v.status, ValidatorStatus::Slashed | ValidatorStatus::Exited) {
             return Err(StateError::InvalidSlashEvidence {
                 reason: "validator already slashed or exited".into(),
@@ -3167,7 +3413,7 @@ fn apply_slash_common(
         }
     }
 
-    if verify_vote_crypto {
+    if matches!(crypto_mode, SlashCryptoMode::Verify) {
         verify_vote_sig_with_keys(&evidence.vote_1, &classical_pk, &pq_pk_bytes, chain_id)
             .map_err(|e| StateError::InvalidSlashEvidence {
                 reason: format!("vote_1 signature invalid: {e}"),
@@ -3235,8 +3481,6 @@ fn apply_slash_common(
         }
     };
 
-    let bps = |amount, rate| bps_of(amount, rate);
-
     let mut position_ids = Vec::new();
     let mut tranche_ids = Vec::new();
     if let Some(tombstone) = tombstone {
@@ -3283,50 +3527,77 @@ fn apply_slash_common(
                 .into(),
         });
     }
-    let slashable_position_stake = position_ids.iter().fold(0u64, |acc, id| {
-        acc.saturating_add(
-            state
-                .stake_positions
-                .get(id)
-                .and_then(|position| position.active)
-                .map(|active| active.principal_spark)
-                .unwrap_or(0),
-        )
-    });
-    let slashable_tranche_stake = tranche_ids.iter().fold(0u64, |acc, id| {
-        acc.saturating_add(
-            state
-                .unbonding_tranches
-                .get(id)
-                .map(|tranche| tranche.principal_spark)
-                .unwrap_or(0),
-        )
-    });
-    let slashable_principal = slashable_position_stake.saturating_add(slashable_tranche_stake);
+    let mut slash_targets = Vec::with_capacity(position_ids.len() + tranche_ids.len());
+    for id in &position_ids {
+        let principal = state
+            .stake_positions
+            .get(id)
+            .and_then(|position| position.active)
+            .map(|active| active.principal_spark)
+            .ok_or(StateError::InvariantViolation {
+                message: "slash position target has no active principal",
+            })?;
+        slash_targets.push((SlashTarget::Position(*id), principal));
+    }
+    for id in &tranche_ids {
+        let principal = state
+            .unbonding_tranches
+            .get(id)
+            .map(|tranche| tranche.principal_spark)
+            .ok_or(StateError::InvariantViolation {
+                message: "slash tranche target is absent",
+            })?;
+        slash_targets.push((SlashTarget::Tranche(*id), principal));
+    }
     let current_stake = state
         .validators
         .get(&validator_id)
         .map(|v| v.stake_spark)
         .unwrap_or(0);
-    let slash_base = slashable_principal.max(current_stake);
-    let slash_amount = bps(slash_base, slash_bps);
-    let potential_reporter_reward = bps(slash_amount, SLASH_REPORTER_REWARD_BPS);
+    let (slash_amount, allocations) = if slash_targets.is_empty() {
+        let direct = [(SlashTarget::Position(Bytes32::ZERO), current_stake)];
+        checked_slash_allocation(&direct, slash_bps)?
+    } else {
+        checked_slash_allocation(&slash_targets, slash_bps)?
+    };
+    let potential_reporter_reward = u64::try_from(
+        (slash_amount as u128)
+            .checked_mul(SLASH_REPORTER_REWARD_BPS as u128)
+            .ok_or(StateError::ValueOverflow)?
+            / 10_000u128,
+    )
+    .map_err(|_| StateError::ValueOverflow)?;
 
-    let mut total_principal_slashed: u64 = 0;
+    let mut total_principal_slashed: u64 = if slash_targets.is_empty() {
+        slash_amount
+    } else {
+        0
+    };
     let mut active_principal_slashed: u64 = 0;
     for position_id in &position_ids {
         if let Some(mut position) = state.stake_positions.get(position_id).cloned() {
             if let Some(active) = position.active {
-                let amount = bps(active.principal_spark, slash_bps);
-                let remaining = active.principal_spark.saturating_sub(amount);
+                let amount = *allocations
+                    .get(&SlashTarget::Position(*position_id))
+                    .ok_or(StateError::InvariantViolation {
+                        message: "missing slash position allocation",
+                    })?;
+                let remaining = active
+                    .principal_spark
+                    .checked_sub(amount)
+                    .ok_or(StateError::ValueOverflow)?;
                 position.active = (remaining > 0).then(|| {
                     indra_core::types::stake_position::ActiveStakeAggregateV1 {
                         principal_spark: remaining,
                         ..active
                     }
                 });
-                active_principal_slashed = active_principal_slashed.saturating_add(amount);
-                total_principal_slashed = total_principal_slashed.saturating_add(amount);
+                active_principal_slashed = active_principal_slashed
+                    .checked_add(amount)
+                    .ok_or(StateError::ValueOverflow)?;
+                total_principal_slashed = total_principal_slashed
+                    .checked_add(amount)
+                    .ok_or(StateError::ValueOverflow)?;
                 state.stake_positions.insert(*position_id, position.clone());
                 if let Some(commitment) = state.state_commitment_v2.as_mut() {
                     commitment.put_stake_position(&position);
@@ -3338,9 +3609,18 @@ fn apply_slash_common(
     let mut tranche_successors = Vec::new();
     for tranche_id in &tranche_ids {
         if let Some(tranche) = state.unbonding_tranches.get(tranche_id).cloned() {
-            let amount = bps(tranche.principal_spark, slash_bps);
-            let remaining = tranche.principal_spark.saturating_sub(amount);
-            total_principal_slashed = total_principal_slashed.saturating_add(amount);
+            let amount = *allocations.get(&SlashTarget::Tranche(*tranche_id)).ok_or(
+                StateError::InvariantViolation {
+                    message: "missing slash tranche allocation",
+                },
+            )?;
+            let remaining = tranche
+                .principal_spark
+                .checked_sub(amount)
+                .ok_or(StateError::ValueOverflow)?;
+            total_principal_slashed = total_principal_slashed
+                .checked_add(amount)
+                .ok_or(StateError::ValueOverflow)?;
             if remaining == 0 {
                 tranche_successors.push((*tranche_id, None));
             } else {
@@ -3411,6 +3691,7 @@ fn apply_slash_common(
             }
         }
         tombstone.retained_tranche_ids.sort();
+        tombstone.slashed_offense_id = Some(evidence_hash);
         tombstone
             .validate(false)
             .map_err(|error| StateError::InvalidSlashEvidence {
@@ -3432,17 +3713,21 @@ fn apply_slash_common(
 
     let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
-        let stake_slash = if slashable_principal > 0 {
+        let stake_slash = if !slash_targets.is_empty() {
             active_principal_slashed
         } else {
             slash_amount
         };
-        v.stake_spark = v.stake_spark.saturating_sub(stake_slash);
+        v.stake_spark = v
+            .stake_spark
+            .checked_sub(stake_slash)
+            .ok_or(StateError::ValueOverflow)?;
         // Equivocation slashing is prospective-only by policy. Rewards already
         // credited to `pending_rewards` are never clawed back retroactively;
         // the penalty is the immediate stake reduction here plus permanent
         // exclusion from future reward eligibility through `Slashed` status.
         v.status = ValidatorStatus::Slashed;
+        v.slashed_offense_id = Some(evidence_hash);
         updated_validator = Some(v.clone());
         crate::txn::complex_mutation_checkpoint()?;
     }
@@ -3469,13 +3754,18 @@ fn apply_slash_common(
     } else {
         0
     };
-    let burned = slash_amount.saturating_sub(reporter_reward);
-    state.total_supply = state.total_supply.saturating_sub(burned);
-    crate::txn::complex_mutation_checkpoint()?;
-    state.applied_slash_hashes.insert(evidence_hash);
-    if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_slash_hash(&evidence_hash);
+    if total_principal_slashed != slash_amount && !slash_targets.is_empty() {
+        return Err(StateError::InvariantViolation {
+            message: "actual slash reductions do not equal aggregate",
+        });
     }
+    let burned = slash_amount
+        .checked_sub(reporter_reward)
+        .ok_or(StateError::ValueOverflow)?;
+    state.total_supply = state
+        .total_supply
+        .checked_sub(burned)
+        .ok_or(StateError::ValueOverflow)?;
     crate::txn::complex_mutation_checkpoint()?;
 
     Ok(SlashAccounting {
@@ -3490,7 +3780,22 @@ fn apply_slash_common(
 
 /// Compute the canonical proof-carrying evidence hash used for deduplication.
 pub fn compute_slash_evidence_v2_hash(evidence: &SlashEvidenceV2) -> Bytes32 {
-    Bytes32::from(indra_crypto::sha256(&evidence.encode_to_vec()))
+    const DOMAIN: &[u8] = b"INDRA-SLASH-OFFENSE-v1";
+    let first = evidence.vote_1.encode_to_vec();
+    let second = evidence.vote_2.encode_to_vec();
+    let (low, high) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let mut preimage = Vec::with_capacity(DOMAIN.len() + 32 + 8 + low.len() + high.len());
+    preimage.extend_from_slice(DOMAIN);
+    preimage.extend_from_slice(evidence.validator_id.as_ref());
+    preimage.extend_from_slice(&(low.len() as u32).to_le_bytes());
+    preimage.extend_from_slice(&low);
+    preimage.extend_from_slice(&(high.len() as u32).to_le_bytes());
+    preimage.extend_from_slice(&high);
+    Bytes32::from(indra_crypto::sha256(&preimage))
 }
 
 fn create_slash_reporter_reward_utxo(

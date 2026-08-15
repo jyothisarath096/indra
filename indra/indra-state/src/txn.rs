@@ -58,7 +58,6 @@ enum UndoEntry {
         index: std::collections::BTreeMap<Bytes32, Vec<Bytes32>>,
     },
     StakingNonces(PersistentOrdMap<Bytes32, u64>),
-    SlashHashes(PersistentOrdSet<Bytes32>),
     DelegatorIdentities(PersistentOrdMap<Bytes32, HybridPubKey>),
     RetiredColdClassical(PersistentOrdSet<[u8; 32]>),
     RetiredColdPq(PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>),
@@ -87,7 +86,6 @@ pub(crate) struct StateTxn<'a> {
     validators_recorded: bool,
     position_state_recorded: bool,
     staking_nonces_recorded: bool,
-    slash_hashes_recorded: bool,
     delegator_identities_recorded: bool,
     retired_cold_components_recorded: bool,
     governance_recorded: bool,
@@ -114,7 +112,6 @@ impl<'a> StateTxn<'a> {
             validators_recorded: false,
             position_state_recorded: false,
             staking_nonces_recorded: false,
-            slash_hashes_recorded: false,
             delegator_identities_recorded: false,
             retired_cold_components_recorded: false,
             governance_recorded: false,
@@ -298,15 +295,6 @@ impl<'a> StateTxn<'a> {
                         }
                     }
                 }
-                UndoEntry::SlashHashes(before) => {
-                    effects.applied_slash_hashes.extend(
-                        state
-                            .applied_slash_hashes
-                            .iter()
-                            .filter(|hash| !before.contains(hash))
-                            .copied(),
-                    );
-                }
                 UndoEntry::DelegatorIdentities(before) => {
                     for id in before
                         .iter()
@@ -445,7 +433,6 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn snapshot_slashing_scope(&mut self) {
         self.snapshot_validators();
         self.snapshot_position_state();
-        self.snapshot_slash_hashes();
         self.snapshot_evicted_validator_tombstones();
         self.snapshot_utxos();
         self.record_scalars();
@@ -638,8 +625,16 @@ impl<'a> StateTxn<'a> {
     /// Add explicit slash accounting.
     pub(crate) fn add_slash_accounting(&mut self, amount: u64) -> StateResult<()> {
         self.record_scalars();
-        self.state.epoch_slashed_spark = self.state.epoch_slashed_spark.saturating_add(amount);
-        self.state.epoch_slash_event_count = self.state.epoch_slash_event_count.saturating_add(1);
+        self.state.epoch_slashed_spark = self
+            .state
+            .epoch_slashed_spark
+            .checked_add(amount)
+            .ok_or(crate::StateError::ValueOverflow)?;
+        self.state.epoch_slash_event_count = self
+            .state
+            .epoch_slash_event_count
+            .checked_add(1)
+            .ok_or(crate::StateError::ValueOverflow)?;
         self.after_mutation()
     }
 
@@ -685,17 +680,6 @@ impl<'a> StateTxn<'a> {
             let snapshot = measure_undo_recording(|| self.state.staking_nonces.clone());
             self.undo.push(UndoEntry::StakingNonces(snapshot));
             self.staking_nonces_recorded = true;
-        }
-    }
-
-    fn snapshot_slash_hashes(&mut self) {
-        if !self.slash_hashes_recorded {
-            // `PersistentOrdSet::clone()` is an O(1) root-handle copy; applied
-            // slash hashes keep the same coarse rollback boundary without a
-            // full hash-table clone.
-            let snapshot = measure_undo_recording(|| self.state.applied_slash_hashes.clone());
-            self.undo.push(UndoEntry::SlashHashes(snapshot));
-            self.slash_hashes_recorded = true;
         }
     }
 
@@ -811,7 +795,6 @@ impl<'a> StateTxn<'a> {
                     self.state.position_tranche_index = index;
                 }
                 UndoEntry::StakingNonces(nonces) => self.state.staking_nonces = nonces,
-                UndoEntry::SlashHashes(hashes) => self.state.applied_slash_hashes = hashes,
                 UndoEntry::DelegatorIdentities(identities) => {
                     self.state.delegator_identities = identities;
                 }

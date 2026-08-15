@@ -200,9 +200,6 @@ fn parse_governable_action(args: &[String]) -> CliResult<GovernableAction> {
         "slash-double-precommit-bps" => Ok(GovernableAction::SetSlashDoublePrecommitBps {
             value: parse_u32(&required_flag(args, "--value")?, "--value")?,
         }),
-        "slash-surround-vote-bps" => Ok(GovernableAction::SetSlashSurroundVoteBps {
-            value: parse_u32(&required_flag(args, "--value")?, "--value")?,
-        }),
         "max-commission-bps" => Ok(GovernableAction::SetMaxCommissionBps {
             value: parse_u32(&required_flag(args, "--value")?, "--value")?,
         }),

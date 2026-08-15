@@ -162,11 +162,6 @@ pub enum GovernableAction {
         /// New double-precommit slash in basis points.
         value: u32,
     },
-    /// Set surround-vote slash bps.
-    SetSlashSurroundVoteBps {
-        /// New surround-vote slash in basis points.
-        value: u32,
-    },
     /// Set max validator commission bps.
     SetMaxCommissionBps {
         /// New maximum commission in basis points.
@@ -230,24 +225,20 @@ impl Encode for GovernableAction {
                 4u8.encode(buf);
                 value.encode(buf);
             }
-            Self::SetSlashSurroundVoteBps { value } => {
+            Self::SetMaxCommissionBps { value } => {
                 5u8.encode(buf);
                 value.encode(buf);
             }
-            Self::SetMaxCommissionBps { value } => {
+            Self::SetGovernanceDelayEpochs { value } => {
                 6u8.encode(buf);
                 value.encode(buf);
             }
-            Self::SetGovernanceDelayEpochs { value } => {
+            Self::SetGovernanceQuorumBps { value } => {
                 7u8.encode(buf);
                 value.encode(buf);
             }
-            Self::SetGovernanceQuorumBps { value } => {
-                8u8.encode(buf);
-                value.encode(buf);
-            }
             Self::SetGovernanceCriticalQuorumBps { value } => {
-                9u8.encode(buf);
+                8u8.encode(buf);
                 value.encode(buf);
             }
         }
@@ -282,19 +273,16 @@ impl Decode for GovernableAction {
             4 => Ok(Self::SetSlashDoublePrecommitBps {
                 value: u32::decode(r)?,
             }),
-            5 => Ok(Self::SetSlashSurroundVoteBps {
+            5 => Ok(Self::SetMaxCommissionBps {
                 value: u32::decode(r)?,
             }),
-            6 => Ok(Self::SetMaxCommissionBps {
-                value: u32::decode(r)?,
-            }),
-            7 => Ok(Self::SetGovernanceDelayEpochs {
+            6 => Ok(Self::SetGovernanceDelayEpochs {
                 value: u64::decode(r)?,
             }),
-            8 => Ok(Self::SetGovernanceQuorumBps {
+            7 => Ok(Self::SetGovernanceQuorumBps {
                 value: u32::decode(r)?,
             }),
-            9 => Ok(Self::SetGovernanceCriticalQuorumBps {
+            8 => Ok(Self::SetGovernanceCriticalQuorumBps {
                 value: u32::decode(r)?,
             }),
             b => Err(IndraError::InvalidBool { byte: b }),

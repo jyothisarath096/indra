@@ -67,25 +67,18 @@ pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
 /// 5% hurts but doesn't destroy honest validators with software bugs.
 pub const SLASH_DOUBLE_PRECOMMIT_BPS: u32 = 500;
 
-/// Surround vote slash: 10% of stake.
-/// Surround voting is a deliberate protocol attack — higher penalty.
-pub const SLASH_SURROUND_VOTE_BPS: u32 = 1_000;
-
-/// Reporter reward: 50% of slashed amount paid directly to the block
+/// Reporter reward: 5% of slashed amount paid directly to the block
 /// proposer who included the slash evidence as a spendable UTXO.
-/// The remaining 50% is burned (reduces total_supply).
+/// The remaining 95% is burned (reduces total_supply).
 /// This provides meaningful economic incentive for validators to actively
 /// monitor for equivocation and submit evidence.
-pub const SLASH_REPORTER_REWARD_BPS: u32 = 5_000;
+pub const SLASH_REPORTER_REWARD_BPS: u32 = 500;
 
 /// Liveness slash: 0.1% per missed epoch after threshold.
 pub const SLASH_LIVENESS_BPS: u32 = 10;
 
 /// Consecutive missed epochs before liveness slash begins.
 pub const SLASH_LIVENESS_THRESHOLD_EPOCHS: u64 = 3;
-
-/// Grace period epochs for self-reported bug slash.
-pub const SLASH_GRACE_PERIOD_EPOCHS: u64 = 5;
 
 // ── Block and Transaction Limits ──────────────────────────────────────────────
 

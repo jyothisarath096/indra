@@ -36,7 +36,6 @@ const KEY_DOMAIN: &[u8] = b"INDRA-state-v2-key:";
 
 const DOMAIN_VALIDATOR: u8 = 0x01;
 const DOMAIN_STAKING_NONCE: u8 = 0x03;
-const DOMAIN_SLASH_HASH: u8 = 0x05;
 const DOMAIN_DELEGATOR_IDENTITY: u8 = 0x07;
 const DOMAIN_RETIRED_COLD_COMPONENT: u8 = 0x09;
 const DOMAIN_CONSENSUS_SNAPSHOT: u8 = 0x0A;
@@ -80,9 +79,6 @@ impl StateCommitmentV2 {
         }
         for tranche in state.unbonding_tranches.values() {
             leaves.push(unbonding_tranche_commitment_leaf(tranche));
-        }
-        for hash in &state.applied_slash_hashes {
-            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
         }
         for (delegator_id, pubkey) in &state.delegator_identities {
             leaves.push((
@@ -178,10 +174,6 @@ impl StateCommitmentV2 {
     }
 
     /// Insert a slash-evidence hash leaf.
-    pub fn put_slash_hash(&mut self, hash: &Bytes32) {
-        self.tree
-            .insert(slash_hash_key(hash), slash_hash_value_hash(hash));
-    }
 
     /// Insert or replace a delegator identity-registry leaf.
     pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) {
@@ -220,10 +212,6 @@ pub(crate) fn validator_key(validator_id: &Bytes32) -> [u8; 32] {
 
 fn staking_nonce_key(signer_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_STAKING_NONCE, &signer_id.0)
-}
-
-fn slash_hash_key(hash: &Bytes32) -> [u8; 32] {
-    derive_key(DOMAIN_SLASH_HASH, &hash.0)
 }
 
 pub(crate) fn delegator_identity_key(delegator_id: &Bytes32) -> [u8; 32] {
@@ -272,19 +260,19 @@ fn evicted_validator_tombstone_key(validator_id: &Bytes32) -> [u8; 32] {
 }
 
 fn evicted_validator_tombstone_value_hash(tombstone: &EvictedValidatorTombstoneV2) -> [u8; 32] {
-    evicted_validator_tombstone_v2_value_hash(tombstone)
+    evicted_validator_tombstone_v3_value_hash(tombstone)
 }
 
 /// Canonical key for the final tranche-native tombstone occupying domain `0x0D`.
-pub fn evicted_validator_tombstone_v2_key(validator_id: &Bytes32) -> [u8; 32] {
+pub fn evicted_validator_tombstone_v3_key(validator_id: &Bytes32) -> [u8; 32] {
     derive_key(DOMAIN_EVICTED_VALIDATOR_TOMBSTONE, &validator_id.0)
 }
 
 /// Domain-separated value hash for a final tranche-native tombstone.
-pub fn evicted_validator_tombstone_v2_value_hash(
+pub fn evicted_validator_tombstone_v3_value_hash(
     tombstone: &EvictedValidatorTombstoneV2,
 ) -> [u8; 32] {
-    let mut value = b"INDRA-EVICTED-VALIDATOR-TOMBSTONE-v2".to_vec();
+    let mut value = b"INDRA-EVICTED-VALIDATOR-TOMBSTONE-v3".to_vec();
     tombstone.encode(&mut value);
     sha256(&value)
 }
@@ -339,7 +327,10 @@ pub(crate) fn validator_value_hash(validator: &ValidatorEntry, _height: u64) -> 
     value.extend_from_slice(&validator.registered_epoch.to_le_bytes());
     value.extend_from_slice(&validator.last_active_epoch.to_le_bytes());
     value.extend_from_slice(&validator.rewards_last_epoch.to_le_bytes());
-    value.extend_from_slice(&validator.self_report_count.to_le_bytes());
+    value.push(u8::from(validator.slashed_offense_id.is_some()));
+    if let Some(offense_id) = validator.slashed_offense_id {
+        value.extend_from_slice(offense_id.as_ref());
+    }
     value.extend_from_slice(&validator.commission_bps.to_le_bytes());
     value.extend_from_slice(&validator.min_delegation_spark.to_le_bytes());
     value.push(u8::from(validator.auto_delegate_to.is_some()));
@@ -391,10 +382,6 @@ fn staking_nonce_value_hash(signer_id: &Bytes32, nonce: u64) -> [u8; 32] {
     sha256(&value)
 }
 
-fn slash_hash_value_hash(hash: &Bytes32) -> [u8; 32] {
-    sha256(&hash.0)
-}
-
 pub(crate) fn delegator_identity_value_hash(
     delegator_id: &Bytes32,
     pubkey: &HybridPubKey,
@@ -443,7 +430,7 @@ mod tests {
             last_active_epoch: 1,
             pending_rewards: 0,
             rewards_last_epoch: 1,
-            self_report_count: 0,
+            slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,
             pending_commission_effective_epoch: None,
@@ -623,9 +610,6 @@ mod tests {
                 staking_nonce_value_hash(signer_id, *nonce),
             ));
         }
-        for hash in &state.applied_slash_hashes {
-            leaves.push((slash_hash_key(hash), slash_hash_value_hash(hash)));
-        }
         for (delegator_id, pubkey) in &state.delegator_identities {
             leaves.push((
                 delegator_identity_key(delegator_id),
@@ -692,6 +676,10 @@ mod tests {
         let mut display_only = base.clone();
         display_only.name = "uncommitted display metadata".to_string();
         assert_eq!(validator_value_hash(&display_only, height), base_hash);
+
+        let mut slashed = base.clone();
+        slashed.slashed_offense_id = Some(id(0xA5));
+        assert_ne!(validator_value_hash(&slashed, height), base_hash);
 
         let mut cold = base;
         cold.cold_hybrid_classical_pk = Some([0x81; 32]);
@@ -781,7 +769,6 @@ mod tests {
         let identity_key = delegator_identity_key(&delegator_id);
         assert_ne!(identity_key, validator_key(&delegator_id));
         assert_ne!(identity_key, staking_nonce_key(&delegator_id));
-        assert_ne!(identity_key, slash_hash_key(&delegator_id));
     }
 
     #[test]
@@ -828,7 +815,6 @@ mod tests {
         let domains = [
             ("validator", DOMAIN_VALIDATOR),
             ("staking_nonce", DOMAIN_STAKING_NONCE),
-            ("slash_hash", DOMAIN_SLASH_HASH),
             ("delegator_identity", DOMAIN_DELEGATOR_IDENTITY),
             ("retired_cold_component", DOMAIN_RETIRED_COLD_COMPONENT),
             ("consensus_snapshot", DOMAIN_CONSENSUS_SNAPSHOT),
@@ -925,6 +911,7 @@ mod tests {
             last_pq_vote_pk: [0x02; indra_crypto::PQ_PK_BYTES],
             last_vrf_pk: [0x03; 32],
             cold_custody: None,
+            slashed_offense_id: None,
             retained_position_ids: Vec::new(),
             retained_tranche_ids: Vec::new(),
         };

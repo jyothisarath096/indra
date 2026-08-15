@@ -42,6 +42,8 @@ pub struct TombstoneAuthorityV2 {
     pub vrf_pk: [u8; 32],
     /// Cold custody, required when self-owned economic records exist.
     pub cold_custody: Option<EvictedColdCustodyV1>,
+    /// Canonical slash offense already applied before eviction, if any.
+    pub slashed_offense_id: Option<Bytes32>,
 }
 
 /// Return the first ranked victim whose complete eviction is representable.
@@ -157,6 +159,7 @@ pub fn plan_tranche_native_eviction_v2(
         last_pq_vote_pk: authority.pq_vote_pk,
         last_vrf_pk: authority.vrf_pk,
         cold_custody: authority.cold_custody,
+        slashed_offense_id: authority.slashed_offense_id,
         retained_position_ids: owned_positions
             .iter()
             .map(|position| position.position_id)
@@ -378,7 +381,7 @@ fn invalid(error: indra_core::error::IndraError) -> StateError {
 mod tests {
     use super::*;
     use crate::state_commitment::{
-        evicted_validator_tombstone_v2_key, evicted_validator_tombstone_v2_value_hash,
+        evicted_validator_tombstone_v3_key, evicted_validator_tombstone_v3_value_hash,
     };
     use indra_core::{
         codec::{Decode, Encode},
@@ -427,6 +430,7 @@ mod tests {
                 pq_pk: [7; PQ_PK_BYTES],
                 key_version: 1,
             }),
+            slashed_offense_id: None,
         }
     }
 
@@ -599,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_v2_encoding_rejects_unknown_marker() {
+    fn tombstone_encoding_rejects_unknown_marker() {
         let (positions, tranches) = maps();
         let plan = plan_tranche_native_eviction_v2(
             "chain",
@@ -611,7 +615,7 @@ mod tests {
         )
         .unwrap();
         let mut bytes = plan.tombstone.encode_to_vec();
-        bytes[0] = 3;
+        bytes[0] = 2;
         assert!(EvictedValidatorTombstoneV2::decode_exact(&bytes).is_err());
     }
 
@@ -625,6 +629,7 @@ mod tests {
             last_pq_vote_pk: [4; PQ_PK_BYTES],
             last_vrf_pk: [5; 32],
             cold_custody: None,
+            slashed_offense_id: None,
             retained_position_ids: (0..MAX_RETAINED_POSITION_REFERENCES_PER_TOMBSTONE as u64)
                 .map(numbered_id)
                 .collect(),
@@ -705,13 +710,16 @@ mod tests {
             &tranches,
         )
         .unwrap();
-        let key = evicted_validator_tombstone_v2_key(&plan.tombstone.validator_id);
-        assert_eq!(key, evicted_validator_tombstone_v2_key(&id(1)));
-        assert_ne!(key, evicted_validator_tombstone_v2_key(&id(2)));
-        let hash = evicted_validator_tombstone_v2_value_hash(&plan.tombstone);
+        let key = evicted_validator_tombstone_v3_key(&plan.tombstone.validator_id);
+        assert_eq!(key, evicted_validator_tombstone_v3_key(&id(1)));
+        assert_ne!(key, evicted_validator_tombstone_v3_key(&id(2)));
+        let hash = evicted_validator_tombstone_v3_value_hash(&plan.tombstone);
         let mut changed = plan.tombstone.clone();
         changed.eviction_height = 600;
         changed.eviction_epoch = 2;
-        assert_ne!(hash, evicted_validator_tombstone_v2_value_hash(&changed));
+        assert_ne!(hash, evicted_validator_tombstone_v3_value_hash(&changed));
+        let mut slashed = plan.tombstone.clone();
+        slashed.slashed_offense_id = Some(id(0xA5));
+        assert_ne!(hash, evicted_validator_tombstone_v3_value_hash(&slashed));
     }
 }

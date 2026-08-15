@@ -65,7 +65,8 @@ pub use apply::{
     try_apply_slash_candidate, try_apply_slash_candidate_at_index, try_apply_staking_candidate,
     try_apply_staking_candidate_at_index, try_apply_transaction_candidate_with_dust,
     try_apply_verified_governance_candidate, try_apply_verified_slash_candidate,
-    try_apply_verified_staking_candidate, ProjectedBlockRoots,
+    try_apply_verified_staking_candidate, verify_slash_candidate, ProjectedBlockRoots,
+    VerifiedSlashCandidate,
 };
 pub use chain::ChainState;
 pub use delegation::{apply_staking_op, apply_verified_staking_op};

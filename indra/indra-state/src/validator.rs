@@ -14,7 +14,7 @@ use indra_core::types::primitives::{
 
 use crate::error::{StateError, StateResult};
 
-const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 2;
+const VALIDATOR_ENTRY_FORMAT_VERSION: u8 = 3;
 /// Consensus ceiling for active delegator entries under one validator.
 ///
 /// This is intentionally far above expected 200-validator mainnet operating
@@ -112,8 +112,8 @@ pub struct ValidatorEntry {
     pub pending_rewards: u64,
     /// Epoch at which pending_rewards was last updated.
     pub rewards_last_epoch: u64,
-    /// Number of self-reported bug slashes used (max 1 per lifetime).
-    pub self_report_count: u32,
+    /// Canonical identity of the one slashable offense already applied.
+    pub slashed_offense_id: Option<Bytes32>,
     /// Commission rate in basis points (e.g. 1000 = 10%).
     /// Bounded by [MIN_COMMISSION_BPS, MAX_COMMISSION_BPS].
     pub commission_bps: u32,
@@ -177,7 +177,10 @@ impl Encode for ValidatorEntry {
         self.last_active_epoch.encode(buf);
         self.pending_rewards.encode(buf);
         self.rewards_last_epoch.encode(buf);
-        self.self_report_count.encode(buf);
+        self.slashed_offense_id.is_some().encode(buf);
+        if let Some(offense_id) = self.slashed_offense_id {
+            offense_id.encode(buf);
+        }
         self.commission_bps.encode(buf);
         self.pending_commission_bps.is_some().encode(buf);
         if let Some(pending) = self.pending_commission_bps {
@@ -242,7 +245,8 @@ impl Encode for ValidatorEntry {
             + 8
             + 8
             + 8
-            + 4
+            + 1
+            + self.slashed_offense_id.map(|_| 32).unwrap_or(0)
             + 4
             + 1
             + self.pending_commission_bps.map(|_| 2).unwrap_or(0)
@@ -364,7 +368,11 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
     let last_active_epoch = u64::decode(r)?;
     let pending_rewards = u64::decode(r)?;
     let rewards_last_epoch = u64::decode(r)?;
-    let self_report_count = u32::decode(r)?;
+    let slashed_offense_id = if bool::decode(r)? {
+        Some(Bytes32::decode(r)?)
+    } else {
+        None
+    };
     let commission_bps = u32::decode(r)?;
     let pending_commission_bps = if bool::decode(r)? {
         Some(u16::decode(r)?)
@@ -447,7 +455,7 @@ fn decode_validator_entry_fields(r: &mut ByteReader<'_>) -> IndraResult<Validato
         last_active_epoch,
         pending_rewards,
         rewards_last_epoch,
-        self_report_count,
+        slashed_offense_id,
         commission_bps,
         pending_commission_bps,
         pending_commission_effective_epoch,
@@ -876,7 +884,7 @@ mod tests {
             last_active_epoch: epoch,
             pending_rewards: 0,
             rewards_last_epoch: epoch,
-            self_report_count: 0,
+            slashed_offense_id: None,
             commission_bps: 1_000,
             pending_commission_bps: None,
             pending_commission_effective_epoch: None,
@@ -1184,6 +1192,8 @@ pub struct EvictedValidatorTombstoneV2 {
     pub last_vrf_pk: [u8; 32],
     /// Cold custody retained for validator-self principal and rewards.
     pub cold_custody: Option<EvictedColdCustodyV1>,
+    /// Canonical slash offense already applied to retained principal.
+    pub slashed_offense_id: Option<Bytes32>,
     /// Ordered unique canonical positions owned by this eviction.
     pub retained_position_ids: Vec<Bytes32>,
     /// Ordered unique canonical tranches owned by this eviction.
@@ -1222,7 +1232,7 @@ fn strictly_sorted(values: &[Bytes32]) -> bool {
 
 impl Encode for EvictedValidatorTombstoneV2 {
     fn encode(&self, buf: &mut Vec<u8>) {
-        2u8.encode(buf);
+        3u8.encode(buf);
         self.validator_id.encode(buf);
         self.eviction_height.encode(buf);
         self.eviction_epoch.encode(buf);
@@ -1232,6 +1242,10 @@ impl Encode for EvictedValidatorTombstoneV2 {
         self.cold_custody.is_some().encode(buf);
         if let Some(cold) = &self.cold_custody {
             cold.encode(buf);
+        }
+        self.slashed_offense_id.is_some().encode(buf);
+        if let Some(offense_id) = self.slashed_offense_id {
+            offense_id.encode(buf);
         }
         encode_list(&self.retained_position_ids, buf);
         encode_list(&self.retained_tranche_ids, buf);
@@ -1249,6 +1263,8 @@ impl Encode for EvictedValidatorTombstoneV2 {
                 .as_ref()
                 .map(Encode::encoded_len)
                 .unwrap_or(0)
+            + 1
+            + self.slashed_offense_id.map(|_| 32).unwrap_or(0)
             + list_encoded_len(&self.retained_position_ids)
             + list_encoded_len(&self.retained_tranche_ids)
     }
@@ -1257,7 +1273,7 @@ impl Encode for EvictedValidatorTombstoneV2 {
 impl Decode for EvictedValidatorTombstoneV2 {
     fn decode(reader: &mut ByteReader<'_>) -> IndraResult<Self> {
         let version = u8::decode(reader)?;
-        if version != 2 {
+        if version != 3 {
             return Err(IndraError::UnsupportedVersion {
                 version: version.into(),
             });
@@ -1274,6 +1290,11 @@ impl Decode for EvictedValidatorTombstoneV2 {
         } else {
             None
         };
+        let slashed_offense_id = if bool::decode(reader)? {
+            Some(Bytes32::decode(reader)?)
+        } else {
+            None
+        };
         let value = Self {
             validator_id,
             eviction_height,
@@ -1282,6 +1303,7 @@ impl Decode for EvictedValidatorTombstoneV2 {
             last_pq_vote_pk,
             last_vrf_pk,
             cold_custody,
+            slashed_offense_id,
             retained_position_ids: decode_list(
                 reader,
                 MAX_RETAINED_POSITION_REFERENCES_PER_TOMBSTONE,

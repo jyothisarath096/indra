@@ -2294,13 +2294,12 @@ fn get_latest_epoch(state: &NodeState<'_>) -> RpcResult<String> {
 fn get_governance_params(state: &NodeState<'_>) -> RpcResult<String> {
     let params = &state.chain.governance.params;
     Ok(format!(
-        "{{\"slash_liveness_threshold_epochs\":{},\"min_delegation_spark\":{},\"proposal_deposit_spark\":{},\"slash_liveness_bps\":{},\"slash_double_precommit_bps\":{},\"slash_surround_vote_bps\":{},\"max_commission_bps\":{},\"governance_delay_epochs\":{},\"governance_quorum_bps\":{},\"governance_critical_quorum_bps\":{}}}",
+        "{{\"slash_liveness_threshold_epochs\":{},\"min_delegation_spark\":{},\"proposal_deposit_spark\":{},\"slash_liveness_bps\":{},\"slash_double_precommit_bps\":{},\"max_commission_bps\":{},\"governance_delay_epochs\":{},\"governance_quorum_bps\":{},\"governance_critical_quorum_bps\":{}}}",
         params.slash_liveness_threshold_epochs,
         params.min_delegation_spark,
         params.proposal_deposit_spark,
         params.slash_liveness_bps,
         params.slash_double_precommit_bps,
-        params.slash_surround_vote_bps,
         params.max_commission_bps,
         params.governance_delay_epochs,
         params.governance_quorum_bps,
@@ -2470,9 +2469,6 @@ fn governable_action_str(action: &indra_core::types::governance::GovernableActio
         }
         indra_core::types::governance::GovernableAction::SetSlashDoublePrecommitBps { .. } => {
             "SetSlashDoublePrecommitBps"
-        }
-        indra_core::types::governance::GovernableAction::SetSlashSurroundVoteBps { .. } => {
-            "SetSlashSurroundVoteBps"
         }
         indra_core::types::governance::GovernableAction::SetMaxCommissionBps { .. } => {
             "SetMaxCommissionBps"
@@ -3614,7 +3610,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,
@@ -3645,7 +3641,7 @@ mod tests {
                 last_active_epoch: 0,
                 pending_rewards: 0,
                 rewards_last_epoch: 0,
-                self_report_count: 0,
+                slashed_offense_id: None,
                 commission_bps: indra_core::types::primitives::DEFAULT_COMMISSION_BPS,
                 pending_commission_bps: None,
                 pending_commission_effective_epoch: None,

@@ -29,8 +29,7 @@ participation parameters:
 - liveness slashing threshold;
 - minimum delegation floor;
 - proposal deposit;
-- slashing basis points for liveness, double-precommit, and surround-vote
-  evidence;
+- slashing basis points for liveness and double-precommit evidence;
 - maximum validator commission;
 - governance execution delay;
 - standard and critical governance YES-stake thresholds.
