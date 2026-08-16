@@ -838,16 +838,27 @@ pub fn burn_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -> 
     if amount == 0 {
         return Ok(0);
     }
+    crate::monetary::MonetaryDeltaV1::burn(
+        amount,
+        crate::monetary::BurnSourceV1::GovernanceDeposit,
+    )?;
     let new_total_supply = state
         .total_supply
         .checked_sub(amount)
         .ok_or(StateError::ValueOverflow)?;
-    let new_epoch_governance_burned_spark = state
+    let cumulative_governance_burned_spark = state
+        .monetary_ledger
+        .cumulative_governance_burned_spark
+        .checked_add(amount)
+        .ok_or(StateError::ValueOverflow)?;
+    let epoch_ledger_burned_spark = state
+        .monetary_ledger
         .epoch_governance_burned_spark
         .checked_add(amount)
         .ok_or(StateError::ValueOverflow)?;
     state.total_supply = new_total_supply;
-    state.epoch_governance_burned_spark = new_epoch_governance_burned_spark;
+    state.monetary_ledger.cumulative_governance_burned_spark = cumulative_governance_burned_spark;
+    state.monetary_ledger.epoch_governance_burned_spark = epoch_ledger_burned_spark;
     let proposal = state
         .governance
         .proposals
@@ -1112,7 +1123,9 @@ mod tests {
                 name: "governance-test-validator".into(),
                 hybrid_classical_pk: Some(pubkey.classical_pk.0),
                 hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-                vrf_pk: Some([validator_id.0[0]; 32]),
+                vrf_pk: Some(
+                    indra_crypto::VrfKeypair::from_seed(&[validator_id.0[0]; 32]).public_key(),
+                ),
                 vrf_key_activation_epoch: 0,
                 pending_vrf_pk: None,
                 pending_vrf_activation_epoch: None,
@@ -1321,6 +1334,7 @@ mod tests {
             .utxos
             .insert(deposit_output(cold_pubkey.clone(), 1_000), 0, 0, 0)
             .unwrap();
+        state.finalize_genesis().unwrap();
         let mut propose = propose_op(validator_id, &hot_keypair, cold_pubkey.clone(), deposit, 1);
         set_cold_authorization(&mut propose, 1);
         sign_cold_governance_op(&mut propose, &cold_keypair, DEFAULT_CHAIN_ID);
@@ -1352,7 +1366,7 @@ mod tests {
         apply_governance_op(&mut state, &cancel, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
         let cancelled = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(state.total_supply, supply_before_cancel - 1_000);
-        assert_eq!(state.epoch_governance_burned_spark, 1_000);
+        assert_eq!(state.monetary_ledger.epoch_governance_burned_spark, 1_000);
         assert_eq!(cancelled.deposit_spark, 0);
         assert!(cancelled.deposit_burned);
 
@@ -1476,7 +1490,7 @@ mod tests {
             .get_mut(&proposal_id)
             .unwrap()
             .deposit_spark = 1;
-        state.epoch_governance_burned_spark = u64::MAX;
+        state.monetary_ledger.epoch_governance_burned_spark = u64::MAX;
         let supply_before = state.total_supply;
 
         assert!(matches!(
@@ -1484,7 +1498,10 @@ mod tests {
             Err(StateError::ValueOverflow)
         ));
         assert_eq!(state.total_supply, supply_before);
-        assert_eq!(state.epoch_governance_burned_spark, u64::MAX);
+        assert_eq!(
+            state.monetary_ledger.epoch_governance_burned_spark,
+            u64::MAX
+        );
         let proposal = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(proposal.deposit_spark, 1);
         assert!(!proposal.deposit_burned);

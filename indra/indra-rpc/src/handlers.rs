@@ -563,7 +563,7 @@ fn get_tip(state: &NodeState<'_>) -> RpcResult<String> {
 /// `indra_getChainInfo` — returns a full chain summary.
 ///
 /// Result: `{"height", "tip_hash", "base_fee", "total_supply",
-///           "treasury_balance", "burn_buffer", "fee_reward_pool",
+///           "fee_reward_pool",
 ///           "active_validators", "mempool_size", "epoch",
 ///           "pruned_mode", "lowest_block", "blocks_retained",
 ///           "block_reward_spark", "era"}`
@@ -582,7 +582,11 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
         indra_core::types::primitives::validator_set_phase(total_staked_spark);
     let mempool_size = state.mempool_size;
     let epoch = s.current_epoch();
-    let block_reward_spark = indra_state::epoch::block_reward_at_height(s.height);
+    let block_reward_spark = indra_state::monetary::block_reward_for_budget(
+        s.monetary_ledger.reward_budget_spark,
+        s.height.saturating_add(1),
+    )
+    .map_err(|error| RpcError::Internal(error.to_string()))?;
     let era = era_for_height(s.height);
     let pruned_mode = state.pruned_mode;
     let lowest_block = state.lowest_block;
@@ -594,13 +598,11 @@ fn get_chain_info(state: &NodeState<'_>) -> RpcResult<String> {
         .unwrap_or(0);
 
     Ok(format!(
-        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"treasury_balance":{treasury},"burn_buffer":{burn},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"max_active_validators":{max_active_validators},"total_staked_spark":{total_staked_spark},"effective_min_stake_spark":{effective_min_stake_spark},"validator_set_phase":{validator_set_phase},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era},"peers":{peers},"chain_id":"{chain_id}"}}"#,
+        r#"{{"height":{height},"tip_hash":"{tip}","base_fee":{base_fee},"total_supply":{total_supply},"fee_reward_pool":{fee_reward_pool},"active_validators":{validators},"max_active_validators":{max_active_validators},"total_staked_spark":{total_staked_spark},"effective_min_stake_spark":{effective_min_stake_spark},"validator_set_phase":{validator_set_phase},"mempool_size":{mempool},"epoch":{epoch},"pruned_mode":{pruned_mode},"lowest_block":{lowest_block},"blocks_retained":{blocks_retained},"block_reward_spark":{block_reward_spark},"era":{era},"peers":{peers},"chain_id":"{chain_id}"}}"#,
         height = s.height,
         tip = tip,
         base_fee = s.base_fee,
         total_supply = s.total_supply,
-        treasury = s.treasury_balance,
-        burn = s.burn_buffer,
         fee_reward_pool = s.fee_reward_pool,
         validators = active_validators,
         max_active_validators = max_active_validators,
@@ -2132,7 +2134,11 @@ fn get_epoch_info(state: &NodeState<'_>) -> RpcResult<String> {
         .saturating_add(EPOCH_DURATION_BLOCKS)
         .saturating_sub(1);
     let blocks_remaining = epoch_end_height.saturating_sub(height);
-    let block_reward_spark = indra_state::epoch::block_reward_at_height(height);
+    let block_reward_spark = indra_state::monetary::block_reward_for_budget(
+        state.chain.monetary_ledger.reward_budget_spark,
+        height.saturating_add(1),
+    )
+    .map_err(|error| RpcError::Internal(error.to_string()))?;
     let total_staked = state
         .chain
         .validators
@@ -2175,18 +2181,21 @@ fn bytes32_vec_json(values: &[Bytes32]) -> String {
 
 fn epoch_record_json(record: &EpochRecord) -> String {
     format!(
-        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"governance_deposits_burned":{},"total_slashed_spark":{},"slash_event_count":{},"liveness_penalty_count":{},"avg_base_fee":{},"validators_joined":{},"validators_left":{},"era":{},"block_reward_spark":{},"total_supply":{},"treasury_balance":{}}}"#,
+        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"reward_minted_spark":{},"fee_rewards_distributed":{},"fee_burned_spark":{},"slash_burned_spark":{},"governance_burned_spark":{},"total_burned_spark":{},"opening_total_supply_spark":{},"closing_total_supply_spark":{},"slash_event_count":{},"liveness_penalty_count":{},"avg_base_fee":{},"validators_joined":{},"validators_left":{},"era":{},"block_reward_spark":{}}}"#,
         record.epoch,
         record.start_height,
         record.end_height,
         record.timestamp_secs,
         record.active_validators,
         record.total_staked_spark,
-        record.block_rewards_distributed,
+        record.reward_minted_spark,
         record.fee_rewards_distributed,
-        record.fees_burned,
-        record.governance_deposits_burned,
-        record.total_slashed_spark,
+        record.fee_burned_spark,
+        record.slash_burned_spark,
+        record.governance_burned_spark,
+        record.total_burned_spark,
+        record.opening_total_supply_spark,
+        record.closing_total_supply_spark,
         record.slash_event_count,
         record.liveness_penalty_count,
         record.avg_base_fee,
@@ -2194,25 +2203,26 @@ fn epoch_record_json(record: &EpochRecord) -> String {
         bytes32_vec_json(&record.validators_left),
         record.era,
         record.block_reward_spark,
-        record.total_supply,
-        record.treasury_balance,
     )
 }
 
 fn epoch_summary_json(record: &EpochRecord) -> String {
     format!(
-        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"block_rewards_distributed":{},"fee_rewards_distributed":{},"fees_burned":{},"governance_deposits_burned":{},"total_slashed_spark":{},"slash_event_count":{},"validators_joined":{},"validators_left":{}}}"#,
+        r#"{{"epoch":{},"start_height":{},"end_height":{},"timestamp_secs":{},"active_validators":{},"total_staked_spark":{},"reward_minted_spark":{},"fee_rewards_distributed":{},"fee_burned_spark":{},"slash_burned_spark":{},"governance_burned_spark":{},"total_burned_spark":{},"opening_total_supply_spark":{},"closing_total_supply_spark":{},"slash_event_count":{},"validators_joined":{},"validators_left":{}}}"#,
         record.epoch,
         record.start_height,
         record.end_height,
         record.timestamp_secs,
         record.active_validators,
         record.total_staked_spark,
-        record.block_rewards_distributed,
+        record.reward_minted_spark,
         record.fee_rewards_distributed,
-        record.fees_burned,
-        record.governance_deposits_burned,
-        record.total_slashed_spark,
+        record.fee_burned_spark,
+        record.slash_burned_spark,
+        record.governance_burned_spark,
+        record.total_burned_spark,
+        record.opening_total_supply_spark,
+        record.closing_total_supply_spark,
         record.slash_event_count,
         bytes32_vec_json(&record.validators_joined),
         bytes32_vec_json(&record.validators_left),

@@ -13,9 +13,9 @@ use indra_core::types::{
     block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, Bytes64, ProtocolVersion, VariableBytes, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
-        INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES,
-        MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+        Bytes32, Bytes64, ProtocolVersion, VariableBytes, INITIAL_BASE_FEE_SPARK_PER_KB,
+        LIFETIME_SUPPLY_CAP_SPARK, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_QC_SIZE_BYTES,
+        MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
     },
     transaction::OutputV1,
 };
@@ -410,8 +410,11 @@ pub fn build_genesis_state() -> ChainState {
         })
         .unwrap();
     state.finalize_genesis().unwrap();
-    assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
-    assert!(state.total_supply <= HARD_CAP_SPARK);
+    assert_eq!(
+        state.total_supply,
+        state.monetary_aggregates.total_claims_spark().unwrap()
+    );
+    assert!(state.total_supply <= LIFETIME_SUPPLY_CAP_SPARK);
     assert_eq!(state.fee_reward_pool, 0);
     state
 }
@@ -546,11 +549,17 @@ fn load_genesis_validators_with_minimum(
                 value_spark: GENESIS_VALIDATOR_UTXO_SPARK,
                 owner_pubkey: HybridPubKey {
                     classical_pk: Bytes32::from(classical_pk),
-                    pq_pk: VariableBytes::from_slice(&hybrid_pq_pk).unwrap_or_default(),
+                    pq_pk: VariableBytes::from_slice(&hybrid_pq_pk)
+                        .map_err(|error| format!("invalid genesis PQ public key: {error}"))?,
                 },
                 lock_height: 0,
             };
-            let _ = state.utxos.insert(output, 0, 0, state.utxos.len() as u32);
+            let output_index = u32::try_from(state.utxos.len())
+                .map_err(|_| "too many genesis UTXOs for canonical output index".to_string())?;
+            state
+                .utxos
+                .insert(output, 0, 0, output_index)
+                .map_err(|error| format!("cannot create genesis validator UTXO: {error}"))?;
             eprintln!(
                 "[genesis] created UTXO {} Spark for {}",
                 GENESIS_VALIDATOR_UTXO_SPARK, name

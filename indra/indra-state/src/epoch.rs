@@ -2,26 +2,19 @@
 //!
 //! ## What happens at an epoch boundary
 //!
-//! 1. Compute block reward for current era (pre-minted supply, not inflation)
-//! 2. Distribute block reward to active validators proportionally by stake
-//!    with saturation-based anti-concentration adjustment
+//! 1. Close the exact height-indexed issuance counters already minted per block
 //! 3. Distribute accumulated fee rewards to validators
 //! 4. Expire stale rewards
 //! 5. Release unbonded validators
 //!
-//! ## Zero inflation guarantee
-//!
-//! `state.total_supply` never increases during an epoch transition.
-//! Supply only decreases via the fee burn path in `apply.rs`.
+//! Reward issuance is height-derived, checked, and capped by the immutable
+//! lifetime budget; epoch transitions report and reset only epoch-local counters.
 
 use std::collections::HashSet;
 
 use indra_core::{
     types::primitives::{
-        bps_of, muldiv, Bytes32, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS,
-        ERA_1_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK,
-        ERA_3_PLUS_DURATION_BLOCKS, HARD_CAP_SPARK, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-        SATURATION_MIN_VALIDATORS,
+        Bytes32, EPOCH_DURATION_BLOCKS, ERA_1_2_DURATION_BLOCKS, ERA_3_PLUS_DURATION_BLOCKS,
     },
     EpochRecord,
 };
@@ -103,9 +96,23 @@ pub fn apply_epoch_transition(
     context: &EpochTransitionContext,
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
+    let before = state.clone();
     #[cfg(test)]
-    install_reward_basis_if_missing(state)?;
-    apply_epoch_transition_at_height(state, context, timestamp_secs)
+    if let Err(error) = install_reward_basis_if_missing(state) {
+        *state = before;
+        return Err(error);
+    }
+    match apply_epoch_transition_at_height(state, context, timestamp_secs).and_then(|record| {
+        state.refresh_and_reconcile_monetary_state()?;
+        state.rebuild_state_commitment_v2(context.boundary_height);
+        Ok(record)
+    }) {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            *state = before;
+            Err(error)
+        }
+    }
 }
 
 /// Apply an epoch transition using an explicit, validated boundary context.
@@ -115,6 +122,52 @@ pub fn apply_epoch_transition_at_height(
     timestamp_secs: u64,
 ) -> StateResult<EpochRecord> {
     apply_epoch_transition_final(state, context, timestamp_secs)
+}
+
+/// Mint and allocate the unique reward authorized for `height`.
+pub(crate) fn apply_block_reward_issuance(state: &mut ChainState, height: u64) -> StateResult<u64> {
+    use crate::error::StateError;
+    use crate::monetary::cumulative_reward_target_at_height;
+
+    let previous_height = height
+        .checked_sub(1)
+        .ok_or(StateError::InvariantViolation {
+            message: "reward issuance requires a positive block height",
+        })?;
+    let budget = state.monetary_ledger.reward_budget_spark;
+    let previous_target = cumulative_reward_target_at_height(budget, previous_height)?;
+    if state.monetary_ledger.cumulative_reward_minted_spark != previous_target {
+        return Err(StateError::InvariantViolation {
+            message: "persisted cumulative reward mint does not match previous height target",
+        });
+    }
+    let target = cumulative_reward_target_at_height(budget, height)?;
+    let reward = target
+        .checked_sub(previous_target)
+        .ok_or(StateError::InvariantViolation {
+            message: "reward cumulative target decreased",
+        })?;
+    crate::monetary::MonetaryDeltaV1::reward_mint(reward)?;
+    if reward != 0 {
+        let post_mint_supply = state
+            .total_supply
+            .checked_add(reward)
+            .ok_or(StateError::ValueOverflow)?;
+        if target > budget || post_mint_supply > state.monetary_ledger.lifetime_cap_spark {
+            return Err(StateError::InvariantViolation {
+                message: "reward issuance exceeds reward budget or lifetime supply cap",
+            });
+        }
+        distribute_block_rewards(state, reward, epoch_for_height(height), height)?;
+        state.total_supply = post_mint_supply;
+        state.monetary_ledger.epoch_reward_minted_spark = state
+            .monetary_ledger
+            .epoch_reward_minted_spark
+            .checked_add(reward)
+            .ok_or(StateError::ValueOverflow)?;
+    }
+    state.monetary_ledger.cumulative_reward_minted_spark = target;
+    Ok(reward)
 }
 
 fn apply_epoch_transition_final(
@@ -160,9 +213,10 @@ fn apply_epoch_transition_final(
         .total_selectable_self_stake_at_height(height);
     let record_total_staked = closing_snapshot.total_weight_spark;
     let fee_pool_before = state.fee_reward_pool;
-    let fees_burned_this_epoch = state.epoch_fees_burned;
-    let explicit_slashed_this_epoch = state.epoch_slashed_spark;
-    let governance_burned_this_epoch = state.epoch_governance_burned_spark;
+    let reward_minted_this_epoch = state.monetary_ledger.epoch_reward_minted_spark;
+    let fees_burned_this_epoch = state.monetary_ledger.epoch_fee_burned_spark;
+    let slash_burned_this_epoch = state.monetary_ledger.epoch_slash_burned_spark;
+    let governance_burned_this_epoch = state.monetary_ledger.epoch_governance_burned_spark;
     let explicit_slash_count_this_epoch = state.epoch_slash_event_count;
     let record_epoch = context.closing_epoch;
     let record_start_height = context.closing_start_height;
@@ -170,27 +224,18 @@ fn apply_epoch_transition_final(
     // `block_reward_spark` is intentionally the rate at the first rewarded
     // height. A closing epoch may span an era boundary; the exact mixed-rate
     // amount is carried by `block_rewards_distributed`.
-    let reward_per_block = block_reward_at_height(context.closing_start_height);
-    let epoch_block_reward =
-        block_rewards_for_inclusive_range(context.closing_start_height, context.closing_end_height);
+    let reward_per_block = crate::monetary::block_reward_for_budget(
+        state.monetary_ledger.reward_budget_spark,
+        context.closing_start_height,
+    )?;
 
     state.validators.select_active_set(total_staked, height);
-    let supply_before = state.total_supply;
-    distribute_block_rewards(state, epoch_block_reward, current_epoch, height)?;
-
-    assert!(
-        state.total_supply <= HARD_CAP_SPARK,
-        "CRITICAL: Hard cap violated. supply={} cap={}",
-        state.total_supply,
-        HARD_CAP_SPARK
-    );
-    debug_assert_eq!(
-        state.total_supply, supply_before,
-        "supply changed during epoch transition"
-    );
-
     distribute_fee_rewards(state, current_epoch, height)?;
-    let fee_rewards_distributed = fee_pool_before.saturating_sub(state.fee_reward_pool);
+    let fee_rewards_distributed = fee_pool_before.checked_sub(state.fee_reward_pool).ok_or(
+        crate::error::StateError::InvariantViolation {
+            message: "fee reward pool increased during distribution",
+        },
+    )?;
     // This boundary pays the epoch that just elapsed. Activate a due
     // commission only after both reward sources and virtual auto-delegation
     // accounting have used the rate that governed that elapsed epoch.
@@ -202,8 +247,8 @@ fn apply_epoch_transition_final(
         .iter()
         .map(|entry| entry.validator_id)
         .collect::<Vec<_>>();
-    let (liveness_slashed, liveness_penalty_count) =
-        apply_liveness_penalties(state, liveness_epoch, height, Some(&closing_members));
+    let (_liveness_slashed, liveness_penalty_count) =
+        apply_liveness_penalties(state, liveness_epoch, height, Some(&closing_members))?;
 
     let mut active_after: Vec<Bytes32> = state
         .validators
@@ -223,6 +268,15 @@ fn apply_epoch_transition_final(
         .collect();
     validators_left.sort_by_key(|id| id.0);
 
+    let total_burned_spark = fees_burned_this_epoch
+        .checked_add(slash_burned_this_epoch)
+        .and_then(|value| value.checked_add(governance_burned_this_epoch))
+        .ok_or(crate::error::StateError::ValueOverflow)?;
+    let opening_total_supply_spark = state
+        .total_supply
+        .checked_sub(reward_minted_this_epoch)
+        .and_then(|value| value.checked_add(total_burned_spark))
+        .ok_or(crate::error::StateError::ValueOverflow)?;
     let record = EpochRecord {
         epoch: record_epoch,
         start_height: record_start_height,
@@ -230,42 +284,36 @@ fn apply_epoch_transition_final(
         timestamp_secs,
         active_validators: active_validators_before,
         total_staked_spark: record_total_staked,
-        block_rewards_distributed: if state.validators.total_active_stake() == 0 {
-            0
-        } else {
-            epoch_block_reward
-        },
+        reward_minted_spark: reward_minted_this_epoch,
         fee_rewards_distributed,
-        fees_burned: fees_burned_this_epoch,
-        governance_deposits_burned: governance_burned_this_epoch,
-        total_slashed_spark: explicit_slashed_this_epoch.saturating_add(liveness_slashed),
-        slash_event_count: explicit_slash_count_this_epoch.saturating_add(liveness_penalty_count),
+        fee_burned_spark: fees_burned_this_epoch,
+        slash_burned_spark: slash_burned_this_epoch,
+        governance_burned_spark: governance_burned_this_epoch,
+        total_burned_spark,
+        opening_total_supply_spark,
+        closing_total_supply_spark: state.total_supply,
+        slash_event_count: explicit_slash_count_this_epoch
+            .checked_add(liveness_penalty_count)
+            .ok_or(crate::error::StateError::ValueOverflow)?,
         liveness_penalty_count,
         avg_base_fee: state.base_fee,
         validators_joined,
         validators_left,
         era: era_for_height(record_start_height),
         block_reward_spark: reward_per_block,
-        total_supply: state.total_supply,
-        treasury_balance: state.treasury_balance,
     };
 
     eprintln!(
-        "[epoch] complete epoch={} total_supply={} treasury={}",
-        current_epoch, state.total_supply, state.treasury_balance,
+        "[epoch] complete epoch={} total_supply={}",
+        current_epoch, state.total_supply,
     );
-    state.epoch_fees_burned = 0;
-    state.epoch_slashed_spark = 0;
-    state.epoch_governance_burned_spark = 0;
     state.epoch_slash_event_count = 0;
+    state.monetary_ledger.epoch_reward_minted_spark = 0;
+    state.monetary_ledger.epoch_fee_burned_spark = 0;
+    state.monetary_ledger.epoch_slash_burned_spark = 0;
+    state.monetary_ledger.epoch_governance_burned_spark = 0;
     state.rebuild_state_commitment_v2(height);
     Ok(record)
-}
-
-fn block_rewards_for_inclusive_range(start_height: u64, end_height: u64) -> u64 {
-    (start_height..=end_height).fold(0u64, |total, height| {
-        total.saturating_add(block_reward_at_height(height))
-    })
 }
 
 fn apply_pending_commission_changes(state: &mut ChainState, current_epoch: u64) {
@@ -296,28 +344,14 @@ fn apply_pending_commission_changes(state: &mut ChainState, current_epoch: u64) 
     }
 }
 
-/// Compute the block reward in Spark for a given block height.
-pub fn block_reward_at_height(height: u64) -> u64 {
-    if height < ERA_1_2_DURATION_BLOCKS {
-        ERA_1_BLOCK_REWARD_SPARK
-    } else if height < ERA_1_2_DURATION_BLOCKS.saturating_mul(2) {
-        ERA_2_BLOCK_REWARD_SPARK
-    } else {
-        let era_3_start = ERA_1_2_DURATION_BLOCKS.saturating_mul(2);
-        let blocks_since_era_3 = height.saturating_sub(era_3_start);
-        let era_index = blocks_since_era_3 / ERA_3_PLUS_DURATION_BLOCKS;
-        ERA_3_BLOCK_REWARD_SPARK >> era_index.min(63)
-    }
-}
-
 fn era_for_height(height: u64) -> u64 {
+    const ERA_THREE_START: u64 = ERA_1_2_DURATION_BLOCKS * 2;
     if height < ERA_1_2_DURATION_BLOCKS {
         1
-    } else if height < ERA_1_2_DURATION_BLOCKS.saturating_mul(2) {
+    } else if height < ERA_THREE_START {
         2
     } else {
-        3 + height.saturating_sub(ERA_1_2_DURATION_BLOCKS.saturating_mul(2))
-            / ERA_3_PLUS_DURATION_BLOCKS
+        3 + (height - ERA_THREE_START) / ERA_3_PLUS_DURATION_BLOCKS
     }
 }
 
@@ -610,33 +644,6 @@ pub fn tally_votes(proposal: &ProposalRecord) -> (u64, u64, u64) {
     (yes, no, abstain)
 }
 
-fn saturation_adjusted_reward(
-    raw_reward: u64,
-    validator_stake: u64,
-    total_active_stake: u64,
-    active_validator_count: u64,
-    height: u64,
-) -> u64 {
-    if total_active_stake == 0 || active_validator_count == 0 {
-        return raw_reward;
-    }
-
-    if active_validator_count <= SATURATION_MIN_VALIDATORS {
-        return raw_reward;
-    }
-
-    let saturation_point = total_active_stake / active_validator_count;
-    if saturation_point == 0 || validator_stake <= saturation_point {
-        return raw_reward;
-    }
-
-    proportional_reward(raw_reward, saturation_point, validator_stake, height)
-}
-
-fn proportional_reward(amount: u64, numerator: u64, denominator: u64, _height: u64) -> u64 {
-    muldiv(amount, numerator, denominator)
-}
-
 fn distribute_block_rewards(
     state: &mut ChainState,
     epoch_block_reward: u64,
@@ -775,6 +782,12 @@ fn install_reward_basis_if_missing(state: &mut ChainState) -> crate::error::Stat
         state.consensus_snapshots = vec![consensus];
         state.reward_economic_snapshot = Some(economic);
     }
+    if state.height == 0 {
+        state.monetary_aggregates = state.recompute_monetary_aggregates()?;
+        let genesis_issued = state.monetary_aggregates.total_claims_spark()?;
+        state.monetary_ledger = crate::monetary::MonetaryLedgerV1::genesis(genesis_issued)?;
+        state.total_supply = genesis_issued;
+    }
     Ok(())
 }
 
@@ -789,7 +802,7 @@ fn distribute_snapshot_rewards(
     pool: u64,
     current_epoch: u64,
     height: u64,
-    source: SnapshotRewardSource,
+    _source: SnapshotRewardSource,
 ) -> crate::error::StateResult<()> {
     use crate::error::StateError;
 
@@ -807,26 +820,31 @@ fn distribute_snapshot_rewards(
             "paired consensus snapshot has zero total weight".to_string(),
         ));
     }
-    let validator_count = consensus.entries().len() as u64;
+    let validator_allocations = largest_remainder_allocations(
+        pool,
+        consensus.entries().iter().map(|member| {
+            (
+                member.validator_id,
+                member.consensus_weight_spark,
+                member.validator_id.0.to_vec(),
+                Bytes32::default(),
+            )
+        }),
+    )?;
     let mut distributed = 0u64;
 
-    for member in consensus.entries() {
+    for (validator_id, validator_pool) in validator_allocations {
+        let member = consensus
+            .entry_with_position(&validator_id)
+            .map(|(_, member)| member)
+            .ok_or(StateError::InvalidRewardEconomicSnapshot(
+                "reward validator absent from consensus snapshot".to_string(),
+            ))?;
         let economic_entry = economic.validator(&member.validator_id).ok_or_else(|| {
             StateError::InvalidRewardEconomicSnapshot(
                 "paired economic validator entry is missing".to_string(),
             )
         })?;
-        let raw = proportional_reward(pool, member.consensus_weight_spark, total_stake, height);
-        let validator_pool = match source {
-            SnapshotRewardSource::Block => saturation_adjusted_reward(
-                raw,
-                member.consensus_weight_spark,
-                total_stake,
-                validator_count,
-                height,
-            ),
-            SnapshotRewardSource::Fee => raw,
-        };
         let delegated = economic_entry.total_active_delegated_spark;
         if delegated == 0 {
             credit_position_reward(
@@ -848,7 +866,16 @@ fn distribute_snapshot_rewards(
             continue;
         }
 
-        let commission = bps_of(validator_pool, economic_entry.commission_bps);
+        let commission_u128 = u128::from(validator_pool)
+            .checked_mul(u128::from(economic_entry.commission_bps))
+            .ok_or(StateError::InvariantViolation {
+                message: "commission multiplication overflow",
+            })?
+            / 10_000;
+        let commission =
+            u64::try_from(commission_u128).map_err(|_| StateError::InvariantViolation {
+                message: "commission does not fit u64",
+            })?;
         let delegator_pool =
             validator_pool
                 .checked_sub(commission)
@@ -872,51 +899,82 @@ fn distribute_snapshot_rewards(
                     message: "reward distribution total overflow",
                 })?;
 
-        let mut delegated_distributed = 0u64;
-        for delegator in economic_entry.delegators() {
-            let combined = delegator
-                .total_active_principal_spark()
-                .map_err(|error| StateError::InvalidRewardEconomicSnapshot(error.to_string()))?;
-            let identity_reward = muldiv(delegator_pool, combined, delegated);
-            let auto_reward = if delegator.auto_delegated_principal_spark == 0 {
-                0
-            } else {
-                muldiv(
-                    identity_reward,
-                    delegator.auto_delegated_principal_spark,
-                    combined,
+        let identity_allocations = largest_remainder_allocations(
+            delegator_pool,
+            economic_entry.delegators().iter().map(|delegator| {
+                (
+                    delegator.delegator_id,
+                    delegator.total_active_principal_spark().unwrap_or(0),
+                    delegator.delegator_id.0.to_vec(),
+                    Bytes32::default(),
                 )
-            };
-            let bonded_reward =
-                identity_reward
-                    .checked_sub(auto_reward)
-                    .ok_or(StateError::InvariantViolation {
-                        message: "auto-delegation reward exceeds identity reward",
-                    })?;
+            }),
+        )?;
+        let mut delegated_distributed = 0u64;
+        for (delegator_id, identity_reward) in identity_allocations {
+            let delegator = economic_entry
+                .delegators()
+                .iter()
+                .find(|entry| entry.delegator_id == delegator_id)
+                .ok_or(StateError::InvalidRewardEconomicSnapshot(
+                    "reward delegator absent from economic snapshot".to_string(),
+                ))?;
+            let bonded_position = indra_core::types::stake_position::derive_position_id(
+                member.validator_id,
+                delegator.delegator_id,
+                indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                    delegator_id: delegator.delegator_id,
+                },
+            );
+            let auto_position = indra_core::types::stake_position::derive_position_id(
+                delegator.delegator_id,
+                delegator.delegator_id,
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id: delegator.delegator_id,
+                },
+            );
+            let destinations = largest_remainder_allocations(
+                identity_reward,
+                [
+                    (
+                        false,
+                        delegator.bonded_active_principal_spark,
+                        delegator.delegator_id.0.to_vec(),
+                        bonded_position,
+                    ),
+                    (
+                        true,
+                        delegator.auto_delegated_principal_spark,
+                        delegator.delegator_id.0.to_vec(),
+                        auto_position,
+                    ),
+                ],
+            )?;
 
-            if bonded_reward > 0 {
-                credit_position_reward(
-                    state,
-                    member.validator_id,
-                    delegator.delegator_id,
-                    indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
-                        delegator_id: delegator.delegator_id,
-                    },
-                    bonded_reward,
-                    current_epoch,
-                )?;
-            }
-            if auto_reward > 0 {
-                credit_position_reward(
-                    state,
-                    delegator.delegator_id,
-                    delegator.delegator_id,
-                    indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
-                        validator_id: delegator.delegator_id,
-                    },
-                    auto_reward,
-                    current_epoch,
-                )?;
+            for (is_auto, reward) in destinations {
+                if is_auto {
+                    credit_position_reward(
+                        state,
+                        delegator.delegator_id,
+                        delegator.delegator_id,
+                        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                            validator_id: delegator.delegator_id,
+                        },
+                        reward,
+                        current_epoch,
+                    )?;
+                } else {
+                    credit_position_reward(
+                        state,
+                        member.validator_id,
+                        delegator.delegator_id,
+                        indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                            delegator_id: delegator.delegator_id,
+                        },
+                        reward,
+                        current_epoch,
+                    )?;
+                }
             }
             delegated_distributed = delegated_distributed.checked_add(identity_reward).ok_or(
                 StateError::InvariantViolation {
@@ -931,29 +989,76 @@ fn distribute_snapshot_rewards(
         )?;
     }
 
-    let remainder = pool
-        .checked_sub(distributed)
-        .ok_or(StateError::InvariantViolation {
-            message: "distributed rewards exceed source pool",
-        })?;
-    match source {
-        SnapshotRewardSource::Block => {
-            state.treasury_balance = state.treasury_balance.checked_add(remainder).ok_or(
-                StateError::InvariantViolation {
-                    message: "treasury reward remainder overflow",
-                },
-            )?
-        }
-        SnapshotRewardSource::Fee => {
-            state.fee_reward_pool = state.fee_reward_pool.checked_add(remainder).ok_or(
-                StateError::InvariantViolation {
-                    message: "fee reward remainder overflow",
-                },
-            )?
-        }
+    if distributed != pool {
+        return Err(StateError::InvariantViolation {
+            message: "largest-remainder reward allocation did not exhaust the pool",
+        });
     }
     crate::txn::complex_mutation_checkpoint()?;
     Ok(())
+}
+
+fn largest_remainder_allocations<T: Copy>(
+    pool: u64,
+    recipients: impl IntoIterator<Item = (T, u64, Vec<u8>, Bytes32)>,
+) -> crate::error::StateResult<Vec<(T, u64)>> {
+    use crate::error::StateError;
+
+    let recipients = recipients
+        .into_iter()
+        .filter(|(_, weight, _, _)| *weight != 0)
+        .collect::<Vec<_>>();
+    if pool == 0 {
+        return Ok(recipients
+            .into_iter()
+            .map(|(id, _, _, _)| (id, 0))
+            .collect());
+    }
+    if recipients.is_empty() {
+        return Err(StateError::InvariantViolation {
+            message: "nonzero reward pool has no eligible recipient",
+        });
+    }
+    let total_weight = recipients.iter().try_fold(0u64, |sum, (_, weight, _, _)| {
+        sum.checked_add(*weight).ok_or(StateError::ValueOverflow)
+    })?;
+    let mut ranked = Vec::with_capacity(recipients.len());
+    let mut base_sum = 0u64;
+    for (id, weight, identity, position_id) in recipients {
+        let product = u128::from(pool)
+            .checked_mul(u128::from(weight))
+            .ok_or(StateError::ValueOverflow)?;
+        let base = u64::try_from(product / u128::from(total_weight))
+            .map_err(|_| StateError::ValueOverflow)?;
+        let remainder = product % u128::from(total_weight);
+        base_sum = base_sum
+            .checked_add(base)
+            .ok_or(StateError::ValueOverflow)?;
+        ranked.push((id, base, remainder, identity, position_id));
+    }
+    let leftover = pool
+        .checked_sub(base_sum)
+        .ok_or(StateError::InvariantViolation {
+            message: "largest-remainder base allocations exceed pool",
+        })?;
+    let leftover = usize::try_from(leftover).map_err(|_| StateError::ValueOverflow)?;
+    if leftover >= ranked.len() {
+        return Err(StateError::InvariantViolation {
+            message: "largest-remainder residue is not smaller than recipient count",
+        });
+    }
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    for entry in ranked.iter_mut().take(leftover) {
+        entry.1 = entry.1.checked_add(1).ok_or(StateError::ValueOverflow)?;
+    }
+    Ok(ranked
+        .into_iter()
+        .map(|(id, amount, _, _, _)| (id, amount))
+        .collect())
 }
 
 fn credit_position_reward(
@@ -1000,7 +1105,7 @@ fn apply_liveness_penalties(
     current_epoch: u64,
     _height: u64,
     snapshot_members: Option<&[Bytes32]>,
-) -> (u64, u32) {
+) -> StateResult<(u64, u32)> {
     let mut total_slashed = 0u64;
     let mut penalty_count = 0u32;
     let threshold = state.governance.params.slash_liveness_threshold_epochs;
@@ -1031,21 +1136,40 @@ fn apply_liveness_penalties(
                 Some(v) => v,
                 None => continue,
             };
-            let missed = current_epoch.saturating_sub(v.last_active_epoch);
+            let missed = current_epoch.checked_sub(v.last_active_epoch).ok_or(
+                crate::error::StateError::InvariantViolation {
+                    message: "validator last-active epoch is in the future",
+                },
+            )?;
             (missed, v.stake_spark)
         };
 
         if missed >= threshold && stake > 0 {
-            let penalty = bps_of(stake, slash_bps);
-            if let Some(v) = state.validators.get_mut(&validator_id) {
-                v.stake_spark = v.stake_spark.saturating_sub(penalty);
-                if v.stake_spark < MINIMUM_ACTIVE_SELF_STAKE_SPARK {
-                    v.status = ValidatorStatus::Registered;
-                }
-            }
-            state.total_supply = state.total_supply.saturating_sub(penalty);
-            total_slashed = total_slashed.saturating_add(penalty);
-            penalty_count = penalty_count.saturating_add(1);
+            let first_missed_epoch = state
+                .validators
+                .get(&validator_id)
+                .ok_or(crate::error::StateError::InvariantViolation {
+                    message: "liveness validator disappeared",
+                })?
+                .last_active_epoch
+                .checked_add(1)
+                .ok_or(crate::error::StateError::ValueOverflow)?;
+            let infraction_height = first_missed_epoch
+                .checked_mul(EPOCH_DURATION_BLOCKS)
+                .and_then(|height| height.checked_add(1))
+                .ok_or(crate::error::StateError::ValueOverflow)?;
+            let penalty = crate::apply::apply_liveness_principal_slash(
+                state,
+                validator_id,
+                slash_bps,
+                infraction_height,
+            )?;
+            total_slashed = total_slashed
+                .checked_add(penalty)
+                .ok_or(crate::error::StateError::ValueOverflow)?;
+            penalty_count = penalty_count
+                .checked_add(1)
+                .ok_or(crate::error::StateError::ValueOverflow)?;
             eprintln!(
                 "[liveness] validator {} missed {} epochs, penalty={} Spark burned",
                 hex::encode(&validator_id.0[..4]),
@@ -1054,7 +1178,7 @@ fn apply_liveness_penalties(
             );
         }
     }
-    (total_slashed, penalty_count)
+    Ok((total_slashed, penalty_count))
 }
 
 /// True if the given height is the last block of an epoch.
@@ -1081,11 +1205,9 @@ mod tests {
             crypto::HybridPubKey,
             governance::GovernableAction,
             primitives::{
-                Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DEFAULT_COMMISSION_BPS,
-                DUST_LIMIT_SPARK, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-                ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK, SLASH_LIVENESS_BPS,
-                SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+                muldiv, Bytes32, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS,
+                DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
             },
         },
     };
@@ -1137,6 +1259,103 @@ mod tests {
             })
         ));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn runtime_issuance_rejects_inconsistent_cumulative_target_without_mutation() {
+        let mut state = new_test_state();
+        let validator = make_validator(0xEF, MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+        state.validators.upsert(validator).unwrap();
+        state.finalize_genesis().unwrap();
+        state.monetary_ledger.cumulative_reward_minted_spark = 1;
+        let before = state.clone();
+        assert!(matches!(
+            apply_block_reward_issuance(&mut state, 1),
+            Err(crate::error::StateError::InvariantViolation {
+                message: "persisted cumulative reward mint does not match previous height target"
+            })
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn runtime_issuance_rejects_lifetime_cap_overrun_without_mutation() {
+        let mut state = new_test_state();
+        let validator = make_validator(0xEE, MINIMUM_ACTIVE_SELF_STAKE_SPARK);
+        state.validators.upsert(validator).unwrap();
+        state.finalize_genesis().unwrap();
+        state.total_supply = indra_core::types::primitives::LIFETIME_SUPPLY_CAP_SPARK;
+        state.monetary_ledger.genesis_issued_spark = 0;
+        state.monetary_ledger.reward_budget_spark =
+            indra_core::types::primitives::LIFETIME_SUPPLY_CAP_SPARK;
+        state.height = 1;
+        state.monetary_ledger.cumulative_reward_minted_spark =
+            crate::monetary::cumulative_reward_target_at_height(
+                state.monetary_ledger.reward_budget_spark,
+                1,
+            )
+            .unwrap();
+        let before = state.clone();
+        let result = apply_block_reward_issuance(&mut state, 2);
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::StateError::ValueOverflow)
+                    | Err(crate::error::StateError::InvariantViolation { .. })
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn largest_remainder_is_exact_and_input_order_independent() {
+        let recipients = vec![
+            (1u8, 1u64, vec![1], Bytes32::from([1; 32])),
+            (2u8, 1u64, vec![2], Bytes32::from([2; 32])),
+            (3u8, 1u64, vec![3], Bytes32::from([3; 32])),
+        ];
+        let forward = largest_remainder_allocations(10, recipients.clone()).unwrap();
+        let reverse = largest_remainder_allocations(10, recipients.into_iter().rev()).unwrap();
+        let as_map = |values: Vec<(u8, u64)>| {
+            values
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(as_map(forward.clone()), as_map(reverse));
+        assert_eq!(forward.iter().map(|(_, amount)| *amount).sum::<u64>(), 10);
+        assert_eq!(
+            as_map(forward),
+            std::collections::BTreeMap::from([(1, 4), (2, 3), (3, 3)])
+        );
+    }
+
+    #[test]
+    fn position_fragmentation_changes_aggregate_by_at_most_one_spark() {
+        let whole = largest_remainder_allocations(
+            101,
+            [
+                (0u8, 60, vec![0], Bytes32::from([0; 32])),
+                (1u8, 40, vec![1], Bytes32::from([1; 32])),
+            ],
+        )
+        .unwrap();
+        let fragmented = largest_remainder_allocations(
+            101,
+            [
+                (0u8, 30, vec![0], Bytes32::from([0; 32])),
+                (2u8, 30, vec![0], Bytes32::from([2; 32])),
+                (1u8, 40, vec![1], Bytes32::from([1; 32])),
+            ],
+        )
+        .unwrap();
+        let whole_entitlement = whole.iter().find(|(id, _)| *id == 0).unwrap().1;
+        let fragmented_entitlement = fragmented
+            .iter()
+            .filter(|(id, _)| *id == 0 || *id == 2)
+            .map(|(_, amount)| *amount)
+            .sum::<u64>();
+        assert!(whole_entitlement.abs_diff(fragmented_entitlement) <= 1);
     }
 
     fn governance_test_pubkey(byte: u8) -> HybridPubKey {
@@ -1243,6 +1462,30 @@ mod tests {
         validator
     }
 
+    fn install_self_position(state: &mut ChainState, validator_id: Bytes32, principal: u64) {
+        let custody = indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        };
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            validator_id,
+            validator_id,
+            custody,
+            Some(
+                indra_core::types::stake_position::ActiveStakeAggregateV1::new(principal, 0, 0)
+                    .unwrap(),
+            ),
+            0,
+            0,
+        )
+        .unwrap();
+        state.stake_positions.insert(position.position_id, position);
+        state.rebuild_position_tranche_index().unwrap();
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
+    }
+
     #[test]
     fn epoch_transition_context_validates_and_derives_boundary_facts() {
         let context = EpochTransitionContext::new(300, 299).unwrap();
@@ -1293,6 +1536,7 @@ mod tests {
         registered.status = ValidatorStatus::Registered;
         let registered_id = registered.validator_id;
         state.validators.upsert(registered).unwrap();
+        install_self_position(&mut state, registered_id, 20_000);
 
         let mut slashed = make_validator(0xB2, 30_000);
         slashed.status = ValidatorStatus::Slashed;
@@ -1327,7 +1571,8 @@ mod tests {
             1,
             600,
             Some(&[registered_id, slashed_id, tombstoned_id]),
-        );
+        )
+        .unwrap();
         assert_eq!(count, 1);
         assert_eq!(slashed_total, 2_000);
         assert_eq!(state.total_supply, supply_before - 2_000);
@@ -1350,7 +1595,7 @@ mod tests {
             600,
             Some(&[registered_id, slashed_id, tombstoned_id]),
         );
-        assert_eq!(replay_result, (slashed_total, count));
+        assert_eq!(replay_result, Ok((slashed_total, count)));
         assert_eq!(replay.encode_to_vec(), state.encode_to_vec());
         assert_eq!(compute_state_root(&replay), compute_state_root(&state));
     }
@@ -1435,47 +1680,6 @@ mod tests {
     }
 
     #[test]
-    fn block_reward_era_1() {
-        assert_eq!(block_reward_at_height(0), ERA_1_BLOCK_REWARD_SPARK);
-        assert_eq!(block_reward_at_height(1_000_000), ERA_1_BLOCK_REWARD_SPARK);
-        assert_eq!(
-            block_reward_at_height(ERA_1_2_DURATION_BLOCKS - 1),
-            ERA_1_BLOCK_REWARD_SPARK
-        );
-    }
-
-    #[test]
-    fn block_reward_era_2() {
-        assert_eq!(
-            block_reward_at_height(ERA_1_2_DURATION_BLOCKS),
-            ERA_2_BLOCK_REWARD_SPARK
-        );
-        assert_eq!(ERA_2_BLOCK_REWARD_SPARK, ERA_1_BLOCK_REWARD_SPARK / 2);
-    }
-
-    #[test]
-    fn block_reward_era_3() {
-        let era_3_start = ERA_1_2_DURATION_BLOCKS * 2;
-        assert_eq!(
-            block_reward_at_height(era_3_start),
-            ERA_3_BLOCK_REWARD_SPARK
-        );
-        assert_eq!(ERA_3_BLOCK_REWARD_SPARK, ERA_2_BLOCK_REWARD_SPARK / 2);
-    }
-
-    #[test]
-    fn block_reward_halves_each_era() {
-        let r1 = block_reward_at_height(0);
-        let r2 = block_reward_at_height(ERA_1_2_DURATION_BLOCKS);
-        let era_3_start = ERA_1_2_DURATION_BLOCKS * 2;
-        let r3 = block_reward_at_height(era_3_start);
-        let r4 = block_reward_at_height(era_3_start + ERA_3_PLUS_DURATION_BLOCKS);
-        assert_eq!(r2, r1 / 2);
-        assert_eq!(r3, r2 / 2);
-        assert_eq!(r4, r3 / 2);
-    }
-
-    #[test]
     fn reward_distribution_no_overflow_large_stake() {
         let epoch_block_reward: u64 = 356_760_000_000;
         let validator_stake: u64 = 100_000_000_000;
@@ -1500,13 +1704,13 @@ mod tests {
     #[test]
     fn bps_of_correct() {
         let value: u64 = 1_000_000_000 * SPARK_PER_INDRA;
-        let result = bps_of(value, 1_000);
+        let result = indra_core::types::primitives::bps_of(value, 1_000);
         assert_eq!(result, 100_000_000 * SPARK_PER_INDRA);
     }
 
     #[test]
     fn epoch_reward_correct_with_real_values() {
-        let epoch_block_reward: u64 = ERA_1_BLOCK_REWARD_SPARK * EPOCH_DURATION_BLOCKS;
+        let epoch_block_reward: u64 = 356_760_000_000;
         let validator_stake: u64 = 100_000_000_000;
         let total_stake: u64 = 400_000_000_000;
 
@@ -1589,6 +1793,10 @@ mod tests {
             },
         );
         state.governance.proposals.insert(proposal_id, proposal);
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
         let supply_before = state.total_supply;
         let utxos_before = state.utxos.len();
 
@@ -1656,6 +1864,10 @@ mod tests {
             },
         );
         state.governance.proposals.insert(proposal_id, proposal);
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
         let supply_before = state.total_supply;
         let utxos_before = state.utxos.len();
 
@@ -1722,13 +1934,17 @@ mod tests {
             },
         );
         state.governance.proposals.insert(proposal_id, proposal);
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
         let supply_before = state.total_supply;
 
         apply_governance_phase_transitions(&mut state, 0, 1).unwrap();
 
         let proposal = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(state.total_supply, supply_before - 1_000);
-        assert_eq!(state.epoch_governance_burned_spark, 1_000);
+        assert_eq!(state.monetary_ledger.epoch_governance_burned_spark, 1_000);
         assert_eq!(proposal.deposit_spark, 0);
         assert!(proposal.deposit_burned);
 
@@ -1995,32 +2211,9 @@ mod tests {
     }
 
     #[test]
-    fn saturation_below_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 100, 200_000, 200, 0);
-        assert_eq!(reward, 1_000_000);
-    }
-
-    #[test]
-    fn saturation_above_point_reduced_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 2_000, 200_000, 200, 0);
-        assert_eq!(reward, 500_000);
-    }
-
-    #[test]
-    fn saturation_at_point_full_reward() {
-        let reward = saturation_adjusted_reward(1_000_000, 1_000, 200_000, 200, 0);
-        assert_eq!(reward, 1_000_000);
-    }
-
-    #[test]
-    fn saturation_disabled_for_small_validator_sets() {
-        let reward = saturation_adjusted_reward(1_000_000, 50_000, 200_000, 20, 0);
-        assert_eq!(reward, 1_000_000);
-    }
-
-    #[test]
     fn epoch_transition_does_not_increase_supply() {
         let mut state = new_test_state();
+        install_reward_basis_if_missing(&mut state).unwrap();
         let supply_before = state.total_supply;
         apply_epoch_transition(
             &mut state,
@@ -2035,25 +2228,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.total_supply, supply_before);
-    }
-
-    #[test]
-    fn epoch_transition_does_not_increase_treasury() {
-        let mut state = new_test_state();
-        let treasury_before = state.treasury_balance;
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (1u64).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (1u64)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
-        assert_eq!(state.treasury_balance, treasury_before);
     }
 
     #[test]
@@ -2119,6 +2293,7 @@ mod tests {
             .validators
             .upsert(make_validator(0x93, initial_stake))
             .unwrap();
+        install_reward_basis_if_missing(&mut state).unwrap();
         let supply_before = state.total_supply;
         apply_epoch_transition(
             &mut state,
@@ -2205,7 +2380,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s1.total_supply, s2.total_supply);
-        assert_eq!(s1.treasury_balance, s2.treasury_balance);
+        assert_eq!(s1.monetary_ledger, s2.monetary_ledger);
     }
 
     #[test]
@@ -2447,6 +2622,7 @@ mod tests {
             }
             state.validators.upsert(validator).unwrap();
         }
+        install_reward_basis_if_missing(&mut state).unwrap();
         let supply_before = state.total_supply;
 
         apply_epoch_transition(

@@ -700,7 +700,19 @@ mod handle_tests {
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn account_fixture_claims(state: &mut indra_state::ChainState) {
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.total_supply = issued;
+        state.monetary_ledger.genesis_issued_spark = issued;
+        state.monetary_ledger.reward_budget_spark =
+            indra_core::types::primitives::LIFETIME_SUPPLY_CAP_SPARK - issued;
+        state.monetary_ledger.validate(issued).unwrap();
     }
 
     fn handle_from_seed(
@@ -1397,6 +1409,7 @@ mod handle_tests {
                 0,
             )
             .unwrap();
+        account_fixture_claims(&mut state);
         let mut output = out();
         assert_eq!(
             unsafe {
@@ -1440,6 +1453,7 @@ mod handle_tests {
                 0,
             )
             .unwrap();
+        account_fixture_claims(&mut state);
         let title = CString::new("FFI proposal").unwrap();
         let description = CString::new("consensus application proof").unwrap();
         let action = GovernableAction::SetMinDelegationSpark { value: 200_000 };

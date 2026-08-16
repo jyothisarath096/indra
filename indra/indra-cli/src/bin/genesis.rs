@@ -152,6 +152,32 @@ fn print_artifacts(file_bytes: &[u8], state: &ChainState) -> Result<(), String> 
     println!("consensus_snapshot_root={}", consensus.snapshot_root);
     println!("reward_economic_snapshot_root={}", economic.snapshot_root);
     println!("slash_membership_root={}", slash.membership_root);
+    println!(
+        "lifetime_supply_cap_spark={}",
+        state.monetary_ledger.lifetime_cap_spark
+    );
+    println!(
+        "genesis_issued_spark={}",
+        state.monetary_ledger.genesis_issued_spark
+    );
+    println!(
+        "reward_budget_spark={}",
+        state.monetary_ledger.reward_budget_spark
+    );
+    for position in state.stake_positions.values() {
+        if let Some(active) = position.active {
+            println!(
+                "genesis_stake validator_id={} position_id={} value_spark={}",
+                position.validator_id, position.position_id, active.principal_spark
+            );
+        }
+    }
+    for entry in state.utxos.all_entries() {
+        println!(
+            "genesis_utxo utxo_id={} value_spark={} owner_classical_pk={}",
+            entry.utxo_id, entry.output.value_spark, entry.output.owner_pubkey.classical_pk
+        );
+    }
     Ok(())
 }
 

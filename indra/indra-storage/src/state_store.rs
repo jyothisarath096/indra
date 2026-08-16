@@ -609,6 +609,33 @@ mod tests {
         state
     }
 
+    fn move_genesis_principal_to_fee_pool(state: &mut ChainState, amount: u64) {
+        let validator_id = state
+            .validators
+            .active_validators()
+            .next()
+            .unwrap()
+            .validator_id;
+        let mut position = state
+            .stake_positions
+            .values()
+            .find(|position| position.validator_id == validator_id)
+            .unwrap()
+            .clone();
+        let active = position.active.as_mut().unwrap();
+        active.principal_spark = active.principal_spark.checked_sub(amount).unwrap();
+        state.stake_positions.insert(position.position_id, position);
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = state
+            .validators
+            .get(&validator_id)
+            .unwrap()
+            .stake_spark
+            .checked_sub(amount)
+            .unwrap();
+        state.fee_reward_pool = amount;
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    }
+
     #[test]
     fn save_and_load() {
         let dir = temp_dir("a");
@@ -617,7 +644,7 @@ mod tests {
         let mut state = finalized_test_state();
         state.height = 42;
         state.base_fee = 500;
-        state.fee_reward_pool = 777;
+        move_genesis_principal_to_fee_pool(&mut state, 777);
         state.rebuild_state_commitment_v2(state.height);
 
         store.save(&state).unwrap();
@@ -634,7 +661,7 @@ mod tests {
         let store = StateStore::open(&dir).unwrap();
         let mut state = finalized_test_state();
         state.height = 123;
-        state.treasury_balance = 456;
+        move_genesis_principal_to_fee_pool(&mut state, 456);
         state.rebuild_state_commitment_v2(state.height);
         store.save(&state).unwrap();
         assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));

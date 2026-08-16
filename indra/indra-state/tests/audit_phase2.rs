@@ -11,7 +11,8 @@ use indra_core::types::{
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
-        MAX_QC_SIZE_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION,
+        LIFETIME_SUPPLY_CAP_SPARK, MAX_QC_SIZE_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+        TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
@@ -71,6 +72,21 @@ fn finalized_genesis() -> ChainState {
         .unwrap();
     state.finalize_genesis().unwrap();
     state
+}
+
+fn insert_genesis_fixture_utxo(
+    state: &mut ChainState,
+    output: OutputV1,
+    output_index: u32,
+) -> Bytes32 {
+    let id = state.utxos.insert(output, 0, 0, output_index).unwrap();
+    state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+    state.total_supply = issued;
+    state.monetary_ledger.genesis_issued_spark = issued;
+    state.monetary_ledger.reward_budget_spark = LIFETIME_SUPPLY_CAP_SPARK - issued;
+    state.monetary_ledger.validate(state.total_supply).unwrap();
+    id
 }
 
 fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> HybridSignature {
@@ -246,7 +262,7 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
         owner_pubkey.clone(),
         [0x51; 32],
     );
-    let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
+    let utxo_id = insert_genesis_fixture_utxo(&mut state, original_output, 0);
 
     let tx_a = tx_spending(
         utxo_id,
@@ -292,7 +308,7 @@ fn t02_duplicate_utxo_spend_within_single_transaction_inputs_is_rejected() {
         owner_pubkey.clone(),
         [0x52; 32],
     );
-    let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
+    let utxo_id = insert_genesis_fixture_utxo(&mut state, original_output, 0);
     let tx = tx_spending_same_utxo_twice(
         utxo_id,
         input_value,
@@ -323,7 +339,7 @@ fn legitimate_single_spend_still_works_after_duplicate_utxo_fix() {
         owner_pubkey.clone(),
         [0x53; 32],
     );
-    let utxo_id = state.utxos.insert(original_output, 0, 0, 0).unwrap();
+    let utxo_id = insert_genesis_fixture_utxo(&mut state, original_output, 0);
     let tx = tx_spending(
         utxo_id,
         input_value,

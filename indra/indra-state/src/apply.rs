@@ -40,7 +40,7 @@ use indra_core::{
         crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, BLOCK_FORMAT_VERSION, HARD_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            Bytes32, BLOCK_FORMAT_VERSION, LIFETIME_SUPPLY_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
@@ -95,6 +95,28 @@ struct SlashAccounting {
 enum SlashTarget {
     Position(Bytes32),
     Tranche(Bytes32),
+}
+
+/// Internal proof that a slash has been authorized and its principal scope has
+/// been fixed before mutation begins.  Its fields are private so callers
+/// cannot bypass the evidence/liveness verification paths that construct it.
+#[derive(Debug)]
+pub(crate) struct VerifiedSlashDirectiveV1 {
+    validator_id: Bytes32,
+    slash_bps: u32,
+    infraction_height: u64,
+    position_ids: Vec<Bytes32>,
+    tranche_ids: Vec<Bytes32>,
+}
+
+#[derive(Debug)]
+struct AppliedPrincipalSlash {
+    slash_amount: u64,
+    active_principal_slashed: u64,
+    tranche_successors: Vec<(
+        Bytes32,
+        Option<indra_core::types::stake_position::UnbondingTrancheV1>,
+    )>,
 }
 
 fn checked_slash_allocation(
@@ -153,6 +175,228 @@ fn checked_slash_allocation(
         });
     }
     Ok((aggregate, allocations))
+}
+
+fn apply_verified_slash_directive(
+    state: &mut ChainState,
+    directive: &VerifiedSlashDirectiveV1,
+) -> StateResult<AppliedPrincipalSlash> {
+    let mut targets =
+        Vec::with_capacity(directive.position_ids.len() + directive.tranche_ids.len());
+    for id in &directive.position_ids {
+        let position = state
+            .stake_positions
+            .get(id)
+            .ok_or(StateError::InvariantViolation {
+                message: "verified slash position target disappeared",
+            })?;
+        if position.validator_id != directive.validator_id {
+            return Err(StateError::InvariantViolation {
+                message: "verified slash position belongs to another validator",
+            });
+        }
+        let principal = position
+            .active
+            .ok_or(StateError::InvariantViolation {
+                message: "verified slash position has no active principal",
+            })?
+            .principal_spark;
+        targets.push((SlashTarget::Position(*id), principal));
+    }
+    for id in &directive.tranche_ids {
+        let tranche = state
+            .unbonding_tranches
+            .get(id)
+            .ok_or(StateError::InvariantViolation {
+                message: "verified slash tranche target disappeared",
+            })?;
+        if tranche.timing.start_height() < directive.infraction_height {
+            return Err(StateError::InvariantViolation {
+                message: "verified slash contains a pre-infraction tranche",
+            });
+        }
+        targets.push((SlashTarget::Tranche(*id), tranche.principal_spark));
+    }
+    let (slash_amount, allocations) = checked_slash_allocation(&targets, directive.slash_bps)?;
+    let mut active_principal_slashed = 0u64;
+    for position_id in &directive.position_ids {
+        let mut position = state.stake_positions.get(position_id).cloned().ok_or(
+            StateError::InvariantViolation {
+                message: "verified slash position disappeared",
+            },
+        )?;
+        let active = position.active.ok_or(StateError::InvariantViolation {
+            message: "verified slash position lost active principal",
+        })?;
+        let amount = allocations[&SlashTarget::Position(*position_id)];
+        let remaining = active
+            .principal_spark
+            .checked_sub(amount)
+            .ok_or(StateError::ValueOverflow)?;
+        position.active =
+            (remaining != 0).then_some(indra_core::types::stake_position::ActiveStakeAggregateV1 {
+                principal_spark: remaining,
+                ..active
+            });
+        active_principal_slashed = active_principal_slashed
+            .checked_add(amount)
+            .ok_or(StateError::ValueOverflow)?;
+        state.stake_positions.insert(*position_id, position.clone());
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.put_stake_position(&position);
+        }
+        crate::txn::complex_mutation_checkpoint()?;
+    }
+    let mut tranche_successors = Vec::with_capacity(directive.tranche_ids.len());
+    for tranche_id in &directive.tranche_ids {
+        let tranche = state.unbonding_tranches.get(tranche_id).cloned().ok_or(
+            StateError::InvariantViolation {
+                message: "verified slash tranche disappeared",
+            },
+        )?;
+        let amount = allocations[&SlashTarget::Tranche(*tranche_id)];
+        let remaining = tranche
+            .principal_spark
+            .checked_sub(amount)
+            .ok_or(StateError::ValueOverflow)?;
+        let successor = if remaining == 0 {
+            None
+        } else {
+            let successor = indra_core::types::stake_position::UnbondingTrancheV1::new(
+                tranche.position_id,
+                remaining,
+                tranche.timing,
+                tranche.custody,
+                tranche.creation_op_id,
+                tranche.creation_ordinal,
+            )
+            .map_err(|error| StateError::InvalidSlashEvidence {
+                reason: error.to_string(),
+            })?;
+            if successor.tranche_id != *tranche_id
+                && state.unbonding_tranches.contains_key(&successor.tranche_id)
+            {
+                return Err(StateError::InvariantViolation {
+                    message: "verified slash successor tranche collision",
+                });
+            }
+            Some(successor)
+        };
+        tranche_successors.push((*tranche_id, successor));
+    }
+    for (old_id, successor) in &tranche_successors {
+        state.unbonding_tranches.remove(old_id);
+        if let Some(commitment) = state.state_commitment_v2.as_mut() {
+            commitment.delete_unbonding_tranche(old_id);
+        }
+        crate::txn::complex_mutation_checkpoint()?;
+        if let Some(successor) = successor {
+            state
+                .unbonding_tranches
+                .insert(successor.tranche_id, successor.clone());
+            if let Some(commitment) = state.state_commitment_v2.as_mut() {
+                commitment.put_unbonding_tranche(successor);
+            }
+            crate::txn::complex_mutation_checkpoint()?;
+        }
+    }
+    state
+        .rebuild_position_tranche_index()
+        .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
+    let exact = active_principal_slashed
+        .checked_add(directive.tranche_ids.iter().try_fold(0u64, |sum, id| {
+            sum.checked_add(allocations[&SlashTarget::Tranche(*id)])
+                .ok_or(StateError::ValueOverflow)
+        })?)
+        .ok_or(StateError::ValueOverflow)?;
+    if exact != slash_amount {
+        return Err(StateError::InvariantViolation {
+            message: "verified slash reductions do not equal aggregate",
+        });
+    }
+    Ok(AppliedPrincipalSlash {
+        slash_amount,
+        active_principal_slashed,
+        tranche_successors,
+    })
+}
+
+/// Apply a deterministic liveness directive to real self-custody principal.
+///
+/// The directive's authority is created only by the finalized epoch transition;
+/// callers supply the canonical first-missed-block infraction height.
+pub(crate) fn apply_liveness_principal_slash(
+    state: &mut ChainState,
+    validator_id: Bytes32,
+    slash_bps: u32,
+    infraction_height: u64,
+) -> StateResult<u64> {
+    let mut position_ids = Vec::new();
+    let mut tranche_ids = Vec::new();
+    for position in state.stake_positions.values().filter(|position| {
+        position.validator_id == validator_id
+            && matches!(
+                position.custody,
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id: id
+                } if id == validator_id
+            )
+    }) {
+        if position.active.is_some() {
+            position_ids.push(position.position_id);
+        }
+        tranche_ids.extend(
+            state
+                .tranche_ids_for_position(&position.position_id)
+                .iter()
+                .filter(|id| {
+                    state
+                        .unbonding_tranches
+                        .get(id)
+                        .is_some_and(|tranche| tranche.timing.start_height() >= infraction_height)
+                })
+                .copied(),
+        );
+    }
+    if position_ids.is_empty() && tranche_ids.is_empty() {
+        return Ok(0);
+    }
+    let directive = VerifiedSlashDirectiveV1 {
+        validator_id,
+        slash_bps,
+        infraction_height,
+        position_ids,
+        tranche_ids,
+    };
+    let applied = apply_verified_slash_directive(state, &directive)?;
+    if let Some(validator) = state.validators.get_mut(&validator_id) {
+        validator.stake_spark = validator
+            .stake_spark
+            .checked_sub(applied.active_principal_slashed)
+            .ok_or(StateError::ValueOverflow)?;
+        if validator.stake_spark < indra_core::types::primitives::MINIMUM_ACTIVE_SELF_STAKE_SPARK {
+            validator.status = crate::validator::ValidatorStatus::Registered;
+        }
+    }
+    crate::monetary::MonetaryDeltaV1::burn(
+        applied.slash_amount,
+        crate::monetary::BurnSourceV1::ValidatorSlash,
+    )?;
+    state.total_supply = state
+        .total_supply
+        .checked_sub(applied.slash_amount)
+        .ok_or(StateError::ValueOverflow)?;
+    state.monetary_ledger.cumulative_slash_burned_spark = state
+        .monetary_ledger
+        .cumulative_slash_burned_spark
+        .checked_add(applied.slash_amount)
+        .ok_or(StateError::ValueOverflow)?;
+    state.monetary_ledger.epoch_slash_burned_spark = state
+        .monetary_ledger
+        .epoch_slash_burned_spark
+        .checked_add(applied.slash_amount)
+        .ok_or(StateError::ValueOverflow)?;
+    Ok(applied.slash_amount)
 }
 
 /// Unforgeable proof that one slash candidate passed full cryptographic validation
@@ -284,6 +528,7 @@ pub fn try_apply_verified_slash_candidate(
         SlashCryptoMode::PreviouslyVerified(verified),
     )?;
     txn.add_slash_accounting(accounting.slash_amount)?;
+    txn.state_mut().refresh_and_reconcile_monetary_state()?;
     txn.commit_scratch();
     Ok(())
 }
@@ -1349,9 +1594,7 @@ mod tests {
         utxos
             .saturating_add(positions)
             .saturating_add(tranches)
-            .saturating_add(state.treasury_balance)
             .saturating_add(state.fee_reward_pool)
-            .saturating_add(state.burn_buffer)
     }
 
     fn signed_vote(
@@ -1577,17 +1820,7 @@ mod tests {
     }
 
     fn install_inert_gate_snapshot_fixture(state: &mut ChainState) {
-        let (_, _, validator_id) =
-            install_governance_validator(state, [0xD9; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
-        state.validators.get_mut(&validator_id).unwrap().vrf_pk =
-            Some(indra_crypto::VrfKeypair::from_seed(&[0xD9; 32]).public_key());
-        let snapshot = state
-            .build_consensus_snapshot(u64::MAX - 1, u64::MAX - 2)
-            .unwrap();
-        state.reward_economic_snapshot =
-            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
-        state.consensus_snapshots = vec![snapshot];
-        state.rebuild_state_commitment_v2(u64::MAX);
+        state.rebuild_state_commitment_v2(state.height);
     }
 
     fn assert_same_consensus_state(left: &ChainState, right: &ChainState) {
@@ -1662,20 +1895,10 @@ mod tests {
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair, proposer_id) =
             install_governance_validator(&mut state, [0x91; 32], 100_000);
-        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
-        state.reward_economic_snapshot =
-            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
-        state.slash_membership_roots = vec![
-            indra_core::types::slash_membership::SlashMembershipRootRecord {
-                activation_height: 1,
-                membership_root:
-                    indra_core::types::slash_membership::compute_slash_membership_root(&snapshot)
-                        .unwrap(),
-            },
-        ];
-        state.reward_economic_snapshot =
-            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
-        state.consensus_snapshots = vec![snapshot];
+        state.consensus_snapshots.clear();
+        state.reward_economic_snapshot = None;
+        state.slash_membership_roots.clear();
+        state.finalize_genesis().unwrap();
         state.rebuild_state_commitment_v2(0);
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
         let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
@@ -1691,6 +1914,10 @@ mod tests {
             total_stake: 100_000,
         });
         state.governance.proposals.insert(proposal_id, proposal);
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
         (
             state,
             proposer_pubkey,
@@ -1736,11 +1963,11 @@ mod tests {
     fn project_block_for_roots_restores_state_on_success() {
         let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
-        state.height = u64::MAX - 1;
+        state.height = 0;
         state.tip_hash = Bytes32::ZERO;
         state.state_commitment_v2 = None;
         let original = state.clone();
-        let block = empty_block_at(&state, u64::MAX, 0);
+        let block = empty_block_at(&state, 1, 0);
 
         let projected = project_block_for_roots(&mut state, &block, 0).unwrap();
         assert_ne!(projected.state_root, Bytes32::ZERO);
@@ -1773,7 +2000,7 @@ mod tests {
     fn project_block_for_roots_preserves_active_state_commitment_v2_cache() {
         let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
-        state.height = u64::MAX - 1;
+        state.height = 0;
         state.tip_hash = Bytes32::ZERO;
         state.rebuild_state_commitment_v2(state.height);
         assert!(
@@ -1790,7 +2017,7 @@ mod tests {
             "test setup cache must already match a full rebuild"
         );
 
-        let success_block = empty_block_at(&state, u64::MAX, 0);
+        let success_block = empty_block_at(&state, 1, 0);
         let projected = project_block_for_roots(&mut state, &success_block, 0).unwrap();
         assert_ne!(projected.state_root, Bytes32::ZERO);
         assert_same_consensus_state(&state, &original);
@@ -1944,6 +2171,10 @@ mod tests {
                 0,
             )
             .unwrap();
+        state.consensus_snapshots.clear();
+        state.reward_economic_snapshot = None;
+        state.slash_membership_roots.clear();
+        state.finalize_genesis().unwrap();
         let op = signed_delegate_op(
             &state,
             validator_id,
@@ -2038,6 +2269,10 @@ mod tests {
                 0,
             )
             .unwrap();
+        state.consensus_snapshots.clear();
+        state.reward_economic_snapshot = None;
+        state.slash_membership_roots.clear();
+        state.finalize_genesis().unwrap();
         let op = governance_propose_op(
             proposer_id,
             &proposer_keypair,
@@ -2148,9 +2383,9 @@ mod tests {
     fn state_txn_rebuilds_state_commitment_v2_cache_after_rollback() {
         let mut state = canonical_test_genesis();
         install_inert_gate_snapshot_fixture(&mut state);
-        state.height = u64::MAX - 1;
+        state.height = 0;
         state.tip_hash = Bytes32::ZERO;
-        let block = empty_block_at(&state, u64::MAX, 0);
+        let block = empty_block_at(&state, 1, 0);
 
         let mut success = state.clone();
         crate::txn::set_fail_after_mutation(None);
@@ -2463,7 +2698,13 @@ mod tests {
         let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
         let block = make_block(&state, vec![tx]);
         apply_block(&mut state, &block, 0).unwrap();
-        assert_eq!(state.total_supply, initial_supply - (fee / 2));
+        let reward =
+            crate::monetary::block_reward_for_budget(state.monetary_ledger.reward_budget_spark, 1)
+                .unwrap();
+        assert_eq!(
+            state.total_supply,
+            initial_supply.checked_add(reward).unwrap() - (fee / 2)
+        );
         assert_eq!(state.fee_reward_pool, fee - (fee / 2));
     }
 
@@ -3232,6 +3473,117 @@ mod tests {
         assert_eq!(allocations.values().copied().sum::<u64>(), whole_slash);
     }
 
+    #[test]
+    fn unified_liveness_directive_slashes_active_and_post_infraction_self_tranche_only() {
+        use indra_core::types::stake_position::{
+            ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTimingV1,
+            UnbondingTrancheV1,
+        };
+
+        let (mut state, validator_id, _) = slash_validator_state([0x6A; 32], 1_000_000);
+        let self_custody = PositionCustodyV1::ValidatorColdIdentity { validator_id };
+        let self_position_id = indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            validator_id,
+            self_custody,
+        );
+        let mut self_position = state
+            .stake_positions
+            .get(&self_position_id)
+            .unwrap()
+            .clone();
+        self_position.active = Some(ActiveStakeAggregateV1::new(600_000, 0, 0).unwrap());
+        state
+            .stake_positions
+            .insert(self_position_id, self_position);
+
+        let infraction_height = 1_000;
+        let old = UnbondingTrancheV1::new(
+            self_position_id,
+            100_000,
+            UnbondingTimingV1::height_precise(infraction_height - 1).unwrap(),
+            self_custody,
+            Bytes32::from([0x61; 32]),
+            0,
+        )
+        .unwrap();
+        let eligible = UnbondingTrancheV1::new(
+            self_position_id,
+            100_000,
+            UnbondingTimingV1::height_precise(infraction_height).unwrap(),
+            self_custody,
+            Bytes32::from([0x62; 32]),
+            0,
+        )
+        .unwrap();
+        state.unbonding_tranches.insert(old.tranche_id, old.clone());
+        state
+            .unbonding_tranches
+            .insert(eligible.tranche_id, eligible.clone());
+
+        let delegator_id = Bytes32::from([0x63; 32]);
+        let delegated_custody = PositionCustodyV1::DelegatorIdentity { delegator_id };
+        let delegated = StakePositionV1::new(
+            validator_id,
+            delegator_id,
+            delegated_custody,
+            Some(ActiveStakeAggregateV1::new(200_000, 0, 0).unwrap()),
+            0,
+            0,
+        )
+        .unwrap();
+        state
+            .stake_positions
+            .insert(delegated.position_id, delegated.clone());
+        state.validators.get_mut(&validator_id).unwrap().stake_spark = 600_000;
+        state.rebuild_position_tranche_index().unwrap();
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.reconcile_monetary_state().unwrap();
+
+        let burned =
+            apply_liveness_principal_slash(&mut state, validator_id, 1_000, infraction_height)
+                .unwrap();
+
+        assert_eq!(burned, 70_000);
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&self_position_id)
+                .unwrap()
+                .active
+                .unwrap()
+                .principal_spark,
+            540_000
+        );
+        assert_eq!(
+            state
+                .stake_positions
+                .get(&delegated.position_id)
+                .unwrap()
+                .active
+                .unwrap()
+                .principal_spark,
+            200_000,
+            "delegated principal is outside the approved slash burden"
+        );
+        assert_eq!(
+            state
+                .unbonding_tranches
+                .get(&old.tranche_id)
+                .unwrap()
+                .principal_spark,
+            100_000
+        );
+        assert!(!state.unbonding_tranches.contains_key(&eligible.tranche_id));
+        assert!(state.unbonding_tranches.values().any(|tranche| {
+            tranche.position_id == self_position_id
+                && tranche.timing.start_height() == infraction_height
+                && tranche.principal_spark == 90_000
+        }));
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.reconcile_monetary_state().unwrap();
+    }
+
     fn apply_reporter_reward_case(
         stake: u64,
         expected_potential_reward: u64,
@@ -3645,39 +3997,20 @@ fn apply_slash_common(
                 .into(),
         });
     }
-    let mut slash_targets = Vec::with_capacity(position_ids.len() + tranche_ids.len());
-    for id in &position_ids {
-        let principal = state
-            .stake_positions
-            .get(id)
-            .and_then(|position| position.active)
-            .map(|active| active.principal_spark)
-            .ok_or(StateError::InvariantViolation {
-                message: "slash position target has no active principal",
-            })?;
-        slash_targets.push((SlashTarget::Position(*id), principal));
+    if position_ids.is_empty() && tranche_ids.is_empty() {
+        return Err(StateError::InvalidSlashEvidence {
+            reason: "validator has no real self-custody principal at the infraction height".into(),
+        });
     }
-    for id in &tranche_ids {
-        let principal = state
-            .unbonding_tranches
-            .get(id)
-            .map(|tranche| tranche.principal_spark)
-            .ok_or(StateError::InvariantViolation {
-                message: "slash tranche target is absent",
-            })?;
-        slash_targets.push((SlashTarget::Tranche(*id), principal));
-    }
-    let current_stake = state
-        .validators
-        .get(&validator_id)
-        .map(|v| v.stake_spark)
-        .unwrap_or(0);
-    let (slash_amount, allocations) = if slash_targets.is_empty() {
-        let direct = [(SlashTarget::Position(Bytes32::ZERO), current_stake)];
-        checked_slash_allocation(&direct, slash_bps)?
-    } else {
-        checked_slash_allocation(&slash_targets, slash_bps)?
+    let directive = VerifiedSlashDirectiveV1 {
+        validator_id,
+        slash_bps,
+        infraction_height: evidence.vote_1.height,
+        position_ids,
+        tranche_ids,
     };
+    let applied = apply_verified_slash_directive(state, &directive)?;
+    let slash_amount = applied.slash_amount;
     let potential_reporter_reward = u64::try_from(
         (slash_amount as u128)
             .checked_mul(SLASH_REPORTER_REWARD_BPS as u128)
@@ -3686,117 +4019,13 @@ fn apply_slash_common(
     )
     .map_err(|_| StateError::ValueOverflow)?;
 
-    let mut total_principal_slashed: u64 = if slash_targets.is_empty() {
-        slash_amount
-    } else {
-        0
-    };
-    let mut active_principal_slashed: u64 = 0;
-    for position_id in &position_ids {
-        if let Some(mut position) = state.stake_positions.get(position_id).cloned() {
-            if let Some(active) = position.active {
-                let amount = *allocations
-                    .get(&SlashTarget::Position(*position_id))
-                    .ok_or(StateError::InvariantViolation {
-                        message: "missing slash position allocation",
-                    })?;
-                let remaining = active
-                    .principal_spark
-                    .checked_sub(amount)
-                    .ok_or(StateError::ValueOverflow)?;
-                position.active = (remaining > 0).then(|| {
-                    indra_core::types::stake_position::ActiveStakeAggregateV1 {
-                        principal_spark: remaining,
-                        ..active
-                    }
-                });
-                active_principal_slashed = active_principal_slashed
-                    .checked_add(amount)
-                    .ok_or(StateError::ValueOverflow)?;
-                total_principal_slashed = total_principal_slashed
-                    .checked_add(amount)
-                    .ok_or(StateError::ValueOverflow)?;
-                state.stake_positions.insert(*position_id, position.clone());
-                if let Some(commitment) = state.state_commitment_v2.as_mut() {
-                    commitment.put_stake_position(&position);
-                }
-                crate::txn::complex_mutation_checkpoint()?;
-            }
-        }
-    }
-    let mut tranche_successors = Vec::new();
-    for tranche_id in &tranche_ids {
-        if let Some(tranche) = state.unbonding_tranches.get(tranche_id).cloned() {
-            let amount = *allocations.get(&SlashTarget::Tranche(*tranche_id)).ok_or(
-                StateError::InvariantViolation {
-                    message: "missing slash tranche allocation",
-                },
-            )?;
-            let remaining = tranche
-                .principal_spark
-                .checked_sub(amount)
-                .ok_or(StateError::ValueOverflow)?;
-            total_principal_slashed = total_principal_slashed
-                .checked_add(amount)
-                .ok_or(StateError::ValueOverflow)?;
-            if remaining == 0 {
-                tranche_successors.push((*tranche_id, None));
-            } else {
-                let successor_id = indra_core::types::stake_position::derive_tranche_id(
-                    tranche.position_id,
-                    tranche.creation_op_id,
-                    tranche.creation_ordinal,
-                    tranche.timing,
-                    remaining,
-                );
-                let successor = indra_core::types::stake_position::UnbondingTrancheV1::new(
-                    tranche.position_id,
-                    remaining,
-                    tranche.timing,
-                    tranche.custody,
-                    tranche.creation_op_id,
-                    tranche.creation_ordinal,
-                )
-                .map_err(|error| StateError::InvalidSlashEvidence {
-                    reason: error.to_string(),
-                })?;
-                if successor.tranche_id != successor_id
-                    || (successor_id != *tranche_id
-                        && state.unbonding_tranches.contains_key(&successor_id))
-                {
-                    return Err(StateError::InvariantViolation {
-                        message: "slash successor tranche identity collision",
-                    });
-                }
-                tranche_successors.push((*tranche_id, Some(successor)));
-            }
-        }
-    }
-    // A slash is a canonical consume-and-successor transition. Nonzero
-    // reductions are exactly one-for-one and therefore cannot consume tranche
-    // capacity; a complete slash only decreases the count.
-    for (old_id, successor) in &tranche_successors {
-        state.unbonding_tranches.remove(old_id);
-        if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.delete_unbonding_tranche(old_id);
-        }
-        crate::txn::complex_mutation_checkpoint()?;
-        if let Some(successor) = successor {
-            state
-                .unbonding_tranches
-                .insert(successor.tranche_id, successor.clone());
-            if let Some(commitment) = state.state_commitment_v2.as_mut() {
-                commitment.put_unbonding_tranche(successor);
-            }
-            crate::txn::complex_mutation_checkpoint()?;
-        }
-    }
+    let tranche_successors = &applied.tranche_successors;
     if let Some(mut tombstone) = state
         .evicted_validator_tombstones
         .get(&validator_id)
         .cloned()
     {
-        for (old_id, successor) in &tranche_successors {
+        for (old_id, successor) in tranche_successors {
             let index = tombstone
                 .retained_tranche_ids
                 .binary_search(old_id)
@@ -3823,19 +4052,9 @@ fn apply_slash_common(
         }
         crate::txn::complex_mutation_checkpoint()?;
     }
-    state
-        .rebuild_position_tranche_index()
-        .map_err(|error| StateError::InvalidSlashEvidence {
-            reason: error.to_string(),
-        })?;
-
     let mut updated_validator = None;
     if let Some(v) = state.validators.get_mut(&validator_id) {
-        let stake_slash = if !slash_targets.is_empty() {
-            active_principal_slashed
-        } else {
-            slash_amount
-        };
+        let stake_slash = applied.active_principal_slashed;
         v.stake_spark = v
             .stake_spark
             .checked_sub(stake_slash)
@@ -3872,17 +4091,28 @@ fn apply_slash_common(
     } else {
         0
     };
-    if total_principal_slashed != slash_amount && !slash_targets.is_empty() {
-        return Err(StateError::InvariantViolation {
-            message: "actual slash reductions do not equal aggregate",
-        });
-    }
     let burned = slash_amount
         .checked_sub(reporter_reward)
         .ok_or(StateError::ValueOverflow)?;
+    crate::monetary::MonetaryDeltaV1::split_burn(
+        slash_amount,
+        reporter_reward,
+        burned,
+        crate::monetary::BurnSourceV1::ValidatorSlash,
+    )?;
     state.total_supply = state
         .total_supply
         .checked_sub(burned)
+        .ok_or(StateError::ValueOverflow)?;
+    state.monetary_ledger.cumulative_slash_burned_spark = state
+        .monetary_ledger
+        .cumulative_slash_burned_spark
+        .checked_add(burned)
+        .ok_or(StateError::ValueOverflow)?;
+    state.monetary_ledger.epoch_slash_burned_spark = state
+        .monetary_ledger
+        .epoch_slash_burned_spark
+        .checked_add(burned)
         .ok_or(StateError::ValueOverflow)?;
     crate::txn::complex_mutation_checkpoint()?;
 
@@ -3891,7 +4121,7 @@ fn apply_slash_common(
         slash_bps,
         slash_amount,
         burned,
-        self_principal_slashed: total_principal_slashed,
+        self_principal_slashed: slash_amount,
         reporter_reward,
     })
 }
@@ -4503,6 +4733,13 @@ fn apply_block_inner(
     txn.set_tip(block.header.height, block.header.block_hash())?;
     txn.set_election_seed(next_seed, block.header.height.saturating_add(1))?;
 
+    // Rewards are issued at their actual finalized height, never pre-minted or
+    // accumulated into an epoch reserve. This transition also fails closed if
+    // the persisted cumulative target is inconsistent with the prior height.
+    txn.snapshot_epoch_scope();
+    crate::epoch::apply_block_reward_issuance(txn.state_mut(), block.header.height)?;
+    txn.after_mutation()?;
+
     // A slash finalized at H revokes only the affected frozen authorities at
     // H+1. Epoch-boundary blocks use the regular post-transition snapshot below,
     // which observes the same slash plus every scheduled boundary mutation.
@@ -4545,7 +4782,8 @@ fn apply_block_inner(
         txn.after_mutation()?;
     }
 
-    if txn.state().total_supply > HARD_CAP_SPARK {
+    txn.state_mut().refresh_and_reconcile_monetary_state()?;
+    if txn.state().total_supply > LIFETIME_SUPPLY_CAP_SPARK {
         return Err(StateError::InvariantViolation {
             message: "CRITICAL: total supply exceeds hard cap — constitutional invariant violated",
         });

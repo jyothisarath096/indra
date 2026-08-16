@@ -140,13 +140,7 @@ pub const MAX_STANDARD_VRF_OUTPUT_BYTES: usize = 64;
 /// Standard RFC 9381 ELL2 proof length.
 pub const MAX_STANDARD_VRF_PROOF_BYTES: usize = 80;
 
-/// Maximum Bulletproof range proof per output (bytes).
-pub const MAX_RANGE_PROOF_BYTES: usize = 674;
-
 // ── Economics ─────────────────────────────────────────────────────────────────
-
-/// Genesis supply in INDRA (human-readable unit).
-pub const GENESIS_SUPPLY_INDRA: u64 = 1_000_000_000;
 
 /// Default testnet chain ID — matches genesis.toml.example.
 pub const DEFAULT_CHAIN_ID: &str = "indra-testnet-1";
@@ -154,18 +148,8 @@ pub const DEFAULT_CHAIN_ID: &str = "indra-testnet-1";
 /// Spark per INDRA — 8 decimal places (matches Bitcoin's satoshi model).
 pub const SPARK_PER_INDRA: u64 = 100_000_000;
 
-/// Genesis supply in Spark. All 1 billion INDRA are pre-minted at genesis.
-///
-/// Constitutional monetary invariant: governance MUST NOT be able to change
-/// this value, the hard cap, era durations, or era reward constants. Any
-/// monetary-policy change requires an explicit protocol upgrade/hard fork, not
-/// a `GovernableAction`.
-pub const GENESIS_SUPPLY_SPARK: u64 = GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA;
-
-/// Hard cap in Spark. Total supply can only decrease via fee burn.
-///
-/// Constitutional monetary invariant: this is not governable at runtime.
-pub const HARD_CAP_SPARK: u64 = GENESIS_SUPPLY_SPARK;
+/// Permanent absolute lifetime issuance ceiling in Spark.
+pub const LIFETIME_SUPPLY_CAP_SPARK: u64 = 1_000_000_000 * SPARK_PER_INDRA;
 
 /// Minimum UTXO value in Spark. Outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
@@ -236,37 +220,6 @@ pub const ERA_1_2_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 4;
 ///
 /// Monetary schedule invariant: not governable at runtime.
 pub const ERA_3_PLUS_DURATION_BLOCKS: u64 = BLOCKS_PER_YEAR * 8;
-
-/// Era 1 block reward in Spark.
-///
-/// Monetary schedule invariant: not governable at runtime.
-pub const ERA_1_BLOCK_REWARD_SPARK: u64 = 1_189_200_000;
-
-/// Era 2 block reward in Spark.
-///
-/// Monetary schedule invariant: not governable at runtime.
-pub const ERA_2_BLOCK_REWARD_SPARK: u64 = ERA_1_BLOCK_REWARD_SPARK / 2;
-
-/// Era 3 block reward in Spark.
-///
-/// Monetary schedule invariant: not governable at runtime.
-pub const ERA_3_BLOCK_REWARD_SPARK: u64 = ERA_2_BLOCK_REWARD_SPARK / 2;
-
-/// Era 4 block reward in Spark.
-///
-/// Monetary schedule invariant: not governable at runtime.
-pub const ERA_4_BLOCK_REWARD_SPARK: u64 = ERA_3_BLOCK_REWARD_SPARK / 2;
-
-/// Era 5 block reward in Spark.
-///
-/// Monetary schedule invariant: not governable at runtime.
-pub const ERA_5_BLOCK_REWARD_SPARK: u64 = ERA_4_BLOCK_REWARD_SPARK / 2;
-
-/// All 1,000,000,000 INDRA are earned through block rewards.
-/// No pre-allocation to any person or entity.
-///
-/// Monetary schedule invariant: governance cannot alter this reward pool.
-pub const VALIDATOR_REWARDS_POOL_SPARK: u64 = 1_000_000_000 * SPARK_PER_INDRA;
 
 /// Fraction of transaction fees burned (basis points).
 pub const FEE_BURN_BPS: u32 = 5_000;
@@ -731,20 +684,8 @@ mod tests {
 
     #[test]
     fn economics_constants_consistent() {
-        assert_eq!(
-            VALIDATOR_REWARDS_POOL_SPARK, GENESIS_SUPPLY_SPARK,
-            "All INDRA must be in the validator rewards pool — no pre-mine"
-        );
-        assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);
-        assert_eq!(GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA);
+        assert_eq!(LIFETIME_SUPPLY_CAP_SPARK, 1_000_000_000 * SPARK_PER_INDRA);
         assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
-        let era_1_total = ERA_1_2_DURATION_BLOCKS * ERA_1_BLOCK_REWARD_SPARK;
-        let era_1_indra = era_1_total / SPARK_PER_INDRA;
-        assert!(
-            (248_000_000..=252_000_000).contains(&era_1_indra),
-            "Era 1 total INDRA out of range: {}",
-            era_1_indra
-        );
         assert_eq!(SPARK_PER_INDRA, 100_000_000);
         assert!(VALIDATOR_SET_PHASE1_STAKE < VALIDATOR_SET_PHASE2_STAKE);
         assert!(VALIDATOR_SET_PHASE2_STAKE < VALIDATOR_SET_PHASE3_STAKE);

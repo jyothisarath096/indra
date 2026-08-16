@@ -429,11 +429,14 @@ mod tests {
             timestamp_secs: 1_750_000_000 + epoch,
             active_validators: 4,
             total_staked_spark: 400_000_000_000,
-            block_rewards_distributed: 356_760_000_000,
+            reward_minted_spark: 356_760_000_000,
             fee_rewards_distributed: epoch,
-            fees_burned: 0,
-            governance_deposits_burned: 0,
-            total_slashed_spark: 0,
+            fee_burned_spark: 0,
+            slash_burned_spark: 0,
+            governance_burned_spark: 0,
+            total_burned_spark: 0,
+            opening_total_supply_spark: 99_999_643_240_000_000,
+            closing_total_supply_spark: 100_000_000_000_000_000,
             slash_event_count: 0,
             liveness_penalty_count: 0,
             avg_base_fee: 10,
@@ -441,8 +444,6 @@ mod tests {
             validators_left: vec![],
             era: 1,
             block_reward_spark: 1_189_200_000,
-            total_supply: 100_000_000_000_000_000,
-            treasury_balance: 0,
         }
     }
 

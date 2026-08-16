@@ -18,7 +18,7 @@ use indra_core::types::{
 };
 
 use indra_core::types::primitives::{
-    Bytes32, Bytes64, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
+    Bytes32, Bytes64, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
     INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_STAKE_POSITIONS_PER_VALIDATOR,
     MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
     MAX_TRANCHES_TOTAL,
@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     governance::GovernanceState,
+    monetary::{MonetaryAggregatesV1, MonetaryLedgerV1},
     persistent::{PersistentOrdMap, PersistentOrdSet},
     state_commitment::StateCommitmentV2,
     utxo::UtxoSet,
@@ -79,16 +80,11 @@ pub struct ChainState {
     /// Total supply of Spark in existence (minted - burned).
     pub total_supply: u64,
 
-    /// Accumulated block reward dust from proportional distribution rounding.
-    ///
-    /// This balance has no spend path and is effectively locked. Reporter slash
-    /// rewards are not routed here; they are paid directly to the reporting
-    /// block proposer as spendable UTXOs. Future cleanup: burn reward dust
-    /// directly and remove treasury accounting entirely.
-    pub treasury_balance: u64,
+    /// Canonical cumulative issuance and burn accounting.
+    pub monetary_ledger: MonetaryLedgerV1,
 
-    /// Burn buffer balance in Spark (pending governance-directed burns).
-    pub burn_buffer: u64,
+    /// State-root-committed totals of authoritative monetary stores.
+    pub monetary_aggregates: MonetaryAggregatesV1,
 
     /// Accumulated validator fee rewards awaiting epoch distribution.
     pub fee_reward_pool: u64,
@@ -159,18 +155,6 @@ pub struct ChainState {
     /// lookup, or the O(touched delegators) reward distribution pass.
     pub state_commitment_v2: Option<StateCommitmentV2>,
 
-    /// Transient fee burns accumulated for the current epoch summary.
-    /// Not encoded and not included in consensus state roots.
-    pub epoch_fees_burned: u64,
-
-    /// Transient slash total accumulated for the current epoch summary.
-    /// Not encoded and not included in consensus state roots.
-    pub epoch_slashed_spark: u64,
-
-    /// Transient governance-deposit burns accumulated for the current epoch summary.
-    /// Not encoded and not included in consensus state roots.
-    pub epoch_governance_burned_spark: u64,
-
     /// Transient slash event count accumulated for the current epoch summary.
     /// Not encoded and not included in consensus state roots.
     pub epoch_slash_event_count: u32,
@@ -194,8 +178,8 @@ impl ChainState {
             tip_hash: _,
             base_fee: _,
             total_supply: _,
-            treasury_balance: _,
-            burn_buffer: _,
+            monetary_ledger: _,
+            monetary_aggregates: _,
             fee_reward_pool: _,
             utxos: _,
             validators: _,
@@ -212,9 +196,6 @@ impl ChainState {
             retired_cold_pq_components: _,
             governance: _,
             state_commitment_v2: _,
-            epoch_fees_burned: _,
-            epoch_slashed_spark: _,
-            epoch_governance_burned_spark: _,
             epoch_slash_event_count: _,
             ..
         } = before;
@@ -231,8 +212,8 @@ impl ChainState {
         changed!(tip_hash, F::TipHash);
         changed!(base_fee, F::BaseFee);
         changed!(total_supply, F::TotalSupply);
-        changed!(treasury_balance, F::TreasuryBalance);
-        changed!(burn_buffer, F::BurnBuffer);
+        changed!(monetary_ledger, F::MonetaryLedger);
+        changed!(monetary_aggregates, F::MonetaryAggregates);
         changed!(fee_reward_pool, F::FeeRewardPool);
         changed!(utxos, F::Utxos);
         changed!(validators, F::Validators);
@@ -252,9 +233,6 @@ impl ChainState {
         changed!(retired_cold_pq_components, F::RetiredColdPqComponents);
         changed!(governance, F::Governance);
         changed!(state_commitment_v2, F::StateCommitmentV2);
-        changed!(epoch_fees_burned, F::EpochFeesBurned);
-        changed!(epoch_slashed_spark, F::EpochSlashedSpark);
-        changed!(epoch_governance_burned_spark, F::EpochGovernanceBurnedSpark);
         changed!(epoch_slash_event_count, F::EpochSlashEventCount);
         changed
     }
@@ -274,10 +252,8 @@ impl Encode for ChainState {
         self.base_fee.encode(buf);
         // Included: block value hashing and supply accounting depend on total supply.
         self.total_supply.encode(buf);
-        // Included: treasury accounting is part of consensus state and affects rewards.
-        self.treasury_balance.encode(buf);
-        // Included: burn-buffer accounting is consensus-visible and must survive restart.
-        self.burn_buffer.encode(buf);
+        self.monetary_ledger.encode(buf);
+        self.monetary_aggregates.encode(buf);
         // Included: pending fee rewards affect future epoch distribution.
         self.fee_reward_pool.encode(buf);
         // Included: the full UTXO set is required to validate spends after restart.
@@ -317,8 +293,8 @@ impl Encode for ChainState {
             + self.tip_hash.encoded_len()
             + self.base_fee.encoded_len()
             + self.total_supply.encoded_len()
-            + self.treasury_balance.encoded_len()
-            + self.burn_buffer.encoded_len()
+            + self.monetary_ledger.encoded_len()
+            + self.monetary_aggregates.encoded_len()
             + self.fee_reward_pool.encoded_len()
             + self.utxos.encoded_len()
             + self.validators.encoded_len()
@@ -356,8 +332,8 @@ impl Decode for ChainState {
         let tip_hash = Bytes32::decode(r)?;
         let base_fee = u64::decode(r)?;
         let total_supply = u64::decode(r)?;
-        let treasury_balance = u64::decode(r)?;
-        let burn_buffer = u64::decode(r)?;
+        let monetary_ledger = MonetaryLedgerV1::decode(r)?;
+        let monetary_aggregates = MonetaryAggregatesV1::decode(r)?;
         let fee_reward_pool = u64::decode(r)?;
         let utxos = UtxoSet::decode_at_height(r, height)?;
         let validators = ValidatorSet::decode(r)?;
@@ -422,14 +398,14 @@ impl Decode for ChainState {
             &stake_positions,
             &unbonding_tranches,
         )?;
-        Ok(Self {
+        let state = Self {
             chain_id,
             height,
             tip_hash,
             base_fee,
             total_supply,
-            treasury_balance,
-            burn_buffer,
+            monetary_ledger,
+            monetary_aggregates,
             fee_reward_pool,
             utxos,
             validators,
@@ -450,15 +426,85 @@ impl Decode for ChainState {
             retired_cold_pq_components,
             governance,
             state_commitment_v2: None,
-            epoch_fees_burned: 0,
-            epoch_slashed_spark: 0,
-            epoch_governance_burned_spark: 0,
             epoch_slash_event_count: 0,
-        })
+        };
+        let recomputed =
+            state
+                .recompute_monetary_aggregates()
+                .map_err(|_| IndraError::InvariantViolation {
+                    message: "decoded monetary aggregates overflow",
+                })?;
+        if recomputed != state.monetary_aggregates {
+            return Err(IndraError::InvariantViolation {
+                message: "decoded monetary aggregates mismatch authoritative records",
+            });
+        }
+        state
+            .reconcile_monetary_state()
+            .map_err(|_| IndraError::InvariantViolation {
+                message: "decoded monetary state does not reconcile",
+            })?;
+        Ok(state)
     }
 }
 
 impl ChainState {
+    /// Independently derive every authoritative monetary-store aggregate.
+    pub fn recompute_monetary_aggregates(&self) -> crate::error::StateResult<MonetaryAggregatesV1> {
+        let (active_principal_spark, pending_rewards_spark) = self
+            .stake_positions
+            .values()
+            .try_fold((0u64, 0u64), |(principal, rewards), position| {
+                Ok::<_, crate::error::StateError>((
+                    principal
+                        .checked_add(position.active.map_or(0, |active| active.principal_spark))
+                        .ok_or(crate::error::StateError::ValueOverflow)?,
+                    rewards
+                        .checked_add(position.pending_rewards_spark)
+                        .ok_or(crate::error::StateError::ValueOverflow)?,
+                ))
+            })?;
+        let unbonding_principal_spark =
+            self.unbonding_tranches
+                .values()
+                .try_fold(0u64, |sum, tranche| {
+                    sum.checked_add(tranche.principal_spark)
+                        .ok_or(crate::error::StateError::ValueOverflow)
+                })?;
+        let governance_escrow_spark =
+            self.governance
+                .proposals
+                .values()
+                .try_fold(0u64, |sum, proposal| {
+                    sum.checked_add(proposal.deposit_spark)
+                        .ok_or(crate::error::StateError::ValueOverflow)
+                })?;
+        Ok(MonetaryAggregatesV1 {
+            utxo_value_spark: self.utxos.total_value_spark()?,
+            active_principal_spark,
+            unbonding_principal_spark,
+            pending_rewards_spark,
+            governance_escrow_spark,
+            fee_reward_pool_spark: self.fee_reward_pool,
+        })
+    }
+
+    /// Verify claims, supply, cap, reward-budget, and audit-ledger identities.
+    pub fn reconcile_monetary_state(&self) -> crate::error::StateResult<()> {
+        if self.monetary_aggregates.total_claims_spark()? != self.total_supply {
+            return Err(crate::error::StateError::InvariantViolation {
+                message: "authoritative monetary claims do not equal total supply",
+            });
+        }
+        self.monetary_ledger.validate(self.total_supply)
+    }
+
+    /// Recompute aggregate caches and require full monetary reconciliation.
+    pub(crate) fn refresh_and_reconcile_monetary_state(&mut self) -> crate::error::StateResult<()> {
+        self.monetary_aggregates = self.recompute_monetary_aggregates()?;
+        self.reconcile_monetary_state()
+    }
+
     /// Sum active delegated principal from authoritative staking positions.
     pub fn total_active_delegated_stake(&self) -> u64 {
         self.stake_positions
@@ -479,9 +525,9 @@ impl ChainState {
             height: 0,
             tip_hash: Bytes32::ZERO,
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
-            total_supply: GENESIS_SUPPLY_SPARK,
-            treasury_balance: 0,
-            burn_buffer: 0,
+            total_supply: 0,
+            monetary_ledger: MonetaryLedgerV1::empty_genesis(),
+            monetary_aggregates: MonetaryAggregatesV1::default(),
             fee_reward_pool: 0,
             utxos: UtxoSet::new(),
             validators: ValidatorSet::new(),
@@ -502,9 +548,6 @@ impl ChainState {
             retired_cold_pq_components: PersistentOrdSet::new(),
             governance: GovernanceState::new(),
             state_commitment_v2: None,
-            epoch_fees_burned: 0,
-            epoch_slashed_spark: 0,
-            epoch_governance_burned_spark: 0,
             epoch_slash_event_count: 0,
         }
     }
@@ -776,11 +819,12 @@ impl ChainState {
             ));
         }
         self.stake_positions = PersistentOrdMap::new();
-        let active: Vec<(Bytes32, u64)> = self
+        let mut active: Vec<(Bytes32, u64)> = self
             .validators
             .active_validators()
             .map(|validator| (validator.validator_id, validator.stake_spark))
             .collect();
+        active.sort_by_key(|(validator_id, _)| validator_id.0);
         for (validator_id, principal_spark) in active {
             let position = StakePositionV1::new(
                 validator_id,
@@ -802,6 +846,11 @@ impl ChainState {
             // finalize again; replace the same deterministic position atomically.
             self.stake_positions.insert(position.position_id, position);
         }
+        self.monetary_aggregates = self.recompute_monetary_aggregates()?;
+        let genesis_issued_spark = self.monetary_aggregates.total_claims_spark()?;
+        self.monetary_ledger = MonetaryLedgerV1::genesis(genesis_issued_spark)?;
+        self.total_supply = genesis_issued_spark;
+        self.reconcile_monetary_state()?;
         self.rebuild_position_tranche_index().map_err(|error| {
             crate::error::StateError::InvalidRewardEconomicSnapshot(error.to_string())
         })?;
@@ -1771,13 +1820,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use indra_core::{
-        codec::Encode,
+        codec::{Decode, Encode},
         error::IndraError,
         types::{
             crypto::HybridPubKey,
-            primitives::{
-                VariableBytes, GENESIS_SUPPLY_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS,
-            },
+            primitives::{VariableBytes, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS},
         },
     };
 
@@ -1835,12 +1882,70 @@ mod tests {
         assert_eq!(state.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(state.tip_hash, Bytes32::ZERO);
         assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
-        assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
-        assert_eq!(state.treasury_balance, 0);
+        assert_eq!(state.total_supply, 0);
         assert_eq!(state.fee_reward_pool, 0);
         assert!(state.utxos.is_empty());
         assert!(state.validators.is_empty());
         assert!(state.consensus_snapshots.is_empty());
+    }
+
+    #[test]
+    fn genesis_issuance_is_checked_exactly_against_lifetime_cap() {
+        use indra_core::types::{primitives::LIFETIME_SUPPLY_CAP_SPARK, transaction::OutputV1};
+
+        let validator = snapshot_validator(9, 31, LIFETIME_SUPPLY_CAP_SPARK);
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from(validator.hybrid_classical_pk.unwrap()),
+            pq_pk: VariableBytes::from_slice(validator.hybrid_pq_pk.as_ref().unwrap()).unwrap(),
+        };
+        let mut exact = ChainState::new_genesis();
+        exact.validators.upsert(validator.clone()).unwrap();
+        exact.finalize_genesis().unwrap();
+        assert_eq!(exact.total_supply, LIFETIME_SUPPLY_CAP_SPARK);
+        assert_eq!(exact.monetary_ledger.reward_budget_spark, 0);
+
+        let mut over = ChainState::new_genesis();
+        over.validators.upsert(validator).unwrap();
+        over.utxos
+            .insert(
+                OutputV1 {
+                    value_spark: 1,
+                    owner_pubkey: owner,
+                    lock_height: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(over.finalize_genesis().is_err());
+    }
+
+    #[test]
+    fn snapshot_decode_rederives_all_monetary_aggregates_and_ledger_identity() {
+        let state = snapshot_state();
+        for index in 0..6 {
+            let mut corrupt = state.clone();
+            match index {
+                0 => corrupt.monetary_aggregates.utxo_value_spark += 1,
+                1 => corrupt.monetary_aggregates.active_principal_spark += 1,
+                2 => corrupt.monetary_aggregates.unbonding_principal_spark += 1,
+                3 => corrupt.monetary_aggregates.pending_rewards_spark += 1,
+                4 => corrupt.monetary_aggregates.governance_escrow_spark += 1,
+                _ => corrupt.monetary_aggregates.fee_reward_pool_spark += 1,
+            }
+            assert!(
+                ChainState::decode_exact(&corrupt.encode_to_vec()).is_err(),
+                "field {index}"
+            );
+        }
+        let mut bad_ledger = state.clone();
+        bad_ledger.monetary_ledger.genesis_issued_spark += 1;
+        assert!(ChainState::decode_exact(&bad_ledger.encode_to_vec()).is_err());
+
+        let mut trailing = state.encode_to_vec();
+        trailing.push(0);
+        assert!(ChainState::decode_exact(&trailing).is_err());
     }
 
     #[test]

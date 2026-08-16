@@ -58,7 +58,9 @@ The current VRF input includes only `epoch_seed[..8]`; election scoring interpre
 
 The replacement must bind all 256 seed bits and consume the complete standards-defined VRF output. No consensus decision may narrow either value to a machine integer.
 
-### 2.4 T7-06 — proposer-controlled seed and last-revealer choice
+### 2.4 T7-06 — proposer-controlled seed and last-Confirmation — cumulative-target issuance approved
+Option 1, confirmed. Compute the exact halving schedule as a cumulative target function over the remaining post-genesis budget, minting cumulative_target(height) − cumulative_minted at each block via genuine exact integer/rational arithmetic — no floating-point anywhere in the computation, including internal intermediate steps, matching the same discipline already established for the Q768 sortition math. Every era total and the full lifetime total must be exact by construction; individual block rewards may differ by ±1 Spark, and that's fine — no terminal sweep, no special-cased final block.
+Proceed with the design doc using this resolution. Same standing instruction: keep stopping and reporting on any further genuine ambiguity — this is now the second real arithmetic contradiction this exact-convergence work has surfaced, and catching both before they became silent approximations in a permanent monetary schedule is exactly the diligence this needs.revealer choice
 
 The current seed is `SHA-256(parent block hash)`. The parent proposer controls fields that affect that hash and can evaluate candidate blocks before publishing one. INDRA's existing grinding test demonstrates this is reachable. Algorand's own guidance likewise warns that a validator can influence a block seed by declining a proposal and says a block seed must not be used directly as application randomness [Algorand randomness guidance](https://dev.algorand.co/concepts/protocol/randomness/).
 

@@ -5,9 +5,8 @@
 
 use indra_core::codec::{Decode, Encode};
 use indra_core::types::primitives::{
-    DUST_LIMIT_SPARK, FEE_BURN_BPS, FEE_VALIDATOR_BPS, GENESIS_SUPPLY_INDRA, GENESIS_SUPPLY_SPARK,
-    HARD_CAP_SPARK, MAX_INPUTS, MAX_OUTPUTS, MIN_BASE_FEE_SPARK_PER_KB, SPARK_PER_INDRA,
-    TRANSACTION_PROTOCOL_VERSION, VALIDATOR_REWARDS_POOL_SPARK,
+    DUST_LIMIT_SPARK, FEE_BURN_BPS, FEE_VALIDATOR_BPS, LIFETIME_SUPPLY_CAP_SPARK, MAX_INPUTS,
+    MAX_OUTPUTS, MIN_BASE_FEE_SPARK_PER_KB, TRANSACTION_PROTOCOL_VERSION,
 };
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use indra_core::types::vote::VoteStep;
@@ -254,16 +253,13 @@ fn truncated_bytes_rejected() {
 // ── Protocol constant consistency tests ───────────────────────────────────────
 
 #[test]
-fn genesis_supply_consistency() {
-    assert_eq!(GENESIS_SUPPLY_SPARK, GENESIS_SUPPLY_INDRA * SPARK_PER_INDRA);
-    assert_eq!(GENESIS_SUPPLY_SPARK, 100_000_000_000_000_000u64);
-    assert_eq!(HARD_CAP_SPARK, GENESIS_SUPPLY_SPARK);
+fn lifetime_supply_cap_is_exact() {
+    assert_eq!(LIFETIME_SUPPLY_CAP_SPARK, 100_000_000_000_000_000u64);
 }
 
 #[test]
 fn allocation_shares_sum_to_ten_thousand() {
     assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
-    assert_eq!(VALIDATOR_REWARDS_POOL_SPARK, GENESIS_SUPPLY_SPARK);
 }
 
 #[test]

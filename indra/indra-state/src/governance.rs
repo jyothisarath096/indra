@@ -1060,62 +1060,56 @@ fn proposal_map_len(map: &BTreeMap<Bytes32, ProposalRecord>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epoch::block_reward_at_height;
+    use crate::monetary::cumulative_reward_target_at_height;
     use indra_core::types::primitives::{
-        VariableBytes, BLOCKS_PER_YEAR, ERA_1_2_DURATION_BLOCKS, ERA_1_BLOCK_REWARD_SPARK,
-        ERA_2_BLOCK_REWARD_SPARK, ERA_3_BLOCK_REWARD_SPARK, ERA_3_PLUS_DURATION_BLOCKS,
-        ERA_4_BLOCK_REWARD_SPARK, ERA_5_BLOCK_REWARD_SPARK, GENESIS_SUPPLY_SPARK, HARD_CAP_SPARK,
-        VALIDATOR_REWARDS_POOL_SPARK,
+        VariableBytes, BLOCKS_PER_YEAR, ERA_1_2_DURATION_BLOCKS, ERA_3_PLUS_DURATION_BLOCKS,
+        LIFETIME_SUPPLY_CAP_SPARK,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct MonetaryPolicySnapshot {
-        genesis_supply_spark: u64,
-        hard_cap_spark: u64,
-        validator_rewards_pool_spark: u64,
+        lifetime_cap_spark: u64,
         blocks_per_year: u64,
         era_1_2_duration_blocks: u64,
         era_3_plus_duration_blocks: u64,
-        era_rewards_spark: [u64; 5],
-        reward_schedule_samples: Vec<(u64, u64)>,
+        cumulative_schedule_samples: Vec<(u64, u64)>,
     }
 
     fn monetary_policy_snapshot() -> MonetaryPolicySnapshot {
         let era_3_start = ERA_1_2_DURATION_BLOCKS.saturating_mul(2);
         MonetaryPolicySnapshot {
-            genesis_supply_spark: GENESIS_SUPPLY_SPARK,
-            hard_cap_spark: HARD_CAP_SPARK,
-            validator_rewards_pool_spark: VALIDATOR_REWARDS_POOL_SPARK,
+            lifetime_cap_spark: LIFETIME_SUPPLY_CAP_SPARK,
             blocks_per_year: BLOCKS_PER_YEAR,
             era_1_2_duration_blocks: ERA_1_2_DURATION_BLOCKS,
             era_3_plus_duration_blocks: ERA_3_PLUS_DURATION_BLOCKS,
-            era_rewards_spark: [
-                ERA_1_BLOCK_REWARD_SPARK,
-                ERA_2_BLOCK_REWARD_SPARK,
-                ERA_3_BLOCK_REWARD_SPARK,
-                ERA_4_BLOCK_REWARD_SPARK,
-                ERA_5_BLOCK_REWARD_SPARK,
-            ],
-            reward_schedule_samples: vec![
-                (0, block_reward_at_height(0)),
+            cumulative_schedule_samples: vec![
                 (
-                    ERA_1_2_DURATION_BLOCKS.saturating_sub(1),
-                    block_reward_at_height(ERA_1_2_DURATION_BLOCKS.saturating_sub(1)),
+                    0,
+                    cumulative_reward_target_at_height(LIFETIME_SUPPLY_CAP_SPARK, 0).unwrap(),
                 ),
                 (
                     ERA_1_2_DURATION_BLOCKS,
-                    block_reward_at_height(ERA_1_2_DURATION_BLOCKS),
+                    cumulative_reward_target_at_height(
+                        LIFETIME_SUPPLY_CAP_SPARK,
+                        ERA_1_2_DURATION_BLOCKS,
+                    )
+                    .unwrap(),
                 ),
-                (era_3_start, block_reward_at_height(era_3_start)),
+                (
+                    ERA_1_2_DURATION_BLOCKS.saturating_mul(2),
+                    cumulative_reward_target_at_height(
+                        LIFETIME_SUPPLY_CAP_SPARK,
+                        ERA_1_2_DURATION_BLOCKS.saturating_mul(2),
+                    )
+                    .unwrap(),
+                ),
                 (
                     era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS),
-                    block_reward_at_height(era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS)),
-                ),
-                (
-                    era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS.saturating_mul(2)),
-                    block_reward_at_height(
-                        era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS.saturating_mul(2)),
-                    ),
+                    cumulative_reward_target_at_height(
+                        LIFETIME_SUPPLY_CAP_SPARK,
+                        era_3_start.saturating_add(ERA_3_PLUS_DURATION_BLOCKS),
+                    )
+                    .unwrap(),
                 ),
             ],
         }

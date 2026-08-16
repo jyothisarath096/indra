@@ -33,6 +33,7 @@ curve25519-dalek-v5 = { package = "curve25519-dalek", version = "5.0", default-f
 sha2-11            = { package = "sha2", version = "0.11", default-features = false }
 num-bigint         = "0.4"
 num-traits         = "0.2"
+crypto-bigint      = "0.7.5"
 ml-dsa             = { version = "0.1.1", features = ["alloc", "getrandom"] }
 proptest           = { version = "1.4", default-features = false, features = ["std"] }
 subtle             = { version = "2.5", default-features = false }

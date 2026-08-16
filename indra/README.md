@@ -1,6 +1,6 @@
 # INDRA Protocol
 
-**Quantum-safe digital money. Earned, not issued.**
+**Quantum-safe digital money with transparent, capped issuance.**
 
 INDRA is a post-quantum Layer 1 blockchain written in Rust. It implements
 ML-DSA-87 + Ed25519 hybrid signatures, hybrid X25519 + ML-KEM-1024
@@ -8,7 +8,7 @@ encrypted transport, transparent checked-`u64` transaction amounts,
 BFT consensus with 6-second absolute
 finality, and on-chain five-phase commit-reveal governance.
 
-One billion INDRA. No new coins ever. No foundation. No pre-mine.
+One billion INDRA maximum lifetime issuance. No foundation treasury or pre-mine.
 
 → **[indraprotocol.com](https://indraprotocol.com)**
 → **[Whitepaper](docs/WHITEPAPER.md)**
@@ -27,7 +27,7 @@ Tx signatures:    Ed25519 + ML-DSA-87 (NIST FIPS 204, level 5)
 QC signatures:    ML-DSA-87 only (fully post-quantum)
 Transport:        X25519 + ML-KEM-1024 + ChaCha20-Poly1305 + ML-DSA-87
 Transactions:     Transparent amounts and pseudonymous hybrid-key ownership
-Era 1 reward:     11.892 INDRA/block (Year 1–4)
+Rewards:          Exact genesis-normalized cumulative halving schedule
 Fee split:        50% burned / 50% to validators
 Consensus:        Proof of Stake (Tendermint-style BFT)
 Governance:       Five-phase commit-reveal, two-snapshot, on-chain
@@ -323,14 +323,15 @@ window.
 ## Token economics
 
 ```
-Total supply:      1,000,000,000 INDRA (hard cap, immutable)
+Lifetime cap:      1,000,000,000 INDRA (immutable)
+Genesis supply:    Exact checked sum of genesis validator stakes and UTXOs
 Pre-mine:          None. 0% to founders, team, or foundation.
-Distribution:      100% earned via block rewards over ~100 years
+Distribution:      Genesis bootstrap allocations plus checked block issuance
 
-Era 1 (Yr 1–4):   11.892 INDRA/block   ~250,000,000 INDRA total
-Era 2 (Yr 4–8):    5.946 INDRA/block   ~125,000,000 INDRA total
-Era 3 (Yr 8–16):   2.973 INDRA/block   ~125,000,000 INDRA total
-Era 4+:            Halves every 8 years
+Era 1 (Yr 1–4):   40% of the post-genesis reward budget
+Era 2 (Yr 4–8):   20% of the post-genesis reward budget
+Era 3 (Yr 8–16):  20% of the post-genesis reward budget
+Era 4+:            Remaining era allocation halves every 8 years
 
 Fee split:         50% burned / 50% to validators (proportional to stake)
 Supply direction:  Decreasing over time (fee burn)

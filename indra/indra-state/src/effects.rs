@@ -82,8 +82,8 @@ pub(crate) enum CanonicalStateField {
     TipHash,
     BaseFee,
     TotalSupply,
-    TreasuryBalance,
-    BurnBuffer,
+    MonetaryLedger,
+    MonetaryAggregates,
     FeeRewardPool,
     Utxos,
     Validators,
@@ -100,9 +100,6 @@ pub(crate) enum CanonicalStateField {
     RetiredColdPqComponents,
     Governance,
     StateCommitmentV2,
-    EpochFeesBurned,
-    EpochSlashedSpark,
-    EpochGovernanceBurnedSpark,
     EpochSlashEventCount,
 }
 
@@ -145,7 +142,7 @@ impl CanonicalStateEffects {
             F::Height => self.height_changed,
             F::TipHash => self.tip_hash_changed,
             F::BaseFee => self.base_fee_changed,
-            F::TotalSupply | F::TreasuryBalance | F::BurnBuffer | F::FeeRewardPool => {
+            F::TotalSupply | F::MonetaryLedger | F::MonetaryAggregates | F::FeeRewardPool => {
                 self.economic_accounting_changed
             }
             F::Utxos => self.utxo_set_changed,
@@ -167,10 +164,7 @@ impl CanonicalStateEffects {
             }
             F::Governance => self.governance_state_changed,
             F::StateCommitmentV2 => self.state_commitment_cache_changed,
-            F::EpochFeesBurned
-            | F::EpochSlashedSpark
-            | F::EpochGovernanceBurnedSpark
-            | F::EpochSlashEventCount => self.epoch_summary_changed,
+            F::EpochSlashEventCount => self.epoch_summary_changed,
         }
     }
 }

@@ -48,9 +48,9 @@ pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     metadata.extend_from_slice(&state.height.to_le_bytes());
     metadata.extend_from_slice(&state.total_supply.to_le_bytes());
     metadata.extend_from_slice(&state.base_fee.to_le_bytes());
-    metadata.extend_from_slice(&state.treasury_balance.to_le_bytes());
-    metadata.extend_from_slice(&state.burn_buffer.to_le_bytes());
     metadata.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
+    state.monetary_ledger.encode(&mut metadata);
+    state.monetary_aggregates.encode(&mut metadata);
     state.governance.encode(&mut metadata);
     let metadata_hash = sha256(&metadata);
 

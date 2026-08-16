@@ -622,9 +622,7 @@ mod tests {
                     .map(|tranche| tranche.principal_spark)
                     .sum::<u64>(),
             )
-            .saturating_add(state.treasury_balance)
             .saturating_add(state.fee_reward_pool)
-            .saturating_add(state.burn_buffer)
     }
 
     fn validator(validator_id: Bytes32, vote_keys: &HybridKeypair) -> ValidatorEntry {
@@ -683,7 +681,7 @@ mod tests {
         height: u64,
         ordinal: u32,
     ) -> Bytes32 {
-        state
+        let utxo_id = state
             .utxos
             .insert(
                 OutputV1 {
@@ -695,7 +693,12 @@ mod tests {
                 0,
                 ordinal,
             )
-            .unwrap()
+            .unwrap();
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.total_supply = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.monetary_ledger =
+            crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
+        utxo_id
     }
 
     fn signed_exit(
@@ -1048,6 +1051,7 @@ mod tests {
             .unwrap();
             let intent = signed_exit(&keys, &state, position_id, owner_id, 200_000, 1);
             exit_stake_position(&mut state, &intent, 42).unwrap();
+            state.refresh_and_reconcile_monetary_state().unwrap();
             state
         }
         let first = replay();

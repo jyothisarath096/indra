@@ -12,7 +12,7 @@ use indra_consensus::{
 use indra_core::{
     types::{
         crypto::HybridSignature,
-        primitives::{DEFAULT_CHAIN_ID, TRANSACTION_PROTOCOL_VERSION},
+        primitives::{DEFAULT_CHAIN_ID, LIFETIME_SUPPLY_CAP_SPARK, TRANSACTION_PROTOCOL_VERSION},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
@@ -198,6 +198,11 @@ fn mempool_to_block_pipeline() {
             )
             .unwrap();
     }
+    state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+    state.total_supply = issued;
+    state.monetary_ledger.genesis_issued_spark = issued;
+    state.monetary_ledger.reward_budget_spark = LIFETIME_SUPPLY_CAP_SPARK - issued;
     assert_eq!(mempool.len(), 5);
 
     // Set up election with single validator

@@ -1278,6 +1278,25 @@ mod tests {
         (validator_id, hybrid)
     }
 
+    fn advance_fixture_height_with_issuance(state: &mut ChainState, height: u64) {
+        let target = indra_state::monetary::cumulative_reward_target_at_height(
+            state.monetary_ledger.reward_budget_spark,
+            height,
+        )
+        .unwrap();
+        if target != 0 {
+            let mut position = state.stake_positions.values().next().unwrap().clone();
+            position.pending_rewards_spark =
+                position.pending_rewards_spark.checked_add(target).unwrap();
+            state.stake_positions.insert(position.position_id, position);
+        }
+        state.monetary_ledger.cumulative_reward_minted_spark = target;
+        state.monetary_ledger.epoch_reward_minted_spark = target;
+        state.total_supply = state.total_supply.checked_add(target).unwrap();
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        state.height = height;
+    }
+
     fn build_election(state: &ChainState, height: u64, round: u32) -> ProposerElection {
         let snapshot = state
             .snapshot_for_consensus_height(height)
@@ -1715,7 +1734,7 @@ mod tests {
     fn live_import_projection_commit_preserves_epoch_record_timestamp() {
         let mut state = ChainState::new_genesis();
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x62, 10_000, true, true);
-        state.height = EPOCH_DURATION_BLOCKS - 1;
+        advance_fixture_height_with_issuance(&mut state, EPOCH_DURATION_BLOCKS - 1);
         state.tip_hash = Bytes32::from([0xA5; 32]);
 
         let parent_qc = build_qc_bytes(
@@ -2261,8 +2280,16 @@ mod tests {
         let real = make_strict_block(&state, 0xB1, 0, vec![]);
         let mut unfinalized_fork = real.clone();
         unfinalized_fork.header.timestamp = unfinalized_fork.header.timestamp.saturating_add(1);
-        unfinalized_fork.header.value_hash =
-            unfinalized_fork.compute_value_hash(state.total_supply);
+        let mut fork_projection_state = state.clone();
+        let roots = indra_state::project_block_for_roots(
+            &mut fork_projection_state,
+            &unfinalized_fork.block,
+            0,
+        )
+        .unwrap();
+        unfinalized_fork.header.state_root = roots.state_root;
+        unfinalized_fork.header.validator_set_root = roots.validator_set_root;
+        unfinalized_fork.header.value_hash = roots.value_hash;
         authorize_test_proposal(
             &mut unfinalized_fork,
             state.chain_id.as_bytes(),

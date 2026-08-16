@@ -46,6 +46,7 @@ pub mod fee;
 pub mod governance;
 pub mod governance_apply;
 pub mod identity;
+pub mod monetary;
 pub mod pending;
 pub mod persistent;
 pub mod smt;

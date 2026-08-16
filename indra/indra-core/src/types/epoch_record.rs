@@ -21,16 +21,22 @@ pub struct EpochRecord {
     pub active_validators: u32,
     /// Total Spark staked at epoch start.
     pub total_staked_spark: u64,
-    /// Total block rewards distributed this epoch in Spark.
-    pub block_rewards_distributed: u64,
+    /// Total rewards minted and distributed this epoch in Spark.
+    pub reward_minted_spark: u64,
     /// Total fee rewards distributed this epoch in Spark.
     pub fee_rewards_distributed: u64,
     /// Total Spark burned via fee burn this epoch.
-    pub fees_burned: u64,
+    pub fee_burned_spark: u64,
+    /// Total Spark burned from validator principal this epoch.
+    pub slash_burned_spark: u64,
     /// Total Spark burned from governance proposal deposits this epoch.
-    pub governance_deposits_burned: u64,
-    /// Total Spark slashed this epoch.
-    pub total_slashed_spark: u64,
+    pub governance_burned_spark: u64,
+    /// Checked sum of every burn source this epoch.
+    pub total_burned_spark: u64,
+    /// Total supply at the beginning of the epoch.
+    pub opening_total_supply_spark: u64,
+    /// Total supply at the end of the epoch.
+    pub closing_total_supply_spark: u64,
     /// Number of slash events this epoch.
     pub slash_event_count: u32,
     /// Number of liveness penalties applied this epoch.
@@ -49,10 +55,6 @@ pub struct EpochRecord {
     /// rate. In that case this field remains the starting rate while
     /// `block_rewards_distributed` records the exact mixed-rate total.
     pub block_reward_spark: u64,
-    /// Total supply at end of epoch.
-    pub total_supply: u64,
-    /// Treasury balance at end of epoch.
-    pub treasury_balance: u64,
 }
 
 impl Encode for EpochRecord {
@@ -64,11 +66,14 @@ impl Encode for EpochRecord {
         self.timestamp_secs.encode(buf);
         self.active_validators.encode(buf);
         self.total_staked_spark.encode(buf);
-        self.block_rewards_distributed.encode(buf);
+        self.reward_minted_spark.encode(buf);
         self.fee_rewards_distributed.encode(buf);
-        self.fees_burned.encode(buf);
-        self.governance_deposits_burned.encode(buf);
-        self.total_slashed_spark.encode(buf);
+        self.fee_burned_spark.encode(buf);
+        self.slash_burned_spark.encode(buf);
+        self.governance_burned_spark.encode(buf);
+        self.total_burned_spark.encode(buf);
+        self.opening_total_supply_spark.encode(buf);
+        self.closing_total_supply_spark.encode(buf);
         self.slash_event_count.encode(buf);
         self.liveness_penalty_count.encode(buf);
         self.avg_base_fee.encode(buf);
@@ -76,12 +81,10 @@ impl Encode for EpochRecord {
         encode_list(&self.validators_left, buf);
         self.era.encode(buf);
         self.block_reward_spark.encode(buf);
-        self.total_supply.encode(buf);
-        self.treasury_balance.encode(buf);
     }
 
     fn encoded_len(&self) -> usize {
-        1 + 15 * 8
+        1 + 16 * 8
             + 3 * 4
             + list_encoded_len(&self.validators_joined)
             + list_encoded_len(&self.validators_left)
@@ -103,18 +106,21 @@ impl Decode for EpochRecord {
 }
 
 fn decode_epoch_record(r: &mut ByteReader<'_>) -> IndraResult<EpochRecord> {
-    Ok(EpochRecord {
+    let record = EpochRecord {
         epoch: u64::decode(r)?,
         start_height: u64::decode(r)?,
         end_height: u64::decode(r)?,
         timestamp_secs: u64::decode(r)?,
         active_validators: u32::decode(r)?,
         total_staked_spark: u64::decode(r)?,
-        block_rewards_distributed: u64::decode(r)?,
+        reward_minted_spark: u64::decode(r)?,
         fee_rewards_distributed: u64::decode(r)?,
-        fees_burned: u64::decode(r)?,
-        governance_deposits_burned: u64::decode(r)?,
-        total_slashed_spark: u64::decode(r)?,
+        fee_burned_spark: u64::decode(r)?,
+        slash_burned_spark: u64::decode(r)?,
+        governance_burned_spark: u64::decode(r)?,
+        total_burned_spark: u64::decode(r)?,
+        opening_total_supply_spark: u64::decode(r)?,
+        closing_total_supply_spark: u64::decode(r)?,
         slash_event_count: u32::decode(r)?,
         liveness_penalty_count: u32::decode(r)?,
         avg_base_fee: u64::decode(r)?,
@@ -122,9 +128,29 @@ fn decode_epoch_record(r: &mut ByteReader<'_>) -> IndraResult<EpochRecord> {
         validators_left: decode_list(r, MAX_VALIDATORS, "epoch.validators_left")?,
         era: u64::decode(r)?,
         block_reward_spark: u64::decode(r)?,
-        total_supply: u64::decode(r)?,
-        treasury_balance: u64::decode(r)?,
-    })
+    };
+    let total_burned = record
+        .fee_burned_spark
+        .checked_add(record.slash_burned_spark)
+        .and_then(|value| value.checked_add(record.governance_burned_spark))
+        .ok_or(IndraError::InvariantViolation {
+            message: "epoch burn accounting overflow",
+        })?;
+    let expected_close = record
+        .opening_total_supply_spark
+        .checked_add(record.reward_minted_spark)
+        .and_then(|value| value.checked_sub(total_burned))
+        .ok_or(IndraError::InvariantViolation {
+            message: "epoch supply accounting overflow",
+        })?;
+    if total_burned != record.total_burned_spark
+        || expected_close != record.closing_total_supply_spark
+    {
+        return Err(IndraError::InvariantViolation {
+            message: "epoch monetary identity mismatch",
+        });
+    }
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -139,11 +165,14 @@ mod tests {
             timestamp_secs: 1_750_000_000,
             active_validators: 4,
             total_staked_spark: 400_000_000_000,
-            block_rewards_distributed: 356_760_000_000,
+            reward_minted_spark: 356_760_000_000,
             fee_rewards_distributed: 123,
-            fees_burned: 456,
-            governance_deposits_burned: 123,
-            total_slashed_spark: 789,
+            fee_burned_spark: 456,
+            slash_burned_spark: 789,
+            governance_burned_spark: 123,
+            total_burned_spark: 1_368,
+            opening_total_supply_spark: 100_000_000_000_000_000,
+            closing_total_supply_spark: 100_000_356_759_998_632,
             slash_event_count: 2,
             liveness_penalty_count: 1,
             avg_base_fee: 10,
@@ -151,8 +180,6 @@ mod tests {
             validators_left: vec![Bytes32::from([3u8; 32])],
             era: 1,
             block_reward_spark: 1_189_200_000,
-            total_supply: 100_000_000_000_000_000,
-            treasury_balance: 42,
         }
     }
 

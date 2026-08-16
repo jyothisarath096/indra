@@ -7,16 +7,16 @@ governance and monetary policy.
 
 Runtime governance must not be able to change:
 
-- the genesis supply;
-- the hard cap;
-- the validator reward pool;
+- the checked genesis issuance;
+- the lifetime issuance cap;
+- the genesis-fixed post-genesis reward budget;
 - reward-era durations;
-- per-era block reward constants;
-- the block-height schedule that maps a block to its reward amount.
+- the exact cumulative-target formula that maps height to minted rewards.
 
-These values live in `indra-core/src/types/primitives.rs` as protocol
-constants. The reward schedule is applied by
-`indra-state/src/epoch.rs::block_reward_at_height`.
+The cap and era durations are protocol constants. Genesis fixes the reward
+budget as cap minus checked real genesis claims. The exact schedule is
+implemented in `indra-state/src/monetary.rs` and applied only by the
+height-derived issuance transition in `indra-state/src/epoch.rs`.
 
 Changing any of these values requires an explicit protocol upgrade or
 hard fork. It must not be introduced as a `GovernableAction`.

@@ -9,8 +9,8 @@ use indra_core::{
         block::{BlockHeaderVNext, BlockVNext},
         crypto::PQVoteSig,
         primitives::{
-            DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, GENESIS_SUPPLY_SPARK,
-            INITIAL_BASE_FEE_SPARK_PER_KB, MAX_QC_SIZE_BYTES, TRANSACTION_PROTOCOL_VERSION,
+            DUST_LIMIT_SPARK, EPOCH_DURATION_BLOCKS, INITIAL_BASE_FEE_SPARK_PER_KB,
+            LIFETIME_SUPPLY_CAP_SPARK, MAX_QC_SIZE_BYTES, TRANSACTION_PROTOCOL_VERSION,
         },
         qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES},
         staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
@@ -151,6 +151,34 @@ fn finalized_genesis() -> ChainState {
     state.validators.get_mut(&validator_id).unwrap().stake_spark = TEST_INPUT_VALUE;
     state.finalize_genesis().unwrap();
     state
+}
+
+fn account_fixture_claims(state: &mut ChainState) {
+    state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+    state.total_supply = issued;
+    state.monetary_ledger.genesis_issued_spark = issued;
+    state.monetary_ledger.reward_budget_spark = LIFETIME_SUPPLY_CAP_SPARK - issued;
+    state.monetary_ledger.validate(issued).unwrap();
+}
+
+fn advance_fixture_height_with_issuance(state: &mut ChainState, height: u64) {
+    let target = indra_state::monetary::cumulative_reward_target_at_height(
+        state.monetary_ledger.reward_budget_spark,
+        height,
+    )
+    .unwrap();
+    if target != 0 {
+        let mut position = state.stake_positions.values().next().unwrap().clone();
+        position.pending_rewards_spark =
+            position.pending_rewards_spark.checked_add(target).unwrap();
+        state.stake_positions.insert(position.position_id, position);
+    }
+    state.monetary_ledger.cumulative_reward_minted_spark = target;
+    state.monetary_ledger.epoch_reward_minted_spark = target;
+    state.total_supply = state.total_supply.checked_add(target).unwrap();
+    state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    state.height = height;
 }
 
 fn sign_transaction(
@@ -355,7 +383,10 @@ fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockVNext 
 #[test]
 fn genesis_state_constants() {
     let state = new_test_state();
-    assert_eq!(state.total_supply, GENESIS_SUPPLY_SPARK);
+    assert_eq!(
+        state.total_supply,
+        state.monetary_aggregates.total_claims_spark().unwrap()
+    );
     assert_eq!(state.height, 0);
     assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
 }
@@ -364,7 +395,7 @@ fn genesis_state_constants() {
 fn last_active_epoch_updated_identically_live_and_replay() {
     let mut live_state = new_test_state();
     let signer_ids = install_test_validators_for_qc(&mut live_state);
-    live_state.height = EPOCH_DURATION_BLOCKS;
+    advance_fixture_height_with_issuance(&mut live_state, EPOCH_DURATION_BLOCKS);
 
     let mut replay_state = live_state.clone();
     for _ in 0..10 {
@@ -414,7 +445,7 @@ fn last_active_epoch_updated_identically_live_and_replay() {
 fn apply_block_updates_last_active_epoch_for_qc_signers() {
     let mut state = new_test_state();
     let signer_ids = install_test_validators_for_qc(&mut state);
-    state.height = EPOCH_DURATION_BLOCKS;
+    advance_fixture_height_with_issuance(&mut state, EPOCH_DURATION_BLOCKS);
 
     for validator_id in &signer_ids {
         assert_eq!(
@@ -533,6 +564,7 @@ fn utxo_lifecycle_across_blocks() {
     // Create a UTXO by inserting it at genesis
     let output = make_output(0x01, owner_pubkey.clone());
     let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+    account_fixture_claims(&mut state);
 
     // Block 1: spend that UTXO, create a new one
     let block1_output_value = (TEST_INPUT_VALUE + 0x01u64) - (INITIAL_BASE_FEE_SPARK_PER_KB * 10);
@@ -601,7 +633,7 @@ fn fee_evolves_over_blocks() {
 fn epoch_transition_fires_at_boundary() {
     let mut state = finalized_genesis();
     let supply_before = state.total_supply;
-    let treasury_before = state.treasury_balance;
+    let reward_budget = state.monetary_ledger.reward_budget_spark;
 
     // Apply exactly one epoch worth of blocks
     for _ in 0..EPOCH_DURATION_BLOCKS {
@@ -611,28 +643,40 @@ fn epoch_transition_fires_at_boundary() {
 
     assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
     assert_eq!(state.current_epoch(), 1);
-    assert_eq!(state.total_supply, supply_before);
-    assert_eq!(state.treasury_balance, treasury_before);
+    let expected = indra_state::monetary::cumulative_reward_target_at_height(
+        reward_budget,
+        EPOCH_DURATION_BLOCKS,
+    )
+    .unwrap();
+    assert_eq!(
+        state.total_supply,
+        supply_before.checked_add(expected).unwrap()
+    );
 }
 
 #[test]
-fn two_epochs_preserve_supply() {
+fn two_epochs_follow_exact_cumulative_issuance() {
     let mut state = finalized_genesis();
+    let genesis_supply = state.total_supply;
+    let budget = state.monetary_ledger.reward_budget_spark;
 
     // First epoch
     for _ in 0..EPOCH_DURATION_BLOCKS {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
     }
-    let supply_after_epoch1 = state.total_supply;
-
     // Second epoch
     for _ in 0..EPOCH_DURATION_BLOCKS {
         let block = make_block(&state, vec![]);
         apply_block(&mut state, &block, 0).unwrap();
     }
 
-    assert_eq!(state.total_supply, supply_after_epoch1);
+    let expected = indra_state::monetary::cumulative_reward_target_at_height(
+        budget,
+        EPOCH_DURATION_BLOCKS * 2,
+    )
+    .unwrap();
+    assert_eq!(state.total_supply, genesis_supply + expected);
     assert_eq!(state.current_epoch(), 2);
 }
 
@@ -644,7 +688,13 @@ fn fees_are_burned() {
     // Insert a spendable UTXO
     let output = make_output(0x01, owner_pubkey.clone());
     let utxo_id = state.utxos.insert(output, 0, 0, 0).unwrap();
+    account_fixture_claims(&mut state);
     let supply_before = state.total_supply;
+    let reward = indra_state::monetary::block_reward_for_budget(
+        state.monetary_ledger.reward_budget_spark,
+        1,
+    )
+    .unwrap();
 
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
     let tx = make_tx(
@@ -662,7 +712,7 @@ fn fees_are_burned() {
     let block = make_block(&state, vec![tx]);
     apply_block(&mut state, &block, 0).unwrap();
 
-    assert_eq!(state.total_supply, supply_before - (fee / 2));
+    assert_eq!(state.total_supply, supply_before + reward - (fee / 2));
     assert_eq!(state.fee_reward_pool, fee - (fee / 2));
 }
 
@@ -734,19 +784,9 @@ fn test_auto_delegate_full_lifecycle() {
     apply_block(&mut state, &set_block, 0).unwrap();
 
     let mut previous_rewards = 0;
-    for epoch in 1u64..=3 {
-        apply_epoch_transition(
-            &mut state,
-            &EpochTransitionContext::new(
-                (epoch).saturating_mul(EPOCH_DURATION_BLOCKS),
-                (epoch)
-                    .saturating_mul(EPOCH_DURATION_BLOCKS)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-            0,
-        )
-        .unwrap();
+    for _ in 1u64..=3 {
+        let reward_block = make_block(&state, vec![]);
+        apply_block(&mut state, &reward_block, 0).unwrap();
         let rewards = state
             .stake_positions
             .get(&inactive_position_id)
@@ -778,13 +818,14 @@ fn test_auto_delegate_full_lifecycle() {
     claim_block.staking_ops = vec![claim_rewards];
     apply_block(&mut state, &claim_block, 0).unwrap();
 
-    assert_eq!(
-        state
-            .stake_positions
-            .get(&inactive_position_id)
-            .unwrap()
-            .pending_rewards_spark,
-        0
+    let post_claim_accrual = state
+        .stake_positions
+        .get(&inactive_position_id)
+        .unwrap()
+        .pending_rewards_spark;
+    assert!(
+        post_claim_accrual < claimed,
+        "the claim must clear prior accrual even though its own block issues a fresh reward"
     );
     assert_eq!(state.utxos.len(), utxos_before + 1);
     assert!(state

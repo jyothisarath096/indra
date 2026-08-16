@@ -210,6 +210,14 @@ impl UtxoSet {
         self.entries.is_empty()
     }
 
+    /// Checked sum of every live output value.
+    pub fn total_value_spark(&self) -> StateResult<u64> {
+        self.entries.values().try_fold(0u64, |sum, entry| {
+            sum.checked_add(entry.output.value_spark)
+                .ok_or(StateError::ValueOverflow)
+        })
+    }
+
     /// Compute the deterministic UTXO ID for an output at a given position.
     ///
     /// utxo_id = SHA-256(encode(output) || u64_le(height) || u32_le(tx_idx) || u32_le(out_idx))

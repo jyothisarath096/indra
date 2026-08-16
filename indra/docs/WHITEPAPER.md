@@ -33,12 +33,12 @@ observers can see OutputV1 owner/value metadata. Future transaction
 privacy work is documented as planned, not implemented. This distinction
 is stated clearly here and not buried.
 
-The monetary policy is simple and immutable: one billion INDRA, all
-pre-minted at genesis and locked in a protocol reward reserve, released
-deterministically to validators through block rewards over approximately
-one hundred years. No new supply is ever created after genesis. No coins
-were pre-allocated to any person or entity. Every INDRA is earned by
-securing the network.
+The monetary policy has an immutable lifetime cap of one billion INDRA.
+Genesis supply is only the checked sum of real validator self-stakes and
+liquid genesis UTXOs. The remainder is minted, with checked arithmetic, as
+height-derived validator rewards under an exact cumulative halving schedule.
+There is no reward reserve, treasury, foundation allocation, or governance
+path capable of changing the cap or issuance schedule.
 
 INDRA is written entirely in Rust. All code is open source. The
 implementation has undergone preliminary internal review. A professional
@@ -338,15 +338,16 @@ cross the C ABI boundary; no raw-key compatibility exports exist.
 
 ### 3.1 Supply model
 
-All one billion INDRA are created at the genesis block. No new supply
-is ever created after this point. The total supply can only decrease
-over time through transaction fee burn.
+INDRA uses capped issuance. Genesis creates only its real bootstrap claims;
+subsequent blocks mint the exact reward derived from height and the immutable
+post-genesis reward budget. Burns can reduce supply, but total supply can
+never exceed the lifetime cap.
 
 ```
 Hard cap:            1,000,000,000 INDRA
 Decimals:            8 (1 INDRA = 100,000,000 Spark)
-Post-genesis supply: Zero new INDRA ever created
-Supply direction:    Decreasing (fee burn only)
+Post-genesis supply: Checked height-derived reward issuance
+Supply direction:    Issuance minus transaction/governance/slash burns
 ```
 
 The hard cap is enforced as a constitutional invariant in the protocol.
@@ -355,14 +356,10 @@ billion INDRA. This cannot be overridden by governance.
 
 ### 3.2 Genesis allocation
 
-```
-Validator Rewards Pool   1,000,000,000 INDRA   100%
-```
-
-All 1,000,000,000 INDRA exist in protocol state from the genesis block,
-locked in a reward reserve not controlled by any private key. Block
-rewards are distributed automatically by the state machine according
-to the immutable schedule. No human intervention is required or possible.
+Genesis issuance is the canonical checked sum of validator self-stakes and
+liquid validator UTXOs actually created by the genesis manifest. Consensus
+rejects allocations above the cap and fixes
+`reward_budget_spark = lifetime_cap - genesis_issued_spark` permanently.
 
 Every INDRA must be earned by running infrastructure that secures the
 network. There is no foundation pre-mine, no team allocation, no investor
@@ -371,25 +368,25 @@ they earn block rewards by running validator nodes.
 
 ### 3.3 Block reward schedule
 
-Rewards are distributed from the locked reserve — not newly created
-supply. The reward per block follows a flat-then-halving schedule:
+Rewards are checked-minted at each successful height. Exact cumulative
+targets normalize the fixed-duration halving shape to the post-genesis budget:
 
 ```
-Era    Period          Reward / block         Total released
+Era    Period          Share of post-genesis budget
 ─────────────────────────────────────────────────────────────
-1      Year 1–4        11.892 INDRA           ~250,000,000 INDRA
-2      Year 4–8         5.946 INDRA           ~125,000,000 INDRA
-3      Year 8–16        2.973 INDRA           ~125,000,000 INDRA
-4      Year 16–24       1.486 INDRA            ~62,500,000 INDRA
-5+     Halves every 8 years thereafter
+1      Year 1–4        40%
+2      Year 4–8        20%
+3      Year 8–16       20%
+4      Year 16–24      10%
+5+     Remaining era share halves every 8 years
 ```
 
-Era 1 releases approximately 25% of the total supply over four years.
+Era 1 issues 40% of the post-genesis reward budget over four years.
 High early rewards attract validators during the bootstrap period.
 The reward schedule is immutable and cannot be changed by governance.
 
-**Epoch rewards:** 300 blocks × 11.892 INDRA/block = 3,567.6 INDRA
-distributed per epoch (~30 minutes) during Era 1.
+Adjacent per-block rewards can differ by one Spark so every era and the full
+lifetime budget telescope exactly, without a terminal sweep or remainder fund.
 
 ### 3.4 Fee model
 
@@ -695,8 +692,8 @@ impractical.
 The following are enforced immutable in code and cannot be changed by
 any governance action regardless of support level:
 
-- `HARD_CAP_SPARK` — 1,000,000,000 INDRA maximum supply
-- Era block reward schedule — halving schedule
+- `LIFETIME_SUPPLY_CAP_SPARK` — 1,000,000,000 INDRA maximum lifetime issuance
+- Exact cumulative era/block reward schedule and genesis-fixed reward budget
 - Exact strict BFT quorum predicate — `signed_stake * 3 > total_stake * 2`,
   evaluated with checked `u128` intermediates; it is not a rounded BPS parameter
 - `active_slot_coefficient_numerator` (`F`) — immutable genesis-selected
@@ -966,7 +963,9 @@ a quantum adversary. Considered acceptable at current parameter sizes.
 ### B. Protocol constants
 
 ```
-Hard cap:                    1,000,000,000 INDRA
+Lifetime issuance cap:       1,000,000,000 INDRA
+Genesis issuance:            Checked real genesis claims only
+Post-genesis rewards:        Exact cumulative halving targets
 Spark per INDRA:             100,000,000 (8 decimal places)
 Dust limit:                  0.001 INDRA (100,000 Spark)
 Block time:                  6 seconds
@@ -984,7 +983,8 @@ Validator set phases:
   Phase 3 (<50M INDRA staked):  100 validators
   Phase 4 (≥50M INDRA staked):  200 validators
 
-Era 1 block reward:          11.892 INDRA (1,189,200,000 Spark)
+Era 1 allocation:            40% of genesis-fixed reward budget
+Per-block amount:            Exact cumulative-target difference (±1 Spark)
 Era 1 duration:              4 years (21,024,000 blocks)
 Era 2 duration:              4 years
 Era 3+ duration:             8 years per era

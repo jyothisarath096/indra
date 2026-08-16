@@ -19,6 +19,7 @@ use indra_core::{
     Bytes32,
 };
 
+use crate::monetary::{MonetaryAggregatesV1, MonetaryLedgerV1};
 use crate::{
     chain::ChainState,
     effects::CanonicalStateEffects,
@@ -37,13 +38,10 @@ struct ScalarSnapshot {
     tip_hash: Bytes32,
     base_fee: u64,
     total_supply: u64,
-    treasury_balance: u64,
-    burn_buffer: u64,
     fee_reward_pool: u64,
-    epoch_fees_burned: u64,
-    epoch_slashed_spark: u64,
-    epoch_governance_burned_spark: u64,
     epoch_slash_event_count: u32,
+    monetary_ledger: MonetaryLedgerV1,
+    monetary_aggregates: MonetaryAggregatesV1,
     election_seed: Bytes64,
     election_seed_height: u64,
 }
@@ -166,14 +164,11 @@ impl<'a> StateTxn<'a> {
                     effects.base_fee_changed |= before.base_fee != state.base_fee;
                     effects.economic_accounting_changed |= before.total_supply
                         != state.total_supply
-                        || before.treasury_balance != state.treasury_balance
-                        || before.burn_buffer != state.burn_buffer
-                        || before.fee_reward_pool != state.fee_reward_pool;
-                    effects.epoch_summary_changed |= before.epoch_fees_burned
-                        != state.epoch_fees_burned
-                        || before.epoch_slashed_spark != state.epoch_slashed_spark
-                        || before.epoch_governance_burned_spark
-                            != state.epoch_governance_burned_spark
+                        || before.fee_reward_pool != state.fee_reward_pool
+                        || before.monetary_ledger != state.monetary_ledger
+                        || before.monetary_aggregates != state.monetary_aggregates;
+                    effects.epoch_summary_changed |= before.monetary_ledger
+                        != state.monetary_ledger
                         || before.epoch_slash_event_count != state.epoch_slash_event_count;
                     effects.epoch_changed |= before.height
                         / indra_core::types::primitives::EPOCH_DURATION_BLOCKS
@@ -394,13 +389,10 @@ impl<'a> StateTxn<'a> {
             tip_hash: self.state.tip_hash,
             base_fee: self.state.base_fee,
             total_supply: self.state.total_supply,
-            treasury_balance: self.state.treasury_balance,
-            burn_buffer: self.state.burn_buffer,
             fee_reward_pool: self.state.fee_reward_pool,
-            epoch_fees_burned: self.state.epoch_fees_burned,
-            epoch_slashed_spark: self.state.epoch_slashed_spark,
-            epoch_governance_burned_spark: self.state.epoch_governance_burned_spark,
             epoch_slash_event_count: self.state.epoch_slash_event_count,
+            monetary_ledger: self.state.monetary_ledger.clone(),
+            monetary_aggregates: self.state.monetary_aggregates,
             election_seed: self.state.election_seed,
             election_seed_height: self.state.election_seed_height,
         });
@@ -619,21 +611,44 @@ impl<'a> StateTxn<'a> {
         burn_amount: u64,
         validator_amount: u64,
     ) -> StateResult<()> {
+        let gross = burn_amount
+            .checked_add(validator_amount)
+            .ok_or(crate::StateError::ValueOverflow)?;
+        crate::monetary::MonetaryDeltaV1::split_burn(
+            gross,
+            validator_amount,
+            burn_amount,
+            crate::monetary::BurnSourceV1::TransactionFee,
+        )?;
         self.record_scalars();
-        self.state.total_supply = self.state.total_supply.saturating_sub(burn_amount);
-        self.state.fee_reward_pool = self.state.fee_reward_pool.saturating_add(validator_amount);
-        self.state.epoch_fees_burned = self.state.epoch_fees_burned.saturating_add(burn_amount);
+        self.state.total_supply = self.state.total_supply.checked_sub(burn_amount).ok_or(
+            crate::StateError::InvariantViolation {
+                message: "fee burn exceeds total supply",
+            },
+        )?;
+        self.state.fee_reward_pool = self
+            .state
+            .fee_reward_pool
+            .checked_add(validator_amount)
+            .ok_or(crate::StateError::ValueOverflow)?;
+        self.state.monetary_ledger.cumulative_fee_burned_spark = self
+            .state
+            .monetary_ledger
+            .cumulative_fee_burned_spark
+            .checked_add(burn_amount)
+            .ok_or(crate::StateError::ValueOverflow)?;
+        self.state.monetary_ledger.epoch_fee_burned_spark = self
+            .state
+            .monetary_ledger
+            .epoch_fee_burned_spark
+            .checked_add(burn_amount)
+            .ok_or(crate::StateError::ValueOverflow)?;
         self.after_mutation()
     }
 
     /// Add explicit slash accounting.
-    pub(crate) fn add_slash_accounting(&mut self, amount: u64) -> StateResult<()> {
+    pub(crate) fn add_slash_accounting(&mut self, _amount: u64) -> StateResult<()> {
         self.record_scalars();
-        self.state.epoch_slashed_spark = self
-            .state
-            .epoch_slashed_spark
-            .checked_add(amount)
-            .ok_or(crate::StateError::ValueOverflow)?;
         self.state.epoch_slash_event_count = self
             .state
             .epoch_slash_event_count
@@ -769,14 +784,10 @@ impl<'a> StateTxn<'a> {
                     self.state.tip_hash = snapshot.tip_hash;
                     self.state.base_fee = snapshot.base_fee;
                     self.state.total_supply = snapshot.total_supply;
-                    self.state.treasury_balance = snapshot.treasury_balance;
-                    self.state.burn_buffer = snapshot.burn_buffer;
                     self.state.fee_reward_pool = snapshot.fee_reward_pool;
-                    self.state.epoch_fees_burned = snapshot.epoch_fees_burned;
-                    self.state.epoch_slashed_spark = snapshot.epoch_slashed_spark;
-                    self.state.epoch_governance_burned_spark =
-                        snapshot.epoch_governance_burned_spark;
                     self.state.epoch_slash_event_count = snapshot.epoch_slash_event_count;
+                    self.state.monetary_ledger = snapshot.monetary_ledger;
+                    self.state.monetary_aggregates = snapshot.monetary_aggregates;
                     self.state.election_seed = snapshot.election_seed;
                     self.state.election_seed_height = snapshot.election_seed_height;
                 }

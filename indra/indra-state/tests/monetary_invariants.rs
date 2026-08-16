@@ -4,7 +4,8 @@ use indra_core::types::{
     block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES, TRANSACTION_PROTOCOL_VERSION,
+        Bytes32, ProtocolVersion, VariableBytes, LIFETIME_SUPPLY_CAP_SPARK, MAX_QC_SIZE_BYTES,
+        TRANSACTION_PROTOCOL_VERSION,
     },
     transaction::{InputV1, OutputV1, TransactionV1},
 };
@@ -84,6 +85,15 @@ fn state() -> (ChainState, HybridPubKey, HybridKeypair) {
     (state, owner, pair)
 }
 
+fn account_fixture_claims(state: &mut ChainState) {
+    state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+    let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+    state.total_supply = issued;
+    state.monetary_ledger.genesis_issued_spark = issued;
+    state.monetary_ledger.reward_budget_spark = LIFETIME_SUPPLY_CAP_SPARK - issued;
+    state.monetary_ledger.validate(issued).unwrap();
+}
+
 fn signed_tx(
     state: &ChainState,
     pair: &HybridKeypair,
@@ -153,6 +163,18 @@ fn apply_values(inputs: &[u64], outputs: &[u64], fee: u64) -> Result<(), StateEr
                 .unwrap()
         })
         .collect();
+    if inputs
+        .iter()
+        .try_fold(0u64, |sum, value| sum.checked_add(*value))
+        .is_some_and(|input_total| {
+            state
+                .total_supply
+                .checked_add(input_total)
+                .is_some_and(|total| total <= LIFETIME_SUPPLY_CAP_SPARK)
+        })
+    {
+        account_fixture_claims(&mut state);
+    }
     let tx = signed_tx(
         &state,
         &pair,
@@ -203,7 +225,8 @@ fn dust_boundaries_are_consensus_enforced() {
     let dust = indra_core::types::primitives::DUST_LIMIT_SPARK;
     assert!(apply_values(&[dust], &[0], dust).is_err());
     assert!(apply_values(&[dust], &[dust - 1], 1).is_err());
-    assert!(apply_values(&[dust], &[dust], 0).is_ok());
+    let exact_dust = apply_values(&[dust], &[dust], 0);
+    assert!(exact_dust.is_ok(), "exact dust failed: {exact_dust:?}");
     assert!(apply_values(&[1_000_000_000], &[999_900_000], 100_000).is_ok());
 }
 
@@ -230,6 +253,7 @@ fn fee_burn_reduces_total_supply() {
         .utxos
         .insert(output(input_value, owner.clone()), 0, 0, 0)
         .unwrap();
+    account_fixture_claims(&mut state);
     let tx = signed_tx(
         &state,
         &pair,
@@ -238,9 +262,17 @@ fn fee_burn_reduces_total_supply() {
         fee,
     );
     let supply_before = state.total_supply;
+    let expected_reward = indra_state::monetary::block_reward_for_budget(
+        state.monetary_ledger.reward_budget_spark,
+        1,
+    )
+    .unwrap();
     let block = block(&state, tx);
     apply_block(&mut state, &block, 0).unwrap();
-    assert_eq!(state.total_supply, supply_before - fee / 2);
+    assert_eq!(
+        state.total_supply,
+        supply_before + expected_reward - fee / 2
+    );
 }
 
 #[test]
@@ -267,6 +299,7 @@ fn total_supply_invariant_across_full_epoch_cycle() {
         .utxos
         .insert(output(input_value, owner.clone()), 0, 0, 0)
         .unwrap();
+    account_fixture_claims(&mut state);
     let tx = signed_tx(
         &state,
         &pair,
@@ -275,6 +308,11 @@ fn total_supply_invariant_across_full_epoch_cycle() {
         fee,
     );
     let supply_before = state.total_supply;
+    let expected_reward = indra_state::monetary::block_reward_for_budget(
+        state.monetary_ledger.reward_budget_spark,
+        1,
+    )
+    .unwrap();
     let block = block(&state, tx);
     apply_block(&mut state, &block, 0).unwrap();
     let after_block = state.total_supply;
@@ -285,6 +323,6 @@ fn total_supply_invariant_across_full_epoch_cycle() {
         0,
     )
     .unwrap();
-    assert_eq!(after_block, supply_before - fee / 2);
+    assert_eq!(after_block, supply_before + expected_reward - fee / 2);
     assert_eq!(state.total_supply, after_block);
 }

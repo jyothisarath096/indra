@@ -1799,6 +1799,17 @@ fn validate_manifest_if_present(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account_fixture_claims(state: &mut ChainState) {
+        state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
+        let issued = state.monetary_aggregates.total_claims_spark().unwrap();
+        state.total_supply = issued;
+        state.monetary_ledger.genesis_issued_spark = issued;
+        state.monetary_ledger.reward_budget_spark =
+            indra_core::types::primitives::LIFETIME_SUPPLY_CAP_SPARK - issued;
+        state.monetary_ledger.cumulative_reward_minted_spark = 0;
+        state.monetary_ledger.epoch_reward_minted_spark = 0;
+    }
     use indra_consensus::{
         build_qc,
         producer::{produce_block, BlockTemplate},
@@ -3730,11 +3741,14 @@ mod tests {
                     timestamp_secs: 1,
                     active_validators: 1,
                     total_staked_spark: 1,
-                    block_rewards_distributed: 0,
+                    reward_minted_spark: 0,
                     fee_rewards_distributed: 0,
-                    fees_burned: 0,
-                    governance_deposits_burned: 0,
-                    total_slashed_spark: 0,
+                    fee_burned_spark: 0,
+                    slash_burned_spark: 0,
+                    governance_burned_spark: 0,
+                    total_burned_spark: 0,
+                    opening_total_supply_spark: projected.total_supply,
+                    closing_total_supply_spark: projected.total_supply,
                     slash_event_count: 0,
                     liveness_penalty_count: 0,
                     avg_base_fee: 1,
@@ -3742,8 +3756,6 @@ mod tests {
                     validators_left: vec![],
                     era: 0,
                     block_reward_spark: 0,
-                    total_supply: projected.total_supply,
-                    treasury_balance: projected.treasury_balance,
                 })
                 .unwrap();
         }
@@ -4676,6 +4688,7 @@ mod tests {
             proof_carrying_slash(&engine, &slash_a),
             proof_carrying_slash(&engine, &slash_b),
         ];
+        account_fixture_claims(&mut engine.state);
 
         let contents = engine.select_block_contents();
         assert_eq!(contents.transactions, vec![expected_tx.clone()]);

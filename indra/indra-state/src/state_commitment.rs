@@ -487,8 +487,8 @@ mod tests {
         );
 
         let mut unrelated = state.clone();
-        unrelated.epoch_fees_burned = 99;
-        unrelated.epoch_slashed_spark = 88;
+        unrelated.monetary_ledger.epoch_fee_burned_spark = 99;
+        unrelated.monetary_ledger.epoch_slash_burned_spark = 88;
         unrelated.epoch_slash_event_count = 7;
         assert_eq!(
             StateCommitmentV2::from_state(&unrelated, height).root(),
@@ -534,7 +534,7 @@ mod tests {
         );
 
         let mut unrelated = state.clone();
-        unrelated.epoch_fees_burned = 99;
+        unrelated.monetary_ledger.epoch_fee_burned_spark = 99;
         assert_eq!(
             StateCommitmentV2::from_state(&unrelated, height).root(),
             baseline
@@ -564,7 +564,7 @@ mod tests {
         );
 
         let mut unrelated = state.clone();
-        unrelated.epoch_fees_burned = 99;
+        unrelated.monetary_ledger.epoch_fee_burned_spark = 99;
         assert_eq!(
             StateCommitmentV2::from_state(&unrelated, height).root(),
             baseline

@@ -328,8 +328,6 @@ struct MetricsSnapshot {
     base_fee: u64,
     total_supply: u64,
     total_staked: u64,
-    treasury: u64,
-    burn_buffer: u64,
     block_reward: u64,
     round: u32,
     connected_validator_peers: usize,
@@ -390,9 +388,13 @@ impl MetricsSnapshot {
             base_fee: s.base_fee,
             total_supply: s.total_supply,
             total_staked,
-            treasury: s.treasury_balance,
-            burn_buffer: s.burn_buffer,
-            block_reward: indra_state::epoch::block_reward_at_height(s.height),
+            block_reward: indra_state::monetary::block_reward_for_budget(
+                s.monetary_ledger.reward_budget_spark,
+                s.height
+                    .checked_add(1)
+                    .expect("validated chain height must admit a successor"),
+            )
+            .expect("validated monetary schedule must produce the next reward"),
             round,
             connected_validator_peers,
             observer_connections: observer_count.load(Ordering::Relaxed),
@@ -461,18 +463,6 @@ fn render_snapshot(
         "indra_total_staked_spark",
         "Total staked Spark (self-stake + delegated)",
         snapshot.total_staked,
-    );
-    gauge(
-        &mut buf,
-        "indra_treasury_balance_spark",
-        "Treasury balance in Spark",
-        snapshot.treasury,
-    );
-    gauge(
-        &mut buf,
-        "indra_burn_buffer_spark",
-        "Accumulated burn buffer in Spark",
-        snapshot.burn_buffer,
     );
     gauge(
         &mut buf,
@@ -835,8 +825,6 @@ mod tests {
             "indra_base_fee_spark",
             "indra_total_supply_spark",
             "indra_total_staked_spark",
-            "indra_treasury_balance_spark",
-            "indra_burn_buffer_spark",
             "indra_block_reward_spark",
             "indra_consensus_round",
             "indra_connected_validator_peers",
