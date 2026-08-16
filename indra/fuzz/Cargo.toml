@@ -1,0 +1,48 @@
+[package]
+name = "indra-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+indra-core = { path = "../indra-core" }
+indra-network = { path = "../indra-network" }
+indra-rpc = { path = "../indra-rpc" }
+indra-state = { path = "../indra-state" }
+
+[[bin]]
+name = "transaction_deserialization"
+path = "fuzz_targets/transaction_deserialization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "public_json_rpc"
+path = "fuzz_targets/public_json_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "governance_parsing"
+path = "fuzz_targets/governance_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_gossip_parsing"
+path = "fuzz_targets/p2p_gossip_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
