@@ -6,22 +6,25 @@ does not yet protect.
 
 ## What is protected today
 
-Casual remote surveillance through public RPC endpoints is closed for legacy
-OutputV1 wallet scans.
+Public RPC does not provide unauthenticated owner-indexed scans or joined
+protocol-output provenance. Raw blocks and transactions remain public and can
+still be downloaded and scanned by any caller.
 
 The old unauthenticated address-indexed RPC methods have been replaced by:
 
-- `indra_getLegacyScanChallenge(address)`
+- `indra_getScanChallenge(payment_address)`
+- `indra_explainUtxoProvenanceAuthorized(payment_address, proof, utxo_id)`
+- optional authenticated provenance parameters on `indra_getCanonicalBlocks`
 
-The authorized methods require a dual-verified hybrid signature and an exact
-full-hybrid-public-key match to the requested UTXO owner before returning
-address-specific UTXO or balance data. The legacy 32-byte address remains a
-lookup label only; its classical-key hash is not an authorization boundary.
-A public RPC endpoint can still serve general chain data, but it should
-not let arbitrary callers enumerate a specific owner's holdings by address.
+The authorized methods use canonical chain-bound `PaymentAddressV1`, a random
+two-minute challenge, and a dual-verified hybrid signature. A challenge is
+consumed after its first successful verification. Joined provenance is filtered
+by exact full-hybrid-public-key equality; no classical-only lookup identity or
+authorization path remains.
 
-This is RPC-layer hardening only. The proof is not a view key and does not grant
-read-only third-party visibility without spend-key possession.
+This is RPC-layer hardening only. It prevents the node from performing extra
+owner-specific joins for an unauthorized caller; it cannot prevent that caller
+from independently analyzing public block data. The proof is not a view key.
 
 ## What is not protected today
 

@@ -1,23 +1,18 @@
 # Canonical Stake-Position Releases
 
 INDRA launches with one genesis-native staking model. Canonical state stores
-`StakePositionV1` aggregates and immutable `UnbondingTrancheV1` exits; it does
-not retain or decode an older bond representation and has no activation or
-migration height.
+`StakePositionV1` aggregates and immutable `UnbondingTrancheV1` exits. There is
+one current representation and no compatibility decoder.
 
 ## Release output
 
-Exiting stake creates an immutable tranche. At maturity, consensus creates a
-fresh UTXO for the tranche value using the tranche's recorded owner, lock
-height, and deterministic refund blinding. The output commitment and range
-proof are regenerated together, so the release is independently verifiable
-and its UTXO ID is derived from the new canonical output and block location.
-
-The refund blinding is derived by the canonical
-`derive_tranche_refund_blinding_v1` domain-separated construction from the
-tranche identity and release context. Wallets recover it from the tranche
-provenance embedded in the resulting UTXO rather than from a historical bond
-record.
+Exiting stake creates an immutable tranche. At maturity, consensus resolves its
+full hybrid custody key and creates a transparent `OutputV1 { value_spark,
+owner_pubkey, lock_height }`. Its UTXO ID is derived from that canonical output
+and the synthetic staking coordinate. `TrancheRefundEventV1` is attached to the
+unspent UTXO for the same lifetime and binds its position, tranche, principal,
+custody, release height, and maturity epoch. It is recovery metadata, not an
+independent monetary or authorization mechanism.
 
 ## Custody
 
@@ -29,6 +24,7 @@ record.
 
 ## Wallet behavior
 
-Wallets scan canonical outputs, validate their embedded tranche provenance,
-derive the refund blinding, and persist the resulting UTXO location and value.
-No old-output recreation or compatibility decoder is required.
+Wallets scan canonical outputs by exact full-hybrid-key equality. Joined
+tranche provenance is returned by RPC only after a random, expiring, single-use
+challenge is signed by the canonical `PaymentAddressV1` owner. The wallet then
+validates and persists the resulting UTXO location and value.

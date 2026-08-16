@@ -173,10 +173,12 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
             std::process::exit(1);
         }),
     };
-    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &[owner_pubkey]).unwrap_or_else(|error| {
-        eprintln!("Error scanning canonical blocks: {}", error);
-        std::process::exit(1);
-    });
+    indra_cli::scan_canonical_blocks(rpc, &mut wallet, keys, &[owner_pubkey]).unwrap_or_else(
+        |error| {
+            eprintln!("Error scanning canonical blocks: {}", error);
+            std::process::exit(1);
+        },
+    );
     wallet.save(wallet_path).unwrap_or_else(|error| {
         eprintln!("Error saving wallet {}: {}", wallet_path, error);
         std::process::exit(1);

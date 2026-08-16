@@ -327,6 +327,7 @@ pub fn rpc_method_cost(method: &str) -> RpcMethodCost {
         | "indra_getUtxoProof"
         | "indra_getValidatorRewards"
         | "indra_getValidatorSet"
+        | "indra_getScanChallenge"
         | "indra_explainUtxoProvenanceAuthorized"
         | "indra_getCanonicalBlocks" => RpcMethodCost::Expensive,
         _ => RpcMethodCost::Cheap,
@@ -726,15 +727,11 @@ mod tests {
     }
 
     #[test]
-    fn rpc_legacy_scan_challenge_returns_error_for_invalid_address() {
+    fn rpc_scan_challenge_returns_error_for_invalid_payment_address() {
         let engine = ChainState::new_genesis();
-        let resp = call_rpc(
-            "indra_getLegacyScanChallenge",
-            &["not-hex".to_string()],
-            &engine,
-        );
+        let resp = call_rpc("indra_getScanChallenge", &["not-hex".to_string()], &engine);
         assert!(resp.contains("\"error\""));
-        assert!(resp.contains("invalid address"));
+        assert!(resp.contains("invalid payment address"));
         assert!(!resp.contains("\"balance\":0"));
     }
 

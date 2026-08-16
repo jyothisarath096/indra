@@ -6,13 +6,14 @@ use indra_core::{
 };
 use indra_state::{utxo::UtxoEntry, UtxoSet};
 
-use crate::{json_string, rpc_call_raw_params, Wallet};
+use crate::{build_scan_authorization, json_string, rpc_call_raw_params, KeysFile, Wallet};
 
 /// Scan canonical blocks from the wallet's saved scan tip and add ordinary
 /// payment outputs owned by one of `owner_pubkeys`.
 pub fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut Wallet,
+    keys: &KeysFile,
     owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
     let mut discovered = 0usize;
@@ -20,6 +21,8 @@ pub fn scan_canonical_blocks(
         let (from_height, expected_parent) = wallet
             .scan_tip()
             .map_or((1, Bytes32::ZERO), |(height, hash)| (height + 1, hash));
+        let authorization =
+            build_scan_authorization(node_url, keys).map_err(|error| error.to_string())?;
         let response = rpc_call_raw_params(
             node_url,
             "indra_getCanonicalBlocks",
@@ -27,6 +30,8 @@ pub fn scan_canonical_blocks(
                 from_height.to_string(),
                 "25".to_string(),
                 json_string(&hex::encode(expected_parent.0)),
+                json_string(&authorization.payment_address),
+                authorization.proof,
             ],
         )
         .map_err(|error| error.to_string())?;

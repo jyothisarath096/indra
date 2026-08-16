@@ -428,9 +428,10 @@ amounts from raw-chain observers. Sender/recipient public keys,
 transaction graph metadata, and `value_spark` output metadata are visible
 to full nodes and anyone reading block/state data directly.
 
-The existing RPC hardening prevents casual remote address surveillance
-through public RPC endpoints, but that is not the same as protocol-level
-transaction privacy.
+RPC hardening prevents unauthenticated owner-indexed queries and server-side
+joined protocol-output provenance. It does not prevent a remote caller from
+downloading public blocks and independently analyzing them, and is not
+protocol-level transaction privacy.
 
 ### 4.2 What current RPC hardening does not hide
 
@@ -447,11 +448,12 @@ anyone reading raw chain data directly. It is a transparent-amount,
 pseudonymous model, not a full transaction-privacy model; amount correlation
 can deanonymize flows.
 
-Remote RPC-based legacy address scanning requires authorization: a caller
-must prove ownership of the address before using the legacy UTXO/balance
-scan methods. This closes casual remote surveillance through public RPC
-endpoints, but it does not hide OutputV1 owner/value metadata from a full
-node or anyone with raw block data.
+Server-side owner-specific provenance requires canonical `PaymentAddressV1`
+authorization: a random, expiring, single-use challenge is dual-signed and the
+complete hybrid key must equal the UTXO owner. Unauthenticated canonical-block
+RPC still returns raw blocks, but never the node's joined tranche-provenance
+records. This does not hide OutputV1 owner/value metadata from a full node or
+any caller that downloads and analyzes raw blocks.
 
 Full owner-level transaction privacy against node-level observers
 requires a future protocol upgrade using stealth destinations, encrypted
@@ -872,7 +874,7 @@ has already been pruned.
 Submission
   indra_sendTransaction      Submit a transaction
   indra_submitStakingOp      Submit a staking operation
-  indra_getLegacyScanChallenge        Ownership challenge for protocol-output provenance
+  indra_getScanChallenge        Single-use ownership challenge for protocol-output provenance
   indra_getStakingNonce      Replay-protection nonce for staking ops
   indra_getPeers             Connected validator and observer peers
   indra_getRpcPolicy         Listener mode and admin-token policy, no token value

@@ -25,7 +25,111 @@ use crate::{
     error::{RpcError, RpcResult},
     types::unquote,
 };
-use std::time::Instant;
+use indra_crypto::PaymentAddressV1;
+use rand_core::{OsRng, RngCore};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+/// Scan challenges expire quickly enough to bound credential exposure while
+/// leaving ample time for a wallet to sign and submit one RPC request.
+pub const SCAN_CHALLENGE_TTL: Duration = Duration::from_secs(120);
+const MAX_LIVE_SCAN_CHALLENGES: usize = 4_096;
+const SCAN_AUTH_DOMAIN: &[u8] = b"INDRA-PAYMENT-ADDRESS-SCAN-AUTH-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanChallengeStatus {
+    Available,
+    Verifying,
+}
+
+#[derive(Debug, Clone)]
+struct ScanChallengeRecord {
+    address: String,
+    issued_at: Instant,
+    status: ScanChallengeStatus,
+}
+
+#[derive(Debug, Default)]
+struct ScanChallengeRegistry {
+    records: BTreeMap<[u8; 32], ScanChallengeRecord>,
+}
+
+impl ScanChallengeRegistry {
+    fn issue_at(&mut self, address: String, now: Instant) -> RpcResult<[u8; 32]> {
+        while self.records.len() >= MAX_LIVE_SCAN_CHALLENGES {
+            let oldest = self
+                .records
+                .iter()
+                .min_by_key(|(_, record)| record.issued_at)
+                .map(|(challenge, _)| *challenge)
+                .ok_or_else(|| RpcError::Internal("scan challenge registry is full".into()))?;
+            self.records.remove(&oldest);
+        }
+        for _ in 0..8 {
+            let mut challenge = [0u8; 32];
+            OsRng.try_fill_bytes(&mut challenge).map_err(|_| {
+                RpcError::Internal("operating-system randomness unavailable".into())
+            })?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.records.entry(challenge)
+            {
+                entry.insert(ScanChallengeRecord {
+                    address: address.clone(),
+                    issued_at: now,
+                    status: ScanChallengeStatus::Available,
+                });
+                return Ok(challenge);
+            }
+        }
+        Err(RpcError::Internal(
+            "could not allocate a unique scan challenge".into(),
+        ))
+    }
+
+    fn begin_verification(
+        &mut self,
+        challenge: [u8; 32],
+        address: &str,
+        now: Instant,
+    ) -> RpcResult<()> {
+        let Some(record) = self.records.get_mut(&challenge) else {
+            return Err(RpcError::Forbidden(
+                "scan challenge is unknown or already consumed".into(),
+            ));
+        };
+        if now.saturating_duration_since(record.issued_at) >= SCAN_CHALLENGE_TTL {
+            self.records.remove(&challenge);
+            return Err(RpcError::Forbidden("scan challenge expired".into()));
+        }
+        if record.address != address {
+            return Err(RpcError::Forbidden(
+                "scan challenge was issued for a different payment address".into(),
+            ));
+        }
+        if record.status != ScanChallengeStatus::Available {
+            return Err(RpcError::Forbidden(
+                "scan challenge verification is already in progress".into(),
+            ));
+        }
+        record.status = ScanChallengeStatus::Verifying;
+        Ok(())
+    }
+
+    fn finish_verification(&mut self, challenge: [u8; 32], success: bool) {
+        if success {
+            self.records.remove(&challenge);
+        } else if let Some(record) = self.records.get_mut(&challenge) {
+            record.status = ScanChallengeStatus::Available;
+        }
+    }
+}
+
+fn scan_challenges() -> &'static Mutex<ScanChallengeRegistry> {
+    static REGISTRY: OnceLock<Mutex<ScanChallengeRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ScanChallengeRegistry::default()))
+}
 
 /// Shared node state passed to all handlers.
 pub struct NodeState<'a> {
@@ -332,7 +436,7 @@ pub const RPC_METHODS: &[(&str, RpcMethodAccess)] = &[
     ("indra_getBlock", RpcMethodAccess::ReadOnly),
     ("indra_getCanonicalBlocks", RpcMethodAccess::ReadOnly),
     ("indra_getTransaction", RpcMethodAccess::ReadOnly),
-    ("indra_getLegacyScanChallenge", RpcMethodAccess::ReadOnly),
+    ("indra_getScanChallenge", RpcMethodAccess::ReadOnly),
     (
         "indra_explainUtxoProvenanceAuthorized",
         RpcMethodAccess::ReadOnly,
@@ -467,7 +571,7 @@ pub fn dispatch_with_admin(
         "indra_getBlock" => Ready(get_block(params, state)),
         "indra_getCanonicalBlocks" => Ready(get_canonical_blocks(params, state)),
         "indra_getTransaction" => Ready(get_transaction(params, state)),
-        "indra_getLegacyScanChallenge" => Ready(get_legacy_scan_challenge(params, state)),
+        "indra_getScanChallenge" => Ready(get_scan_challenge(params, state)),
         "indra_explainUtxoProvenanceAuthorized" => {
             Ready(explain_utxo_provenance_authorized(params, state))
         }
@@ -683,16 +787,21 @@ fn get_block(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
 
 const MAX_CANONICAL_BLOCK_PAGE: u64 = 100;
 
-/// `indra_getCanonicalBlocks(from_height, limit, expected_parent_hash)`.
+/// `indra_getCanonicalBlocks(from_height, limit, expected_parent_hash[, payment_address, proof])`.
 ///
-/// Returns canonical full block encodings. The caller-provided parent anchor
-/// makes a reorg explicit instead of silently continuing on another branch.
+/// Raw canonical blocks remain public. The optional ownership proof enables
+/// only joined tranche-refund provenance owned by that payment address.
 fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    if params.len() != 3 {
+    if params.len() != 3 && params.len() != 5 {
         return Err(RpcError::InvalidParams(
-            "expected [from_height, limit, expected_parent_hash]".to_string(),
+            "expected [from_height, limit, expected_parent_hash] or those fields plus [payment_address, scan_auth_proof]".to_string(),
         ));
     }
+    let authenticated_owner = if params.len() == 5 {
+        Some(authorized_payment_address(&params[3..5], state)?.1)
+    } else {
+        None
+    };
     let from_height = unquote(&params[0])
         .parse::<u64>()
         .map_err(|_| RpcError::InvalidParams("invalid from_height".to_string()))?;
@@ -736,13 +845,24 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
             .get_block_by_height(height)
             .map_err(|error| RpcError::Internal(format!("failed to read block: {error}")))?
             .ok_or_else(|| RpcError::NotFound(format!("block {height} is not retained")))?;
-        let protocol_outputs = state
-            .chain
-            .utxos
-            .all_entries()
-            .filter(|entry| entry.created_height == height && entry.tranche_refund.is_some())
-            .map(|entry| format!(r#"{{"utxo_hex":"{}"}}"#, hex::encode(entry.encode_to_vec())))
-            .collect::<Vec<_>>();
+        let protocol_outputs = authenticated_owner
+            .as_ref()
+            .map(|owner| {
+                state
+                    .chain
+                    .utxos
+                    .all_entries()
+                    .filter(|entry| {
+                        entry.created_height == height
+                            && entry.tranche_refund.is_some()
+                            && entry.output.owner_pubkey == *owner
+                    })
+                    .map(|entry| {
+                        format!(r#"{{"utxo_hex":"{}"}}"#, hex::encode(entry.encode_to_vec()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         entries.push(format!(
             r#"{{"height":{},"block_hash":"{}","block_hex":"{}","protocol_outputs":[{}]}}"#,
             height,
@@ -863,33 +983,16 @@ fn block_rpc_json(block: &BlockVNext) -> String {
     )
 }
 
-/// Domain separator for the temporary legacy UTXO-scan ownership proof.
-///
-/// This is not an OutputV2 view key. It proves possession of the legacy
-/// address spend key before an address-indexed RPC scan is served.
-pub const LEGACY_SCAN_AUTH_DOMAIN: &[u8] = b"INDRA-legacy-utxo-scan-auth-v1:";
-
-fn legacy_scan_challenge_bytes(address: [u8; 32], state: &NodeState<'_>) -> [u8; 32] {
-    let mut preimage = Vec::with_capacity(LEGACY_SCAN_AUTH_DOMAIN.len() + b"challenge:".len() + 32);
-    preimage.extend_from_slice(LEGACY_SCAN_AUTH_DOMAIN);
-    preimage.extend_from_slice(b"challenge:");
-    preimage.extend_from_slice(state.chain.chain_id.as_bytes());
-    preimage.extend_from_slice(&address);
-    indra_crypto::sha256(&preimage)
-}
-
-fn legacy_scan_signing_message(address: [u8; 32], challenge: [u8; 32]) -> [u8; 32] {
-    let mut preimage = Vec::with_capacity(LEGACY_SCAN_AUTH_DOMAIN.len() + 32 + 32);
-    preimage.extend_from_slice(LEGACY_SCAN_AUTH_DOMAIN);
-    preimage.extend_from_slice(b"proof:");
-    preimage.extend_from_slice(&address);
+/// Build the domain-separated message a canonical payment-address owner signs
+/// to authorize one metadata-bearing RPC request.
+pub fn scan_auth_message(address: &PaymentAddressV1, challenge: [u8; 32]) -> [u8; 32] {
+    let address_bytes = address.encode();
+    let mut preimage = Vec::with_capacity(SCAN_AUTH_DOMAIN.len() + 4 + address_bytes.len() + 32);
+    preimage.extend_from_slice(SCAN_AUTH_DOMAIN);
+    preimage.extend_from_slice(&(address_bytes.len() as u32).to_be_bytes());
+    preimage.extend_from_slice(&address_bytes);
     preimage.extend_from_slice(&challenge);
     indra_crypto::sha256(&preimage)
-}
-
-/// Build the message hash that a legacy scan proof must sign.
-pub fn legacy_scan_auth_message(address: [u8; 32], challenge: [u8; 32]) -> [u8; 32] {
-    legacy_scan_signing_message(address, challenge)
 }
 
 fn parse_hex_field<const N: usize>(json: &str, field: &str) -> RpcResult<[u8; N]> {
@@ -935,86 +1038,86 @@ fn extract_json_string_field<'a>(json: &'a str, field: &str) -> Option<&'a str> 
     Some(&after[..end])
 }
 
-fn verify_legacy_scan_auth(
-    address: [u8; 32],
+fn verify_scan_auth(
+    address_text: &str,
+    address: &PaymentAddressV1,
     auth_json: &str,
-    state: &NodeState<'_>,
 ) -> RpcResult<HybridPubKey> {
     let version = parse_u8_field(auth_json, "version")?;
     if version != 1 {
         return Err(RpcError::Forbidden(format!(
-            "unsupported legacy scan auth version {version}"
+            "unsupported scan authorization version {version}"
         )));
     }
 
     let challenge = parse_hex_field::<32>(auth_json, "challenge")?;
-    let expected_challenge = legacy_scan_challenge_bytes(address, state);
-    if challenge != expected_challenge {
-        return Err(RpcError::Forbidden(
-            "legacy scan authorization challenge was not issued for this address and chain".into(),
-        ));
-    }
+    scan_challenges()
+        .lock()
+        .map_err(|_| RpcError::Internal("scan challenge registry lock poisoned".into()))?
+        .begin_verification(challenge, address_text, Instant::now())?;
 
-    let classical_pk = parse_hex_field::<32>(auth_json, "hybrid_classical_pk")?;
-    if indra_crypto::sha256(&classical_pk) != address {
-        return Err(RpcError::Forbidden(
-            "legacy scan authorization public key does not match requested address".into(),
-        ));
-    }
+    let verification = (|| {
+        let classical_sig = parse_hex_vec_field(auth_json, "classical_sig")?;
+        let pq_sig = parse_hex_vec_field(auth_json, "pq_sig")?;
+        let sig = HybridSignature {
+            classical_sig: indra_core::types::primitives::VariableBytes::from_slice(&classical_sig)
+                .map_err(|_| RpcError::InvalidParams("classical_sig too large".into()))?,
+            pq_sig: indra_core::types::primitives::VariableBytes::from_slice(&pq_sig)
+                .map_err(|_| RpcError::InvalidParams("pq_sig too large".into()))?,
+        };
+        let crypto_sig = sig.to_crypto_sig().map_err(|reason| {
+            RpcError::InvalidParams(format!("invalid auth signature: {reason}"))
+        })?;
+        let msg = scan_auth_message(address, challenge);
+        indra_crypto::verify_hybrid(&msg, &crypto_sig, address.owner_pubkey())
+            .map_err(|_| RpcError::Forbidden("scan authorization signature invalid".into()))?;
+        Ok(HybridPubKey {
+            classical_pk: Bytes32::from(address.owner_pubkey().classical.0),
+            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(
+                &address.owner_pubkey().pq.0,
+            )
+            .map_err(|_| RpcError::InvalidParams("PQ public key exceeds wire bound".into()))?,
+        })
+    })();
 
-    let pq_pk = parse_hex_vec_field(auth_json, "hybrid_pq_pk")?;
-    let classical_sig = parse_hex_vec_field(auth_json, "classical_sig")?;
-    let pq_sig = parse_hex_vec_field(auth_json, "pq_sig")?;
-
-    let pk = HybridPubKey {
-        classical_pk: Bytes32::from(classical_pk),
-        pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&pq_pk)
-            .map_err(|_| RpcError::InvalidParams("hybrid_pq_pk too large".into()))?,
-    };
-    let sig = HybridSignature {
-        classical_sig: indra_core::types::primitives::VariableBytes::from_slice(&classical_sig)
-            .map_err(|_| RpcError::InvalidParams("classical_sig too large".into()))?,
-        pq_sig: indra_core::types::primitives::VariableBytes::from_slice(&pq_sig)
-            .map_err(|_| RpcError::InvalidParams("pq_sig too large".into()))?,
-    };
-    let crypto_pk = pk
-        .to_crypto_pubkey()
-        .map_err(|reason| RpcError::InvalidParams(format!("invalid auth public key: {reason}")))?;
-    let crypto_sig = sig
-        .to_crypto_sig()
-        .map_err(|reason| RpcError::InvalidParams(format!("invalid auth signature: {reason}")))?;
-    let msg = legacy_scan_signing_message(address, challenge);
-    indra_crypto::verify_hybrid(&msg, &crypto_sig, &crypto_pk)
-        .map_err(|_| RpcError::Forbidden("legacy scan authorization signature invalid".into()))?;
-    Ok(pk)
+    scan_challenges()
+        .lock()
+        .map_err(|_| RpcError::Internal("scan challenge registry lock poisoned".into()))?
+        .finish_verification(challenge, verification.is_ok());
+    verification
 }
 
-fn authorized_address(
+fn authorized_payment_address(
     params: &[String],
     state: &NodeState<'_>,
-) -> RpcResult<(String, [u8; 32], HybridPubKey)> {
+) -> RpcResult<(String, HybridPubKey)> {
     if params.len() < 2 {
         return Err(RpcError::InvalidParams(
-            "expected address and scan_auth_proof parameters".into(),
+            "expected payment_address and scan_auth_proof parameters".into(),
         ));
     }
-    let address_hex = unquote(&params[0]).to_string();
+    let address_text = unquote(&params[0]).to_string();
     let auth = unquote(&params[1]);
-    let address = parse_address_hex(&address_hex)?;
-    let owner_pubkey = verify_legacy_scan_auth(address, auth, state)?;
-    Ok((address_hex, address, owner_pubkey))
+    let address = PaymentAddressV1::from_text(&address_text, state.chain.chain_id.as_bytes())
+        .map_err(|error| RpcError::InvalidParams(format!("invalid payment address: {error}")))?;
+    let owner_pubkey = verify_scan_auth(&address_text, &address, auth)?;
+    Ok((address_text, owner_pubkey))
 }
 
-/// `indra_getLegacyScanChallenge` — returns a node-provided challenge for a
-/// temporary legacy UTXO-scan ownership proof.
-fn get_legacy_scan_challenge(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
-    let address_hex = first_param(params, "address")?;
-    let address = parse_address_hex(&address_hex)?;
-    let challenge = legacy_scan_challenge_bytes(address, state);
+/// `indra_getScanChallenge` — issue a random, expiring, single-use ownership challenge.
+fn get_scan_challenge(params: &[String], state: &NodeState<'_>) -> RpcResult<String> {
+    let address_text = first_param(params, "payment_address")?;
+    PaymentAddressV1::from_text(&address_text, state.chain.chain_id.as_bytes())
+        .map_err(|error| RpcError::InvalidParams(format!("invalid payment address: {error}")))?;
+    let challenge = scan_challenges()
+        .lock()
+        .map_err(|_| RpcError::Internal("scan challenge registry lock poisoned".into()))?
+        .issue_at(address_text.clone(), Instant::now())?;
     Ok(format!(
-        r#"{{"address":"{}","challenge":"{}","auth_format_version":1,"note":"sign INDRA legacy UTXO-scan authorization; this is not an OutputV2 view key"}}"#,
-        address_hex,
-        hex::encode(challenge)
+        r#"{{"payment_address":"{}","challenge":"{}","expires_in_seconds":{},"auth_format_version":1}}"#,
+        address_text,
+        hex::encode(challenge),
+        SCAN_CHALLENGE_TTL.as_secs()
     ))
 }
 
@@ -1029,7 +1132,7 @@ fn explain_utxo_provenance_authorized(
             "expected address, scan_auth_proof, and utxo_id parameters".into(),
         ));
     }
-    let (address_hex, _address, authenticated_owner) = authorized_address(&params[..2], state)?;
+    let (address_text, authenticated_owner) = authorized_payment_address(&params[..2], state)?;
     let utxo_id = parse_hex32_value(unquote(&params[2]), "utxo_id")?;
     let entry =
         state.chain.utxos.get(&utxo_id).ok_or_else(|| {
@@ -1044,7 +1147,7 @@ fn explain_utxo_provenance_authorized(
     let explanation = classify_utxo_provenance(entry, state);
     Ok(format!(
         r#"{{"address":"{}","utxo_id":"{}","amount":{},"created_height":{},"tx_index":{},"out_index":{},"lock_height":{},"output_hex":"{}","category":"{}","recoverable":{},"context":{},"reason":{},"privacy_note":"{}"}}"#,
-        address_hex,
+        address_text,
         hex::encode(entry.utxo_id.0),
         entry.output.value_spark,
         entry.created_height,
@@ -1056,7 +1159,7 @@ fn explain_utxo_provenance_authorized(
         explanation.recoverable,
         explanation.context.unwrap_or_else(|| "null".to_string()),
         json_string_or_null(explanation.reason.as_deref()),
-        LEGACY_SCAN_PRIVACY_NOTE,
+        SCAN_PRIVACY_NOTE,
     ))
 }
 
@@ -1356,21 +1459,8 @@ fn json_string_or_null(value: Option<&str>) -> String {
     }
 }
 
-const LEGACY_SCAN_PRIVACY_NOTE: &str =
-    "authorized legacy RPC scan only; raw OutputV1 chain data still exposes owner and value metadata to full-node observers";
-
-fn parse_address_hex(address_hex: &str) -> RpcResult<[u8; 32]> {
-    if address_hex.len() != 64 {
-        return Err(RpcError::InvalidParams(
-            "invalid address: expected 32-byte hex".into(),
-        ));
-    }
-    let bytes = hex::decode(address_hex)
-        .map_err(|_| RpcError::InvalidParams("invalid address: expected 32-byte hex".into()))?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
+const SCAN_PRIVACY_NOTE: &str =
+    "authorized RPC provenance only; raw OutputV1 chain data still exposes owner and value metadata to full-node observers";
 
 /// `indra_getPeers` — returns public aggregate peer counts.
 fn get_peers(state: &NodeState<'_>) -> RpcResult<String> {
@@ -2790,7 +2880,9 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
                 ProposalTier,
             },
-            stake_position::{ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1},
+            stake_position::{
+                ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, TrancheRefundEventV1,
+            },
             staking::{StakingOp, StakingOpBody},
             transaction::OutputV1,
         },
@@ -2799,7 +2891,7 @@ mod tests {
     use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
     use indra_state::{
         governance::{ProposalPhase, ProposalRecord},
-        ChainState,
+        ChainState, UtxoSet,
     };
     use std::collections::BTreeMap;
 
@@ -2911,25 +3003,36 @@ mod tests {
         utxo_id: Bytes32,
         keypair: &HybridKeypair,
     ) -> Vec<String> {
-        let state = NodeState::read_only(engine);
-        let public = keypair.public_key();
-        let address = indra_crypto::sha256(&public.classical.0);
-        let challenge = legacy_scan_challenge_bytes(address, &state);
-        let msg = legacy_scan_auth_message(address, challenge);
-        let sig = keypair.sign(&msg).unwrap();
-        let proof = format!(
-            r#"{{"version":1,"challenge":"{}","hybrid_classical_pk":"{}","hybrid_pq_pk":"{}","classical_sig":"{}","pq_sig":"{}","reserved_output_v2":null}}"#,
-            hex::encode(challenge),
-            hex::encode(public.classical.0),
-            hex::encode(public.pq.0),
-            hex::encode(sig.classical.0),
-            hex::encode(sig.pq.0)
-        );
+        let (address, proof) = authorization_for_keypair(engine, keypair);
         vec![
-            format!(r#""{}""#, hex::encode(address)),
+            format!(r#""{}""#, address),
             proof,
             format!(r#""{}""#, hex::encode(utxo_id.0)),
         ]
+    }
+
+    fn authorization_for_keypair(
+        engine: &BlockBackedEngine,
+        keypair: &HybridKeypair,
+    ) -> (String, String) {
+        let public = keypair.public_key();
+        let address =
+            PaymentAddressV1::new(engine.chain.chain_id.as_bytes(), public.clone()).unwrap();
+        let address_text = address.to_text();
+        let challenge = scan_challenges()
+            .lock()
+            .unwrap()
+            .issue_at(address_text.clone(), Instant::now())
+            .unwrap();
+        let msg = scan_auth_message(&address, challenge);
+        let sig = keypair.sign(&msg).unwrap();
+        let proof = format!(
+            r#"{{"version":1,"challenge":"{}","classical_sig":"{}","pq_sig":"{}"}}"#,
+            hex::encode(challenge),
+            hex::encode(sig.classical.0),
+            hex::encode(sig.pq.0)
+        );
+        (address_text, proof)
     }
 
     fn scan_owner_pubkey() -> HybridPubKey {
@@ -3186,7 +3289,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scan_auth_rejects_same_classical_key_with_substituted_pq_key() {
+    fn scan_auth_rejects_same_classical_key_with_substituted_pq_key() {
         let mut engine = block_backed_engine();
         let utxo_id = engine
             .chain
@@ -3350,6 +3453,126 @@ mod tests {
         assert!(
             matches!(error, RpcError::InvalidParams(message) if message.contains("canonical parent mismatch"))
         );
+    }
+
+    #[test]
+    fn canonical_block_protocol_outputs_require_matching_owner_authorization() {
+        let mut engine = block_backed_engine();
+        let output = owned_output(7_500, [0xA1; 32]);
+        let height = 2;
+        let tx_index = STAKING_TX_IDX;
+        let output_index = 7;
+        let utxo_id = UtxoSet::compute_utxo_id(&output, height, tx_index, output_index);
+        let owner_id = Bytes32::from([0x41; 32]);
+        let event = TrancheRefundEventV1 {
+            refund_utxo_id: utxo_id,
+            position_id: Bytes32::from([0x42; 32]),
+            tranche_id: Bytes32::from([0x43; 32]),
+            principal_owner_id: owner_id,
+            custody: PositionCustodyV1::DelegatorIdentity {
+                delegator_id: owner_id,
+            },
+            principal_spark: output.value_spark,
+            release_height: height,
+            end_epoch: 9,
+        };
+        engine
+            .chain
+            .utxos
+            .insert_with_tranche_refund(output, height, tx_index, output_index, Some(event))
+            .unwrap();
+        let state = NodeState::read_only(&engine);
+        let public_params = vec![
+            "2".to_string(),
+            "1".to_string(),
+            format!(r#""{}""#, "21".repeat(32)),
+        ];
+        let public = get_canonical_blocks(&public_params, &state).unwrap();
+        assert!(public.contains(r#""protocol_outputs":[]"#), "{public}");
+        assert!(!public.contains(&hex::encode(utxo_id.0)), "{public}");
+
+        let attacker = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x33; 32]),
+            PqKeypair::from_seed(&[0x44; 32]).unwrap(),
+        );
+        let (attacker_address, attacker_proof) = authorization_for_keypair(&engine, &attacker);
+        let mut attacker_params = public_params.clone();
+        attacker_params.push(format!(r#""{}""#, attacker_address));
+        attacker_params.push(attacker_proof);
+        let wrong_owner = get_canonical_blocks(&attacker_params, &state).unwrap();
+        assert!(
+            wrong_owner.contains(r#""protocol_outputs":[]"#),
+            "{wrong_owner}"
+        );
+        assert!(
+            !wrong_owner.contains(&hex::encode(utxo_id.0)),
+            "{wrong_owner}"
+        );
+
+        let (owner_address, owner_proof) = authorization_for_keypair(&engine, &scan_keypair());
+        let mut owner_params = public_params;
+        owner_params.push(format!(r#""{}""#, owner_address));
+        owner_params.push(owner_proof);
+        let authorized = get_canonical_blocks(&owner_params, &state).unwrap();
+        assert!(
+            !authorized.contains(r#""protocol_outputs":[]"#),
+            "{authorized}"
+        );
+        assert!(authorized.contains(&hex::encode(utxo_id.0)), "{authorized}");
+    }
+
+    #[test]
+    fn successful_scan_authorization_is_single_use() {
+        let mut engine = block_backed_engine();
+        let utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(1_234, [0xB1; 32]), 2, 0, 0)
+            .unwrap();
+        let params = authorized_params(&engine, utxo_id);
+        let state = NodeState::read_only(&engine);
+        assert!(explain_utxo_provenance_authorized(&params, &state).is_ok());
+        let replay = explain_utxo_provenance_authorized(&params, &state).unwrap_err();
+        assert!(matches!(replay, RpcError::Forbidden(message)
+            if message.contains("unknown or already consumed")));
+    }
+
+    #[test]
+    fn expired_scan_challenge_rejects_valid_signature() {
+        let mut engine = block_backed_engine();
+        let utxo_id = engine
+            .chain
+            .utxos
+            .insert(owned_output(1_234, [0xB2; 32]), 2, 0, 0)
+            .unwrap();
+        let keypair = scan_keypair();
+        let address =
+            PaymentAddressV1::new(engine.chain.chain_id.as_bytes(), keypair.public_key()).unwrap();
+        let address_text = address.to_text();
+        let issued_at = Instant::now().checked_sub(SCAN_CHALLENGE_TTL).unwrap();
+        let challenge = scan_challenges()
+            .lock()
+            .unwrap()
+            .issue_at(address_text.clone(), issued_at)
+            .unwrap();
+        let signature = keypair
+            .sign(&scan_auth_message(&address, challenge))
+            .unwrap();
+        let proof = format!(
+            r#"{{"version":1,"challenge":"{}","classical_sig":"{}","pq_sig":"{}"}}"#,
+            hex::encode(challenge),
+            hex::encode(signature.classical.0),
+            hex::encode(signature.pq.0),
+        );
+        let params = vec![
+            format!(r#""{}""#, address_text),
+            proof,
+            format!(r#""{}""#, hex::encode(utxo_id.0)),
+        ];
+        let error = explain_utxo_provenance_authorized(&params, &NodeState::read_only(&engine))
+            .unwrap_err();
+        assert!(matches!(error, RpcError::Forbidden(message)
+            if message.contains("expired")));
     }
 
     #[test]

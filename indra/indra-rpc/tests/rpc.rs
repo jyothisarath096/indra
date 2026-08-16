@@ -405,7 +405,7 @@ fn test_all_methods_reachable_via_dispatch() {
         ("indra_getChainInfo", vec![]),
         ("indra_getMempoolSize", vec![]),
         ("indra_getBlock", vec!["0".to_string()]),
-        ("indra_getLegacyScanChallenge", vec![hex32.clone()]),
+        ("indra_getScanChallenge", vec![hex32.clone()]),
         ("indra_getUtxoProof", vec![hex32.clone()]),
         ("indra_getPeers", vec![]),
         ("indra_getStakingNonce", vec![hex32.clone()]),
@@ -612,7 +612,7 @@ fn read_only_listener_allows_every_classified_read_method() {
     let params_for = |method: &str| -> Vec<String> {
         match method {
             "indra_getBlock" => vec!["0".to_string()],
-            "indra_getLegacyScanChallenge"
+            "indra_getScanChallenge"
             | "indra_getUtxoProof"
             | "indra_getStakingNonce"
             | "indra_getDelegatorRewards"

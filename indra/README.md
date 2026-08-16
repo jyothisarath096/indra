@@ -308,14 +308,15 @@ distinguish those cases.
 **Wallet**
 | Method | Description |
 |--------|-------------|
-| `indra_getLegacyScanChallenge` | Ownership challenge for protocol-output provenance |
+| `indra_getScanChallenge` | Single-use ownership challenge for protocol-output provenance |
 | `indra_sendTransaction` | Submit a signed transaction |
 | `indra_submitStakingOp` | Submit a staking operation |
 | `indra_getStakingNonce` | Replay-protection nonce for staking |
 
 Tranche-refund provenance is committed inside the refund UTXO and remains
 available for exactly that UTXO's unspent lifetime. Canonical block-range wallet
-scanning recovers the deterministic refund opening without a fixed retention
+scanning retrieves owner-filtered provenance with a random, expiring,
+single-use full-hybrid ownership proof, without a fixed retention
 window.
 
 ---

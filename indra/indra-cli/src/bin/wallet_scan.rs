@@ -99,7 +99,7 @@ fn main() {
             std::process::exit(1);
         }),
     };
-    match scan_canonical_blocks(&node_url, &mut wallet, &[owner_pubkey]) {
+    match scan_canonical_blocks(&node_url, &mut wallet, &keys, &[owner_pubkey]) {
         Ok(discovered) => {
             wallet.save(&wallet_path).unwrap_or_else(|error| {
                 eprintln!("Error saving wallet: {error}");
@@ -123,7 +123,8 @@ fn main() {
 fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut indra_cli::Wallet,
+    keys: &indra_cli::KeysFile,
     owner_pubkeys: &[HybridPubKey],
 ) -> Result<usize, String> {
-    indra_cli::scan_canonical_blocks(node_url, wallet, owner_pubkeys)
+    indra_cli::scan_canonical_blocks(node_url, wallet, keys, owner_pubkeys)
 }

@@ -660,7 +660,8 @@ validator to be currently Active, Registered, or keyed identically.
 
 For a validator still present in `ValidatorSet`, current economic records remain
 the penalty target. For a validator removed by a post-activation full-registry
-eviction, Section 7's tombstone and retained `StakeBondEntry` records are the
+eviction, Section 7's tombstone and retained `StakePositionV1`/
+`UnbondingTrancheV1` records are the
 penalty target. Absence from both locations MUST fail closed. A membership proof
 proves historical authority; it does not create stake that canonical state no
 longer retains.
@@ -690,7 +691,7 @@ Section 7 adds a third, separate collection:
 
 ```text
 evicted_validator_tombstones
-    identity, custody, eviction timing, and bond references
+    identity, custody, eviction timing, and position/tranche references
     authoritative only for post-eviction economic targeting and release
     retained until both evidence expiry and final bond maturity
 ```
@@ -712,19 +713,14 @@ A membership root cannot supply vote weights, bitfield positions, totals, or
 full candidate sets to live consensus. No consensus consumer may use the root
 history as a fallback when full snapshot lookup fails.
 
-## 7. Evicted-validator tombstones and retained bond custody
+## 7. Evicted-validator tombstones and retained tranche custody
 
 ### 7.1 Existing eviction defect and design objective
 
-When the live registry is full, current replacement logic selects an evictable
-validator, pays pending rewards, removes its delegation records, removes every
-associated `StakeBondEntry`, creates immediately spendable refund outputs, and
-then deletes the `ValidatorEntry`
-(`indra-state/src/delegation.rs:945-963`,
-`indra-state/src/delegation.rs:1061-1178`). It does this without respecting
-each bond's `unbonding_end_epoch`. Later evidence then fails because slash
-application begins with a live-registry lookup
-(`indra-state/src/apply.rs:141-170`).
+Eviction is tranche-native. The planner converts each active position to a
+height-precise `UnbondingTrancheV1`, retains the positions and tranches under
+their canonical IDs, and commits an `EvictedValidatorTombstoneV2` before the
+live `ValidatorEntry` is removed. No principal is released at eviction.
 
 The live `ValidatorSet` is canonically capped at `MAX_VALIDATORS = 1,500`, and
 the cap includes all retained lifecycle entries
@@ -739,7 +735,7 @@ registry entries.
 The post-activation eviction transition has four objectives:
 
 1. remove the victim from the live registry so the new validator can register;
-2. retain all bond principal under its existing canonical bond IDs;
+2. retain all principal under its canonical position and tranche IDs;
 3. preserve enough identity, historical-key, custody, and timing data to apply
    valid delayed slash evidence and later release each bond; and
 4. keep the new collection explicitly bounded under adversarial replacement
@@ -765,12 +761,8 @@ EvictedValidatorTombstoneV1
             pq_pk: [u8; 2592]
             key_version: u64
         }
-    retained_bonds: ordered list<EvictedBondReferenceV1>
-
-EvictedBondReferenceV1
-    bond_utxo_id: Bytes32
-    delegator_id: Bytes32
-    unbonding_end_epoch: u64
+    retained_position_ids: ordered list<Bytes32>
+    retained_tranche_ids: ordered list<Bytes32>
 
 ChainState
     evicted_validator_tombstones:
@@ -779,8 +771,7 @@ ChainState
 
 `eviction_epoch` MUST equal `epoch_for_height(eviction_height)`. Tombstones are
 keyed by `validator_id`, encoded in ascending validator-ID order, and MUST be
-unique. Bond references are encoded in ascending `bond_utxo_id` order, with no
-duplicates.
+unique. Position and tranche references are strictly sorted with no duplicates.
 
 The vote and VRF keys are the last complete, validated hot consensus-key set
 held by the removed `ValidatorEntry`. They preserve an auditable identity/key
@@ -790,34 +781,28 @@ proof for the infraction height. This distinction is necessary if a future
 key-rotation protocol permits the eviction-time key set to differ from the set
 that governed an older height.
 
-`cold_custody` is required when any retained self-bond has
-`StakeBondCustodyOwner::ValidatorColdIdentity`. Today that role resolves
-through the live validator entry when protocol code recreates a released output
-(`indra-state/src/validator.rs:1790-1818`,
-`indra-state/src/epoch.rs:1047-1085`). Deleting the entry without preserving
-the active cold public key would make a normally matured self-bond
-unreleasable. A tombstone MUST reject:
+`cold_custody` is required when any retained position has
+`PositionCustodyV1::ValidatorColdIdentity`. Deleting the live entry without
+preserving the active cold public key would make the corresponding matured
+tranche unreleasable. A tombstone MUST reject:
 
 - a missing or malformed hot consensus key;
-- a retained cold-owned bond without a complete active cold custody key;
+- a retained cold-owned position without a complete active cold custody key;
 - a cold key version inconsistent with the evicted entry;
-- an empty retained-bond list at tombstone creation (an empty list is valid
-  later only after every originally retained bond has canonically matured or
+- empty retained position/tranche lists at tombstone creation (empty lists are valid
+  later only after every originally retained tranche has canonically matured or
   been slashed away, and the tombstone then remains until Section 7.6 permits
   pruning);
-- a bond reference whose `validator_id` does not equal the tombstone ID;
-- a reference whose end epoch differs from its canonical `StakeBondEntry`;
-- duplicate bond IDs within or across tombstones; or
+- a referenced position whose `validator_id` does not equal the tombstone ID;
+- a tranche reference whose parent position is not retained;
+- duplicate position or tranche IDs within or across tombstones; or
 - any count above the bounds in Section 7.6.
 
-The tombstone deliberately does not duplicate principal, original output,
-unbonding precision, or custody-owner fields. The existing canonical
-`staked_bonds: map<bond_utxo_id, StakeBondEntry>` remains the sole source of
-truth for those values (`indra-state/src/chain.rs:112-113`,
-`indra-state/src/validator.rs:1770-1798`). The tombstone is a bounded ownership
-index and historical validator record. Every referenced bond MUST exist in
-`staked_bonds`, and every retained bond for an absent evicted validator MUST
-have exactly one tombstone reference.
+The tombstone deliberately does not duplicate principal, unbonding precision,
+or custody-owner fields. Canonical `stake_positions` and
+`unbonding_tranches` remain the sole sources of truth. The tombstone is a
+bounded ownership index and historical validator record. Every reference MUST
+resolve to exactly one canonical record belonging to the evicted validator.
 
 ### 7.3 Atomic eviction transition
 
@@ -826,12 +811,12 @@ any state mutation:
 
 1. select the victim under the existing replacement ranking and custody rules;
 2. validate the victim's complete hot keys and any required cold custody keys;
-3. collect all associated bonds in ascending UTXO-ID order;
-4. determine each bond's post-eviction unbonding end epoch;
+3. collect all associated positions and tranches in ascending canonical-ID order;
+4. convert active principal to height-precise eviction tranches;
 5. prove that adding one tombstone and all references remains within the hard
    bounds;
 6. settle pending validator/delegator rewards under the existing policy; and
-7. validate every resulting bond/tombstone cross-reference.
+7. validate every resulting position/tranche/tombstone cross-reference.
 
 The atomic mutation then:
 
@@ -883,8 +868,8 @@ from the live registry, slash validation MUST require all of:
 5. both vote signatures valid under the keys in that proven entry;
 6. the ordinary equivocation, chain-ID, duplicate, and 500-epoch window rules;
    and
-7. at least one canonical self-bond reference that remains slashable under the
-   existing height-aware bond predicate.
+7. at least one canonical self-custody position or tranche that remains
+   slashable under the height-aware principal predicate.
 
 The non-strict height comparison is intentional. An eviction applied while
 processing block `E` changes post-`E` economic state, while `S(E)` may still
@@ -919,38 +904,36 @@ reward eligibility while the tombstone exists. Re-registration under the same
 validator ID MUST be rejected until the tombstone is pruned, preventing a new
 live identity from aliasing a retained penalty target.
 
-### 7.5 Bond custody, maturity, and release
+### 7.5 Position/tranche custody, maturity, and release
 
-Retained principal continues to live in the existing `staked_bonds` map. This
-preserves `StakeBondEntry.original_output`, amount, custody role, precise
-unbonding metadata, existing bond encoding, and the existing staked-bond
-commitment leaf. It avoids a second principal-bearing store and makes
-double-release structurally detectable.
+Retained principal remains in canonical `StakePositionV1` and
+`UnbondingTrancheV1` records. Active principal is converted to an immutable,
+height-precise tranche during eviction. This avoids a second principal-bearing
+store and makes double release structurally detectable.
 
-The normal maturity scan currently visits all `staked_bonds`, selects entries
-whose `unbonding_end_epoch <= current_epoch`, recreates their outputs, and
-removes them (`indra-state/src/epoch.rs:1003-1042`). The post-gate release path
-MUST additionally:
+The maturity scan visits immutable tranches whose release height has arrived,
+creates a transparent `OutputV1` under the resolved full hybrid custody key,
+attaches `TrancheRefundEventV1` recovery context, removes the tranche, and
+updates or removes its parent position. The tombstone-aware path MUST also:
 
 1. resolve validator cold custody from the tombstone when the live validator
    lookup is absent;
-2. create the release output under the same height-gated blinding and output
-   rules used for non-evicted bonds;
-3. remove the canonical `StakeBondEntry`;
-4. remove the matching tombstone reference in the same atomic transition; and
+2. create the same transparent release output used for non-evicted tranches;
+3. remove the canonical tranche and update its parent position;
+4. remove the matching tombstone references in the same atomic transition; and
 5. emit the ordinary matured-return event where that event is otherwise
    required.
 
-A referenced bond MUST never be released before its own
-`unbonding_end_epoch`. Slashing MUST never reset or accelerate that epoch.
-Deleting a tombstone while it still contains a bond reference is forbidden.
-Deleting a bond without deleting its reference, or deleting a reference without
-releasing/slashing the corresponding bond as specified, is an invariant error.
+A referenced tranche MUST never be released before its height-precise maturity.
+Slashing MUST never reset or accelerate that maturity. Deleting a tombstone
+while it still contains a position or tranche reference is forbidden. Removing
+a retained record without updating its reference, or removing a reference
+without the corresponding canonical transition, is an invariant error.
 
 Because `SLASH_EVIDENCE_WINDOW_EPOCHS = 500` is less than
-`UNBONDING_PERIOD_EPOCHS = 1008`, a bond whose unbonding begins at eviction
+`UNBONDING_PERIOD_EPOCHS = 1008`, a tranche whose unbonding begins at eviction
 remains locked throughout every admissible evidence epoch. An already-unbonding
-self-bond is slashable only when its recorded start is not earlier than the
+ self-custody tranche is slashable only when its recorded start is not earlier than the
 infraction under the existing legacy/height-precise predicate. This preserves
 the security relationship without extending unrelated delegator locks.
 
@@ -1016,7 +999,7 @@ capacity error. It MUST NOT:
 - refund bonds early;
 - delete the oldest protected tombstone;
 - reuse a tombstone key;
-- omit some bond references;
+- omit some position or tranche references;
 - fall back to current eviction behavior; or
 - register the newcomer without atomically removing a live victim.
 
@@ -1061,18 +1044,18 @@ Canonical encoding MUST include:
 - a bounded tombstone count;
 - ascending validator IDs;
 - each tombstone's exact fields;
-- a bounded aggregate bond-reference count; and
-- ascending bond IDs within each record.
+- bounded aggregate position- and tranche-reference counts; and
+- ascending position and tranche IDs within each record.
 
 Decode and checkpoint restore MUST validate all key material, ordering, count,
-epoch/height, bond existence, bond ownership, custody, and end-epoch
+epoch/height, record existence, ownership, custody, and maturity
 invariants before accepting state. Unknown tombstone versions fail closed.
 
 Both state-root systems MUST bind the collection. `StateCommitmentV2` uses the
 dedicated leaves above. The legacy/full state-root projection MUST include the
 same canonical tombstone encoding under its own unambiguous collection
-placement. Existing `StakeBondEntry` leaves continue to bind principal and
-bond-local maturity independently.
+placement. Existing position and tranche leaves continue to bind principal and
+record-local maturity independently.
 
 The collection and every coupled mutation MUST be included in:
 
@@ -1086,7 +1069,7 @@ The collection and every coupled mutation MUST be included in:
 - differential live-versus-sync tests.
 
 Rollback snapshots must cover the live validator/delegation removal,
-`staked_bonds`, tombstone map, UTXOs, pending rewards, delegation-return events,
+stake positions, unbonding tranches, tombstone map, UTXOs, pending rewards,
 applied slash hashes, supply accounting, and both commitment systems as one
 atomic unit.
 
@@ -1386,7 +1369,7 @@ An independent audit must cover:
 - `StateCommitmentV2` domain inventory and incremental updates;
 - transaction rollback and failed-block atomicity;
 - boundary root creation and pruning order;
-- tombstone/bond encoding, bounds, custody resolution, maturity, and pruning;
+- tombstone/position/tranche encoding, bounds, custody resolution, maturity, and pruning;
 - eviction, slash, release, and replacement atomicity;
 - live, projected, sync, replay, and restored-checkpoint equivalence;
 - use of proven historical keys;
@@ -1403,8 +1386,8 @@ Tests must include:
 - a current registry key differing from the historical proven key;
 - validator currently demoted, slashed, exited, evicted, or absent;
 - eviction before, at, and after the alleged infraction height;
-- active and already-unbonding bonds at eviction;
-- tombstone and bond-reference cap exhaustion;
+- active positions and already-unbonding tranches at eviction;
+- tombstone position/tranche-reference cap exhaustion;
 - injected rollback failure at every eviction/slash/release mutation;
 - evidence at the first and last valid window epoch;
 - pruning immediately after expiry;
@@ -1441,9 +1424,9 @@ testnet constant accidentally.
 - Membership proof: 2,717–2,973 bytes.
 - Typical proof-carrying evidence: approximately 12.3–12.6 KB.
 - Maximum additional proof bytes for three slash items: 8,919 bytes.
-- Tombstone base encoding: 2,710 bytes without cold custody or 5,342 bytes
-  with cold custody, plus 72 bytes per retained bond reference.
-- 1,500 cold-custody tombstones with no bond references: 8,013,005 bytes
+- Tombstone base encoding includes the retained position and tranche ID lists;
+  cold custody adds one complete hybrid key and version.
+- Tombstones with no remaining position or tranche references become prunable
   (7.64 MiB), including the four-byte outer count.
 
 These replace the roughly 257 MiB maximum-set canonical cost of retaining 500
@@ -1462,13 +1445,11 @@ This refines “hundreds of MB” to 257.65 MiB at the active-set ceiling and
 shows that even the current four-validator set would otherwise consume
 5.18 MiB canonically.
 
-The tombstone collection's principal remains in the already-counted
-`staked_bonds` map; the figures above are index/key overhead, not duplicated
-stake outputs. The approved aggregate ceiling of 104,096 references costs
-exactly 7,494,912 reference bytes. Combining that binding reference maximum
-with the conservative 1,500 cold-custody tombstone bases produces a maximum
-canonical tombstone encoding of 15,507,917 bytes (14.79 MiB), including the
-outer count. Capacity exhaustion fails closed as specified in Section 7.6.
+The tombstone collection's principal remains in the already-counted position
+and tranche maps; tombstone IDs are index/key overhead, not duplicated stake.
+The implementation's explicit per-tombstone and aggregate reference caps bound
+this collection, and capacity exhaustion fails closed as specified in Section
+7.6.
 
 ### 12.2 Relative implementation size
 

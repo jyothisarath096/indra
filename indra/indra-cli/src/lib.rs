@@ -39,8 +39,8 @@ pub mod canonical_scan;
 pub mod error;
 pub mod genesis_cmd;
 pub mod keygen;
-pub mod legacy_scan_auth;
 pub mod query;
+pub mod scan_auth;
 pub mod staking;
 pub mod tx_builder;
 pub mod wallet;
@@ -62,11 +62,11 @@ pub use keygen::{
     write_keys_file_secure, ColdKeysFile, ColdShareCeremony, ColdShareFile, ColdShareManifest,
     ExpectedColdPublicKey, KeyFilePublicMetadata, KeysFile, PasswordSource, ValidatorKeys,
 };
-pub use legacy_scan_auth::{
-    build_legacy_scan_auth_proof, fetch_legacy_scan_challenge, json_string, rpc_call_raw_params,
-    ScanAuthFileV1,
-};
 pub use query::{rpc_call, QueryResult};
+pub use scan_auth::{
+    build_scan_authorization, fetch_scan_challenge, json_string, rpc_call_raw_params,
+    ScanAuthorization,
+};
 pub use staking::{
     build_claim_rewards_op, build_cold_authorized_staking_op, build_delegate_op,
     build_exit_stake_position_op, build_register_validator_op_with_cold,
