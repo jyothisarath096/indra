@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn genesis_entry(
+    chain_id: &str,
     name: &str,
     keys: &indra_cli::KeysFile,
     stake: u64,
@@ -40,6 +41,18 @@ fn genesis_entry(
     let mut entry = entry_from_keys(name, keys, stake);
     entry.cold_hybrid_classical_pk = hex::encode(cold.classical.0);
     entry.cold_hybrid_pq_pk = hex::encode(cold.pq.0);
+    let validator_id = Bytes32::from(keys.public.validator_id);
+    let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+        chain_id,
+        &validator_id,
+        &Bytes32::from(vrf.public_key()),
+        0,
+    )
+    .unwrap();
+    let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+    entry.vrf_possession_output = hex::encode(output.0);
+    entry.vrf_possession_proof = hex::encode(proof.0);
     entry
 }
 
@@ -47,6 +60,26 @@ fn temp_dir(suffix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("indra_cli_test_{}_{}", suffix, std::process::id()));
     p
+}
+
+#[cfg(unix)]
+fn mock_bitcoin_cli(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("bitcoin-cli-mock");
+    let header = vec![0x22; 80];
+    let mut displayed_hash = indra_crypto::sha256(&indra_crypto::sha256(&header));
+    displayed_hash.reverse();
+    let displayed_hash = hex::encode(displayed_hash);
+    let script = format!(
+        "#!/bin/sh\ncase \"$1:$2\" in\n  getblockhash:0) echo {} ;;\n  getblockhash:1) echo {} ;;\n  getblockheader:{}) echo {} ;;\n  getblockcount:) echo 200 ;;\n  *) echo unexpected bitcoin-cli arguments >&2; exit 1 ;;\nesac\n",
+        "11".repeat(32),
+        displayed_hash,
+        displayed_hash,
+        "22".repeat(80),
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
 }
 
 fn engine(suffix: &str) -> (NodeEngine, PathBuf) {
@@ -432,7 +465,7 @@ fn genesis_with_4_validators() {
         .map(|i| {
             let seed = [i + 1; 32];
             let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
-            genesis_entry(&format!("v{i}"), &keys, stake, i + 20)
+            genesis_entry("indra-testnet-1", &format!("v{i}"), &keys, stake, i + 20)
         })
         .collect();
 
@@ -451,7 +484,7 @@ fn genesis_rejects_3_validators() {
         .map(|i| {
             let seed = [i + 1; 32];
             let keys = generate_from_master_seed(format!("v{i}"), seed).unwrap();
-            genesis_entry(&format!("v{i}"), &keys, stake, i + 20)
+            genesis_entry("test", &format!("v{i}"), &keys, stake, i + 20)
         })
         .collect();
 
@@ -479,6 +512,7 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
     let dir = temp_dir("genesis_artifacts");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("genesis.toml");
+    let bitcoin_cli = mock_bitcoin_cli(&dir);
     let mut command = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
     command.args([
         "build",
@@ -494,6 +528,8 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
         "--bitcoin-minimum-confirmations",
         "100",
+        "--bitcoin-cli",
+        bitcoin_cli.to_str().unwrap(),
         "--output",
         path.to_str().unwrap(),
     ]);
@@ -512,6 +548,26 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         let pq_hex = hex::encode(cold_public.pq.0);
         expected_cold_public.push((classical_hex.clone(), pq_hex.clone()));
         let cold_path = dir.join(format!("cold-{i}.json"));
+        let proof_path = dir.join(format!("vrf-proof-{i}.json"));
+        let validator_id = Bytes32::from(keys.public.validator_id);
+        let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            "indra-testnet-artifact-test",
+            &validator_id,
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+        std::fs::write(
+            &proof_path,
+            serde_json::json!({
+                "vrf_possession_output": hex::encode(output.0),
+                "vrf_possession_proof": hex::encode(proof.0),
+            })
+            .to_string(),
+        )
+        .unwrap();
         let cold_keys = indra_cli::ColdKeysFile {
             classical_seed: [i + 20; 32],
             pq_seed: [i + 84; 32],
@@ -547,11 +603,12 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
             .unwrap();
         }
         command.arg("--validator").arg(format!(
-            "v{i},{stake},{},{}",
+            "v{i},{stake},{},{},{}",
             hot_path.display(),
-            cold_path.display()
+            cold_path.display(),
+            proof_path.display()
         ));
-        validator_inputs.push((hot_path, cold_path));
+        validator_inputs.push((hot_path, cold_path, proof_path));
     }
     let build = command.output().unwrap();
     assert!(
@@ -583,15 +640,18 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
         "--bitcoin-minimum-confirmations",
         "100",
+        "--bitcoin-cli",
+        bitcoin_cli.to_str().unwrap(),
         "--output",
         malformed_genesis.to_str().unwrap(),
     ]);
-    for (index, (hot, cold)) in validator_inputs.iter().enumerate() {
+    for (index, (hot, cold, proof)) in validator_inputs.iter().enumerate() {
         let cold = if index == 0 { &malformed_path } else { cold };
         malformed.arg("--validator").arg(format!(
-            "v{index},{stake},{},{}",
+            "v{index},{stake},{},{},{}",
             hot.display(),
-            cold.display()
+            cold.display(),
+            proof.display()
         ));
     }
     let malformed = malformed.output().unwrap();
@@ -651,7 +711,9 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
     );
     assert_eq!(
         artifact("genesis_block_hash"),
-        indra_node::genesis::genesis_block_hash().to_string()
+        indra_node::genesis::genesis_block_hash(&state)
+            .unwrap()
+            .to_string()
     );
     assert_eq!(
         artifact("state_root"),
@@ -703,10 +765,10 @@ fn full_testnet_setup_pipeline() {
     // Step 2: Coordinator builds genesis
     let stake = DUST_LIMIT_SPARK * 100;
     let validators = vec![
-        genesis_entry("alice", &alice, stake, 21),
-        genesis_entry("bob", &bob, stake, 22),
-        genesis_entry("carol", &carol, stake, 23),
-        genesis_entry("dave", &dave, stake, 24),
+        genesis_entry("indra-private-testnet-1", "alice", &alice, stake, 21),
+        genesis_entry("indra-private-testnet-1", "bob", &bob, stake, 22),
+        genesis_entry("indra-private-testnet-1", "carol", &carol, stake, 23),
+        genesis_entry("indra-private-testnet-1", "dave", &dave, stake, 24),
     ];
 
     let config = build_test_genesis("indra-private-testnet-1", validators);

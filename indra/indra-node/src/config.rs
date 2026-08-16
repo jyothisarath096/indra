@@ -173,7 +173,8 @@ impl NodeConfig {
             let hot_public = hot.public_key();
             let cold_public = cold.public_key();
             let cold_public = cold_public.as_complete_hybrid();
-            let vrf_public = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]).public_key();
+            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]);
+            let vrf_public = vrf.public_key();
             let validator_id = indra_core::types::crypto::HybridPubKey {
                 classical_pk: indra_core::Bytes32::from(hot_public.classical.0),
                 pq_pk: indra_core::VariableBytes::from_slice(&hot_public.pq.0)
@@ -181,10 +182,19 @@ impl NodeConfig {
             }
             .identity_id()
             .0;
+            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+                "indra-testnet-1",
+                &indra_core::Bytes32::from(validator_id),
+                &indra_core::Bytes32::from(vrf_public),
+                0,
+            )
+            .expect("local test VRF challenge");
+            let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
             let contents = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
                 hex::encode(validator_id), hex::encode(hot_public.classical.0),
                 hex::encode(hot_public.pq.0), hex::encode(vrf_public),
+                hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
                 hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
             );
             std::fs::write(&genesis_path, contents).expect("write local-test genesis");

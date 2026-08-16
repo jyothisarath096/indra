@@ -70,7 +70,7 @@ fn anchored_genesis_state() -> ChainState {
     state.reward_economic_snapshot = None;
     state.slash_membership_roots.clear();
     state.finalize_genesis().unwrap();
-    state.tip_hash = genesis_block_hash();
+    state.tip_hash = genesis_block_hash(&state).unwrap();
     state
 }
 
@@ -266,6 +266,7 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
         .unwrap();
     if state.height == 0 {
         state.finalize_genesis().unwrap();
+        state.tip_hash = genesis_block_hash(state).unwrap();
     }
     hybrid
 }
@@ -285,16 +286,25 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
     let validator_id = indra_core::types::crypto::hybrid_identity_id(
         &classical.public_key().0,
         &pq.public_key().0,
+    );
+    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+        DEFAULT_CHAIN_ID,
+        &validator_id,
+        &Bytes32::from(vrf.public_key()),
+        0,
     )
-    .0;
+    .unwrap();
+    let (vrf_possession_output, vrf_possession_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
     let genesis_path = dir.join("genesis.toml");
     let genesis = format!(
-        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
         name,
-        hex::encode(validator_id),
+        hex::encode(validator_id.0),
         hex::encode(classical.public_key().0),
         hex::encode(pq.public_key().0),
         hex::encode(vrf.public_key()),
+        hex::encode(vrf_possession_output.0),
+        hex::encode(vrf_possession_proof.0),
         hex::encode(cold_public.classical.0),
         hex::encode(cold_public.pq.0),
     );
@@ -350,6 +360,7 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     config.vrf_seed = Some(seed);
     config.pq_pk = Some(pq.public_key().0.to_vec());
     config.pq_seed = Some(pq.secret_key_bytes());
+    config.genesis_path = Some(write_single_validator_genesis(&dir, seed, "local"));
     let engine = NodeEngine::init(config).unwrap();
     let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
     (ConsensusDriver::new(engine, vote_safety), dir)
@@ -380,8 +391,9 @@ fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
 
 #[test]
 fn genesis_is_deterministic() {
-    let h1 = genesis_block_hash();
-    let h2 = genesis_block_hash();
+    let state = build_genesis_state();
+    let h1 = genesis_block_hash(&state).unwrap();
+    let h2 = genesis_block_hash(&state).unwrap();
     assert_eq!(h1, h2);
 }
 
@@ -509,7 +521,13 @@ fn restarted_block_store_preserves_hash_chain() {
     let dir = temp_dir("restart_chain");
     std::fs::create_dir_all(&dir).unwrap();
     let mut config = NodeConfig::local_test(dir.clone());
-    config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32], "local"));
+    let seed = [0x42u8; 32];
+    let pq = PqKeypair::from_seed(&seed).unwrap();
+    config.genesis_path = Some(write_single_validator_genesis(&dir, seed, "local"));
+    config.validator_seed = Some(seed);
+    config.vrf_seed = Some(seed);
+    config.pq_pk = Some(pq.public_key().0.to_vec());
+    config.pq_seed = Some(pq.secret_key_bytes());
 
     {
         let mut engine = NodeEngine::init(config.clone()).unwrap();
@@ -602,6 +620,12 @@ fn sync_state_downloads_full_chain_from_genesis() {
         .is_none());
     assert!(sync.is_caught_up());
     assert_eq!(follower_state.height, source_state.height);
+    use indra_core::codec::Encode;
+    assert_eq!(follower_state.encode_to_vec(), source_state.encode_to_vec());
+    assert_eq!(
+        indra_state::compute_state_root(&follower_state),
+        indra_state::compute_state_root(&source_state)
+    );
     assert_block_log_roundtrip_and_links(&follower_log);
 
     let _ = std::fs::remove_dir_all(&dir);

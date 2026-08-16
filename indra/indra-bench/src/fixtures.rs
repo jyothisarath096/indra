@@ -75,6 +75,12 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockVNe
                 &vrf_proof.0,
             )
             .unwrap(),
+            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                origin_proposer_id: Bytes32::ZERO,
+                origin_round: 0,
+                vrf_output: VariableBytes::from_slice(&vrf_output.0).unwrap(),
+                vrf_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
+            },
             sortition_claim: SortitionClaimV1::PraosThreshold,
             proposer_priority: Bytes64([0; 64]),
             quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),

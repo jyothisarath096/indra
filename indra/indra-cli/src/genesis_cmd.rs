@@ -50,6 +50,10 @@ pub struct GenesisEntry {
     pub hybrid_pq_pk: String,
     /// VRF public key (hex).
     pub vrf_pk: String,
+    /// RFC 9381 output proving possession of the VRF secret key (hex).
+    pub vrf_possession_output: String,
+    /// RFC 9381 possession proof (hex).
+    pub vrf_possession_proof: String,
     /// Ed25519 cold public key (hex).
     pub cold_hybrid_classical_pk: String,
     /// ML-DSA-87 cold public key (hex).
@@ -111,9 +115,8 @@ impl GenesisConfig {
         ));
         out.push_str(&format!("reorg_policy = {}\n", source.reorg_policy));
         out.push_str(&format!(
-            "# {} validators, total stake = {} Spark\n\n",
-            self.validators.len(),
-            self.validators.iter().map(|v| v.stake).sum::<u64>()
+            "# {} validators; total stake is checked during validation\n\n",
+            self.validators.len()
         ));
 
         for v in &self.validators {
@@ -126,6 +129,14 @@ impl GenesisConfig {
             ));
             out.push_str(&format!("hybrid_pq_pk        = \"{}\"\n", v.hybrid_pq_pk));
             out.push_str(&format!("vrf_pk              = \"{}\"\n", v.vrf_pk));
+            out.push_str(&format!(
+                "vrf_possession_output = \"{}\"\n",
+                v.vrf_possession_output
+            ));
+            out.push_str(&format!(
+                "vrf_possession_proof = \"{}\"\n",
+                v.vrf_possession_proof
+            ));
             out.push_str(&format!(
                 "cold_hybrid_classical_pk = \"{}\"\n",
                 v.cold_hybrid_classical_pk
@@ -153,6 +164,11 @@ impl GenesisConfig {
     /// - All stakes are above the protocol dust floor
     /// - Total stake matches expectations
     pub fn validate(&self) -> CliResult<()> {
+        self.validators.iter().try_fold(0u64, |sum, validator| {
+            sum.checked_add(validator.stake).ok_or_else(|| {
+                CliError::Genesis("genesis validator stake sum overflows u64".into())
+            })
+        })?;
         use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
         if self.validators.len() < 4 {
@@ -221,6 +237,8 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
         hybrid_classical_pk: hex::encode(keys.public.hybrid_classical_pk),
         hybrid_pq_pk: hex::encode(&keys.public.hybrid_pq_pk),
         vrf_pk: hex::encode(keys.public.vrf_pk),
+        vrf_possession_output: String::new(),
+        vrf_possession_proof: String::new(),
         cold_hybrid_classical_pk: String::new(),
         cold_hybrid_pq_pk: String::new(),
         cold_key_version: 1,
@@ -241,6 +259,8 @@ pub fn entry_from_public_keys(
         hybrid_classical_pk: hex::encode(public.hybrid_classical_pk),
         hybrid_pq_pk: hex::encode(&public.hybrid_pq_pk),
         vrf_pk: hex::encode(public.vrf_pk),
+        vrf_possession_output: String::new(),
+        vrf_possession_proof: String::new(),
         cold_hybrid_classical_pk: String::new(),
         cold_hybrid_pq_pk: String::new(),
         cold_key_version: 1,
@@ -347,7 +367,7 @@ mod tests {
         build_genesis_config(chain_id, f, source, header, validators)
     }
 
-    fn test_validators(count: usize) -> Vec<GenesisEntry> {
+    fn test_validators(chain_id: &str, count: usize) -> Vec<GenesisEntry> {
         (0..count)
             .map(|i| {
                 let seed = [i as u8 + 1; 32];
@@ -363,6 +383,18 @@ mod tests {
                     entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10);
                 entry.cold_hybrid_classical_pk = hex::encode(cold.classical.0);
                 entry.cold_hybrid_pq_pk = hex::encode(cold.pq.0);
+                let validator_id = indra_core::Bytes32::from(keys.public.validator_id);
+                let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+                let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+                    chain_id,
+                    &validator_id,
+                    &indra_core::Bytes32::from(vrf.public_key()),
+                    0,
+                )
+                .unwrap();
+                let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+                entry.vrf_possession_output = hex::encode(output.0);
+                entry.vrf_possession_proof = hex::encode(proof.0);
                 entry
             })
             .collect()
@@ -370,7 +402,7 @@ mod tests {
 
     #[test]
     fn build_valid_genesis() {
-        let validators = test_validators(4);
+        let validators = test_validators("indra-testnet-1", 4);
         let config = build("indra-testnet-1", validators).unwrap();
         assert_eq!(config.validators.len(), 4);
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
@@ -390,7 +422,7 @@ mod tests {
 
     #[test]
     fn toml_renderer_escapes_operator_text() {
-        let validators = test_validators(4);
+        let validators = test_validators("indra-\"test\\chain", 4);
         let config = build("indra-\"test\\chain", validators).unwrap();
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
         assert_eq!(parsed.genesis.chain_id, "indra-\"test\\chain");
@@ -398,14 +430,14 @@ mod tests {
 
     #[test]
     fn too_few_validators_rejected() {
-        let validators = test_validators(3);
+        let validators = test_validators("test", 3);
         let result = build("test", validators);
         assert!(result.is_err());
     }
 
     #[test]
     fn below_dust_stake_rejected() {
-        let mut validators = test_validators(4);
+        let mut validators = test_validators("test", 4);
         validators[0].stake = 1; // below DUST_LIMIT_SPARK
         let result = build("test", validators);
         assert!(result.is_err());
@@ -413,7 +445,7 @@ mod tests {
 
     #[test]
     fn duplicate_validator_id_rejected() {
-        let mut validators = test_validators(4);
+        let mut validators = test_validators("test", 4);
         validators[1].validator_id = validators[0].validator_id.clone();
         let result = build("test", validators);
         assert!(result.is_err());
@@ -421,7 +453,7 @@ mod tests {
 
     #[test]
     fn toml_output_has_all_fields() {
-        let validators = test_validators(4);
+        let validators = test_validators("indra-testnet-1", 4);
         let config = build("indra-testnet-1", validators).unwrap();
         let toml = config.to_toml();
         assert!(toml.contains("[genesis]"));

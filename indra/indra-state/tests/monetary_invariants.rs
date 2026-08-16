@@ -142,6 +142,12 @@ fn block(state: &ChainState, tx: TransactionV1) -> BlockVNext {
             election_seed: state.election_seed,
             proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                origin_proposer_id: Bytes32::from([0x83; 32]),
+                origin_round: 0,
+                vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            },
             sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
             proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),

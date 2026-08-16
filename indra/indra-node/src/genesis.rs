@@ -115,6 +115,19 @@ impl BitcoinPowEntropySourceV1 {
     }
 }
 
+/// Commit to the complete canonical public entropy record used at genesis.
+pub fn genesis_entropy_record_hash(settings: &GenesisSettings) -> Result<Bytes32, String> {
+    let descriptor = settings.bitcoin_pow_entropy_source.canonical_bytes()?;
+    let header = decode_hex_exact::<80>(
+        &settings.bitcoin_pow_entropy_header,
+        "bitcoin_pow_entropy_header",
+    )?;
+    let mut preimage = b"INDRA-GENESIS-ENTROPY-RECORD-v1".to_vec();
+    preimage.extend_from_slice(&descriptor);
+    preimage.extend_from_slice(&header);
+    Ok(Bytes32::from(sha256(&preimage)))
+}
+
 /// Deterministically derive the signed genesis election seed.
 pub fn derive_genesis_election_seed(settings: &GenesisSettings) -> Result<Bytes64, String> {
     indra_core::sortition::validate_f(settings.active_slot_coefficient_numerator)
@@ -152,6 +165,10 @@ pub struct GenesisValidator {
     pub hybrid_pq_pk: String,
     /// VRF public key.
     pub vrf_pk: String,
+    /// RFC 9381 output proving possession of the genesis VRF secret key.
+    pub vrf_possession_output: String,
+    /// RFC 9381 proof over the genesis registration transcript.
+    pub vrf_possession_proof: String,
     /// Ed25519 cold public key.
     pub cold_hybrid_classical_pk: String,
     /// ML-DSA-87 cold public key.
@@ -234,6 +251,10 @@ fn validate_genesis_manifest_with_minimum(
             "hybrid_pq_pk",
         )?;
         let vrf_pk = decode_hex_exact::<32>(&validator.vrf_pk, "vrf_pk")?;
+        let vrf_output =
+            decode_hex_exact::<64>(&validator.vrf_possession_output, "vrf_possession_output")?;
+        let vrf_proof =
+            decode_hex_exact::<80>(&validator.vrf_possession_proof, "vrf_possession_proof")?;
         let cold_classical_pk = decode_hex_exact::<32>(
             &validator.cold_hybrid_classical_pk,
             "cold_hybrid_classical_pk",
@@ -254,6 +275,25 @@ fn validate_genesis_manifest_with_minimum(
                 validator.name
             ));
         }
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            &manifest.genesis.chain_id,
+            &Bytes32::from(validator_id),
+            &Bytes32::from(vrf_pk),
+            0,
+        )
+        .map_err(|error| error.to_string())?;
+        indra_crypto::vrf_verify(
+            &vrf_pk,
+            &challenge,
+            &indra_crypto::VrfOutput(vrf_output),
+            &indra_crypto::VrfProof(vrf_proof.to_vec()),
+        )
+        .map_err(|_| {
+            format!(
+                "genesis validator {} VRF possession proof is invalid",
+                validator.name
+            )
+        })?;
         for (inserted, label) in [
             (validator_ids.insert(validator_id.to_vec()), "validator_id"),
             (
@@ -266,7 +306,7 @@ fn validate_genesis_manifest_with_minimum(
                 classical_keys.insert(cold_classical_pk.to_vec()),
                 "classical hot/cold key",
             ),
-            (pq_keys.insert(cold_pq_pk), "PQ hot/cold key"),
+            (pq_keys.insert(cold_pq_pk.clone()), "PQ hot/cold key"),
         ] {
             if !inserted {
                 return Err(format!("duplicate genesis {label}"));
@@ -278,9 +318,39 @@ fn validate_genesis_manifest_with_minimum(
                 validator.name
             ));
         }
-        if validator.cold_key_version == 0 {
+        indra_crypto::validate_classical_public_key(&indra_crypto::ClassicalPublicKey(
+            cold_classical_pk,
+        ))
+        .map_err(|_| {
+            format!(
+                "genesis validator {} has invalid cold classical key",
+                validator.name
+            )
+        })?;
+        let cold_pq_array: [u8; indra_crypto::PQ_PK_BYTES] =
+            cold_pq_pk.as_slice().try_into().map_err(|_| {
+                format!(
+                    "genesis validator {} has invalid cold PQ key length",
+                    validator.name
+                )
+            })?;
+        indra_crypto::validate_pq_public_key(&indra_crypto::PqPublicKey(cold_pq_array)).map_err(
+            |_| {
+                format!(
+                    "genesis validator {} has invalid cold PQ key",
+                    validator.name
+                )
+            },
+        )?;
+        if validator.cold_key_version != 1 {
             return Err(format!(
-                "genesis validator {} cold_key_version must be nonzero",
+                "genesis validator {} cold_key_version must equal 1",
+                validator.name
+            ));
+        }
+        if validator.cold_nonce != 0 {
+            return Err(format!(
+                "genesis validator {} cold_nonce must equal 0",
                 validator.name
             ));
         }
@@ -289,6 +359,7 @@ fn validate_genesis_manifest_with_minimum(
 }
 
 fn decode_hex_exact<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    reject_noncanonical_hex(value, field)?;
     let bytes = hex::decode(value).map_err(|_| format!("invalid hex in genesis {field}"))?;
     bytes
         .try_into()
@@ -296,6 +367,7 @@ fn decode_hex_exact<const N: usize>(value: &str, field: &str) -> Result<[u8; N],
 }
 
 fn decode_hex_len(value: &str, expected: usize, field: &str) -> Result<Vec<u8>, String> {
+    reject_noncanonical_hex(value, field)?;
     let bytes = hex::decode(value).map_err(|_| format!("invalid hex in genesis {field}"))?;
     if bytes.len() != expected {
         return Err(format!("genesis {field} must be exactly {expected} bytes"));
@@ -303,28 +375,65 @@ fn decode_hex_len(value: &str, expected: usize, field: &str) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+fn reject_noncanonical_hex(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() % 2 != 0
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "genesis {field} must be canonical lowercase hexadecimal"
+        ));
+    }
+    Ok(())
+}
+
 /// Build the genesis block.
 ///
 /// The genesis block hash is SHA-256(encode(genesis_header)).
-pub fn build_genesis_block() -> BlockVNext {
-    BlockVNext {
+pub fn genesis_fingerprint(state: &ChainState) -> Result<Bytes32, String> {
+    use indra_core::codec::Encode;
+    let roots = indra_state::compute_state_roots(state);
+    let snapshot = state
+        .snapshot_for_consensus_height(1)
+        .map_err(|error| error.to_string())?;
+    let mut preimage = b"INDRA-GENESIS-FINGERPRINT-v1".to_vec();
+    let chain_id = state.chain_id.as_bytes();
+    let chain_len = u16::try_from(chain_id.len()).map_err(|_| "genesis chain id too long")?;
+    preimage.extend_from_slice(&chain_len.to_be_bytes());
+    preimage.extend_from_slice(chain_id);
+    preimage.extend_from_slice(&roots.state_root.0);
+    preimage.extend_from_slice(&snapshot.snapshot_root.0);
+    state.monetary_ledger.encode(&mut preimage);
+    preimage.extend_from_slice(&state.election_seed.0);
+    preimage.extend_from_slice(&state.genesis_entropy_record_hash.0);
+    Ok(Bytes32::from(sha256(&preimage)))
+}
+
+/// Build the unique height-zero block bound to finalized canonical genesis state.
+pub fn build_genesis_block(state: &ChainState) -> Result<BlockVNext, String> {
+    let roots = indra_state::compute_state_roots(state);
+    let fingerprint = genesis_fingerprint(state)?;
+    Ok(BlockVNext {
         header: BlockHeaderVNext {
             protocol_version: ProtocolVersion::CURRENT,
             height: 0,
             prev_hash: Bytes32::ZERO,
             timestamp: 1_700_000_000, // 2023-11-14 — fixed genesis timestamp
-            state_root: Bytes32::ZERO,
-            validator_set_root: Bytes32::ZERO,
+            state_root: roots.state_root,
+            validator_set_root: roots.validator_set_root,
             mempool_set_root: Bytes32::ZERO,
-            value_hash: Bytes32::ZERO,
+            value_hash: fingerprint,
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round: 0,
             polc_round: indra_core::types::block::NO_POLC_ROUND,
             proposer_id: Bytes32::ZERO,
             vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
-            election_seed: Bytes64([0; 64]),
+            election_seed: state.election_seed,
             proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::default(),
             proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::default(),
+            value_entropy: indra_core::types::block::ProposalEntropyV1::genesis(),
             sortition_claim: SortitionClaimV1::PraosThreshold,
             proposer_priority: Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::default(),
@@ -333,25 +442,25 @@ pub fn build_genesis_block() -> BlockVNext {
         slashing_evidence: vec![],
         governance_ops: vec![],
         staking_ops: vec![],
-    }
+    })
 }
 
 /// Canonical storage envelope for the unsigned genesis exception.
-pub fn build_genesis_proposal() -> BlockProposalVNext {
-    BlockProposalVNext {
-        block: build_genesis_block(),
+pub fn build_genesis_proposal(state: &ChainState) -> Result<BlockProposalVNext, String> {
+    Ok(BlockProposalVNext {
+        block: build_genesis_block(state)?,
         proposer_authorization: HybridSignature {
             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::default(),
             pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::default(),
         },
-    }
+    })
 }
 
 /// Compute the genesis block hash.
-pub fn genesis_block_hash() -> Bytes32 {
+pub fn genesis_block_hash(state: &ChainState) -> Result<Bytes32, String> {
     use indra_core::codec::Encode;
-    let block = build_genesis_block();
-    Bytes32::from(sha256(&block.header.encode_to_vec()))
+    let block = build_genesis_block(state)?;
+    Ok(Bytes32::from(sha256(&block.header.encode_to_vec())))
 }
 
 /// Build the canonical local genesis state.
@@ -473,8 +582,10 @@ fn load_genesis_validators_with_minimum(
     state.chain_id = manifest.genesis.chain_id.clone();
     state.active_slot_coefficient_numerator = manifest.genesis.active_slot_coefficient_numerator;
     state.election_seed = derive_genesis_election_seed(&manifest.genesis)?;
+    state.genesis_entropy_record_hash = genesis_entropy_record_hash(&manifest.genesis)?;
     state.election_seed_height = 1;
-    let validators = manifest.validators;
+    let mut validators = manifest.validators;
+    validators.sort_by(|left, right| left.validator_id.cmp(&right.validator_id));
 
     // NOTE: startup logging for node bootstrap; replace with structured tracing later.
     println!(
@@ -597,6 +708,7 @@ pub(crate) fn build_finalized_genesis_state_with_minimum(
     state
         .finalize_genesis()
         .map_err(|error| error.to_string())?;
+    state.genesis_fingerprint = genesis_fingerprint(&state)?;
     Ok(state)
 }
 
@@ -626,20 +738,28 @@ mod tests {
                 .unwrap();
                 let cold_public = cold.public_key();
                 let cold_public = cold_public.as_complete_hybrid();
+                let validator_id = indra_core::types::crypto::hybrid_identity_id(
+                    &hot_public.classical.0,
+                    &hot_public.pq.0,
+                );
+                let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&[index + 41; 32]);
+                let vrf_pk = Bytes32::from(vrf_keypair.public_key());
+                let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+                    "indra-testnet-new",
+                    &validator_id,
+                    &vrf_pk,
+                    0,
+                )
+                .unwrap();
+                let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf_keypair, &challenge);
                 GenesisValidator {
                     name: format!("validator-{index}"),
-                    validator_id: hex::encode(
-                        indra_core::types::crypto::hybrid_identity_id(
-                            &hot_public.classical.0,
-                            &hot_public.pq.0,
-                        )
-                        .0,
-                    ),
+                    validator_id: hex::encode(validator_id.0),
                     hybrid_classical_pk: hex::encode(hot_public.classical.0),
                     hybrid_pq_pk: hex::encode(hot_public.pq.0),
-                    vrf_pk: hex::encode(
-                        indra_crypto::VrfKeypair::from_seed(&[index + 41; 32]).public_key(),
-                    ),
+                    vrf_pk: hex::encode(vrf_pk.0),
+                    vrf_possession_output: hex::encode(vrf_output.0),
+                    vrf_possession_proof: hex::encode(vrf_proof.0),
                     cold_hybrid_classical_pk: hex::encode(cold_public.classical.0),
                     cold_hybrid_pq_pk: hex::encode(cold_public.pq.0),
                     cold_key_version: 1,
@@ -672,7 +792,7 @@ mod tests {
         let s = &manifest.genesis.bitcoin_pow_entropy_source;
         let mut rendered = format!("[genesis]\nchain_id = \"{}\"\nactive_slot_coefficient_numerator = \"{}\"\nbitcoin_pow_entropy_header = \"{}\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = {}\nnetwork_genesis_hash = \"{}\"\nannounced_height = {}\nheader_codec = {}\nextraction_algorithm = {}\nminimum_confirmations = {}\nreorg_policy = {}\n", manifest.genesis.chain_id,manifest.genesis.active_slot_coefficient_numerator,manifest.genesis.bitcoin_pow_entropy_header,s.scheme,s.network_genesis_hash,s.announced_height,s.header_codec,s.extraction_algorithm,s.minimum_confirmations,s.reorg_policy);
         for validator in &manifest.validators {
-            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk));
+            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk, validator.vrf_possession_output, validator.vrf_possession_proof));
             if !omit_cold {
                 rendered.push_str(&format!(
                     "cold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\n",
@@ -818,21 +938,96 @@ mod tests {
     }
 
     #[test]
+    fn genesis_rejects_vrf_squatting_cold_history_and_noncanonical_hex() {
+        let manifest = valid_manifest();
+        let mut squatted = manifest.clone();
+        squatted.validators[0].vrf_pk = squatted.validators[1].vrf_pk.clone();
+        assert!(validate_genesis_manifest(&squatted).is_err());
+
+        let mut wrong_version = manifest.clone();
+        wrong_version.validators[0].cold_key_version = 2;
+        assert!(validate_genesis_manifest(&wrong_version).is_err());
+        let mut used_nonce = manifest.clone();
+        used_nonce.validators[0].cold_nonce = 1;
+        assert!(validate_genesis_manifest(&used_nonce).is_err());
+        let mut uppercase = manifest;
+        uppercase.validators[0].validator_id = uppercase.validators[0].validator_id.to_uppercase();
+        assert!(validate_genesis_manifest(&uppercase).is_err());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_every_genesis_identity_domain() {
+        let manifest = valid_manifest();
+        let path = std::env::temp_dir().join(format!(
+            "indra-genesis-fingerprint-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, render_manifest(&manifest, false)).unwrap();
+        let state = build_finalized_genesis_state_with_minimum(path.to_str(), 1).unwrap();
+        let original = genesis_fingerprint(&state).unwrap();
+
+        let mut changed = state.clone();
+        changed.chain_id.push_str("-other");
+        assert_ne!(original, genesis_fingerprint(&changed).unwrap());
+        let mut changed = state.clone();
+        changed.election_seed.0[0] ^= 1;
+        assert_ne!(original, genesis_fingerprint(&changed).unwrap());
+        let mut changed = state.clone();
+        changed.genesis_entropy_record_hash.0[0] ^= 1;
+        assert_ne!(original, genesis_fingerprint(&changed).unwrap());
+        let mut changed = state.clone();
+        changed.monetary_ledger.genesis_issued_spark = changed
+            .monetary_ledger
+            .genesis_issued_spark
+            .checked_add(1)
+            .unwrap();
+        assert_ne!(original, genesis_fingerprint(&changed).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn genesis_liquid_issuance_is_independent_of_manifest_validator_order() {
+        use indra_core::codec::Encode;
+        let manifest = valid_manifest();
+        let mut reversed = manifest.clone();
+        reversed.validators.reverse();
+        let base = std::env::temp_dir().join(format!("indra-genesis-order-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let first_path = base.join("first.toml");
+        let second_path = base.join("second.toml");
+        std::fs::write(&first_path, render_manifest(&manifest, false)).unwrap();
+        std::fs::write(&second_path, render_manifest(&reversed, false)).unwrap();
+        let first = build_finalized_genesis_state_with_minimum(first_path.to_str(), 1).unwrap();
+        let second = build_finalized_genesis_state_with_minimum(second_path.to_str(), 1).unwrap();
+        assert_eq!(first.utxos.encode_to_vec(), second.utxos.encode_to_vec());
+        assert_eq!(
+            indra_state::compute_state_root(&first),
+            indra_state::compute_state_root(&second)
+        );
+        assert_eq!(
+            genesis_fingerprint(&first).unwrap(),
+            genesis_fingerprint(&second).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn genesis_block_is_deterministic() {
-        let h1 = genesis_block_hash();
-        let h2 = genesis_block_hash();
+        let state = build_genesis_state();
+        let h1 = genesis_block_hash(&state).unwrap();
+        let h2 = genesis_block_hash(&state).unwrap();
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn genesis_block_height_is_zero() {
-        let b = build_genesis_block();
+        let b = build_genesis_block(&build_genesis_state()).unwrap();
         assert_eq!(b.header.height, 0);
     }
 
     #[test]
     fn genesis_block_has_zero_prev_hash() {
-        let b = build_genesis_block();
+        let b = build_genesis_block(&build_genesis_state()).unwrap();
         assert_eq!(b.header.prev_hash, Bytes32::ZERO);
     }
 
@@ -857,15 +1052,26 @@ mod tests {
         let cold_public = cold_public.as_complete_hybrid();
         let mut state = ChainState::new_genesis();
         let path = std::env::temp_dir().join(format!(
-            "indra-genesis-blinding-test-{}.toml",
+            "indra-genesis-transparent-output-test-{}.toml",
             std::process::id()
         ));
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[0x11; 32]);
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            "test",
+            &validator_id,
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         let mut contents = format!(
-            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"1\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"1\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
             hex::encode(validator_id.0),
             hex::encode(classical_pk),
             hex::encode(&pq_pk),
-            hex::encode([0x11u8; 32]),
+            hex::encode(vrf.public_key()),
+            hex::encode(vrf_output.0),
+            hex::encode(vrf_proof.0),
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
@@ -882,18 +1088,27 @@ mod tests {
             .unwrap();
             let extra_cold_public = extra_cold.public_key();
             let extra_cold_public = extra_cold_public.as_complete_hybrid();
+            let extra_id = indra_core::types::crypto::hybrid_identity_id(
+                &hot_public.classical.0,
+                &hot_public.pq.0,
+            );
+            let extra_vrf = indra_crypto::VrfKeypair::from_seed(&[0xA0 + i; 32]);
+            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+                "test",
+                &extra_id,
+                &Bytes32::from(extra_vrf.public_key()),
+                0,
+            )
+            .unwrap();
+            let (extra_output, extra_proof) = indra_crypto::vrf_prove(&extra_vrf, &challenge);
             contents.push_str(&format!(
-                "\n[[validators]]\nname = \"extra-{i}\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
-                hex::encode(
-                    indra_core::types::crypto::hybrid_identity_id(
-                        &hot_public.classical.0,
-                        &hot_public.pq.0,
-                    )
-                    .0,
-                ),
+                "\n[[validators]]\nname = \"extra-{i}\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                hex::encode(extra_id.0),
                 hex::encode(hot_public.classical.0),
                 hex::encode(hot_public.pq.0),
-                hex::encode([0xA0 + i; 32]),
+                hex::encode(extra_vrf.public_key()),
+                hex::encode(extra_output.0),
+                hex::encode(extra_proof.0),
                 hex::encode(extra_cold_public.classical.0),
                 hex::encode(extra_cold_public.pq.0),
             ));

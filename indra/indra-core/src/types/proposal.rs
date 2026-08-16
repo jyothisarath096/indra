@@ -4,7 +4,7 @@ use crate::{
     error::{IndraError, IndraResult},
     sortition::{evaluate, priority, CertifiedLogInterval},
     types::{
-        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1},
+        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1, NO_POLC_ROUND},
         consensus_snapshot::ConsensusSnapshot,
         primitives::{Bytes32, Bytes64},
     },
@@ -75,10 +75,9 @@ pub fn next_election_seed(
     material.extend_from_slice(chain_id);
     prior.encode(&mut material);
     h.height.encode(&mut material);
-    h.proposer_round.encode(&mut material);
-    h.block_hash().encode(&mut material);
-    h.proposer_id.encode(&mut material);
-    material.extend_from_slice(h.proposer_vrf_output.as_slice());
+    h.value_entropy.origin_round.encode(&mut material);
+    h.value_entropy.origin_proposer_id.encode(&mut material);
+    material.extend_from_slice(h.value_entropy.vrf_output.as_slice());
     snapshot_root.encode(&mut material);
     let digest = Sha512::digest(&material);
     let mut out = [0u8; 64];
@@ -163,6 +162,56 @@ pub fn verify_proposal<'a>(
     if h.proposer_priority != Bytes64(priority(&output, &h.proposer_id.0)) {
         return Err(IndraError::InvalidSortition(
             "proposer priority mismatch".into(),
+        ));
+    }
+
+    let (_, entropy_entry) = snapshot
+        .entry_with_position(&h.value_entropy.origin_proposer_id)
+        .ok_or_else(|| {
+            IndraError::InvalidSortition(
+                "value-entropy origin is absent from governing snapshot".into(),
+            )
+        })?;
+    let entropy_alpha = proposer_vrf_alpha(
+        chain_id,
+        expected_seed,
+        h.height,
+        h.value_entropy.origin_round,
+        &snapshot.snapshot_root,
+        &h.value_entropy.origin_proposer_id,
+    )?;
+    let entropy_output: [u8; 64] = h
+        .value_entropy
+        .vrf_output
+        .as_slice()
+        .try_into()
+        .map_err(|_| IndraError::VrfProofInvalid)?;
+    vrf_verify(
+        &entropy_entry.vrf_pk,
+        &entropy_alpha,
+        &VrfOutput(entropy_output),
+        &VrfProof(h.value_entropy.vrf_proof.as_slice().to_vec()),
+    )
+    .map_err(|_| IndraError::VrfProofInvalid)?;
+    let entropy_result = evaluate(
+        &log,
+        entropy_entry.consensus_weight_spark,
+        snapshot.total_weight_spark,
+        &entropy_output,
+    )?;
+    if !entropy_result.eligible {
+        return Err(IndraError::InvalidSortition(
+            "value-entropy origin was not eligible".into(),
+        ));
+    }
+    if h.polc_round == NO_POLC_ROUND
+        && (h.value_entropy.origin_proposer_id != h.proposer_id
+            || h.value_entropy.origin_round != h.proposer_round
+            || h.value_entropy.vrf_output.as_slice() != h.proposer_vrf_output.as_slice()
+            || h.value_entropy.vrf_proof.as_slice() != h.proposer_vrf_proof.as_slice())
+    {
+        return Err(IndraError::InvalidSortition(
+            "first proposal does not bind entropy to its current-round VRF proof".into(),
         ));
     }
     Ok(VerifiedProposal { proposal })

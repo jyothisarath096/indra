@@ -2320,6 +2320,12 @@ mod tests {
                 election_seed: state.election_seed,
                 proposer_vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
                 proposer_vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                    origin_proposer_id: Bytes32::ZERO,
+                    origin_round: 0,
+                    vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+                    vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                },
                 sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
                 proposer_priority: indra_core::types::primitives::Bytes64::ZERO,
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
@@ -2518,14 +2524,25 @@ mod tests {
             &pq.public_key().0,
         )
         .0;
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &indra_core::types::primitives::Bytes32(validator_id),
+            &indra_core::types::primitives::Bytes32(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_possession_output, vrf_possession_proof) =
+            indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
             hex::encode(vrf.public_key()),
+            hex::encode(vrf_possession_output.0),
+            hex::encode(vrf_possession_proof.0),
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
@@ -2535,7 +2552,7 @@ mod tests {
         config.vrf_seed = Some(seed);
         config.pq_pk = Some(pq.public_key().0.to_vec());
         config.pq_seed = Some(pq.secret_key_bytes());
-        let engine = NodeEngine::init(config).unwrap();
+        let engine = NodeEngine::init(config.clone()).unwrap();
         let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
         let mut driver = ConsensusDriver::new(engine, vote_safety);
         for counter in 0u64..4_096 {
@@ -2575,8 +2592,18 @@ mod tests {
                     &hex::encode([0u8; 80]),
                     &settings.bitcoin_pow_entropy_header,
                 );
+                // The entropy header is consensus-critical genesis input. The
+                // exploratory engine above was built only to locate a
+                // deterministic eligible fixture seed; rebuild from an empty
+                // store so its height-zero anchor and fingerprint bind the
+                // finalized manifest rather than the placeholder header.
+                drop(driver);
+                std::fs::remove_dir_all(&dir).unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(&genesis_path, persisted).unwrap();
-                return (driver, dir);
+                let engine = NodeEngine::init(config).unwrap();
+                let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+                return (ConsensusDriver::new(engine, vote_safety), dir);
             }
         }
         panic!("test genesis could not find an eligible deterministic election seed")
@@ -2806,6 +2833,24 @@ mod tests {
         forged_eligibility.block.header.proposer_vrf_output =
             VariableBytes::from_slice(&output_bytes).unwrap();
         assert!(verify_live_proposal(&driver, &forged_eligibility).is_err());
+
+        let mut forged_entropy = valid.clone();
+        let mut entropy_bytes = forged_entropy
+            .block
+            .header
+            .value_entropy
+            .vrf_output
+            .as_slice()
+            .to_vec();
+        entropy_bytes[0] ^= 1;
+        forged_entropy.block.header.value_entropy.vrf_output =
+            VariableBytes::from_slice(&entropy_bytes).unwrap();
+        reauthorize_test_proposal(
+            &mut forged_entropy,
+            seed,
+            driver.engine.state.chain_id.as_bytes(),
+        );
+        assert!(verify_live_proposal(&driver, &forged_entropy).is_err());
 
         let mut tampered_content = valid.clone();
         tampered_content.block.header.timestamp ^= 1;
@@ -4761,7 +4806,6 @@ mod tests {
 
     #[test]
     fn driver_restart_with_stale_persisted_qc_does_not_restore_it() {
-        let dir = temp_dir("restart_stale_qc");
         let seed = [0xA5u8; 32];
         let stale_qc_bytes = {
             let (mut source_driver, source_dir) = local_driver(seed, "restart_stale_qc_source");
@@ -4774,17 +4818,10 @@ mod tests {
             bytes
         };
 
-        let mut config = NodeConfig::local_test(dir.clone());
-        let pq = PqKeypair::from_seed(&seed).unwrap();
-        config.genesis_path = Some(dir.join("genesis.toml").to_string_lossy().to_string());
-        config.validator_seed = Some(seed);
-        config.vrf_seed = Some(seed);
-        config.pq_pk = Some(pq.public_key().0.to_vec());
-        config.pq_seed = Some(pq.secret_key_bytes());
-        {
-            let mut pristine = NodeEngine::init(config.clone()).unwrap();
-            pristine.write_chain_manifest().unwrap();
-        }
+        let (mut pristine, dir) = local_driver(seed, "restart_stale_qc");
+        let config = pristine.engine.config.clone();
+        pristine.engine.write_chain_manifest().unwrap();
+        drop(pristine);
         indra_storage::save_last_qc(&config.state_dir(), &stale_qc_bytes).unwrap();
 
         let mut engine = NodeEngine::init(config).unwrap();
@@ -5297,6 +5334,11 @@ mod tests {
             )
             .expect("reproposal should succeed");
 
+        assert!(verify_live_proposal(&driver, &reproposed).is_ok());
+        assert_eq!(
+            proposal.header.value_entropy,
+            reproposed.header.value_entropy
+        );
         assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
         assert_ne!(proposal.header.block_hash(), reproposed.header.block_hash());
 

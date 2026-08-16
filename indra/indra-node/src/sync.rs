@@ -724,7 +724,8 @@ where
 
     // Store genesis placeholder if block_store is empty and this is height 1
     if block_store.is_empty() && height == 1 {
-        let genesis = crate::genesis::build_genesis_proposal();
+        let genesis = crate::genesis::build_genesis_proposal(state)
+            .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
         block_store.append(&genesis)?;
     }
     block_store.append(proposal)?;
@@ -1873,7 +1874,7 @@ mod tests {
         let block = make_block(&state);
 
         block_store
-            .append(&crate::genesis::build_genesis_proposal())
+            .append(&crate::genesis::build_genesis_proposal(&state).unwrap())
             .unwrap();
         block_store.append(&block).unwrap();
         let error = import_unfinalized_block_for_test(

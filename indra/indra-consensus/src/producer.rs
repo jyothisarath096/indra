@@ -132,6 +132,20 @@ pub fn produce_block(
             detail: e.to_string(),
         })?,
         proposer_vrf_proof: vrf_proof_bytes,
+        value_entropy: indra_core::types::block::ProposalEntropyV1 {
+            origin_proposer_id: slot.proposer_id,
+            origin_round: election.round,
+            vrf_output: VariableBytes::from_slice(&slot.vrf_output.0).map_err(|e| {
+                ConsensusError::CryptoError {
+                    detail: e.to_string(),
+                }
+            })?,
+            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).map_err(|e| {
+                ConsensusError::CryptoError {
+                    detail: e.to_string(),
+                }
+            })?,
+        },
         sortition_claim: SortitionClaimV1::PraosThreshold,
         proposer_priority: slot.priority,
         quorum_certificate: qc_bytes,

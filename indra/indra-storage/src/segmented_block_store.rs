@@ -562,6 +562,12 @@ mod tests {
                         &[0; 80],
                     )
                     .unwrap(),
+                    value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                        origin_proposer_id: indra_core::Bytes32::from([0x77; 32]),
+                        origin_round: 0,
+                        vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+                        vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                    },
                     sortition_claim: SortitionClaimV1::PraosThreshold,
                     proposer_priority: Bytes64([0x79; 64]),
                     quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),

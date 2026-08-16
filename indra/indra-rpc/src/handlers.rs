@@ -2951,6 +2951,12 @@ mod tests {
                 proposer_vrf_output: VariableBytes::from_slice(&[byte.wrapping_add(4); 64])
                     .unwrap(),
                 proposer_vrf_proof: VariableBytes::from_slice(&[byte; 80]).unwrap(),
+                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                    origin_proposer_id: Bytes32::from([byte.wrapping_add(3); 32]),
+                    origin_round: byte as u32,
+                    vrf_output: VariableBytes::from_slice(&[byte.wrapping_add(4); 64]).unwrap(),
+                    vrf_proof: VariableBytes::from_slice(&[byte; 80]).unwrap(),
+                },
                 sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
                 proposer_priority: indra_core::types::primitives::Bytes64(
                     [byte.wrapping_add(5); 64],

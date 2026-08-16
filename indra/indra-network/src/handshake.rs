@@ -21,7 +21,7 @@ use crate::{
 };
 
 const MAGIC: &[u8; 4] = b"INDR";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const X25519_PK_LEN: usize = 32;
 const ML_KEM_1024_EK_LEN: usize = 1_568;
 const ML_KEM_1024_CT_LEN: usize = 1_568;
@@ -41,6 +41,8 @@ pub struct HandshakeConfig {
     pub my_signing_key: PqKeypair,
     /// Current chain id used by relay signature verification.
     pub chain_id: String,
+    /// Canonical fingerprint of the complete finalized genesis configuration.
+    pub genesis_fingerprint: Bytes32,
     /// Accepted validator identities and their ML-DSA-87 verifying keys.
     pub known_validators: Vec<(Bytes32, PqPublicKey)>,
     /// Active validator public-key snapshot used by the peer manager for
@@ -76,23 +78,30 @@ fn lookup_validator_pk(
         .ok_or(NetworkError::UnknownValidator { validator_id })
 }
 
-fn build_chain_preface(chain_id: &str) -> NetworkResult<Vec<u8>> {
+fn build_chain_preface(chain_id: &str, genesis_fingerprint: Bytes32) -> NetworkResult<Vec<u8>> {
     let chain_id = chain_id.as_bytes();
     if chain_id.is_empty() || chain_id.len() > MAX_CHAIN_ID_BYTES {
         return Err(NetworkError::DecodeFailed {
             reason: format!("local chain id length must be 1..={MAX_CHAIN_ID_BYTES} bytes"),
         });
     }
-    let mut out = Vec::with_capacity(CHAIN_PREFACE_HEADER_LEN + chain_id.len());
+    let mut out = Vec::with_capacity(CHAIN_PREFACE_HEADER_LEN + chain_id.len() + 32);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(chain_id.len() as u16).to_le_bytes());
     out.extend_from_slice(chain_id);
+    out.extend_from_slice(&genesis_fingerprint.0);
     Ok(out)
 }
 
-async fn write_chain_preface(stream: &mut TcpStream, chain_id: &str) -> NetworkResult<()> {
-    stream.write_all(&build_chain_preface(chain_id)?).await?;
+async fn write_chain_preface(
+    stream: &mut TcpStream,
+    chain_id: &str,
+    genesis_fingerprint: Bytes32,
+) -> NetworkResult<()> {
+    stream
+        .write_all(&build_chain_preface(chain_id, genesis_fingerprint)?)
+        .await?;
     stream.flush().await?;
     Ok(())
 }
@@ -100,6 +109,7 @@ async fn write_chain_preface(stream: &mut TcpStream, chain_id: &str) -> NetworkR
 async fn read_and_verify_chain_preface(
     stream: &mut TcpStream,
     expected_chain_id: &str,
+    expected_genesis_fingerprint: Bytes32,
 ) -> NetworkResult<()> {
     let mut header = [0u8; CHAIN_PREFACE_HEADER_LEN];
     stream.read_exact(&mut header).await?;
@@ -119,6 +129,13 @@ async fn read_and_verify_chain_preface(
         return Err(NetworkError::ChainIdMismatch {
             expected: expected_chain_id.to_string(),
             got: peer_chain_id,
+        });
+    }
+    let mut peer_fingerprint = [0u8; 32];
+    stream.read_exact(&mut peer_fingerprint).await?;
+    if peer_fingerprint != expected_genesis_fingerprint.0 {
+        return Err(NetworkError::DecodeFailed {
+            reason: "peer genesis fingerprint does not match local canonical genesis".into(),
         });
     }
     Ok(())
@@ -305,8 +322,9 @@ async fn perform_handshake_inner(
     if initiator {
         // Establish chain identity before generating or exchanging any key
         // material and before looking up either validator identity.
-        write_chain_preface(&mut stream, &config.chain_id).await?;
-        read_and_verify_chain_preface(&mut stream, &config.chain_id).await?;
+        write_chain_preface(&mut stream, &config.chain_id, config.genesis_fingerprint).await?;
+        read_and_verify_chain_preface(&mut stream, &config.chain_id, config.genesis_fingerprint)
+            .await?;
 
         let x_secret = EphemeralSecret::random();
         let x_public = PublicKey::from(&x_secret).to_bytes();
@@ -357,8 +375,9 @@ async fn perform_handshake_inner(
     } else {
         // Fail closed on cross-chain connections before key exchange or
         // validator authorization. Only acknowledge a matching chain.
-        read_and_verify_chain_preface(&mut stream, &config.chain_id).await?;
-        write_chain_preface(&mut stream, &config.chain_id).await?;
+        read_and_verify_chain_preface(&mut stream, &config.chain_id, config.genesis_fingerprint)
+            .await?;
+        write_chain_preface(&mut stream, &config.chain_id, config.genesis_fingerprint).await?;
 
         let mut step1 = vec![0u8; STEP1_LEN];
         stream.read_exact(&mut step1).await?;
@@ -454,6 +473,7 @@ mod tests {
             my_validator_id: validator_id,
             my_signing_key: signing_key,
             chain_id: "indra-testnet-1".to_string(),
+            genesis_fingerprint: Bytes32::from([0x51; 32]),
             known_validators,
             relay_validator_keys: Vec::new(),
             timeout,
@@ -542,6 +562,41 @@ mod tests {
             responder_result,
             Err(NetworkError::ChainIdMismatch { expected, got })
                 if expected == "indra-testnet-1" && got == "indra-other-chain"
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_genesis_fingerprint_mismatch_before_key_exchange() {
+        let (initiator_id, initiator_sk, _) = make_validator(0x23, 0xA3);
+        let (responder_id, responder_sk, _) = make_validator(0x24, 0xB4);
+        let mut initiator_cfg = make_config(
+            initiator_id,
+            initiator_sk,
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+        initiator_cfg.genesis_fingerprint = Bytes32::from([0x99; 32]);
+        let responder_cfg = make_config(
+            responder_id,
+            responder_sk,
+            Vec::new(),
+            Duration::from_secs(2),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            perform_handshake_responder(stream, &responder_cfg).await
+        });
+        let initiator = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            perform_handshake_initiator(stream, &initiator_cfg).await
+        });
+        let responder_result = responder.await.unwrap();
+        let _ = initiator.await.unwrap();
+        assert!(matches!(
+            responder_result,
+            Err(NetworkError::DecodeFailed { reason }) if reason.contains("genesis fingerprint")
         ));
     }
 
@@ -665,10 +720,14 @@ mod tests {
 
         let responder = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            read_and_verify_chain_preface(&mut stream, "indra-testnet-1")
-                .await
-                .expect("read chain preface");
-            write_chain_preface(&mut stream, "indra-testnet-1")
+            read_and_verify_chain_preface(
+                &mut stream,
+                "indra-testnet-1",
+                Bytes32::from([0x51; 32]),
+            )
+            .await
+            .expect("read chain preface");
+            write_chain_preface(&mut stream, "indra-testnet-1", Bytes32::from([0x51; 32]))
                 .await
                 .expect("write chain preface");
             let mut step1 = vec![0u8; STEP1_LEN];

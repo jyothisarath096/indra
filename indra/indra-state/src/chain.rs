@@ -58,13 +58,16 @@ pub const MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE: usize =
 
 /// The complete chain state at a given block height.
 ///
-/// Two `ChainState` values are equivalent if and only if they represent
-/// the same chain history. The `state_root` field (once implemented in
-/// Phase 5) will be a cryptographic commitment to this entire structure.
+/// Two `ChainState` values are equivalent if and only if they represent the
+/// same chain history. `compute_state_root` commits every consensus-critical
+/// member, while derived caches are independently reconstructed on decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
     /// Chain identifier loaded from genesis and included in consensus-visible state.
     pub chain_id: String,
+    /// Immutable fingerprint of the finalized genesis manifest and state.
+    /// Excluded from its own state-root preimage to avoid circular hashing.
+    pub genesis_fingerprint: Bytes32,
 
     /// Height of the most recently applied block (0 = genesis, before block 1).
     pub height: u64,
@@ -107,6 +110,9 @@ pub struct ChainState {
     pub active_slot_coefficient_numerator: u64,
     /// Current QC-certified election seed.
     pub election_seed: Bytes64,
+    /// SHA-256 commitment to the canonical external-entropy descriptor and
+    /// source header used to construct genesis.
+    pub genesis_entropy_record_hash: Bytes32,
     /// Seed format version.
     pub election_seed_version: u8,
     /// First height to which `election_seed` applies.
@@ -244,6 +250,7 @@ impl Encode for ChainState {
         VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
             .unwrap_or_default()
             .encode(buf);
+        self.genesis_fingerprint.encode(buf);
         // Included: the applied height determines the next valid block height.
         self.height.encode(buf);
         // Included: the next block must chain to the exact committed tip hash.
@@ -271,6 +278,7 @@ impl Encode for ChainState {
         encode_list(&self.consensus_snapshots, buf);
         self.active_slot_coefficient_numerator.encode(buf);
         self.election_seed.encode(buf);
+        self.genesis_entropy_record_hash.encode(buf);
         self.election_seed_version.encode(buf);
         self.election_seed_height.encode(buf);
         self.reward_economic_snapshot.is_some().encode(buf);
@@ -289,6 +297,7 @@ impl Encode for ChainState {
         VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
             .unwrap_or_default()
             .encoded_len()
+            + self.genesis_fingerprint.encoded_len()
             + self.height.encoded_len()
             + self.tip_hash.encoded_len()
             + self.base_fee.encoded_len()
@@ -308,6 +317,7 @@ impl Encode for ChainState {
             + list_encoded_len(&self.consensus_snapshots)
             + 8
             + 64
+            + 32
             + 1
             + 8
             + 1
@@ -326,8 +336,12 @@ impl Encode for ChainState {
 impl Decode for ChainState {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let chain_id_bytes = VariableBytes::<MAX_CHAIN_ID_BYTES>::decode(r)?;
-        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec())
-            .unwrap_or_else(|_| DEFAULT_CHAIN_ID.to_string());
+        let chain_id = String::from_utf8(chain_id_bytes.as_slice().to_vec()).map_err(|_| {
+            indra_core::error::IndraError::InvalidConsensusSnapshot(
+                "persisted chain_id is not valid UTF-8".into(),
+            )
+        })?;
+        let genesis_fingerprint = Bytes32::decode(r)?;
         let height = u64::decode(r)?;
         let tip_hash = Bytes32::decode(r)?;
         let base_fee = u64::decode(r)?;
@@ -350,6 +364,7 @@ impl Decode for ChainState {
         let active_slot_coefficient_numerator = u64::decode(r)?;
         indra_core::sortition::validate_f(active_slot_coefficient_numerator)?;
         let election_seed = Bytes64::decode(r)?;
+        let genesis_entropy_record_hash = Bytes32::decode(r)?;
         let election_seed_version = u8::decode(r)?;
         let election_seed_height = u64::decode(r)?;
         if election_seed_version != 1 {
@@ -400,6 +415,7 @@ impl Decode for ChainState {
         )?;
         let state = Self {
             chain_id,
+            genesis_fingerprint,
             height,
             tip_hash,
             base_fee,
@@ -412,6 +428,7 @@ impl Decode for ChainState {
             consensus_snapshots,
             active_slot_coefficient_numerator,
             election_seed,
+            genesis_entropy_record_hash,
             election_seed_version,
             election_seed_height,
             reward_economic_snapshot,
@@ -522,6 +539,7 @@ impl ChainState {
     pub fn new_genesis() -> Self {
         Self {
             chain_id: DEFAULT_CHAIN_ID.to_string(),
+            genesis_fingerprint: Bytes32::ZERO,
             height: 0,
             tip_hash: Bytes32::ZERO,
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -534,6 +552,7 @@ impl ChainState {
             consensus_snapshots: Vec::new(),
             active_slot_coefficient_numerator: 0,
             election_seed: Bytes64::ZERO,
+            genesis_entropy_record_hash: Bytes32::ZERO,
             election_seed_version: 1,
             election_seed_height: 1,
             reward_economic_snapshot: None,
@@ -2658,6 +2677,20 @@ mod tests {
             IndraError::DuplicateEntries {
                 field: "snapshot.delegator_identities"
             }
+        ));
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_non_utf8_chain_id_without_default_substitution() {
+        let state = ChainState::new_genesis();
+        let mut bytes = state.encode_to_vec();
+        // VariableBytes encodes its u32 length before the chain-id bytes.
+        bytes[4] = 0xff;
+        let error = ChainState::decode_exact(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            IndraError::InvalidConsensusSnapshot(message)
+                if message.contains("chain_id is not valid UTF-8")
         ));
     }
 }

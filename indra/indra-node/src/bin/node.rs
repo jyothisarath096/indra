@@ -1023,6 +1023,7 @@ fn build_handshake_config(engine: &NodeEngine) -> indra_node::NodeResult<Option<
         my_validator_id,
         my_signing_key: pq_keypair,
         chain_id: engine.state.chain_id.clone(),
+        genesis_fingerprint: engine.state.genesis_fingerprint,
         known_validators,
         relay_validator_keys,
         timeout: Duration::from_secs(10),
@@ -5534,20 +5535,29 @@ mod tests {
         cold_seed[0] ^= 0xFF;
         let cold_classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&cold_seed);
         let cold_pq = indra_crypto::hybrid::PqKeypair::from_seed(&cold_seed).unwrap();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        );
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &validator_id,
+            &indra_core::Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_possession_output, vrf_possession_proof) =
+            indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
-                hex::encode(
-                    indra_core::types::crypto::hybrid_identity_id(
-                        &classical.public_key().0,
-                        &pq.public_key().0,
-                    )
-                    .0,
-                ),
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+                hex::encode(validator_id.0),
                 hex::encode(classical.public_key().0),
                 hex::encode(pq.public_key().0),
                 hex::encode(vrf.public_key()),
+                hex::encode(vrf_possession_output.0),
+                hex::encode(vrf_possession_proof.0),
                 hex::encode(cold_classical.public_key().0),
                 hex::encode(cold_pq.public_key().0),
             );
@@ -7038,6 +7048,12 @@ mod tests {
                     { indra_core::types::primitives::MAX_STANDARD_VRF_PROOF_BYTES },
                 >::from_slice(&[0x16; 80])
                 .unwrap(),
+                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                    origin_proposer_id: indra_core::Bytes32::from([0x15; 32]),
+                    origin_round: 0,
+                    vrf_output: indra_core::VariableBytes::from_slice(&[0x15; 64]).unwrap(),
+                    vrf_proof: indra_core::VariableBytes::from_slice(&[0x16; 80]).unwrap(),
+                },
                 sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
                 proposer_priority: indra_core::types::primitives::Bytes64([0x17; 64]),
                 quorum_certificate: indra_core::VariableBytes::from_slice(&[]).unwrap(),
@@ -7428,6 +7444,12 @@ mod tests {
                 election_seed: indra_core::types::primitives::Bytes64([0x05; 64]),
                 proposer_vrf_output: VariableBytes::from_slice(&[0x05; 64]).unwrap(),
                 proposer_vrf_proof: VariableBytes::from_slice(&[0x06; 80]).unwrap(),
+                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                    origin_proposer_id: Bytes32::from([0x05; 32]),
+                    origin_round: 3,
+                    vrf_output: VariableBytes::from_slice(&[0x05; 64]).unwrap(),
+                    vrf_proof: VariableBytes::from_slice(&[0x06; 80]).unwrap(),
+                },
                 sortition_claim: SortitionClaimV1::PraosThreshold,
                 proposer_priority: indra_core::types::primitives::Bytes64([0x07; 64]),
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
@@ -7471,6 +7493,12 @@ mod tests {
                 election_seed: indra_core::types::primitives::Bytes64::ZERO,
                 proposer_vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
                 proposer_vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                    origin_proposer_id: Bytes32::ZERO,
+                    origin_round: 0,
+                    vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+                    vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+                },
                 sortition_claim: SortitionClaimV1::PraosThreshold,
                 proposer_priority: indra_core::types::primitives::Bytes64::ZERO,
                 quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),

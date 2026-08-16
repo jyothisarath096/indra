@@ -84,6 +84,54 @@ impl Decode for SortitionClaimV1 {
 /// Sentinel value meaning a proposal did not carry a prior PoLC round.
 pub const NO_POLC_ROUND: u32 = u32::MAX;
 
+/// Immutable, independently-verifiable entropy carried by one consensus value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalEntropyV1 {
+    /// Validator whose first proposal fixed the value's entropy.
+    pub origin_proposer_id: Bytes32,
+    /// Round in which that validator first proposed the value.
+    pub origin_round: u32,
+    /// RFC 9381 output for the origin's height/round-bound alpha.
+    pub vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+    /// RFC 9381 proof authenticating `vrf_output`.
+    pub vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+}
+
+impl ProposalEntropyV1 {
+    /// Empty form used only by the height-zero genesis anchor.
+    pub fn genesis() -> Self {
+        Self {
+            origin_proposer_id: Bytes32::ZERO,
+            origin_round: 0,
+            vrf_output: VariableBytes::default(),
+            vrf_proof: VariableBytes::default(),
+        }
+    }
+}
+
+impl Encode for ProposalEntropyV1 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.origin_proposer_id.encode(buf);
+        self.origin_round.encode(buf);
+        self.vrf_output.encode(buf);
+        self.vrf_proof.encode(buf);
+    }
+    fn encoded_len(&self) -> usize {
+        32 + 4 + self.vrf_output.encoded_len() + self.vrf_proof.encoded_len()
+    }
+}
+
+impl Decode for ProposalEntropyV1 {
+    fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        Ok(Self {
+            origin_proposer_id: Bytes32::decode(r)?,
+            origin_round: u32::decode(r)?,
+            vrf_output: VariableBytes::decode(r)?,
+            vrf_proof: VariableBytes::decode(r)?,
+        })
+    }
+}
+
 /// Canonical INDRA block header.
 ///
 /// `block_hash` is SHA-256 over the complete canonical header encoding. Votes,
@@ -132,6 +180,8 @@ pub struct BlockHeaderVNext {
     pub proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
     /// Full standard VRF proof.
     pub proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+    /// Round-stable entropy record retained unchanged across reproposals.
+    pub value_entropy: ProposalEntropyV1,
     /// Sortition claim.
     pub sortition_claim: SortitionClaimV1,
     /// Full-width proposal priority.
@@ -187,6 +237,7 @@ impl Encode for BlockHeaderVNext {
         self.election_seed.encode(buf);
         self.proposer_vrf_output.encode(buf);
         self.proposer_vrf_proof.encode(buf);
+        self.value_entropy.encode(buf);
         self.sortition_claim.encode(buf);
         self.proposer_priority.encode(buf);
     }
@@ -207,6 +258,7 @@ impl Encode for BlockHeaderVNext {
             + 64
             + self.proposer_vrf_output.encoded_len()
             + self.proposer_vrf_proof.encoded_len()
+            + self.value_entropy.encoded_len()
             + 1
             + 64
     }
@@ -238,15 +290,20 @@ impl Decode for BlockHeaderVNext {
             election_seed: Bytes64::decode(r)?,
             proposer_vrf_output: VariableBytes::decode(r)?,
             proposer_vrf_proof: VariableBytes::decode(r)?,
+            value_entropy: ProposalEntropyV1::decode(r)?,
             sortition_claim: SortitionClaimV1::decode(r)?,
             proposer_priority: Bytes64::decode(r)?,
         };
         let genesis_exception = header.height == 0
             && header.proposer_id == Bytes32::ZERO
             && header.proposer_vrf_output.is_empty()
-            && header.proposer_vrf_proof.is_empty();
+            && header.proposer_vrf_proof.is_empty()
+            && header.value_entropy == ProposalEntropyV1::genesis();
         if !genesis_exception
-            && (header.proposer_vrf_output.len() != 64 || header.proposer_vrf_proof.len() != 80)
+            && (header.proposer_vrf_output.len() != 64
+                || header.proposer_vrf_proof.len() != 80
+                || header.value_entropy.vrf_output.len() != 64
+                || header.value_entropy.vrf_proof.len() != 80)
         {
             return Err(crate::error::IndraError::VrfProofInvalid);
         }
@@ -400,6 +457,12 @@ mod tests {
             election_seed: Bytes64([0x42; 64]),
             proposer_vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
             proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+            value_entropy: ProposalEntropyV1 {
+                origin_proposer_id: Bytes32::from([0x43u8; 32]),
+                origin_round: 0,
+                vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
+                vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+            },
             sortition_claim: SortitionClaimV1::PraosThreshold,
             proposer_priority: Bytes64([0x45; 64]),
             quorum_certificate: VariableBytes::from_slice(&[0xBBu8; 256]).unwrap(),

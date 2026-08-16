@@ -49,6 +49,11 @@ pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     metadata.extend_from_slice(&state.total_supply.to_le_bytes());
     metadata.extend_from_slice(&state.base_fee.to_le_bytes());
     metadata.extend_from_slice(&state.fee_reward_pool.to_le_bytes());
+    metadata.extend_from_slice(&state.active_slot_coefficient_numerator.to_le_bytes());
+    metadata.extend_from_slice(&state.election_seed.0);
+    metadata.push(state.election_seed_version);
+    metadata.extend_from_slice(&state.election_seed_height.to_le_bytes());
+    metadata.extend_from_slice(&state.genesis_entropy_record_hash.0);
     state.monetary_ledger.encode(&mut metadata);
     state.monetary_aggregates.encode(&mut metadata);
     state.governance.encode(&mut metadata);
@@ -118,5 +123,23 @@ mod tests {
         second.chain_id = "other-chain".to_string();
         second.rebuild_state_commitment_v2(second.height);
         assert_ne!(compute_state_root(&first), compute_state_root(&second));
+    }
+
+    #[test]
+    fn election_seed_and_genesis_entropy_record_are_committed() {
+        let first = ChainState::new_genesis();
+        let mut changed_seed = first.clone();
+        changed_seed.election_seed = indra_core::Bytes64([0xA5; 64]);
+        assert_ne!(
+            compute_state_root(&first),
+            compute_state_root(&changed_seed)
+        );
+
+        let mut changed_entropy = first.clone();
+        changed_entropy.genesis_entropy_record_hash = Bytes32::from([0x5A; 32]);
+        assert_ne!(
+            compute_state_root(&first),
+            compute_state_root(&changed_entropy)
+        );
     }
 }

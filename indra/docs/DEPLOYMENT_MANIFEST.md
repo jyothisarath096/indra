@@ -1,5 +1,11 @@
 # INDRA Testnet-3 Deployment Manifest
 
+> Historical deployment record. The checked-in `releases/genesis.toml` is an
+> obsolete testnet-1 artifact and is not the genesis of the validators listed
+> here. It must not be used with the current protocol. T14-03 regeneration of
+> the next release manifest is intentionally deferred until a real future
+> Bitcoin entropy block has reached the declared confirmation depth.
+
 ## Deployment
 
 - **Chain ID:** `indra-testnet-3`
@@ -21,6 +27,19 @@ not in use on this network and is deferred to a future mainnet deployment.
 
 This manifest contains public deployment facts only. Keystore passwords,
 mnemonics, private keys, and other secret material must never be recorded here.
+
+The next deployment record must additionally publish the canonical genesis
+fingerprint, genesis block hash, state and consensus-snapshot roots, monetary
+ledger identity, active-slot coefficient, complete Bitcoin entropy descriptor
+and 80-byte header, and each validator's verified VRF proof of possession.
+
+Genesis assembly is fail-closed on Bitcoin entropy verification. Operators run
+`indra-genesis build ... --bitcoin-cli /path/to/bitcoin-cli`; the tool queries a
+local Bitcoin Core node for the announced height on its active most-work chain,
+locally double-SHA-256 checks the returned 80-byte header against that block
+hash, verifies the configured Bitcoin network genesis hash, and requires the
+declared confirmation floor. `indra-genesis verify-bitcoin-entropy` repeats the
+same checks for an assembled manifest. There is no deadline or offline fallback.
 
 ## Validators
 

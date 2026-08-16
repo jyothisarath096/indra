@@ -195,6 +195,12 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             election_seed: state.election_seed,
             proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
             proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+                origin_proposer_id: Bytes32::from([0x81; 32]),
+                origin_round: 0,
+                vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+            },
             sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
             proposer_priority: indra_core::types::primitives::Bytes64([0; 64]),
             quorum_certificate: VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&[]).unwrap(),

@@ -21,6 +21,17 @@
 
 [genesis]
 chain_id     = "indra-testnet-1"
+active_slot_coefficient_numerator = "9223372036854775808"
+bitcoin_pow_entropy_header = "<160 lowercase hex characters from the verified Bitcoin header>"
+
+[genesis.bitcoin_pow_entropy_source]
+scheme = 1
+network_genesis_hash = "<64 lowercase hex characters, raw byte order>"
+announced_height = 0 # replace with the publicly precommitted future height
+header_codec = 1
+extraction_algorithm = 1
+minimum_confirmations = 100
+reorg_policy = 1
 
 # Minimum 4 validators required (BFT safety: 3f+1, f=1 means tolerate 1 failure)
 # Recommended for testnet: 4–10 validators
@@ -29,8 +40,10 @@ chain_id     = "indra-testnet-1"
 name                = "alice"
 validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
 hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
-hybrid_pq_pk        = "aabbcc..."   # variable length (Dilithium2 public key)
+hybrid_pq_pk        = "aabbcc..."   # exact ML-DSA-87 public-key length
 vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
+vrf_possession_output = "aabbcc..." # 128 hex chars (RFC 9381 output)
+vrf_possession_proof  = "aabbcc..." # 160 hex chars (RFC 9381 proof)
 cold_hybrid_classical_pk = "aabbcc..." # 64 hex chars
 cold_hybrid_pq_pk        = "aabbcc..." # exact ML-DSA-87 public-key length
 cold_key_version         = 1
@@ -49,6 +62,8 @@ validator_id        = "112233..."
 hybrid_classical_pk = "112233..."
 hybrid_pq_pk        = "112233..."
 vrf_pk              = "112233..."
+vrf_possession_output = "112233..."
+vrf_possession_proof  = "112233..."
 cold_hybrid_classical_pk = "112233..."
 cold_hybrid_pq_pk        = "112233..."
 cold_key_version         = 1
@@ -61,6 +76,8 @@ validator_id        = "334455..."
 hybrid_classical_pk = "334455..."
 hybrid_pq_pk        = "334455..."
 vrf_pk              = "334455..."
+vrf_possession_output = "334455..."
+vrf_possession_proof  = "334455..."
 cold_hybrid_classical_pk = "334455..."
 cold_hybrid_pq_pk        = "334455..."
 cold_key_version         = 1
@@ -73,6 +90,8 @@ validator_id        = "556677..."
 hybrid_classical_pk = "556677..."
 hybrid_pq_pk        = "556677..."
 vrf_pk              = "556677..."
+vrf_possession_output = "556677..."
+vrf_possession_proof  = "556677..."
 cold_hybrid_classical_pk = "556677..."
 cold_hybrid_pq_pk        = "556677..."
 cold_key_version         = 1

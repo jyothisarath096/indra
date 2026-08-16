@@ -353,6 +353,66 @@ Comparing `-ln(U)/stake` yields an elegant weighted exponential race, but consen
 
 ## 6. Grinding-resistant seed evolution
 
+### 6.0 Addendum: round eligibility and value-bound entropy are distinct
+
+State-root commitment of the next election seed makes the entropy contribution
+part of the round-stable consensus value. It therefore cannot be re-derived
+from the proposer metadata of each later-round reproposal: doing so would change
+the post-state root and turn a Tendermint reproposal into a different value.
+
+`BlockHeaderVNext` consequently carries two independently verified records:
+
+- `proposer_id`, `proposer_round`, `proposer_vrf_output`, and
+  `proposer_vrf_proof` are the **per-round eligibility proof**. They establish
+  that the signer of this particular envelope is eligible in this particular
+  round. They are proposal-instance metadata, remain outside the state-root
+  preimage, and change normally across reproposals.
+- `value_entropy` is an immutable `ProposalEntropyV1` containing
+  `origin_proposer_id`, `origin_round`, the original RFC 9381 VRF output, and
+  its RFC 9381 proof. On a first proposal it must be byte-identical to the
+  current-round eligibility record. A later reproposal copies it unchanged.
+  Every verifier independently verifies its proof and sortition eligibility
+  against the governing snapshot and the VRF alpha for its recorded origin.
+
+Only `value_entropy.vrf_output` contributes secret-derived randomness to the
+next seed. The origin height is the enclosing block height; the seed transcript
+also binds the origin round, origin validator identity, prior seed, chain ID,
+and governing snapshot root. The current-round proposer fields do not enter the
+next-seed transcript. Thus all envelopes for the same locked value compute the
+same post-state root and `value_hash`, while each envelope still needs a fresh,
+valid current-round eligibility proof and full hybrid authorization.
+
+This does not reopen content grinding. RFC 9381 uniqueness fixes the origin
+output for one registered VRF key and its fully bound alpha before block content
+is selected. Carrying that already-fixed output across reproposals creates no
+new choice; it removes the erroneous choice of replacing the entropy whenever
+the same value is re-enveloped. A proposer cannot substitute arbitrary entropy:
+the retained origin proof and stake-threshold result are reverified at every
+proposal trust boundary.
+
+This is a breaking header change in the existing batched redeploy wave:
+
+```text
+ProposalEntropyV1 {
+    origin_proposer_id: Bytes32,
+    origin_round: u32,
+    vrf_output: VariableBytes<64>,
+    vrf_proof: VariableBytes<80>,
+}
+
+BlockHeaderVNext {
+    ...
+    proposer_vrf_output,       // current-round eligibility
+    proposer_vrf_proof,        // current-round eligibility
+    value_entropy: ProposalEntropyV1, // immutable across reproposals
+    ...
+}
+```
+
+There is no legacy decoder and no reconstruction fallback for headers missing
+the record. Canonical storage, replay, sync, persisted locks, and proposal
+request/response paths retain and verify it as part of the mandatory envelope.
+
 ### 6.1 Selected construction
 
 The seed for height `h+1` is derived from the prior seed and the unique VRF output carried by the block finalized at height `h`:
@@ -363,10 +423,9 @@ election_seed[h+1] = SHA-512(
     u16_be(chain_id_len) || chain_id ||
     election_seed[h] ||
     u64_le(h) ||
-    u32_le(finalized_proposer_round[h]) ||
-    finalized_block_id[h] ||
-    finalized_proposer_id[h] ||
-    finalized_proposer_vrf_output[h] ||
+    u32_le(value_entropy.origin_round[h]) ||
+    value_entropy.origin_proposer_id[h] ||
+    value_entropy.vrf_output[h] ||
     governing_snapshot_root[h]
 )
 ```
@@ -377,8 +436,8 @@ Why this prevents current content grinding:
 
 - RFC ECVRF uniqueness fixes one output for a registered key and `vrf_alpha`.
 - `vrf_alpha` is fixed before the proposer chooses timestamp, transaction ordering, state roots, or other block content.
-- changing block content changes `finalized_block_id` but cannot change the fixed VRF output or eligibility for height `h`.
-- the next seed includes the finalized block ID for chain binding, but its unpredictable contribution is the unique VRF output, not proposer-selectable content.
+- changing block content cannot change the fixed origin output or its eligibility for height `h`.
+- chain, height, prior seed, origin identity/round, and the governing snapshot are explicitly bound without introducing the circular `block_id -> state_root -> election_seed -> block_id` dependency.
 
 ### 6.2 Why raw parent QC bytes are not hashed as entropy
 

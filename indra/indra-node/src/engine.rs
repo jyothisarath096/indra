@@ -490,8 +490,19 @@ impl NodeEngine {
             config.genesis_validator_minimum,
         )
         .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
+        if !block_store.is_empty() && block_store.lowest_height() == 0 {
+            let stored = block_store.get(0)?;
+            let expected = crate::genesis::build_genesis_proposal(&genesis_base)
+                .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
+            if stored != expected {
+                return Err(NodeError::GenesisMismatch);
+            }
+        }
         let startup_log;
         let state = if let Some(snapshot) = state_store.load_latest()? {
+            if snapshot.genesis_fingerprint != genesis_base.genesis_fingerprint {
+                return Err(NodeError::GenesisMismatch);
+            }
             verify_snapshot_tip_against_retained_block(&snapshot, &mut block_store)?;
             let replay_start = snapshot.height.saturating_add(1);
             if !block_store.is_empty() && block_store.lowest_height() > replay_start {
@@ -567,6 +578,24 @@ impl NodeEngine {
                 }
                 (None, None) => (None, None, None),
             };
+        if let (Some(id), Some(vrf)) = (validator_id, vrf_keypair.as_ref()) {
+            let registered =
+                state
+                    .validators
+                    .get(&id)
+                    .ok_or_else(|| NodeError::ValidatorConfigIncomplete {
+                        detail: format!(
+                            "configured validator {id} is absent from genesis/registry"
+                        ),
+                    })?;
+            if registered.vrf_pk != Some(vrf.public_key()) {
+                return Err(NodeError::ValidatorConfigIncomplete {
+                    detail: format!(
+                        "configured VRF secret key does not match registered VRF public key for validator {id}"
+                    ),
+                });
+            }
+        }
 
         let pending_dependency_epoch = epoch_for_height(state.height.saturating_add(1));
         let rpc_snapshot = crate::rpc_snapshot::RpcSnapshotPublisher::new(
@@ -1663,17 +1692,20 @@ fn rebuild_state_from_height(
     block_store: &mut BlockStore,
     start_height: u64,
 ) -> NodeResult<()> {
-    let canonical_genesis = build_genesis_block();
     if block_store.is_empty() {
         if start_height <= 1 {
+            let canonical_genesis = build_genesis_block(state)
+                .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
             state.tip_hash = canonical_genesis.header.block_hash();
         }
         return Ok(());
     }
 
     if start_height <= 1 {
+        let canonical_genesis = build_genesis_block(state)
+            .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
         let genesis = block_store.get(0)?;
-        if genesis.block.header.height != canonical_genesis.header.height {
+        if genesis.block != canonical_genesis {
             return Err(NodeError::GenesisMismatch);
         }
 
@@ -1951,18 +1983,36 @@ mod tests {
             &pq.public_key().0,
         )
         .0;
+        let challenge = StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &Bytes32::from(validator_id),
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
             hex::encode(vrf.public_key()),
+            hex::encode(vrf_output.0),
+            hex::encode(vrf_proof.0),
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         genesis_path.to_string_lossy().to_string()
+    }
+
+    fn configure_validator_keys(config: &mut NodeConfig, seed: [u8; 32]) {
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        config.validator_seed = Some(seed);
+        config.vrf_seed = Some(seed);
+        config.pq_pk = Some(pq.public_key().0.to_vec());
+        config.pq_seed = Some(pq.secret_key_bytes());
     }
 
     fn dummy_signature() -> HybridSignature {
@@ -3684,6 +3734,7 @@ mod tests {
         let dir = temp_dir("d");
         let mut config = NodeConfig::local_test(dir.clone());
         config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         let mut engine = NodeEngine::init(config.clone()).unwrap();
         let mut last_qc = Vec::new();
 
@@ -3707,10 +3758,59 @@ mod tests {
     }
 
     #[test]
+    fn literal_height_zero_replay_is_byte_identical_to_continuous_state() {
+        use indra_core::codec::Encode;
+
+        let dir = temp_dir("literal_genesis_replay_identity");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42; 32]));
+        configure_validator_keys(&mut config, [0x42; 32]);
+        config.snapshot_interval = 10_000;
+
+        let continuous = {
+            let mut engine = NodeEngine::init(config.clone()).unwrap();
+            let mut last_qc = Vec::new();
+            for height in 1..=3 {
+                let block = make_strict_block(&engine.state, [0x42; 32], last_qc.clone());
+                engine.commit_proposal(&block).unwrap();
+                last_qc = build_single_validator_qc_bytes(
+                    height,
+                    block.header.proposer_round,
+                    block.header.block_hash(),
+                    [0x42; 32],
+                    [0x42; 32],
+                );
+            }
+            engine.state.clone()
+        };
+
+        // Remove the snapshot explicitly and point the durable manifest back
+        // at height zero. The retained canonical envelope log is then the only
+        // source from which startup can reconstruct heights 1..=3.
+        let mut manifest = indra_storage::load_chain_manifest(&dir).unwrap().unwrap();
+        manifest.snapshot_height = 0;
+        indra_storage::save_chain_manifest(&dir, &manifest).unwrap();
+        let state_dir = config.state_dir();
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir).unwrap();
+        }
+
+        let replayed = NodeEngine::init(config).unwrap().state;
+        assert_eq!(replayed.encode_to_vec(), continuous.encode_to_vec());
+        assert_eq!(
+            indra_state::compute_state_root(&replayed),
+            indra_state::compute_state_root(&continuous)
+        );
+        assert_eq!(replayed, continuous);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manifest_last_recovery_discards_all_unconfirmed_store_artifacts() {
         let dir = temp_dir("manifest_last_cross_store_recovery");
         let mut config = NodeConfig::local_test(dir.clone());
         config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         let confirmed_tip;
         {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
@@ -3776,6 +3876,7 @@ mod tests {
         let dir = temp_dir("replay_bad_root");
         let mut config = NodeConfig::local_test(dir.clone());
         config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             let mut block = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
@@ -3797,7 +3898,7 @@ mod tests {
             };
             engine
                 .block_store
-                .append(&crate::genesis::build_genesis_proposal())
+                .append(&crate::genesis::build_genesis_proposal(&engine.state).unwrap())
                 .unwrap();
             engine.block_store.append(&block).unwrap();
             indra_storage::save_chain_manifest(
@@ -3863,6 +3964,7 @@ mod tests {
         let dir = temp_dir("snapshot_retained_block_mismatch");
         let mut config = NodeConfig::local_test(dir.clone());
         config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
             let block = make_strict_block(&engine.state, [0x42u8; 32], vec![]);
@@ -3884,11 +3986,12 @@ mod tests {
     fn startup_from_snapshot_with_pruned_log() {
         let dir = temp_dir("snapshot_pruned");
         let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         config.prune_keep_blocks = Some(1_000);
 
         let final_tip_hash = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
-            install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
             for height in 1..=1_300u64 {
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
@@ -3917,11 +4020,12 @@ mod tests {
     fn restart_from_snapshot_produces_same_state_as_continuous() {
         let dir = temp_dir("snapshot_state_root");
         let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         config.prune_keep_blocks = Some(650);
 
         let (continuous_state, next_block) = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
-            install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
             for height in 1..=610u64 {
                 let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
@@ -3969,10 +4073,45 @@ mod tests {
     fn chain_id_survives_snapshot_restart() {
         let dir = temp_dir("chain_id_snapshot");
         let config = NodeConfig::local_test(dir.clone());
+        let genesis_path = config.genesis_path.as_ref().unwrap();
+        let mut genesis = std::fs::read_to_string(genesis_path).unwrap();
+        let hot = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x42; 32]),
+            PqKeypair::from_seed(&[0x43; 32]).unwrap(),
+        );
+        let hot_public = hot.public_key();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &hot_public.classical.0,
+            &hot_public.pq.0,
+        );
+        let vrf = VrfKeypair::from_seed(&[0x42; 32]);
+        let old_challenge = StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &validator_id,
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let new_challenge = StakingOp::vrf_possession_challenge(
+            "indra-custom-testnet",
+            &validator_id,
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (old_output, old_proof) = indra_crypto::vrf_prove(&vrf, &old_challenge);
+        let (new_output, new_proof) = indra_crypto::vrf_prove(&vrf, &new_challenge);
+        genesis = genesis
+            .replace(
+                "chain_id = \"indra-testnet-1\"",
+                "chain_id = \"indra-custom-testnet\"",
+            )
+            .replace(&hex::encode(old_output.0), &hex::encode(new_output.0))
+            .replace(&hex::encode(old_proof.0), &hex::encode(new_proof.0));
+        std::fs::write(genesis_path, genesis).unwrap();
 
         {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
-            engine.state.chain_id = "indra-custom-testnet".to_string();
             engine.state_store.save(&engine.state).unwrap();
             engine.write_chain_manifest().unwrap();
         }
@@ -3984,15 +4123,65 @@ mod tests {
     }
 
     #[test]
+    fn startup_rejects_changed_manifest_and_tampered_snapshot_fingerprint() {
+        let manifest_dir = temp_dir("genesis_manifest_fingerprint_mismatch");
+        let manifest_config = NodeConfig::local_test(manifest_dir.clone());
+        {
+            let mut engine = NodeEngine::init(manifest_config.clone()).unwrap();
+            engine.state_store.save(&engine.state).unwrap();
+            engine.write_chain_manifest().unwrap();
+        }
+        let genesis_path = manifest_config.genesis_path.as_ref().unwrap();
+        let genesis = std::fs::read_to_string(genesis_path).unwrap().replace(
+            "active_slot_coefficient_numerator = \"9223372036854775808\"",
+            "active_slot_coefficient_numerator = \"1\"",
+        );
+        std::fs::write(genesis_path, genesis).unwrap();
+        assert!(matches!(
+            NodeEngine::init(manifest_config),
+            Err(NodeError::GenesisMismatch)
+        ));
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+
+        let snapshot_dir = temp_dir("snapshot_fingerprint_mismatch");
+        let snapshot_config = NodeConfig::local_test(snapshot_dir.clone());
+        {
+            let mut engine = NodeEngine::init(snapshot_config.clone()).unwrap();
+            engine.state.genesis_fingerprint.0[0] ^= 1;
+            engine.state_store.save(&engine.state).unwrap();
+            engine.write_chain_manifest().unwrap();
+        }
+        assert!(matches!(
+            NodeEngine::init(snapshot_config),
+            Err(NodeError::GenesisMismatch)
+        ));
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+    }
+
+    #[test]
+    fn engine_initialization_rejects_local_vrf_key_mismatch() {
+        let dir = temp_dir("startup_vrf_mismatch");
+        let mut config = NodeConfig::local_test(dir.clone());
+        config.vrf_seed = Some([0x99; 32]);
+        assert!(matches!(
+            NodeEngine::init(config),
+            Err(NodeError::ValidatorConfigIncomplete { detail })
+                if detail.contains("VRF secret key does not match")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn startup_fails_on_snapshot_replay_gap() {
         let dir = temp_dir("snapshot_gap");
         let mut config = NodeConfig::local_test(dir.clone());
+        config.genesis_path = Some(write_single_validator_genesis(&dir, [0x42u8; 32]));
+        configure_validator_keys(&mut config, [0x42u8; 32]);
         config.snapshot_interval = 30;
         config.prune_keep_blocks = Some(1_000);
 
         let extra_block = {
             let mut engine = NodeEngine::init(config.clone()).unwrap();
-            install_active_validator(&mut engine, [0x42u8; 32], "local");
             let mut last_qc = Vec::new();
             for _ in 0..1_300u64 {
                 let height = engine.state.height + 1;
@@ -4030,7 +4219,11 @@ mod tests {
         }
 
         let state_store = StateStore::open(&state_dir).unwrap();
-        let mut snapshot = crate::genesis::canonical_test_genesis();
+        let mut snapshot = crate::genesis::build_finalized_genesis_state_with_minimum(
+            config.genesis_path.as_deref(),
+            1,
+        )
+        .unwrap();
         snapshot.height = 10;
         snapshot.tip_hash = Bytes32::from([0x55; 32]);
         state_store.save(&snapshot).unwrap();
@@ -4091,18 +4284,33 @@ mod tests {
             &pq.public_key().0,
         )
         .0;
+        let challenge = StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &Bytes32::from(validator_id),
+            &Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
             hex::encode(vrf.public_key()),
+            hex::encode(vrf_output.0),
+            hex::encode(vrf_proof.0),
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+        config.validator_seed = Some([0x11; 32]);
+        config.vrf_seed = Some([0x22; 32]);
+        let configured_pq = PqKeypair::from_seed(&[0x11; 32]).unwrap();
+        config.pq_pk = Some(configured_pq.public_key().0.to_vec());
+        config.pq_seed = Some(configured_pq.secret_key_bytes());
 
         let mut engine = NodeEngine::init(config).unwrap();
         assert_eq!(engine.state.utxos.len(), 1);
