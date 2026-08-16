@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use crate::error::{ERR_INVALID_REQUEST, ERR_PARSE_ERROR};
+use crate::error::{ERR_INTERNAL_ERROR, ERR_INVALID_REQUEST, ERR_PARSE_ERROR};
 
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Clone)]
@@ -96,11 +96,11 @@ pub enum JsonId {
 
 impl JsonId {
     /// Serialise the id as a JSON value.
-    pub fn to_json(&self) -> String {
+    fn to_value(&self) -> Value {
         match self {
-            JsonId::Number(n) => n.to_string(),
-            JsonId::Str(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-            JsonId::Null => "null".to_string(),
+            JsonId::Number(n) => Value::Number((*n).into()),
+            JsonId::Str(s) => Value::String(s.clone()),
+            JsonId::Null => Value::Null,
         }
     }
 }
@@ -108,21 +108,37 @@ impl JsonId {
 impl RpcResponse {
     /// Serialise to JSON string.
     pub fn to_json(&self) -> String {
-        let id_str = self.id.to_json();
-
+        let mut response = serde_json::Map::new();
+        response.insert("jsonrpc".to_string(), Value::String(self.jsonrpc.clone()));
         match &self.body {
-            ResponseBody::Result(result) => {
-                format!(r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#, result, id_str)
-            }
-            ResponseBody::Error(err) => {
-                format!(
-                    r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"{}"}},"id":{}}}"#,
-                    err.code,
-                    err.message.replace('"', "\\\""),
-                    id_str
-                )
+            ResponseBody::Result(result) => match serde_json::from_str(result) {
+                Ok(result) => {
+                    response.insert("result".to_string(), result);
+                }
+                Err(_) => {
+                    response.insert(
+                        "error".to_string(),
+                        serde_json::json!({
+                            "code": ERR_INTERNAL_ERROR,
+                            "message": "RPC handler produced invalid JSON",
+                        }),
+                    );
+                }
+            },
+            ResponseBody::Error(error) => {
+                response.insert(
+                    "error".to_string(),
+                    serde_json::json!({
+                        "code": error.code,
+                        "message": error.message,
+                    }),
+                );
             }
         }
+        response.insert("id".to_string(), self.id.to_value());
+        serde_json::to_string(&Value::Object(response)).unwrap_or_else(|_| {
+            r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"RPC response serialization failed"},"id":null}"#.to_string()
+        })
     }
 
     /// Build a success response.

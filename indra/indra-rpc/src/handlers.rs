@@ -3955,4 +3955,80 @@ mod tests {
         assert!(peers.contains(r#""peer_count":3"#));
         assert!(peers.contains(r#""discovered_count":7"#));
     }
+
+    /// Reproducible dispatcher-level adversarial corpus for every public read method.
+    /// HTTP framing/body-limit cases are exercised separately in `server` tests.
+    #[test]
+    fn all_public_rpc_methods_reject_adversarial_parameter_corpus_without_panicking_or_leaking() {
+        let engine = make_state("rpc-wide-adversarial-corpus");
+        let state = NodeState::read_only(&engine);
+        let long_string = format!(r#""{}""#, "a".repeat(65_536));
+        let deep_json = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+        let corpus = vec![
+            Vec::new(),
+            vec!["0".to_string()],
+            vec!["1".to_string()],
+            vec![u64::MAX.to_string()],
+            vec!["18446744073709551616".to_string()],
+            vec!["-1".to_string()],
+            vec!["+1".to_string()],
+            vec!["01".to_string()],
+            vec!["null".to_string()],
+            vec!["true".to_string()],
+            vec!["{}".to_string()],
+            vec!["[]".to_string()],
+            vec![deep_json],
+            vec!["00".repeat(31)],
+            vec!["00".repeat(32)],
+            vec!["00".repeat(33)],
+            vec!["gg".repeat(32)],
+            vec![r#""not-a-payment-address""#.to_string()],
+            vec![long_string],
+            vec!["0".to_string(), "0".to_string()],
+            vec![u64::MAX.to_string(), u64::MAX.to_string()],
+            vec!["-1".to_string(), "18446744073709551616".to_string()],
+            vec![
+                r#""not-a-payment-address""#.to_string(),
+                r#"{"version":1,"challenge":"00","classical_sig":"00","pq_sig":"00"}"#.to_string(),
+                format!(r#""{}""#, "00".repeat(32)),
+            ],
+            vec!["null".to_string(); 16],
+        ];
+
+        let public_methods = RPC_METHODS
+            .iter()
+            .filter(|(_, access)| *access == RpcMethodAccess::ReadOnly)
+            .map(|(method, _)| *method)
+            .collect::<Vec<_>>();
+        assert_eq!(public_methods.len(), 34, "update the audited method count");
+        assert_eq!(corpus.len(), 24, "update the audited corpus count");
+
+        for method in public_methods {
+            for params in &corpus {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_with_mode(method, params, &state, RpcMode::ReadOnly)
+                }));
+                let result = result.unwrap_or_else(|_| {
+                    panic!("public RPC method {method} panicked for params {params:?}")
+                });
+                if matches!(
+                    method,
+                    "indra_getScanChallenge" | "indra_explainUtxoProvenanceAuthorized"
+                ) {
+                    let rendered = match result {
+                        DispatchResult::Ready(Ok(value)) => value,
+                        DispatchResult::Ready(Err(error)) => error.message().to_string(),
+                        DispatchResult::SubmitTransaction(_)
+                        | DispatchResult::SubmitStakingOp(_)
+                        | DispatchResult::SubmitGovernanceOp(_) => {
+                            panic!("read-only authorization method produced a write action")
+                        }
+                    };
+                    assert!(!rendered.contains("validator_peers"));
+                    assert!(!rendered.contains("cold_hybrid"));
+                    assert!(!rendered.contains("private_key"));
+                }
+            }
+        }
+    }
 }

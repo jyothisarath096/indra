@@ -927,4 +927,127 @@ mod tests {
     fn oversized_rpc_body_limit_is_documented() {
         assert_eq!(MAX_RPC_BODY_BYTES, 1_048_576);
     }
+
+    #[test]
+    fn json_rpc_envelope_adversarial_corpus_never_panics() {
+        let deep = format!("{}0{}", "[".repeat(256), "]".repeat(256));
+        let large_string = "a".repeat(65_536);
+        let cases = vec![
+            "".to_string(),
+            "{".to_string(),
+            "[".to_string(),
+            r#"{"jsonrpc":"2.0""#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":[}"#.to_string(),
+            "null".to_string(),
+            "true".to_string(),
+            "0".to_string(),
+            r#""string""#.to_string(),
+            "[]".to_string(),
+            "[{}]".to_string(),
+            r#"{"jsonrpc":"1.0","method":"indra_getHeight","params":[],"id":1}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":1,"params":[],"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":{},"id":1}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":null,"id":1}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":[],"id":{}}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":[],"id":[]}"#
+                .to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"indra_getHeight","params":[{}],"id":1}}"#,
+                deep
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"indra_getScanChallenge","params":["{}"],"id":1}}"#,
+                large_string
+            ),
+            r#"{"jsonrpc":"2.0","method":"indra_getScanChallenge","params":["�"],"id":1}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_explainUtxoProvenanceAuthorized","params":[[],{},null],"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getCanonicalBlocks","params":[-1,18446744073709551616],"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getProposals","params":[18446744073709551615,18446744073709551616],"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"indra_getValidatorSet","params":["-1","+1","01"],"id":1}"#.to_string(),
+        ];
+        assert_eq!(cases.len(), 24, "update the audited envelope count");
+
+        for (index, body) in cases.iter().enumerate() {
+            assert!(
+                body.len() <= MAX_RPC_BODY_BYTES,
+                "case {index} belongs in the pre-allocation oversize test"
+            );
+            let outcome = std::panic::catch_unwind(|| http_rpc_response_body(body));
+            let response =
+                outcome.unwrap_or_else(|_| panic!("JSON-RPC corpus case {index} panicked"));
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&response).is_ok(),
+                "case {index} returned non-JSON: {response}"
+            );
+            assert!(!response.contains("private_key"), "case {index}");
+            assert!(!response.contains("cold_hybrid"), "case {index}");
+            assert!(!response.contains("X-Admin-Token:"), "case {index}");
+        }
+    }
+
+    #[test]
+    fn json_rpc_seeded_mutation_fuzz_never_panics_or_emits_non_json() {
+        let methods = crate::handlers::RPC_METHODS
+            .iter()
+            .filter(|(_, access)| *access == crate::handlers::RpcMethodAccess::ReadOnly)
+            .map(|(method, _)| *method)
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), 34, "update the fuzzed public method count");
+
+        let mut invalid_json_responses = Vec::new();
+        for case in 0..4_096usize {
+            let method = methods[case % methods.len()];
+            let mut bytes = format!(
+                r#"{{"jsonrpc":"2.0","method":"{method}","params":["0",0,true,null],"id":{case}}}"#
+            )
+            .into_bytes();
+            let pivot = case.wrapping_mul(0x9E37_79B1) % bytes.len();
+            match case % 5 {
+                0 => bytes.truncate(pivot),
+                1 => bytes[pivot] ^= ((case >> 3) as u8) | 1,
+                2 => bytes.insert(pivot, b'['),
+                3 => {
+                    let end = (pivot + 16).min(bytes.len());
+                    let duplicate = bytes[pivot..end].to_vec();
+                    bytes.splice(pivot..pivot, duplicate);
+                }
+                4 => bytes[pivot] = 0xFF,
+                _ => unreachable!(),
+            }
+            let body = String::from_utf8_lossy(&bytes);
+            let outcome = std::panic::catch_unwind(|| http_rpc_response_body(&body));
+            let response =
+                outcome.unwrap_or_else(|_| panic!("seeded JSON-RPC mutation case {case} panicked"));
+            if serde_json::from_str::<serde_json::Value>(&response).is_err() {
+                invalid_json_responses.push((case, response.clone()));
+            }
+            assert!(!response.contains("private_key"), "mutation case {case}");
+            assert!(!response.contains("cold_hybrid"), "mutation case {case}");
+            assert!(!response.contains("X-Admin-Token:"), "mutation case {case}");
+        }
+        assert!(
+            invalid_json_responses.is_empty(),
+            "{invalid_json_responses:?}"
+        );
+    }
+
+    #[test]
+    fn json_rpc_response_serialization_escapes_control_characters() {
+        let method_response = http_rpc_response_body(
+            r#"{"jsonrpc":"2.0","method":"unknown\tmethod","params":[],"id":1}"#,
+        );
+        let method_value: serde_json::Value = serde_json::from_str(&method_response).unwrap();
+        assert_eq!(method_value["error"]["message"], "unknown\tmethod");
+
+        let id_response = http_rpc_response_body(
+            r#"{"jsonrpc":"2.0","method":"indra_getHeight","params":[],"id":"line\nbreak"}"#,
+        );
+        let id_value: serde_json::Value = serde_json::from_str(&id_response).unwrap();
+        assert_eq!(id_value["id"], "line\nbreak");
+    }
 }

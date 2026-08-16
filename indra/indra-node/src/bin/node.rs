@@ -4,8 +4,10 @@
 //! Consensus and state transition logic remain synchronous on dedicated threads.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -3997,6 +3999,59 @@ fn print_help() {
     println!("  --peers-file <path>");
 }
 
+fn atomic_write_private_config(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no file name",
+        )
+    })?;
+
+    for _ in 0..32 {
+        let temp_path = parent.join(format!(
+            ".{}.tmp-{}-{:016x}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut temp = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let result = (|| -> std::io::Result<()> {
+            // Creation can only be as permissive as 0600. Set the exact final
+            // mode before writing any credential bytes, independently of umask.
+            temp.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            temp.write_all(contents)?;
+            temp.sync_all()?;
+            std::fs::rename(&temp_path, path)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a private temporary config file",
+    ))
+}
+
 fn run_init() {
     let name = prompt_default("Validator name (e.g. your name or city)", "validator");
     let data_dir = prompt_default("Data directory", "/root/.indra/data");
@@ -4103,7 +4158,7 @@ mempool_capacity  = 5000
         toml_escape(&metrics_addr),
         prune_keep
     );
-    if let Err(e) = std::fs::write(&config_path, config) {
+    if let Err(e) = atomic_write_private_config(&config_path, config.as_bytes()) {
         eprintln!("ERROR: cannot write {}: {}", config_path.display(), e);
         std::process::exit(1);
     }
@@ -5519,6 +5574,49 @@ fn decode_node_rpc_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialized_rpc_credentials_are_atomic_and_mode_0600_regardless_of_umask() {
+        const CHILD_ENV: &str = "INDRA_PRIVATE_CONFIG_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::initialized_rpc_credentials_are_atomic_and_mode_0600_regardless_of_umask",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated umask test process failed");
+            return;
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "indra-node-private-config-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        unsafe { libc::umask(0o777) };
+        let path = directory.join("config.toml");
+        let config = b"[rpc]\nadmin_token = \"admin-secret\"\naccess_token = \"rpc-secret\"\n";
+
+        atomic_write_private_config(&path, config).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), config);
+        let entries = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("config.toml")]);
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     fn proposer_test_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
         let mut dir = std::env::temp_dir();
