@@ -19,6 +19,19 @@ use crate::{
     },
 };
 
+/// Canonical commitment to the unordered set of transactions selected for a block.
+///
+/// Both proposal production and proposal verification must use this function.
+pub fn transaction_set_root(transactions: &[TransactionV1]) -> Bytes32 {
+    let mut tx_ids: Vec<[u8; 32]> = transactions.iter().map(|tx| tx.tx_hash().0).collect();
+    tx_ids.sort_unstable();
+    let mut encoded = Vec::with_capacity(tx_ids.len().saturating_mul(32));
+    for tx_id in tx_ids {
+        encoded.extend_from_slice(&tx_id);
+    }
+    Bytes32::from(indra_crypto::sha256(&encoded))
+}
+
 /// Sole accepted standard VRF suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VrfSuiteV1 {

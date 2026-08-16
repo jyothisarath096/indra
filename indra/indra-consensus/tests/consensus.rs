@@ -66,7 +66,7 @@ fn dummy_tx(
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         },
     };
-    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+    let sig = keypair.sign(&tx.signing_bytes(chain_id).unwrap()).unwrap();
     tx.signature = HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),

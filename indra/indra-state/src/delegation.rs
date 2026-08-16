@@ -1286,9 +1286,8 @@ fn check_validator_identity_consistency(
 
 /// Claim pending rewards for a delegator.
 ///
-/// Transfers pending_rewards to the delegator's UTXO set entry.
-/// In Phase 3 this will create an actual UTXO output.
-/// For now, rewards are zeroed and added to total supply as distributed.
+/// Materializes already-issued pending rewards as a canonical synthetic UTXO;
+/// this is a balance transfer and does not mint or change total supply.
 fn apply_claim_rewards(
     state: &mut ChainState,
     validator_id: &Bytes32,

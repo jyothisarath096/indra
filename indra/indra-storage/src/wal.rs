@@ -110,9 +110,7 @@ impl MempoolWal {
 
             match tag {
                 TAG_SUBMIT => {
-                    use indra_core::codec::ByteReader;
-                    let mut r = ByteReader::new(&payload);
-                    if let Ok(tx) = TransactionV1::decode(&mut r) {
+                    if let Ok(tx) = TransactionV1::decode_exact(&payload) {
                         entries.push(WalEntry::Submit(tx));
                     }
                 }
@@ -280,6 +278,20 @@ mod tests {
         let mut wal = MempoolWal::open(&path).unwrap();
         let err = wal.recover().unwrap_err();
         assert!(err.to_string().contains("unknown WAL entry tag 0xff"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recovery_rejects_transaction_payload_with_trailing_bytes() {
+        let path = temp_path("trailing_tx");
+        let mut payload = dummy_tx(0x55).encode_to_vec();
+        payload.push(0xAA);
+        {
+            let mut wal = MempoolWal::open(&path).unwrap();
+            wal.write_entry(TAG_SUBMIT, &payload).unwrap();
+        }
+        let mut wal = MempoolWal::open(&path).unwrap();
+        assert!(wal.recover().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -2743,6 +2743,19 @@ mod tests {
     }
 
     #[test]
+    fn proposal_verification_rejects_mismatched_transaction_set_root() {
+        let seed = [0xA4u8; 32];
+        let (driver, dir) = local_driver(seed, "mismatched_transaction_set_root");
+        let mut proposal = make_strict_block(&driver, seed, 0, vec![]);
+        proposal.block.header.mempool_set_root = Bytes32::from([0xFF; 32]);
+
+        let error = verify_live_proposal(&driver, &proposal).unwrap_err();
+        assert!(error.contains("transaction-set root mismatch"), "{error}");
+        drop(driver);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn proposal_requires_both_hybrid_components_and_independent_vrf_validity() {
         let seed = [0xA4u8; 32];
         let (driver, dir) = local_driver(seed, "proposal_hybrid_and_vrf_independence");

@@ -593,10 +593,9 @@ fn dispatch_to_response<E: RpcEngineMut>(
             }
         }
         DispatchResult::SubmitTransaction(tx_bytes) => {
-            use indra_core::codec::{ByteReader, Decode};
+            use indra_core::codec::Decode;
             use indra_core::types::transaction::TransactionV1;
-            let mut reader = ByteReader::new(&tx_bytes);
-            match TransactionV1::decode(&mut reader) {
+            match TransactionV1::decode_exact(&tx_bytes) {
                 Ok(tx) => match engine.rpc_submit_transaction(tx) {
                     Ok(tx_id) => RpcResponse::ok(
                         id,
@@ -617,7 +616,38 @@ fn dispatch_to_response<E: RpcEngineMut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::{
+        codec::Encode,
+        types::{
+            crypto::{HybridPubKey, HybridSignature},
+            primitives::{Bytes32, ProtocolVersion, VariableBytes, TRANSACTION_PROTOCOL_VERSION},
+            transaction::{InputV1, OutputV1, TransactionV1},
+        },
+    };
     use indra_state::ChainState;
+
+    fn test_transaction() -> TransactionV1 {
+        TransactionV1 {
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::from([0x41; 32]),
+            }],
+            outputs: vec![OutputV1 {
+                value_spark: 100_000,
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([0x42; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0x43; 2592]).unwrap(),
+                },
+                lock_height: 0,
+            }],
+            fee_amount: 10_000,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0x44; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0x45; 4627]).unwrap(),
+            },
+        }
+    }
 
     fn http_rpc_response_body(body: &str) -> String {
         let request = match parse_http_json_rpc_body(body) {
@@ -661,6 +691,22 @@ mod tests {
         let full_resp = call_rpc_with_mode("indra_fake", &[], &engine, RpcMode::Full);
         assert!(full_resp.contains("\"error\""));
         assert!(full_resp.contains("-32601"));
+    }
+
+    #[test]
+    fn generic_rpc_rejects_transaction_with_trailing_bytes() {
+        let mut encoded = test_transaction().encode_to_vec();
+        encoded.push(0xAA);
+        let mut state = ChainState::new_genesis();
+        let response = dispatch_to_response(
+            "indra_sendTransaction",
+            &[hex::encode(encoded)],
+            JsonId::Number(1),
+            &mut state,
+            RpcMode::Full,
+        );
+        assert!(response.contains(r#""code":-32602"#), "{response}");
+        assert!(response.contains("trailing bytes"), "{response}");
     }
 
     #[test]

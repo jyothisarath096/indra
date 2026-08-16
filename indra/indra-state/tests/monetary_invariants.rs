@@ -113,7 +113,9 @@ fn signed_tx(
         fee_amount,
         signature: dummy_sig(),
     };
-    let sig = pair.sign(&tx.signing_bytes(&state.chain_id)).unwrap();
+    let sig = pair
+        .sign(&tx.signing_bytes(&state.chain_id).unwrap())
+        .unwrap();
     tx.signature = HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),

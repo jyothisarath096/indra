@@ -80,11 +80,50 @@ pub fn tx_to_hex(tx_bytes: &[u8]) -> String {
 
 /// Decode transaction bytes from the built output, validating they form a transaction.
 pub fn decode_transaction(tx_bytes: &[u8]) -> Result<TransactionV1, IndraError> {
-    let mut reader = indra_core::codec::ByteReader::new(tx_bytes);
-    TransactionV1::decode(&mut reader).map_err(|_| IndraError::TxBuildFailed)
+    TransactionV1::decode_exact(tx_bytes).map_err(|_| IndraError::TxBuildFailed)
 }
 
 /// Convert a byte array to a transaction id.
 pub fn tx_id_from_bytes(tx_bytes: &[u8]) -> [u8; 32] {
     indra_crypto::sha256(tx_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indra_core::{
+        codec::Encode,
+        types::{
+            crypto::{HybridPubKey, HybridSignature},
+            primitives::{Bytes32, ProtocolVersion, VariableBytes, TRANSACTION_PROTOCOL_VERSION},
+            transaction::{InputV1, OutputV1},
+        },
+    };
+
+    #[test]
+    fn builder_result_validation_rejects_trailing_bytes() {
+        let tx = TransactionV1 {
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::from([1; 32]),
+            }],
+            outputs: vec![OutputV1 {
+                value_spark: 100_000,
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::from([2; 32]),
+                    pq_pk: VariableBytes::from_slice(&[3; 2592]).unwrap(),
+                },
+                lock_height: 0,
+            }],
+            fee_amount: 10_000,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[4; 64]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[5; 4627]).unwrap(),
+            },
+        };
+        let mut encoded = tx.encode_to_vec();
+        encoded.push(0xAA);
+        assert_eq!(decode_transaction(&encoded), Err(IndraError::TxBuildFailed));
+    }
 }

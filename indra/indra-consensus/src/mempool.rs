@@ -274,6 +274,26 @@ impl Mempool {
             prospective_bytes = prospective_bytes.saturating_sub(candidate_size);
         }
 
+        // Replacement must improve both fee rate and absolute fee revenue.
+        // This is checked after the complete eviction set is known so a compact,
+        // high-rate transaction cannot displace larger transactions while paying
+        // less than their aggregate fees.
+        let evicted_fee_total = evict_ids.iter().try_fold(0u64, |total, id| {
+            self.entries
+                .get(id)
+                .and_then(|entry| total.checked_add(entry.tx.fee_amount))
+        });
+        let Some(evicted_fee_total) = evicted_fee_total else {
+            return Err(ConsensusError::InvalidTransaction {
+                reason: "replacement eviction-fee total overflow",
+            });
+        };
+        if tx.fee_amount < evicted_fee_total {
+            return Err(ConsensusError::InvalidTransaction {
+                reason: "replacement fee is below aggregate evicted fees",
+            });
+        }
+
         for evict_id in evict_ids {
             self.remove_entry(&evict_id);
         }
@@ -600,7 +620,7 @@ mod tests {
     }
 
     fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> HybridSignature {
-        let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+        let sig = keypair.sign(&tx.signing_bytes(chain_id).unwrap()).unwrap();
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -726,6 +746,36 @@ mod tests {
             mempool.submit(lower, 100, 1),
             Err(ConsensusError::InvalidTransaction { reason })
                 if reason.contains("equal-or-higher-fee")
+        ));
+        assert!(mempool.contains(&incumbent_id));
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn higher_rate_replacement_cannot_reduce_absolute_fee_revenue() {
+        let mut mempool = Mempool::default_config();
+        let mut incumbent = dummy_tx(20_000, 0x34);
+        let owner = incumbent.outputs[0].owner_pubkey.clone();
+        incumbent.outputs.extend((0..15).map(|_| OutputV1 {
+            value_spark: DUST_LIMIT_SPARK,
+            owner_pubkey: owner.clone(),
+            lock_height: 0,
+        }));
+        let mut compact = dummy_tx(19_000, 0x34);
+        compact.inputs = incumbent.inputs.clone();
+
+        let incumbent_rate = incumbent.fee_amount / incumbent.weight_kb();
+        let compact_rate = compact.fee_amount / compact.weight_kb();
+        assert!(
+            compact_rate > incumbent_rate,
+            "fixture must have a higher fee rate"
+        );
+        let incumbent_id = mempool.submit(incumbent, 100, 1).unwrap();
+
+        assert!(matches!(
+            mempool.submit(compact, 100, 1),
+            Err(ConsensusError::InvalidTransaction { reason })
+                if reason.contains("aggregate evicted fees")
         ));
         assert!(mempool.contains(&incumbent_id));
         assert_eq!(mempool.len(), 1);

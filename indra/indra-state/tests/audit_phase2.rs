@@ -90,7 +90,7 @@ fn insert_genesis_fixture_utxo(
 }
 
 fn sign_tx(tx: &TransactionV1, keypair: &HybridKeypair, chain_id: &str) -> HybridSignature {
-    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+    let sig = keypair.sign(&tx.signing_bytes(chain_id).unwrap()).unwrap();
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),

@@ -360,9 +360,10 @@ impl Message {
                 Ok(Self::Vote(vote))
             }
             MessageType::Tx => {
-                let mut r = ByteReader::new(payload);
-                let tx = TransactionV1::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
+                let tx = TransactionV1::decode_exact(payload).map_err(|e| {
+                    NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    }
                 })?;
                 Ok(Self::Tx(tx))
             }
@@ -702,8 +703,10 @@ mod tests {
         primitives::{
             Bytes32, Bytes64, ProtocolVersion, VariableBytes, MAX_CLASSICAL_SIG_BYTES,
             MAX_PQ_SIG_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+            TRANSACTION_PROTOCOL_VERSION,
         },
         staking::{StakingOp, StakingOpBody},
+        transaction::{InputV1, OutputV1, TransactionV1},
     };
 
     fn test_block(height: u64) -> BlockVNext {
@@ -786,6 +789,26 @@ mod tests {
         }
     }
 
+    fn test_transaction() -> TransactionV1 {
+        TransactionV1 {
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::from([0x51; 32]),
+            }],
+            outputs: vec![OutputV1 {
+                value_spark: 100_000,
+                owner_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: Bytes32::from([0x52; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0x53; 2592]).unwrap(),
+                },
+                lock_height: 0,
+            }],
+            fee_amount: 10_000,
+            signature: dummy_sig(),
+        }
+    }
+
     #[test]
     fn ping_round_trip() {
         let msg = Message::Ping(0xDEADBEEF_CAFEBABE);
@@ -828,6 +851,18 @@ mod tests {
         let mut payload = op.encode_to_vec();
         payload.extend_from_slice(&[0xAA, 0x55]);
         let mut wire = vec![MessageType::GovernanceOp as u8];
+        wire.extend_from_slice(&payload);
+        assert!(matches!(
+            Message::decode_wire(&wire),
+            Err(NetworkError::DecodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn transaction_wire_rejects_trailing_bytes() {
+        let mut payload = test_transaction().encode_to_vec();
+        payload.extend_from_slice(&[0xAA, 0x55]);
+        let mut wire = vec![MessageType::Tx as u8];
         wire.extend_from_slice(&payload);
         assert!(matches!(
             Message::decode_wire(&wire),

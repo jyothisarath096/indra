@@ -192,7 +192,9 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     };
 
     // 9. Sign: compute tx hash (all fields except signature), then sign
-    let tx_bytes_unsigned = tx.signing_bytes(params.chain_id);
+    let tx_bytes_unsigned = tx
+        .signing_bytes(params.chain_id)
+        .map_err(|error| CliError::Transaction(error.to_string()))?;
 
     let classical = ClassicalKeypair::from_seed(&params.ed25519_seed);
     let pq = PqKeypair::from_bytes(

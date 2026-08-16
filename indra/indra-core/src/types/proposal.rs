@@ -4,7 +4,7 @@ use crate::{
     error::{IndraError, IndraResult},
     sortition::{evaluate, priority, CertifiedLogInterval},
     types::{
-        block::{BlockProposalVNext, VrfSuiteV1},
+        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1},
         consensus_snapshot::ConsensusSnapshot,
         primitives::{Bytes32, Bytes64},
     },
@@ -94,6 +94,11 @@ pub fn verify_proposal<'a>(
     snapshot: &ConsensusSnapshot,
 ) -> IndraResult<VerifiedProposal<'a>> {
     let h = &proposal.block.header;
+    if h.mempool_set_root != transaction_set_root(&proposal.block.transactions) {
+        return Err(IndraError::InvalidSortition(
+            "proposal transaction-set root mismatch".into(),
+        ));
+    }
     if h.election_seed != *expected_seed {
         return Err(IndraError::InvalidSortition(
             "proposal election seed differs from committed state".into(),

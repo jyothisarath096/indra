@@ -146,33 +146,19 @@ impl TransactionV1 {
         bytes.div_ceil(1024)
     }
 
-    /// Validate the fee is sufficient given the current base fee.
-    pub fn validate_fee(&self, base_fee_spark_per_kb: u64) -> IndraResult<()> {
-        let required = base_fee_spark_per_kb.saturating_mul(self.weight_kb());
-        if self.fee_amount < required {
-            return Err(IndraError::FeeTooLow {
-                actual: self.fee_amount,
-                minimum: required,
-            });
-        }
-        Ok(())
-    }
-
     /// Canonical bytes covered by the transaction signature.
-    pub fn signing_bytes(&self, chain_id: &str) -> Vec<u8> {
+    pub fn signing_bytes(&self, chain_id: &str) -> IndraResult<Vec<u8>> {
         use indra_crypto::hash::domains::TX_SIGN;
 
         let mut buf = Vec::new();
         buf.extend_from_slice(TX_SIGN);
-        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(chain_id.as_bytes())
-            .unwrap_or_default()
-            .encode(&mut buf);
+        VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(chain_id.as_bytes())?.encode(&mut buf);
         self.version.encode(&mut buf);
         self.signature_module_id.encode(&mut buf);
         encode_list(&self.inputs, &mut buf);
         encode_list(&self.outputs, &mut buf);
         self.fee_amount.encode(&mut buf);
-        buf
+        Ok(buf)
     }
 
     /// Canonical transaction hash including signatures.
@@ -302,20 +288,6 @@ mod transparent_transaction_tests {
     }
 
     #[test]
-    fn fee_too_low_rejected() {
-        let tx = minimal_tx();
-        let base_fee = tx.fee_amount.saturating_add(1);
-        assert!(tx.validate_fee(base_fee).is_err());
-    }
-
-    #[test]
-    fn fee_sufficient_passes() {
-        let mut tx = minimal_tx();
-        tx.fee_amount = tx.weight_kb().saturating_mul(100);
-        assert!(tx.validate_fee(100).is_ok());
-    }
-
-    #[test]
     fn weight_is_nonzero() {
         assert!(minimal_tx().weight_kb() >= 1);
     }
@@ -342,7 +314,14 @@ mod transparent_transaction_tests {
     #[test]
     fn transaction_signing_bytes_include_domain() {
         let tx = minimal_tx();
-        let signing_bytes = tx.signing_bytes("indra-testnet-1");
+        let signing_bytes = tx.signing_bytes("indra-testnet-1").unwrap();
         assert!(signing_bytes.starts_with(indra_crypto::hash::domains::TX_SIGN));
+    }
+
+    #[test]
+    fn transaction_signing_rejects_overlong_chain_id() {
+        let tx = minimal_tx();
+        let chain_id = "x".repeat(MAX_CHAIN_ID_BYTES + 1);
+        assert!(tx.signing_bytes(&chain_id).is_err());
     }
 }

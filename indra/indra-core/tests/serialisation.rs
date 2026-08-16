@@ -6,7 +6,7 @@
 use indra_core::codec::{Decode, Encode};
 use indra_core::types::primitives::{
     DUST_LIMIT_SPARK, FEE_BURN_BPS, FEE_VALIDATOR_BPS, LIFETIME_SUPPLY_CAP_SPARK, MAX_INPUTS,
-    MAX_OUTPUTS, MIN_BASE_FEE_SPARK_PER_KB, TRANSACTION_PROTOCOL_VERSION,
+    MAX_OUTPUTS, TRANSACTION_PROTOCOL_VERSION,
 };
 use indra_core::types::qc::SIGNER_BITFIELD_BYTES;
 use indra_core::types::vote::VoteStep;
@@ -202,13 +202,6 @@ fn zero_outputs_rejected() {
     let mut tx = minimal_tx();
     tx.outputs.clear();
     assert_eq!(tx.validate_structure(), Err(IndraError::ZeroOutputs));
-}
-
-#[test]
-fn fee_below_base_rejected() {
-    let mut tx = minimal_tx();
-    tx.fee_amount = 0;
-    assert!(tx.validate_fee(MIN_BASE_FEE_SPARK_PER_KB).is_err());
 }
 
 // ── Canonicality tests ────────────────────────────────────────────────────────

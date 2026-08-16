@@ -117,7 +117,7 @@ pub fn produce_block(
         timestamp: template.timestamp,
         state_root: Bytes32::ZERO,
         validator_set_root: Bytes32::ZERO,
-        mempool_set_root: compute_selected_tx_root(&selected),
+        mempool_set_root: indra_core::types::block::transaction_set_root(&selected),
         value_hash: Bytes32::ZERO,
         base_fee: state.base_fee,
         proposer_round: election.round,
@@ -159,7 +159,8 @@ pub fn produce_block(
             });
         }
     }
-    block.header.mempool_set_root = compute_selected_tx_root(&block.transactions);
+    block.header.mempool_set_root =
+        indra_core::types::block::transaction_set_root(&block.transactions);
 
     let projected =
         project_block_for_roots(state, &block, 0).map_err(|err| ConsensusError::CryptoError {
@@ -175,18 +176,6 @@ pub fn produce_block(
 /// Compute a simple selected-transaction root: SHA-256 of all selected tx_ids sorted and hashed.
 ///
 /// This binds the header hash to the exact transaction set included in the block.
-fn compute_selected_tx_root(transactions: &[TransactionV1]) -> Bytes32 {
-    use indra_crypto::sha256;
-    let mut tx_ids: Vec<[u8; 32]> = transactions.iter().map(|tx| tx.tx_hash().0).collect();
-    tx_ids.sort();
-
-    let mut data = Vec::new();
-    for id in &tx_ids {
-        data.extend_from_slice(id);
-    }
-    Bytes32::from(sha256(&data))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

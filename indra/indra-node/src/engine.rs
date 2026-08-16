@@ -2060,7 +2060,7 @@ mod tests {
             signature: dummy_signature(),
         };
         let signature = owner
-            .sign(&tx.signing_bytes(&engine.state.chain_id))
+            .sign(&tx.signing_bytes(&engine.state.chain_id).unwrap())
             .unwrap();
         tx.signature = HybridSignature {
             classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
@@ -3238,7 +3238,7 @@ mod tests {
             let mut pending = transaction.clone();
             pending.inputs[0].utxo_id = utxo_id;
             let signature = transaction_owner
-                .sign(&pending.signing_bytes(&engine.state.chain_id))
+                .sign(&pending.signing_bytes(&engine.state.chain_id).unwrap())
                 .unwrap();
             pending.signature = HybridSignature {
                 classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),

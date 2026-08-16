@@ -186,7 +186,7 @@ fn sign_transaction(
     chain_id: &str,
     tx: &TransactionV1,
 ) -> HybridSignature {
-    let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+    let sig = keypair.sign(&tx.signing_bytes(chain_id).unwrap()).unwrap();
     HybridSignature {
         classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
         pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),

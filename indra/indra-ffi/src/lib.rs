@@ -1025,7 +1025,7 @@ mod handle_tests {
         );
         let tx = unsafe { decode_tx_result(session, result, &metadata) };
         let direct = direct_keypair_from_master_seed([0x76; 32])
-            .sign(&tx.signing_bytes(DEFAULT_CHAIN_ID))
+            .sign(&tx.signing_bytes(DEFAULT_CHAIN_ID).unwrap())
             .unwrap();
         assert_wire_signature_matches_direct(&tx.signature, &direct);
         assert_eq!(tx.outputs[0].value_spark, amount);

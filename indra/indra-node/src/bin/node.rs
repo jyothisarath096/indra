@@ -5260,10 +5260,7 @@ fn handle_rpc(
                         metrics,
                     );
                 }
-                use indra_core::codec::{ByteReader, Decode};
-                use indra_core::types::transaction::TransactionV1;
-                let mut reader = ByteReader::new(&tx_bytes);
-                match TransactionV1::decode(&mut reader) {
+                match decode_node_rpc_transaction(&tx_bytes) {
                     Ok(tx) => {
                         let submit_result = lock_driver_for_rpc(driver, metrics)
                             .map_err(|_| "consensus driver lock poisoned".to_string())
@@ -5509,6 +5506,13 @@ impl Drop for RpcRequestMetricsGuard<'_> {
             Ordering::Relaxed,
         );
     }
+}
+
+fn decode_node_rpc_transaction(
+    tx_bytes: &[u8],
+) -> indra_core::IndraResult<indra_core::types::transaction::TransactionV1> {
+    use indra_core::codec::Decode;
+    indra_core::types::transaction::TransactionV1::decode_exact(tx_bytes)
 }
 
 #[cfg(test)]
@@ -6963,6 +6967,16 @@ mod tests {
                 .unwrap(),
             },
         }
+    }
+
+    #[test]
+    fn real_node_rpc_decoder_rejects_transaction_with_trailing_bytes() {
+        let mut encoded = snapshot_test_transaction(0xA8).encode_to_vec();
+        encoded.push(0xAA);
+        assert!(matches!(
+            decode_node_rpc_transaction(&encoded),
+            Err(indra_core::IndraError::TrailingBytes { count: 1 })
+        ));
     }
 
     #[test]

@@ -624,7 +624,7 @@ mod tests {
         chain_id: &str,
         tx: &TransactionV1,
     ) -> HybridSignature {
-        let sig = keypair.sign(&tx.signing_bytes(chain_id)).unwrap();
+        let sig = keypair.sign(&tx.signing_bytes(chain_id).unwrap()).unwrap();
         HybridSignature {
             classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
             pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -5051,7 +5051,11 @@ pub fn validate_transaction_with_dust(
         .signature
         .to_crypto_sig()
         .map_err(|reason| StateError::SignatureInvalid { reason })?;
-    let signing_bytes = tx.signing_bytes(chain_id);
+    let signing_bytes = tx
+        .signing_bytes(chain_id)
+        .map_err(|e| StateError::SignatureInvalid {
+            reason: e.to_string(),
+        })?;
     verify_hybrid(&signing_bytes, &crypto_sig, &crypto_pk).map_err(|e| {
         StateError::SignatureInvalid {
             reason: e.to_string(),
@@ -5136,7 +5140,10 @@ fn apply_transaction(
     }
 
     let burn_amount = tx.fee_amount / 2;
-    let validator_amount = tx.fee_amount.saturating_sub(burn_amount);
+    let validator_amount = tx
+        .fee_amount
+        .checked_sub(burn_amount)
+        .ok_or(StateError::ValueOverflow)?;
     txn.apply_fee_accounting(burn_amount, validator_amount)?;
 
     Ok(())
