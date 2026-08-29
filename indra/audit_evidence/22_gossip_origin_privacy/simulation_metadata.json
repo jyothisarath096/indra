@@ -1,0 +1,63 @@
+{
+  "model": "INDRA Dandelion++ validator-topology Monte Carlo",
+  "seed": 32204204148784,
+  "cells": 432,
+  "transactions_per_cell": 1000,
+  "total_transactions": 432000,
+  "topology_epochs_per_cell": 10,
+  "constants": {
+    "target_outbound_peers": 8,
+    "max_inbound_peers": 64,
+    "max_peers": 80,
+    "min_active_validators": 4
+  },
+  "sweep": {
+    "validator_counts": [
+      4,
+      8,
+      20,
+      50,
+      100,
+      200
+    ],
+    "adversary_fractions": [
+      0.05,
+      0.1,
+      0.2,
+      0.33
+    ],
+    "fluff_probabilities": [
+      0.1,
+      0.15,
+      0.2
+    ],
+    "relay_counts": [
+      1,
+      2
+    ],
+    "embargo_base_seconds": [
+      30,
+      60,
+      120
+    ]
+  },
+  "assumptions": {
+    "colluding_stem_behavior": "observe first predecessor then black-hole",
+    "transient_edge_down_probability_per_transaction": 0.02,
+    "active_reconnect_delay_seconds": 2.0,
+    "zero_outbound_window_seconds": 3.0,
+    "propagation_bound_seconds": 180.0,
+    "link_latency_distribution": "independent lognormal per edge/transaction",
+    "link_latency_median_seconds": 0.08,
+    "link_latency_log_sigma": 0.35,
+    "embargo_distribution": "independent exponential with named mean/base",
+    "adversarial_diffusion_behavior": "receive but do not forward",
+    "small_n_topology": "complete; lower identity initiates duplicate-resolved edge"
+  },
+  "metric_definitions": {
+    "first_spy_precision": "correct adversarial source guesses / all adversarial guesses",
+    "first_spy_recall": "macro-average across honest sources of correctly guessed transactions / transactions originated",
+    "duplicate_stem_rate": "duplicate honest stem receipts / stem transmissions",
+    "added_latency": "Dandelion completion minus immediate-flood completion on the same active graph and edge latencies"
+  }
+}

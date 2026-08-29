@@ -1,0 +1,60 @@
+{
+  "model": "INDRA Dandelion++ small-N relay eligibility and embargo sweep v2",
+  "seed": 2110534723094708226,
+  "policy_a_reference_rows": 8,
+  "policy_b_cells": 72,
+  "transactions_per_new_cell": 1000,
+  "new_transactions": 72000,
+  "v1_artifacts_modified": false,
+  "min_round_time_ms": 3000,
+  "target_outbound_peers": 8,
+  "small_n_policy_threshold": 9,
+  "flat_embargo_seconds": [
+    5,
+    10,
+    15,
+    20,
+    30
+  ],
+  "round_multipliers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    10
+  ],
+  "round_embargo_seconds": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    30
+  ],
+  "deduplicated_embargo_seconds": [
+    3,
+    5,
+    6,
+    9,
+    10,
+    12,
+    15,
+    20,
+    30
+  ],
+  "validator_counts": [
+    4,
+    8
+  ],
+  "adversary_fractions": [
+    0.05,
+    0.1,
+    0.2,
+    0.33
+  ],
+  "q": 0.2,
+  "relay_count": 1,
+  "policy_b": "any authenticated connection at N<=9; outbound-only at N>9",
+  "inherited_v1_assumptions": "See simulation_metadata.json and imported v1 model"
+}
