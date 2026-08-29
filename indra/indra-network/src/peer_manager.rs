@@ -560,6 +560,7 @@ impl PeerManagerActor {
                     vote.step,
                     &vote.block_hash,
                     &vote.validator_id,
+                    &vote.snapshot_root,
                     &self.relay_chain_id,
                 );
                 verify_relay_hybrid_signature(&signing_bytes, &vote.signature, key)
@@ -1041,12 +1042,7 @@ impl PeerManagerActor {
                     Err(_) => break,
                 };
                 let msg_size = plaintext.len();
-                let payload = if plaintext.len() >= 4 {
-                    &plaintext[4..]
-                } else {
-                    &plaintext[..]
-                };
-                let msg = match Message::decode_wire(payload) {
+                let msg = match Message::decode_framed_wire(&plaintext) {
                     Ok(msg) => msg,
                     Err(NetworkError::UnknownMessageType { .. }) => continue,
                     Err(_) => break,
@@ -1384,10 +1380,7 @@ mod tests {
     use super::*;
     use crate::rate_limit::RateLimitReason;
     use indra_core::types::{
-        block::{
-            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
-            NO_POLC_ROUND,
-        },
+        block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         crypto::HybridSignature,
         primitives::{
             Bytes64, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES,
@@ -1657,13 +1650,22 @@ mod tests {
         step: VoteStep,
         block_hash: Bytes32,
     ) -> VoteV1 {
-        let bytes = vote_signing_bytes(7, 2, step, &block_hash, &validator_id, "indra-testnet-1");
+        let bytes = vote_signing_bytes(
+            7,
+            2,
+            step,
+            &block_hash,
+            &validator_id,
+            &Bytes32::ZERO,
+            "indra-testnet-1",
+        );
         VoteV1 {
             height: 7,
             round: 2,
             step,
             block_hash,
             validator_id,
+            snapshot_root: Bytes32::ZERO,
             signature: core_signature(keypair.sign(&bytes).unwrap()),
         }
     }
@@ -1734,7 +1736,7 @@ mod tests {
                 value_hash,
                 base_fee: 0,
                 proposer_round: round,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: validator_id,
                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: Bytes64([0x55; 64]),
@@ -1892,6 +1894,7 @@ mod tests {
             step: VoteStep::Prevote,
             block_hash: Bytes32::from([0xAA; 32]),
             validator_id: Bytes32::from([0xBB; 32]),
+            snapshot_root: Bytes32::ZERO,
             signature: dummy_signature(),
         });
         let key = consensus_message_key(&vote).expect("vote key");
@@ -1937,7 +1940,10 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:32102".parse().unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
-        let started = Instant::now();
+        actor.limiters_by_validator.insert(
+            validator,
+            PeerRateLimiter::new_for_test_with_frozen_vote_bucket(),
+        );
         for index in 0..81u8 {
             // All votes claim the exact same consensus slot, but differ in
             // signed content and encoded hash. They therefore evade the
@@ -1949,6 +1955,7 @@ mod tests {
                 step: VoteStep::Prevote,
                 block_hash: Bytes32::from([index; 32]),
                 validator_id: validator,
+                snapshot_root: Bytes32::ZERO,
                 signature: dummy_signature(),
             });
             actor
@@ -1964,13 +1971,98 @@ mod tests {
         while event_rx.try_recv().is_ok() {
             delivered += 1;
         }
-        let elapsed = started.elapsed();
         assert_eq!(delivered, 80);
         assert_eq!(actor.limiters_by_validator.len(), 1);
-        eprintln!(
-            "[near-duplicate-vote-rate-limit] attempted=81 delivered={delivered} elapsed_us={}",
-            elapsed.as_micros()
+    }
+
+    #[tokio::test]
+    async fn distinct_validators_have_independent_vote_budgets() {
+        let validator_a = Bytes32::from([0xB3; 32]);
+        let validator_b = Bytes32::from([0xB4; 32]);
+        let addr: SocketAddr = "127.0.0.1:32103".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        for validator in [validator_a, validator_b] {
+            actor.limiters_by_validator.insert(
+                validator,
+                PeerRateLimiter::new_for_test_with_frozen_vote_bucket(),
+            );
+            for index in 0..80u8 {
+                actor
+                    .handle_control(PeerManagerMessage::InboundMessage {
+                        validator_id: validator,
+                        addr,
+                        msg: Message::Vote(VoteV1 {
+                            height: 1,
+                            round: 0,
+                            step: VoteStep::Prevote,
+                            block_hash: Bytes32::from([index; 32]),
+                            validator_id: validator,
+                            snapshot_root: Bytes32::ZERO,
+                            signature: dummy_signature(),
+                        }),
+                        msg_size: 5_000,
+                    })
+                    .await;
+            }
+        }
+        let mut delivered = 0;
+        while event_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 160);
+        assert_eq!(actor.limiters_by_validator.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disconnect_does_not_reset_validator_vote_budget() {
+        let validator = Bytes32::from([0xB5; 32]);
+        let addr: SocketAddr = "127.0.0.1:32104".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.limiters_by_validator.insert(
+            validator,
+            PeerRateLimiter::new_for_test_with_frozen_vote_bucket(),
         );
+        let vote = |index| {
+            Message::Vote(VoteV1 {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash: Bytes32::from([index; 32]),
+                validator_id: validator,
+                snapshot_root: Bytes32::ZERO,
+                signature: dummy_signature(),
+            })
+        };
+        for index in 0..80u8 {
+            actor
+                .handle_control(PeerManagerMessage::InboundMessage {
+                    validator_id: validator,
+                    addr,
+                    msg: vote(index),
+                    msg_size: 5_000,
+                })
+                .await;
+        }
+        actor.drop_peer(validator, addr).await;
+        actor
+            .handle_control(PeerManagerMessage::InboundMessage {
+                validator_id: validator,
+                addr,
+                msg: vote(80),
+                msg_size: 5_000,
+            })
+            .await;
+
+        let mut delivered_votes = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, NetworkEvent::Message { .. }) {
+                delivered_votes += 1;
+            }
+        }
+        assert_eq!(delivered_votes, 80);
+        assert!(actor.limiters_by_validator.contains_key(&validator));
     }
 
     #[test]

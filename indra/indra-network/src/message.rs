@@ -11,8 +11,13 @@
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
     types::{
-        block::BlockProposalVNext, governance::GovernanceOpV2, primitives::Bytes32,
-        staking::StakingOp, transaction::TransactionV1, vote::VoteV1,
+        block::BlockProposalVNext,
+        crypto::HybridSignature,
+        governance::GovernanceOpV2,
+        primitives::{validate_consensus_round, Bytes32},
+        staking::{StakingOp, StakingOpBody},
+        transaction::TransactionV1,
+        vote::VoteV1,
     },
 };
 
@@ -192,6 +197,56 @@ pub enum Message {
     },
 }
 
+fn require_exact_hybrid_signature(signature: &HybridSignature) -> NetworkResult<()> {
+    let classical_len = signature.classical_sig.len();
+    if classical_len != indra_crypto::CLASSICAL_SIG_BYTES {
+        return Err(NetworkError::DecodeFailed {
+            reason: format!(
+                "hybrid classical signature must be exactly {} bytes, got {classical_len}",
+                indra_crypto::CLASSICAL_SIG_BYTES
+            ),
+        });
+    }
+    let pq_len = signature.pq_sig.len();
+    if pq_len != indra_crypto::PQ_SIG_BYTES {
+        return Err(NetworkError::DecodeFailed {
+            reason: format!(
+                "hybrid PQ signature must be exactly {} bytes, got {pq_len}",
+                indra_crypto::PQ_SIG_BYTES
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn require_exact_staking_signatures(operation: &StakingOp) -> NetworkResult<()> {
+    require_exact_hybrid_signature(&operation.signature)?;
+    match &operation.body {
+        StakingOpBody::RegisterValidator { cold_signature, .. } => {
+            require_exact_hybrid_signature(cold_signature)
+        }
+        StakingOpBody::RotateValidatorColdKey {
+            new_cold_signature: Some(signature),
+            ..
+        } => require_exact_hybrid_signature(signature),
+        _ => Ok(()),
+    }
+}
+
+fn require_exact_proposal_signatures(proposal: &BlockProposalVNext) -> NetworkResult<()> {
+    require_exact_hybrid_signature(&proposal.proposer_authorization)?;
+    for transaction in &proposal.block.transactions {
+        require_exact_hybrid_signature(&transaction.signature)?;
+    }
+    for operation in &proposal.block.staking_ops {
+        require_exact_staking_signatures(operation)?;
+    }
+    for operation in &proposal.block.governance_ops {
+        require_exact_hybrid_signature(&operation.signature)?;
+    }
+    Ok(())
+}
+
 impl Message {
     /// The message type discriminant.
     pub fn message_type(&self) -> MessageType {
@@ -217,6 +272,11 @@ impl Message {
     ///
     /// Wire format: [u32 length LE] [u8 type] [payload]
     pub fn encode_wire(&self) -> NetworkResult<Vec<u8>> {
+        if let Self::Status { round, .. } | Self::RequestProposal { round, .. } = self {
+            validate_consensus_round(*round).map_err(|error| NetworkError::DecodeFailed {
+                reason: error.to_string(),
+            })?;
+        }
         let payload = self.encode_payload();
         let total_len = 1 + payload.len(); // type byte + payload
 
@@ -245,6 +305,39 @@ impl Message {
         let msg_type = MessageType::from_byte(msg_type_byte)?;
 
         Self::decode_payload(msg_type, payload)
+    }
+
+    /// Decode one complete inner wire object, including its 4-byte length prefix.
+    ///
+    /// The declared length covers the message-type byte plus payload, but not
+    /// the length prefix itself. The authenticated transport frame must contain
+    /// exactly that one declared object.
+    pub fn decode_framed_wire(data: &[u8]) -> NetworkResult<Self> {
+        let length_bytes: [u8; 4] = data
+            .get(..4)
+            .ok_or(NetworkError::DecodeFailed {
+                reason: "message length prefix truncated".to_string(),
+            })?
+            .try_into()
+            .map_err(|_| NetworkError::DecodeFailed {
+                reason: "invalid message length prefix".to_string(),
+            })?;
+        let declared_len = u32::from_le_bytes(length_bytes) as usize;
+        if declared_len > MAX_MSG_BYTES {
+            return Err(NetworkError::MessageTooLarge {
+                size: declared_len,
+                max: MAX_MSG_BYTES,
+            });
+        }
+        let actual_len = data.len() - 4;
+        if declared_len != actual_len {
+            return Err(NetworkError::DecodeFailed {
+                reason: format!(
+                    "message length mismatch: declared {declared_len} bytes, frame contains {actual_len}"
+                ),
+            });
+        }
+        Self::decode_wire(&data[4..])
     }
 
     /// Encode the payload (without length prefix or type byte).
@@ -350,13 +443,15 @@ impl Message {
                         reason: e.to_string(),
                     }
                 })?;
+                require_exact_proposal_signatures(&block)?;
                 Ok(Self::Block(block))
             }
             MessageType::Vote => {
-                let mut r = ByteReader::new(payload);
-                let vote = VoteV1::decode(&mut r).map_err(|e| NetworkError::DecodeFailed {
-                    reason: e.to_string(),
-                })?;
+                let vote =
+                    VoteV1::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    })?;
+                require_exact_hybrid_signature(&vote.signature)?;
                 Ok(Self::Vote(vote))
             }
             MessageType::Tx => {
@@ -365,6 +460,7 @@ impl Message {
                         reason: e.to_string(),
                     }
                 })?;
+                require_exact_hybrid_signature(&tx.signature)?;
                 Ok(Self::Tx(tx))
             }
             MessageType::StakingOp => {
@@ -372,6 +468,7 @@ impl Message {
                     StakingOp::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
                         reason: e.to_string(),
                     })?;
+                require_exact_staking_signatures(&op)?;
                 Ok(Self::StakingOp(op))
             }
             MessageType::GovernanceOp => {
@@ -380,6 +477,7 @@ impl Message {
                         reason: e.to_string(),
                     }
                 })?;
+                require_exact_hybrid_signature(&op.signature)?;
                 Ok(Self::GovernanceOp(op))
             }
             MessageType::PeerList => {
@@ -420,7 +518,11 @@ impl Message {
                             reason: "peer list entry truncated".to_string(),
                         });
                     };
-                    let s = String::from_utf8_lossy(peer_bytes).to_string();
+                    let s = std::str::from_utf8(peer_bytes)
+                        .map_err(|_| NetworkError::DecodeFailed {
+                            reason: "peer list address is not valid UTF-8".to_string(),
+                        })?
+                        .to_owned();
                     offset += len;
                     let Some(identity_flag) = payload.get(offset) else {
                         return Err(NetworkError::DecodeFailed {
@@ -460,6 +562,11 @@ impl Message {
                 Ok(Self::PeerList(peers))
             }
             MessageType::Ping => {
+                if payload.len() != 8 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "ping payload must be exactly 8 bytes".to_string(),
+                    });
+                }
                 let nonce_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -473,6 +580,11 @@ impl Message {
                 Ok(Self::Ping(nonce))
             }
             MessageType::Pong => {
+                if payload.len() != 8 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "pong payload must be exactly 8 bytes".to_string(),
+                    });
+                }
                 let nonce_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -486,6 +598,11 @@ impl Message {
                 Ok(Self::Pong(nonce))
             }
             MessageType::RequestBlocks => {
+                if payload.len() != 16 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "request_blocks payload must be exactly 16 bytes".to_string(),
+                    });
+                }
                 let from_height_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -539,6 +656,7 @@ impl Message {
                             reason: e.to_string(),
                         }
                     })?;
+                    require_exact_proposal_signatures(&block)?;
                     blocks.push(block);
                 }
                 let flags = u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
@@ -574,6 +692,11 @@ impl Message {
                 })
             }
             MessageType::Status => {
+                if payload.len() != 44 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "status payload must be exactly 44 bytes".to_string(),
+                    });
+                }
                 let height_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -593,17 +716,18 @@ impl Message {
                         reason: "invalid status tip hash".to_string(),
                     })?;
                 let height = u64::from_le_bytes(height_bytes);
-                let round = if payload.len() >= 44 {
-                    let round_bytes: [u8; 4] =
-                        payload[40..44]
-                            .try_into()
-                            .map_err(|_| NetworkError::DecodeFailed {
-                                reason: "invalid status round".to_string(),
-                            })?;
-                    u32::from_le_bytes(round_bytes)
-                } else {
-                    0
-                };
+                let round_bytes: [u8; 4] =
+                    payload[40..44]
+                        .try_into()
+                        .map_err(|_| NetworkError::DecodeFailed {
+                            reason: "invalid status round".to_string(),
+                        })?;
+                let round =
+                    validate_consensus_round(u32::from_le_bytes(round_bytes)).map_err(|error| {
+                        NetworkError::DecodeFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
                 Ok(Self::Status {
                     height,
                     tip_hash: Bytes32::from(tip),
@@ -611,6 +735,11 @@ impl Message {
                 })
             }
             MessageType::RequestProposal => {
+                if payload.len() != 44 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "request_proposal payload must be exactly 44 bytes".to_string(),
+                    });
+                }
                 let height_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -638,13 +767,24 @@ impl Message {
                     .map_err(|_| NetworkError::DecodeFailed {
                         reason: "invalid request_proposal hash".to_string(),
                     })?;
+                let round =
+                    validate_consensus_round(u32::from_le_bytes(round_bytes)).map_err(|error| {
+                        NetworkError::DecodeFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
                 Ok(Self::RequestProposal {
                     height: u64::from_le_bytes(height_bytes),
-                    round: u32::from_le_bytes(round_bytes),
+                    round,
                     hash: Bytes32::from(hash),
                 })
             }
             MessageType::RequestQC => {
+                if payload.len() != 8 {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: "request_qc payload must be exactly 8 bytes".to_string(),
+                    });
+                }
                 let height_bytes: [u8; 8] = payload
                     .get(..8)
                     .ok_or(NetworkError::DecodeFailed {
@@ -678,8 +818,19 @@ impl Message {
                         reason: "invalid qc_response length".to_string(),
                     })?;
                 let len = u32::from_le_bytes(len_bytes) as usize;
+                let expected_len = 12usize.checked_add(len).ok_or(NetworkError::DecodeFailed {
+                    reason: "qc_response length overflow".to_string(),
+                })?;
+                if payload.len() != expected_len {
+                    return Err(NetworkError::DecodeFailed {
+                        reason: format!(
+                            "qc_response payload length mismatch: declared {len} QC bytes, payload contains {}",
+                            payload.len().saturating_sub(12)
+                        ),
+                    });
+                }
                 let qc_bytes = payload
-                    .get(12..12 + len)
+                    .get(12..expected_len)
                     .ok_or(NetworkError::DecodeFailed {
                         reason: "truncated qc_response bytes".to_string(),
                     })?
@@ -697,8 +848,7 @@ impl Message {
 mod tests {
     use super::*;
     use indra_core::types::{
-        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
-        crypto::HybridSignature,
+        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
         primitives::{
             Bytes32, Bytes64, ProtocolVersion, VariableBytes, MAX_CLASSICAL_SIG_BYTES,
@@ -707,6 +857,7 @@ mod tests {
         },
         staking::{StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
+        vote::{VoteStep, VoteV1},
     };
 
     fn test_block(height: u64) -> BlockVNext {
@@ -722,7 +873,7 @@ mod tests {
                 value_hash: Bytes32::from([0x44u8; 32]),
                 base_fee: 1,
                 proposer_round: 0,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::from([0x45; 32]),
                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: Bytes64([0x46; 64]),
@@ -813,6 +964,90 @@ mod tests {
             fee_amount: 10_000,
             signature: dummy_sig(),
         }
+    }
+
+    fn signature_bearing_messages(signature: HybridSignature) -> Vec<Message> {
+        let mut proposal = test_proposal(11);
+        proposal.proposer_authorization = signature.clone();
+
+        let mut tx = test_transaction();
+        tx.signature = signature.clone();
+        let mut staking = test_staking_op();
+        staking.signature = signature.clone();
+        let mut governance = test_governance_op();
+        governance.signature = signature.clone();
+
+        vec![
+            Message::Block(proposal.clone()),
+            Message::BlockResponse {
+                blocks: vec![proposal],
+                lowest_available: None,
+                highest_available: None,
+            },
+            Message::Vote(VoteV1 {
+                height: 11,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash: Bytes32::from([0x61; 32]),
+                validator_id: Bytes32::from([0x62; 32]),
+                snapshot_root: Bytes32::from([0x63; 32]),
+                signature: signature.clone(),
+            }),
+            Message::Tx(tx),
+            Message::StakingOp(staking),
+            Message::GovernanceOp(governance),
+        ]
+    }
+
+    #[test]
+    fn all_hybrid_signature_message_decoders_require_exact_component_lengths() {
+        for message in signature_bearing_messages(dummy_sig()) {
+            assert!(Message::decode_framed_wire(&message.encode_wire().unwrap()).is_ok());
+        }
+
+        for malformed in [
+            HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[0xAA; 63]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES]).unwrap(),
+            },
+            HybridSignature {
+                classical_sig: VariableBytes::from_slice(&[]).unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES]).unwrap(),
+            },
+            HybridSignature {
+                classical_sig: VariableBytes::from_slice(
+                    &[0xAA; indra_crypto::CLASSICAL_SIG_BYTES],
+                )
+                .unwrap(),
+                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES - 1]).unwrap(),
+            },
+            HybridSignature {
+                classical_sig: VariableBytes::from_slice(
+                    &[0xAA; indra_crypto::CLASSICAL_SIG_BYTES],
+                )
+                .unwrap(),
+                pq_sig: VariableBytes::from_slice(&[]).unwrap(),
+            },
+        ] {
+            for message in signature_bearing_messages(malformed.clone()) {
+                let wire = message.encode_wire().unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize,
+                    wire.len() - 4
+                );
+                assert!(Message::decode_framed_wire(&wire).is_err());
+            }
+        }
+
+        let vote = signature_bearing_messages(dummy_sig())
+            .into_iter()
+            .find(|message| matches!(message, Message::Vote(_)))
+            .unwrap();
+        let mut truncated = vote.encode_wire().unwrap();
+        truncated.pop();
+        let declared_len = (truncated.len() - 4) as u32;
+        truncated[..4].copy_from_slice(&declared_len.to_le_bytes());
+        assert!(Message::decode_framed_wire(&truncated).is_err());
     }
 
     #[test]
@@ -977,6 +1212,44 @@ mod tests {
     }
 
     #[test]
+    fn status_and_proposal_request_reject_out_of_domain_rounds() {
+        for round in [
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            let mut status = Message::Status {
+                height: 1,
+                tip_hash: Bytes32::ZERO,
+                round: 0,
+            }
+            .encode_wire()
+            .unwrap();
+            status[4 + 1 + 40..4 + 1 + 44].copy_from_slice(&round.to_le_bytes());
+            assert!(Message::decode_wire(&status[4..]).is_err());
+
+            let mut request = Message::RequestProposal {
+                height: 1,
+                round: 0,
+                hash: Bytes32::ZERO,
+            }
+            .encode_wire()
+            .unwrap();
+            request[4 + 1 + 8..4 + 1 + 12].copy_from_slice(&round.to_le_bytes());
+            assert!(Message::decode_wire(&request[4..]).is_err());
+        }
+
+        let status = Message::Status {
+            height: 1,
+            tip_hash: Bytes32::ZERO,
+            round: 0,
+        }
+        .encode_wire()
+        .unwrap();
+        assert!(Message::decode_wire(&status[4..status.len() - 4]).is_err());
+    }
+
+    #[test]
     fn peer_list_round_trip() {
         let peers = vec![
             PeerListEntry::address_only("192.168.1.1:30303"),
@@ -1023,6 +1296,45 @@ mod tests {
         let decoded = Message::decode_wire(&wire[4..]).unwrap();
 
         assert!(matches!(decoded, Message::PeerList(got) if got == peers));
+    }
+
+    fn framed_peer_list_with_raw_address(address: &[u8]) -> Vec<u8> {
+        let mut payload = vec![MessageType::PeerList as u8];
+        1u32.encode(&mut payload);
+        (address.len() as u16).encode(&mut payload);
+        payload.extend_from_slice(address);
+        0u8.encode(&mut payload);
+
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        (payload.len() as u32).encode(&mut framed);
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    #[test]
+    fn peer_list_address_utf8_is_strict_and_canonical() {
+        for address in [
+            b"validator.example:27656".as_slice(),
+            "例え.テスト:27656".as_bytes(),
+        ] {
+            let framed = framed_peer_list_with_raw_address(address);
+            let decoded = Message::decode_framed_wire(&framed).unwrap();
+            assert_eq!(decoded.encode_wire().unwrap(), framed);
+        }
+
+        for malformed in [
+            &[0xFF][..],
+            &[0xFE][..],
+            &[0xE2, 0x82][..],
+            &[0xC0, 0xAF][..],
+            &[0xF5, 0x80, 0x80, 0x80][..],
+        ] {
+            let framed = framed_peer_list_with_raw_address(malformed);
+            assert!(matches!(
+                Message::decode_framed_wire(&framed),
+                Err(NetworkError::DecodeFailed { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1138,5 +1450,102 @@ mod tests {
         let wire = msg.encode_wire().unwrap();
         let len = u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize;
         assert_eq!(len + 4, wire.len());
+    }
+
+    #[test]
+    fn framed_decoder_enforces_declared_inner_length() {
+        let canonical = Message::Ping(1).encode_wire().unwrap();
+        assert!(matches!(
+            Message::decode_framed_wire(&canonical),
+            Ok(Message::Ping(1))
+        ));
+
+        let declared = u32::from_le_bytes(canonical[..4].try_into().unwrap());
+        for mutated in [declared - 1, declared + 1, 0, u32::MAX] {
+            let mut wire = canonical.clone();
+            wire[..4].copy_from_slice(&mutated.to_le_bytes());
+            assert!(Message::decode_framed_wire(&wire).is_err());
+        }
+
+        let mut missing_byte = canonical.clone();
+        missing_byte.pop();
+        assert!(Message::decode_framed_wire(&missing_byte).is_err());
+
+        assert!(Message::decode_framed_wire(&canonical[..3]).is_err());
+    }
+
+    #[test]
+    fn framed_decoder_rejects_noncanonical_fixed_payload_at_transport_maximum() {
+        let declared_len = MAX_MSG_BYTES - 4;
+        let mut wire = vec![0u8; MAX_MSG_BYTES];
+        wire[..4].copy_from_slice(&(declared_len as u32).to_le_bytes());
+        wire[4] = MessageType::Ping as u8;
+
+        assert!(matches!(
+            Message::decode_framed_wire(&wire),
+            Err(NetworkError::DecodeFailed { .. })
+        ));
+    }
+
+    fn assert_canonical_and_rejects_trailing(msg: Message) {
+        let canonical = msg.encode_wire().unwrap();
+        let decoded = Message::decode_framed_wire(&canonical).unwrap();
+        assert_eq!(decoded.encode_wire().unwrap(), canonical);
+
+        for suffix in [
+            vec![0xAA],
+            vec![0xAA, 0x55, 0x00],
+            Message::Pong(9).encode_wire().unwrap(),
+        ] {
+            let mut malformed = canonical.clone();
+            malformed.extend_from_slice(&suffix);
+            let declared_len = (malformed.len() - 4) as u32;
+            malformed[..4].copy_from_slice(&declared_len.to_le_bytes());
+            assert!(Message::decode_framed_wire(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn ping_payload_is_exact_and_canonical() {
+        assert_canonical_and_rejects_trailing(Message::Ping(u64::MAX));
+    }
+
+    #[test]
+    fn pong_payload_is_exact_and_canonical() {
+        assert_canonical_and_rejects_trailing(Message::Pong(0));
+    }
+
+    #[test]
+    fn request_blocks_payload_is_exact_and_canonical() {
+        assert_canonical_and_rejects_trailing(Message::RequestBlocks {
+            from_height: 0,
+            to_height: u64::MAX,
+        });
+    }
+
+    #[test]
+    fn request_qc_payload_is_exact_and_canonical() {
+        assert_canonical_and_rejects_trailing(Message::RequestQC { height: u64::MAX });
+    }
+
+    #[test]
+    fn qc_response_payload_is_exact_and_canonical() {
+        assert_canonical_and_rejects_trailing(Message::QCResponse {
+            height: 0,
+            qc_bytes: vec![],
+        });
+        assert_canonical_and_rejects_trailing(Message::QCResponse {
+            height: u64::MAX,
+            qc_bytes: vec![0x11, 0x22, 0x33],
+        });
+
+        let maximum = Message::QCResponse {
+            height: 1,
+            qc_bytes: vec![0; MAX_MSG_BYTES - 17],
+        }
+        .encode_wire()
+        .unwrap();
+        assert_eq!(maximum.len(), MAX_MSG_BYTES);
+        assert!(Message::decode_framed_wire(&maximum).is_ok());
     }
 }

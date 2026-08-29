@@ -69,12 +69,13 @@ fn run_register(args: &[String]) -> CliResult<()> {
     let node_url = get(args, "--node").unwrap_or_else(|| DEFAULT_NODE.to_string());
     let chain_id = fetch_chain_id(&node_url)?;
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
+    let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
     let built = indra_cli::tx_builder::build_register_validator_op_with_cold(
         commission_bps,
         deposit_utxo_id,
         &keypair,
         &cold_keypair,
-        keys.public.vrf_pk,
+        &vrf_keypair,
         nonce,
         &chain_id,
     )?;

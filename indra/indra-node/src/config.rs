@@ -191,12 +191,35 @@ impl NodeConfig {
             .expect("local test VRF challenge");
             let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
             let contents = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
                 hex::encode(validator_id), hex::encode(hot_public.classical.0),
                 hex::encode(hot_public.pq.0), hex::encode(vrf_public),
                 hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
                 hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
             );
+            let contents = {
+                let placeholder = hex::encode([0u8; 32]);
+                let provisional = contents
+                    .replacen(
+                        "[genesis]\n",
+                        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
+                        1,
+                    )
+                    .replacen(
+                        "[[validators]]\n",
+                        &format!(
+                            "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
+                            hex::encode([0x70u8; 32])
+                        ),
+                        1,
+                    );
+                let manifest: crate::genesis::GenesisManifest = toml::from_str(&provisional)
+                    .expect("generated local-test genesis has the current schema");
+                let hash =
+                    crate::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
+                        .expect("generated local-test genesis precommit is canonical");
+                provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
+            };
             std::fs::write(&genesis_path, contents).expect("write local-test genesis");
         }
         let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();

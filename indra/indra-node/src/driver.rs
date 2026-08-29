@@ -17,8 +17,10 @@ use indra_consensus::{
 };
 use indra_core::codec::{Decode, Encode};
 use indra_core::types::{
-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
-    primitives::{has_strict_two_thirds_quorum, Bytes32},
+    block::{BlockProposalVNext, BlockVNext},
+    primitives::{
+        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ROUNDS_PER_HEIGHT,
+    },
     proposal::verify_proposal,
     qc::QuorumCertificateV1,
     vote::{VoteStep, VoteV1},
@@ -161,8 +163,6 @@ pub enum DriverAction {
         /// Raw encoded QC bytes.
         qc_bytes: Vec<u8>,
     },
-    /// Re-process a buffered future proposal after the local tip advances.
-    ActivateBufferedProposal(BlockProposalVNext),
     /// Slash evidence was detected.
     SlashDetected(SlashEvidence),
     /// A connected peer sent a consensus message that passed cheap routing
@@ -186,6 +186,33 @@ pub enum DriverAction {
     None,
 }
 
+#[cfg(test)]
+/// Test-only counters proving proposal replay admission cost.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProposalAdmissionMetrics {
+    proposal_verifications: usize,
+    qc_verifications: usize,
+    detached_projections: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedVoteIdentity {
+    block_hash: Bytes32,
+    snapshot_root: Bytes32,
+}
+
+#[cfg(test)]
+/// Test-only counters proving vote replay admission cost and state effects.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VoteAdmissionMetrics {
+    snapshot_lookups: usize,
+    hybrid_authority_calls: usize,
+    successful_ed25519_verifications: usize,
+    successful_mldsa_verifications: usize,
+    collector_insertions: usize,
+    qc_formations: usize,
+}
+
 /// The consensus driver.
 pub struct ConsensusDriver {
     /// The underlying node engine.
@@ -198,14 +225,12 @@ pub struct ConsensusDriver {
     round_advance_evidence: HashMap<(u64, u32), BTreeMap<Bytes32, VoteV1>>,
     /// Pending blocks by block hash.
     pending_blocks: HashMap<Bytes32, BlockProposalVNext>,
-    /// Proposals buffered because they arrived before their parent tip was committed locally.
-    future_proposals: HashMap<(u64, Bytes32), Vec<BlockProposalVNext>>,
     /// Votes received before the matching proposal was staged locally.
     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
     /// Missing proposals already requested from peers.
     requested_proposals: HashSet<(u64, u32, Bytes32)>,
-    /// First accepted vote hash per (validator, height, round, step).
-    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), Bytes32>,
+    /// First accepted vote identity per (validator, height, round, step).
+    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), AcceptedVoteIdentity>,
     /// Blocks whose precommit quorum arrived before the proposal was staged.
     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
     /// Tendermint lock state for the current height.
@@ -236,6 +261,10 @@ pub struct ConsensusDriver {
     pub vote_safety: VoteSafetyStore,
     /// If set, local voting is disabled until operator recovery.
     vote_safety_unavailable: Option<String>,
+    #[cfg(test)]
+    proposal_admission_metrics: ProposalAdmissionMetrics,
+    #[cfg(test)]
+    vote_admission_metrics: VoteAdmissionMetrics,
 }
 
 impl ConsensusDriver {
@@ -247,7 +276,6 @@ impl ConsensusDriver {
             vote_collectors: HashMap::new(),
             round_advance_evidence: HashMap::new(),
             pending_blocks: HashMap::new(),
-            future_proposals: HashMap::new(),
             buffered_votes: HashMap::new(),
             requested_proposals: HashSet::new(),
             seen_round_votes: HashMap::new(),
@@ -266,6 +294,10 @@ impl ConsensusDriver {
             sync: SyncState::follower(0),
             vote_safety,
             vote_safety_unavailable: None,
+            #[cfg(test)]
+            proposal_admission_metrics: ProposalAdmissionMetrics::default(),
+            #[cfg(test)]
+            vote_admission_metrics: VoteAdmissionMetrics::default(),
         };
         driver.sync = if driver.engine.state.height == 0 {
             // At genesis every validator already has genesis state — no sync needed.
@@ -680,9 +712,8 @@ impl ConsensusDriver {
 
     /// External compatibility hook used after height advancement.
     pub fn reset_round(&mut self) {
-        self.prune_future_proposals();
         self.valid_proposal = None;
-        self.start_round(0);
+        self.start_round(0).expect("round zero is always legal");
         self.apply_vote_safety();
     }
 
@@ -691,14 +722,13 @@ impl ConsensusDriver {
         self.sync.mark_caught_up(self.engine.state.height);
         self.refresh_registered_voters();
         self.pending_blocks.clear();
-        self.future_proposals.clear();
         self.buffered_votes.clear();
         self.requested_proposals.clear();
         self.pending_precommit_quorum.clear();
         self.vote_collectors.clear();
         self.round_advance_evidence.clear();
         self.seen_round_votes.clear();
-        self.start_round(0);
+        self.start_round(0).expect("round zero is always legal");
         self.apply_vote_safety();
     }
 
@@ -727,9 +757,14 @@ impl ConsensusDriver {
         (height, round, step)
     }
 
-    fn start_round(&mut self, round: u32) {
+    fn start_round(&mut self, round: u32) -> NodeResult<()> {
+        validate_consensus_round(round).map_err(|error| NodeError::BlockInvalid {
+            height: self.next_height(),
+            reason: error.to_string(),
+        })?;
         self.current_round = round;
         self.current_phase = RoundPhase::Propose;
+        Ok(())
     }
 
     fn enter_precommit_phase(&mut self) {
@@ -749,7 +784,7 @@ impl ConsensusDriver {
             round,
             self.engine.state.election_seed,
             snapshot,
-        )
+        )?
         .election)
     }
 
@@ -807,6 +842,7 @@ impl ConsensusDriver {
         &mut self,
         lock: PersistedConsensusLock,
     ) -> Result<(), String> {
+        validate_consensus_round(lock.round).map_err(|error| error.to_string())?;
         if lock.height != self.next_height()
             || lock.proposal.block.header.height != lock.height
             || lock.proposal.block.header.block_hash() != lock.block_hash
@@ -831,6 +867,7 @@ impl ConsensusDriver {
             lock.round,
             VoteStep::Prevote,
             self.engine.state.chain_id.clone(),
+            snapshot.snapshot_root,
             self.registered_voters.clone(),
         );
         for vote in &lock.polc_votes {
@@ -885,12 +922,28 @@ impl ConsensusDriver {
                 }
                 self.vote_safety_unavailable = None;
                 if record.height == next_height && record.round >= self.current_round {
-                    let safe_round = record.round.saturating_add(1);
+                    let safe_round = match record
+                        .round
+                        .checked_add(1)
+                        .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
+                    {
+                        Some(round) => round,
+                        None => {
+                            let message = format!(
+                                "persisted vote at final legal round {} leaves no safe round at height {}",
+                                record.round, record.height
+                            );
+                            eprintln!("[vote_safety] CRITICAL: {message}");
+                            self.vote_safety_unavailable = Some(message);
+                            return;
+                        }
+                    };
                     eprintln!(
                         "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
                         safe_round, record.height, record.round, record.step
                     );
-                    self.start_round(safe_round);
+                    self.start_round(safe_round)
+                        .expect("safe persisted round was validated above");
                 }
             }
             VoteSafetyLoadResult::Corrupt(reason) => {
@@ -911,7 +964,6 @@ impl ConsensusDriver {
         self.prune_vote_collectors();
         self.prune_round_advance_evidence();
         self.prune_pending_blocks();
-        self.prune_future_proposals_bounded();
         self.prune_buffered_votes();
         self.prune_requested_proposals();
         self.prune_seen_round_votes();
@@ -921,7 +973,11 @@ impl ConsensusDriver {
     fn prune_round_advance_evidence(&mut self) {
         let height = self.next_height();
         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
-        let max_round = self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP);
+        let max_round = self
+            .current_round
+            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
+            .unwrap_or(u32::MAX)
+            .min(MAX_ROUNDS_PER_HEIGHT - 1);
         self.round_advance_evidence
             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
         if self.round_advance_evidence.len() > MAX_STALLED_HEIGHT_ENTRIES {
@@ -980,56 +1036,6 @@ impl ConsensusDriver {
             .map(|(hash, _, _)| hash)
             .collect();
         self.pending_blocks.retain(|hash, _| keep.contains(hash));
-    }
-
-    fn prune_future_proposals_bounded(&mut self) {
-        for proposals in self.future_proposals.values_mut() {
-            if proposals.len() > MAX_STALLED_HEIGHT_ENTRIES {
-                let next_height = self.engine.state.height.saturating_add(1);
-                let current_round = self.current_round;
-                proposals.sort_by_key(|proposal| {
-                    (
-                        proposal.block.header.height.abs_diff(next_height),
-                        proposal.block.header.proposer_round.abs_diff(current_round),
-                        proposal.block.header.block_hash().0,
-                    )
-                });
-                proposals.truncate(MAX_STALLED_HEIGHT_ENTRIES);
-            }
-        }
-        self.future_proposals
-            .retain(|_, proposals| !proposals.is_empty());
-
-        let total: usize = self.future_proposals.values().map(Vec::len).sum();
-        if total <= MAX_STALLED_HEIGHT_ENTRIES {
-            return;
-        }
-
-        let next_height = self.next_height();
-        let current_round = self.current_round;
-        let mut ranked = Vec::new();
-        for proposals in self.future_proposals.values() {
-            for proposal in proposals {
-                let hash = proposal.block.header.block_hash();
-                ranked.push((
-                    hash,
-                    proposal.block.header.height.abs_diff(next_height),
-                    proposal.block.header.proposer_round.abs_diff(current_round),
-                ));
-            }
-        }
-        ranked.sort_by_key(|(hash, height_distance, round_distance)| {
-            (*height_distance, *round_distance, hash.0)
-        });
-        let keep: HashSet<_> = ranked
-            .into_iter()
-            .take(MAX_STALLED_HEIGHT_ENTRIES)
-            .map(|(hash, _, _)| hash)
-            .collect();
-        self.future_proposals.retain(|_, proposals| {
-            proposals.retain(|proposal| keep.contains(&proposal.block.header.block_hash()));
-            !proposals.is_empty()
-        });
     }
 
     fn prune_buffered_votes(&mut self) {
@@ -1107,14 +1113,6 @@ impl ConsensusDriver {
         let keep: HashSet<_> = keys.into_iter().take(MAX_STALLED_HEIGHT_ENTRIES).collect();
         self.pending_precommit_quorum
             .retain(|key| keep.contains(key));
-    }
-
-    fn prune_future_proposals(&mut self) {
-        let next_height = self.next_height();
-        self.future_proposals.retain(|(height, _), _| {
-            *height >= next_height && *height <= next_height.saturating_add(2)
-        });
-        self.prune_future_proposals_bounded();
     }
 
     fn pending_block_for_slot(&self, height: u64, round: u32) -> Option<BlockVNext> {
@@ -1222,7 +1220,7 @@ impl ConsensusDriver {
         };
         let hash = block.header.block_hash();
         let value_hash = block.header.value_hash;
-        let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
+        let vote_hash = if block.header.polc_round.is_none() {
             // Rule 2
             if self.locked_round.is_none() || self.locked_value == Some(hash) {
                 hash
@@ -1231,7 +1229,7 @@ impl ConsensusDriver {
             }
         } else {
             // Rule 3
-            let valid_round = block.header.polc_round;
+            let valid_round = block.header.polc_round.expect("checked Some above");
             if valid_round < self.current_round
                 && self.has_quorum_for_value_hash(
                     height,
@@ -1262,6 +1260,14 @@ impl ConsensusDriver {
         step: VoteStep,
         block_hash: Bytes32,
     ) -> Vec<DriverAction> {
+        let canonical_height = self.next_height();
+        if height != canonical_height || round != self.current_round {
+            eprintln!(
+                "[vote] refusing non-canonical signing coordinates: requested height={} round={}, canonical height={} round={}",
+                height, round, canonical_height, self.current_round
+            );
+            return vec![DriverAction::None];
+        }
         let Some(local_validator_id) = self.engine.validator_id() else {
             return vec![];
         };
@@ -1346,11 +1352,32 @@ impl ConsensusDriver {
         }
     }
 
+    #[cfg(feature = "audit-harness")]
+    pub(crate) fn audit_create_local_vote(
+        &mut self,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> Vec<DriverAction> {
+        self.sign_and_record_local_vote(height, round, step, block_hash)
+    }
+
     fn process_proposal(
         &mut self,
         from: Option<SocketAddr>,
         proposal: BlockProposalVNext,
     ) -> Vec<DriverAction> {
+        if validate_consensus_round(proposal.block.header.proposer_round).is_err()
+            || validate_consensus_round(proposal.block.header.value_entropy.origin_round).is_err()
+            || proposal
+                .block
+                .header
+                .polc_round
+                .is_some_and(|round| validate_consensus_round(round).is_err())
+        {
+            return vec![DriverAction::None];
+        }
         if !self.sync.is_caught_up() {
             return vec![DriverAction::None];
         }
@@ -1360,21 +1387,26 @@ impl ConsensusDriver {
         if block.header.height < next_height {
             return vec![DriverAction::None];
         }
-        if block.header.height > next_height.saturating_add(2) {
+        // A proposal is consensus state only when its parent is the current
+        // canonical tip and its full transition can be projected now. Future
+        // or wrong-parent proposals are dropped; proposal request/response
+        // recovery can fetch them after the parent commits. Keeping decoded
+        // objects here would give unverified data trusted-container status.
+        if block.header.height != next_height
+            || block.header.prev_hash != self.engine.state.tip_hash
+        {
             return vec![DriverAction::None];
         }
-        if block.header.height > next_height || block.header.prev_hash != self.engine.state.tip_hash
-        {
-            let key = (block.header.height, block.header.prev_hash);
-            let entry = self.future_proposals.entry(key).or_default();
-            let block_hash = block.header.block_hash();
-            if !entry
-                .iter()
-                .any(|existing| existing.block.header.block_hash() == block_hash)
-            {
-                entry.push(proposal);
-            }
-            self.prune_future_proposals();
+
+        // `pending_blocks` is authoritative: entries are inserted only after
+        // proposer/VRF, embedded-QC, detached projection, and root validation
+        // all succeed. An exact block hash already present here therefore
+        // identifies an accepted proposal replay without letting unverified
+        // input create trusted replay state. Different-round reproposals and
+        // conflicting proposals have different consensus block hashes and
+        // continue through full admission.
+        let block_hash = block.header.block_hash();
+        if self.pending_blocks.contains_key(&block_hash) {
             return vec![DriverAction::None];
         }
 
@@ -1395,6 +1427,10 @@ impl ConsensusDriver {
                 return vec![DriverAction::None];
             }
         };
+        #[cfg(test)]
+        {
+            self.proposal_admission_metrics.proposal_verifications += 1;
+        }
         let verified = match verify_proposal(
             &proposal,
             self.engine.state.chain_id.as_bytes(),
@@ -1415,6 +1451,10 @@ impl ConsensusDriver {
         };
 
         if block.header.height > 1 {
+            #[cfg(test)]
+            {
+                self.proposal_admission_metrics.qc_verifications += 1;
+            }
             if let Err(err) = crate::sync::verify_network_block_qc(
                 block,
                 &self.engine.state,
@@ -1428,8 +1468,24 @@ impl ConsensusDriver {
             }
         }
 
-        let mut projected_state = self.engine.state.clone();
-        if indra_state::apply_block(&mut projected_state, &verified, 0).is_err() {
+        // Admission must validate the commitments before staging the proposal:
+        // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
+        // without recomputing it would let a PoLC authorize different immutable
+        // value entropy under the same claimed identity.
+        #[cfg(test)]
+        {
+            self.proposal_admission_metrics.detached_projections += 1;
+        }
+        let projected =
+            match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
+            {
+                Ok(projected) => projected,
+                Err(_) => return vec![DriverAction::None],
+            };
+        if projected.state_root != block.header.state_root
+            || projected.validator_set_root != block.header.validator_set_root
+            || projected.value_hash != block.header.value_hash
+        {
             return vec![DriverAction::None];
         }
 
@@ -1488,28 +1544,19 @@ impl ConsensusDriver {
         actions
     }
 
-    fn activate_buffered_proposals_for_new_tip(&mut self) -> Vec<DriverAction> {
-        let key = (self.next_height(), self.engine.state.tip_hash);
-        let Some(buffered) = self.future_proposals.remove(&key) else {
-            self.prune_future_proposals();
-            return vec![];
-        };
-
-        let mut candidates = buffered;
-        candidates.sort_by_key(|proposal| proposal.block.header.proposer_round);
-        self.prune_future_proposals();
-        candidates
-            .into_iter()
-            .map(DriverAction::ActivateBufferedProposal)
-            .collect()
-    }
-
     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
         let mut actions = Vec::new();
 
-        if vote.height != self.next_height()
-            || vote.round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
-        {
+        if validate_consensus_round(vote.round).is_err() {
+            return actions;
+        }
+
+        let maximum_jump_round = self
+            .current_round
+            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
+            .unwrap_or(u32::MAX)
+            .min(MAX_ROUNDS_PER_HEIGHT - 1);
+        if vote.height != self.next_height() || vote.round > maximum_jump_round {
             return actions;
         }
 
@@ -1522,9 +1569,51 @@ impl ConsensusDriver {
             return actions;
         }
 
-        if let Err(err) =
-            verify_vote_authority(&vote, &self.engine.state.chain_id, &self.registered_voters)
-                .map_err(|error| error.to_string())
+        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
+        let replay_identity = AcceptedVoteIdentity {
+            block_hash: vote.block_hash,
+            snapshot_root: vote.snapshot_root,
+        };
+        // This map is populated only after authoritative snapshot and hybrid
+        // verification. Matching the complete signed semantic identity is
+        // therefore safe before repeated snapshot/crypto work. A conflicting
+        // block hash or snapshot root deliberately continues to verification
+        // and slash/evidence handling.
+        if self
+            .seen_round_votes
+            .get(&slot_key)
+            .is_some_and(|accepted| *accepted == replay_identity)
+        {
+            return actions;
+        }
+
+        #[cfg(test)]
+        {
+            self.vote_admission_metrics.snapshot_lookups += 1;
+        }
+        let governing_snapshot_root =
+            match self.engine.state.snapshot_for_consensus_height(vote.height) {
+                Ok(snapshot) => snapshot.snapshot_root,
+                Err(error) => {
+                    actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                        from,
+                        validator_id: vote.validator_id,
+                        reason: format!("Vote snapshot unavailable: {error}"),
+                    });
+                    return actions;
+                }
+            };
+        #[cfg(test)]
+        {
+            self.vote_admission_metrics.hybrid_authority_calls += 1;
+        }
+        if let Err(err) = verify_vote_authority(
+            &vote,
+            &self.engine.state.chain_id,
+            &governing_snapshot_root,
+            &self.registered_voters,
+        )
+        .map_err(|error| error.to_string())
         {
             actions.push(DriverAction::DisconnectInvalidConsensusPeer {
                 from,
@@ -1533,14 +1622,20 @@ impl ConsensusDriver {
             });
             return actions;
         }
+        #[cfg(test)]
+        {
+            // Successful `verify_vote_authority` means both sequential hybrid
+            // components completed successfully.
+            self.vote_admission_metrics.successful_ed25519_verifications += 1;
+            self.vote_admission_metrics.successful_mldsa_verifications += 1;
+        }
 
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
             actions.push(DriverAction::SlashDetected(evidence));
         }
 
-        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
-        if let Some(existing_hash) = self.seen_round_votes.get(&slot_key).copied() {
-            if existing_hash == vote.block_hash {
+        if let Some(existing) = self.seen_round_votes.get(&slot_key).copied() {
+            if existing == replay_identity {
             } else {
                 eprintln!(
                     "[vote] rejected equivocating vote from {} for {} at height={} round={} (already saw {})",
@@ -1548,12 +1643,12 @@ impl ConsensusDriver {
                     hex::encode(&vote.block_hash.0[..4]),
                     vote.height,
                     vote.round,
-                    hex::encode(&existing_hash.0[..4]),
+                    hex::encode(&existing.block_hash.0[..4]),
                 );
             }
             return actions;
         }
-        self.seen_round_votes.insert(slot_key, vote.block_hash);
+        self.seen_round_votes.insert(slot_key, replay_identity);
         self.prune_seen_round_votes();
 
         // VoteV1 signatures bind chain ID, height, round, full validator ID,
@@ -1565,6 +1660,7 @@ impl ConsensusDriver {
             .or_default()
             .entry(vote.validator_id)
             .or_insert_with(|| vote.clone());
+        self.prune_round_advance_evidence();
         let mut round_advance_actions =
             self.maybe_advance_to_certified_round(vote.height, vote.round);
 
@@ -1611,7 +1707,13 @@ impl ConsensusDriver {
         if !self.sync.is_caught_up()
             || height != self.next_height()
             || target_round <= self.current_round
-            || target_round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+            || validate_consensus_round(target_round).is_err()
+            || target_round
+                > self
+                    .current_round
+                    .checked_add(MAX_ACCEPTED_ROUND_JUMP)
+                    .unwrap_or(u32::MAX)
+                    .min(MAX_ROUNDS_PER_HEIGHT - 1)
         {
             return Vec::new();
         }
@@ -1643,7 +1745,8 @@ impl ConsensusDriver {
             "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
             self.current_round, target_round, height, signed_stake, total_stake
         );
-        self.start_round(target_round);
+        self.start_round(target_round)
+            .expect("certified target round was validated before mutation");
         self.apply_vote_safety();
         self.prune_stalled_collections();
         self.maybe_prevote_current_round_proposal()
@@ -1677,6 +1780,7 @@ impl ConsensusDriver {
                     vote.round,
                     vote.step,
                     self.engine.state.chain_id.clone(),
+                    vote.snapshot_root,
                     self.registered_voters.clone(),
                 )
             });
@@ -1689,10 +1793,16 @@ impl ConsensusDriver {
         self.prune_vote_collectors();
 
         match decision {
-            Ok(_decision) => actions.push(DriverAction::ScorePeer {
-                from,
-                event: indra_network::peer::ScoreEvent::ValidVote,
-            }),
+            Ok(_decision) => {
+                #[cfg(test)]
+                {
+                    self.vote_admission_metrics.collector_insertions += 1;
+                }
+                actions.push(DriverAction::ScorePeer {
+                    from,
+                    event: indra_network::peer::ScoreEvent::ValidVote,
+                });
+            }
             Err(err) => {
                 eprintln!(
                     "[vote] rejected vote from {} for {} at height={} round={}: {}",
@@ -1727,6 +1837,7 @@ impl ConsensusDriver {
                     vote.round,
                     vote.step,
                     self.engine.state.chain_id.clone(),
+                    vote.snapshot_root,
                     self.registered_voters.clone(),
                 )
             });
@@ -1740,6 +1851,10 @@ impl ConsensusDriver {
 
         match decision {
             Ok(decision) => {
+                #[cfg(test)]
+                {
+                    self.vote_admission_metrics.collector_insertions += 1;
+                }
                 actions.push(DriverAction::ScorePeer {
                     from,
                     event: indra_network::peer::ScoreEvent::ValidVote,
@@ -1923,11 +2038,20 @@ impl ConsensusDriver {
 
         let quorum_vote_values = self.precommit_votes_for_block(collector, block_hash);
         let quorum_votes: Vec<&VoteV1> = quorum_vote_values.iter().collect();
+        #[cfg(test)]
+        {
+            self.vote_admission_metrics.qc_formations += 1;
+        }
         let qc = match build_qc(
             height,
             round,
             block_hash,
             &self.engine.state.chain_id,
+            self.engine
+                .state
+                .snapshot_for_consensus_height(height)
+                .expect("governing snapshot already resolved")
+                .snapshot_root,
             &qc_validators,
             quorum_votes,
         ) {
@@ -2021,8 +2145,7 @@ impl ConsensusDriver {
                         "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
                     );
                 }
-                self.start_round(0);
-                actions.extend(self.activate_buffered_proposals_for_new_tip());
+                self.start_round(0).expect("round zero is always legal");
 
                 self.vote_collectors
                     .retain(|(vote_height, _, _), _| *vote_height > height);
@@ -2030,9 +2153,6 @@ impl ConsensusDriver {
                     .retain(|(vote_height, _), _| *vote_height > height);
                 self.pending_blocks
                     .retain(|_, pending| pending.block.header.height > height);
-                let next_height = self.next_height();
-                self.future_proposals
-                    .retain(|(proposal_height, _), _| *proposal_height >= next_height);
                 self.buffered_votes
                     .retain(|(vote_height, _, _), _| *vote_height > height);
                 self.seen_round_votes
@@ -2257,11 +2377,19 @@ impl ConsensusDriver {
     }
 
     /// Rule 10 — on precommit timeout, advance to the next round.
-    pub fn on_precommit_timeout(&mut self) {
+    pub fn on_precommit_timeout(&mut self) -> NodeResult<()> {
         if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Precommit {
-            return;
+            return Ok(());
         }
-        self.start_round(self.current_round.saturating_add(1));
+        let next_round = self
+            .current_round
+            .checked_add(1)
+            .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
+            .ok_or(NodeError::RoundLimitExceeded {
+                height: self.next_height(),
+                round: self.current_round,
+            })?;
+        self.start_round(next_round)
     }
 
     /// Current committed chain height.

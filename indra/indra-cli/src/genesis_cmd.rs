@@ -10,7 +10,7 @@
 //! ```toml
 //! [genesis]
 //! chain_id     = "indra-testnet-1"
-//! active_slot_coefficient_numerator = "9223372036854775808"
+//! active_slot_coefficient_numerator = "6917529027641081856"
 //! bitcoin_pow_entropy_header = "<160 lowercase hex chars>"
 //!
 //! [genesis.bitcoin_pow_entropy_source]
@@ -36,9 +36,10 @@
 //! ```
 
 use crate::error::{CliError, CliResult};
+use serde::{Deserialize, Serialize};
 
 /// One validator entry in the genesis config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisEntry {
     /// Human-readable name (for display only).
     pub name: String,
@@ -64,6 +65,8 @@ pub struct GenesisEntry {
     pub cold_nonce: u64,
     /// Initial stake in Spark.
     pub stake: u64,
+    /// Pre-target hiding nonce, revealed only during finalization.
+    pub genesis_commitment_nonce: String,
 }
 
 /// A complete genesis configuration.
@@ -77,6 +80,8 @@ pub struct GenesisConfig {
     pub bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
     /// Exact Bitcoin 80-byte header, lowercase hexadecimal.
     pub bitcoin_pow_entropy_header: String,
+    /// Externally witnessed canonical pre-target ceremony hash.
+    pub genesis_precommit_hash: String,
     /// All initial validators.
     pub validators: Vec<GenesisEntry>,
 }
@@ -93,8 +98,12 @@ impl GenesisConfig {
             self.active_slot_coefficient_numerator
         ));
         out.push_str(&format!(
-            "bitcoin_pow_entropy_header = \"{}\"\n\n",
+            "bitcoin_pow_entropy_header = \"{}\"\n",
             self.bitcoin_pow_entropy_header
+        ));
+        out.push_str(&format!(
+            "genesis_precommit_hash = \"{}\"\n\n",
+            self.genesis_precommit_hash
         ));
         let source = &self.bitcoin_pow_entropy_source;
         out.push_str("[genesis.bitcoin_pow_entropy_source]\n");
@@ -150,7 +159,11 @@ impl GenesisConfig {
                 v.cold_key_version
             ));
             out.push_str(&format!("cold_nonce               = {}\n", v.cold_nonce));
-            out.push_str(&format!("stake               = {}  # Spark\n\n", v.stake));
+            out.push_str(&format!("stake               = {}  # Spark\n", v.stake));
+            out.push_str(&format!(
+                "genesis_commitment_nonce = \"{}\"\n\n",
+                v.genesis_commitment_nonce
+            ));
         }
 
         out
@@ -208,16 +221,18 @@ fn toml_string(value: &str) -> String {
 /// Build a genesis config from a list of entries.
 pub fn build_genesis_config(
     chain_id: &str,
-    active_slot_coefficient_numerator: u64,
     bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
     bitcoin_pow_entropy_header: String,
+    genesis_precommit_hash: String,
     validators: Vec<GenesisEntry>,
 ) -> CliResult<GenesisConfig> {
     let config = GenesisConfig {
         chain_id: chain_id.to_string(),
-        active_slot_coefficient_numerator,
+        active_slot_coefficient_numerator:
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
         bitcoin_pow_entropy_source,
         bitcoin_pow_entropy_header,
+        genesis_precommit_hash,
         validators,
     };
     config.validate()?;
@@ -244,6 +259,7 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
         cold_key_version: 1,
         cold_nonce: 0,
         stake,
+        genesis_commitment_nonce: String::new(),
     }
 }
 
@@ -266,6 +282,7 @@ pub fn entry_from_public_keys(
         cold_key_version: 1,
         cold_nonce: 0,
         stake,
+        genesis_commitment_nonce: String::new(),
     }
 }
 
@@ -346,9 +363,8 @@ mod tests {
     use crate::keygen::generate_from_master_seed;
     use indra_core::types::primitives::DUST_LIMIT_SPARK;
 
-    fn entropy() -> (u64, indra_node::genesis::BitcoinPowEntropySourceV1, String) {
+    fn entropy() -> (indra_node::genesis::BitcoinPowEntropySourceV1, String) {
         (
-            1u64 << 63,
             indra_node::genesis::BitcoinPowEntropySourceV1 {
                 scheme: 1,
                 network_genesis_hash: hex::encode([0x11; 32]),
@@ -363,8 +379,39 @@ mod tests {
     }
 
     fn build(chain_id: &str, validators: Vec<GenesisEntry>) -> CliResult<GenesisConfig> {
-        let (f, source, header) = entropy();
-        build_genesis_config(chain_id, f, source, header, validators)
+        let (source, header) = entropy();
+        let settings = indra_node::GenesisSettings {
+            chain_id: chain_id.into(),
+            active_slot_coefficient_numerator:
+                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            bitcoin_pow_entropy_source: source.clone(),
+            bitcoin_pow_entropy_header: header.clone(),
+            genesis_precommit_hash: String::new(),
+        };
+        let opened = validators
+            .iter()
+            .map(|entry| indra_node::GenesisValidator {
+                name: entry.name.clone(),
+                validator_id: entry.validator_id.clone(),
+                hybrid_classical_pk: entry.hybrid_classical_pk.clone(),
+                hybrid_pq_pk: entry.hybrid_pq_pk.clone(),
+                vrf_pk: entry.vrf_pk.clone(),
+                vrf_possession_output: entry.vrf_possession_output.clone(),
+                vrf_possession_proof: entry.vrf_possession_proof.clone(),
+                cold_hybrid_classical_pk: entry.cold_hybrid_classical_pk.clone(),
+                cold_hybrid_pq_pk: entry.cold_hybrid_pq_pk.clone(),
+                cold_key_version: entry.cold_key_version,
+                cold_nonce: entry.cold_nonce,
+                stake: entry.stake,
+                genesis_commitment_nonce: entry.genesis_commitment_nonce.clone(),
+            })
+            .collect::<Vec<_>>();
+        let hash = hex::encode(
+            indra_node::genesis::genesis_precommit_hash(&settings, &opened)
+                .map_err(CliError::Genesis)?
+                .0,
+        );
+        build_genesis_config(chain_id, source, header, hash, validators)
     }
 
     fn test_validators(chain_id: &str, count: usize) -> Vec<GenesisEntry> {
@@ -395,6 +442,7 @@ mod tests {
                 let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
                 entry.vrf_possession_output = hex::encode(output.0);
                 entry.vrf_possession_proof = hex::encode(proof.0);
+                entry.genesis_commitment_nonce = hex::encode([i as u8 + 121; 32]);
                 entry
             })
             .collect()

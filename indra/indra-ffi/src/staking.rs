@@ -38,6 +38,7 @@ where
     F: FnOnce(
             &HybridKeypair,
             crate::IndraPublicKeyInfo,
+            &handles::SigningMaterial,
             &indra_crypto::ColdHybridKeypair,
             &str,
         ) -> Result<String, IndraError>
@@ -58,7 +59,13 @@ where
         let hot_public = hot_lease.material().hot_public()?;
         let cold_keypair = cold_lease.material().cold_keypair()?;
         let chain = read_chain_id(args.chain_id, args.chain_id_len)?;
-        let hex = build(&hot_keypair, hot_public, &cold_keypair, &chain)?;
+        let hex = build(
+            &hot_keypair,
+            hot_public,
+            hot_lease.material(),
+            &cold_keypair,
+            &chain,
+        )?;
         hot_lease
             .publish(|| cold_lease.publish(|| write_hex_to_buf(&hex, args.out_hex, args.out_len)))
     }) {
@@ -176,14 +183,15 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
             out_hex,
             out_len,
         },
-        |hot_keypair, hot_public, cold_keypair, chain| {
+        |hot_keypair, _hot_public, hot_material, cold_keypair, chain| {
             let bond = Bytes32::from(read_bytes32(deposit_utxo_id));
+            let vrf_keypair = hot_material.vrf_keypair()?;
             build_register_validator_op_with_cold(
                 commission_bps,
                 bond,
                 hot_keypair,
                 cold_keypair,
-                hot_public.vrf_pk,
+                &vrf_keypair,
                 nonce,
                 chain,
             )
@@ -219,7 +227,7 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
             out_hex,
             out_len,
         },
-        |_hot_keypair, hot_public, cold_keypair, chain| {
+        |_hot_keypair, hot_public, _hot_material, cold_keypair, chain| {
             build_cold_authorized_staking_op(
                 ColdAuthorizedStakingAction::SelfStake {
                     deposit_utxo_id: Bytes32::from(read_bytes32(deposit_utxo_id)),
@@ -334,7 +342,7 @@ pub unsafe extern "C" fn indra_build_validator_claim_rewards_with_handle(
             out_hex,
             out_len,
         },
-        |_hot_keypair, hot_public, cold_keypair, chain| {
+        |_hot_keypair, hot_public, _hot_material, cold_keypair, chain| {
             build_cold_authorized_staking_op(
                 ColdAuthorizedStakingAction::ClaimRewards {
                     validator_id: Bytes32::from(hot_public.validator_id),
@@ -377,7 +385,7 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
             out_hex,
             out_len,
         },
-        |_hot_keypair, hot_public, cold_keypair, chain| {
+        |_hot_keypair, hot_public, _hot_material, cold_keypair, chain| {
             build_cold_authorized_staking_op(
                 ColdAuthorizedStakingAction::SetCommission {
                     validator_id: Bytes32::from(hot_public.validator_id),
@@ -420,7 +428,7 @@ pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
             out_hex,
             out_len,
         },
-        |_hot_keypair, hot_public, cold_keypair, chain| {
+        |_hot_keypair, hot_public, _hot_material, cold_keypair, chain| {
             build_cold_authorized_staking_op(
                 ColdAuthorizedStakingAction::SetAutoDelegate {
                     validator_id: Bytes32::from(hot_public.validator_id),

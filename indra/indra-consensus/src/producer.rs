@@ -18,7 +18,7 @@
 use indra_core::{
     codec::Encode,
     types::{
-        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         governance::GovernanceOpV2,
         primitives::{
             Bytes32, ProtocolVersion, VariableBytes, BLOCK_FORMAT_VERSION, MAX_BLOCK_SIZE_BYTES,
@@ -72,6 +72,13 @@ pub fn produce_block(
     state: &mut ChainState,
     election: &ProposerElection,
 ) -> ConsensusResult<BlockVNext> {
+    if let Some(round) = template.polc_round {
+        indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
+            ConsensusError::InvalidRound {
+                detail: error.to_string(),
+            }
+        })?;
+    }
     // Verify this keypair is the elected proposer
     let slot = compute_proposer_vrf(
         election
@@ -121,7 +128,7 @@ pub fn produce_block(
         value_hash: Bytes32::ZERO,
         base_fee: state.base_fee,
         proposer_round: election.round,
-        polc_round: template.polc_round.unwrap_or(NO_POLC_ROUND),
+        polc_round: template.polc_round,
         proposer_id: slot.proposer_id,
         vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
         election_seed: election.election_seed,
@@ -202,7 +209,8 @@ mod tests {
 
     fn finalized_state(vrf_seed: &[u8; 32]) -> ChainState {
         let mut state = ChainState::new_genesis();
-        state.active_slot_coefficient_numerator = 1u64 << 63;
+        state.active_slot_coefficient_numerator =
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
         let hot = indra_crypto::HybridKeypair::new(
             indra_crypto::ClassicalKeypair::from_seed(&[0x31; 32]),
@@ -261,7 +269,12 @@ mod tests {
             chain_id: b"indra-testnet-1".to_vec(),
             election_seed: indra_core::types::primitives::Bytes64([seed[0]; 64]),
             snapshot_root: Bytes32::from([0xA0; 32]),
-            active_slot_coefficient_numerator: 1u64 << 63,
+            active_slot_coefficient_numerator:
+                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            sortition_log: indra_core::sortition::certified_log(
+                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            )
+            .unwrap(),
             height,
             round,
             candidates: vec![crate::proposer::ProposerCandidate {
@@ -311,6 +324,7 @@ mod tests {
             indra_core::types::vote::VoteStep::Precommit,
             state.tip_hash,
             entry.validator_id,
+            snapshot.snapshot_root,
             &state.chain_id,
             &hot,
         )
@@ -320,6 +334,7 @@ mod tests {
             0,
             state.tip_hash,
             &state.chain_id,
+            snapshot.snapshot_root,
             &[crate::qc::QcValidator {
                 validator_id: entry.validator_id,
                 position: 0,

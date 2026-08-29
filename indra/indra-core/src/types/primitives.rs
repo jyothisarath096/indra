@@ -51,11 +51,37 @@ pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
 /// Hard floor on total round time — immutable, not governable.
 pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 
-/// Maximum logical rounds tracked per height when deriving proposer slots.
+/// Exclusive upper bound of the normative consensus-round domain.
 ///
-/// This is used only to derive a unique deterministic slot index from
-/// `(height, round)` and is not a runtime cap on retries.
-pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
+/// Every proposal, vote, QC, PoLC, live transition, and persisted safety
+/// record must satisfy `round < MAX_ROUNDS_PER_HEIGHT`.
+pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1_024;
+
+/// Validate one consensus round against the authoritative protocol domain.
+pub fn validate_consensus_round(round: u32) -> IndraResult<u32> {
+    if round < MAX_ROUNDS_PER_HEIGHT {
+        Ok(round)
+    } else {
+        Err(IndraError::InvalidConsensusRound {
+            round,
+            max: MAX_ROUNDS_PER_HEIGHT - 1,
+        })
+    }
+}
+
+/// The sole active-slot coefficient numerator permitted by the initial
+/// mainnet protocol: `f = F / 2^64 = 3/8`.
+///
+/// Changing this value is a consensus-breaking protocol change and requires
+/// renewed grinding and liveness analysis. It is not a genesis-, runtime-, or
+/// governance-configurable parameter.
+pub const MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR: u64 = 6_917_529_027_641_081_856;
+
+/// Sole declared Bitcoin confirmation depth for mainnet genesis entropy.
+pub const BITCOIN_GENESIS_CONFIRMATIONS: u32 = 100;
+
+/// Minimum inclusive distance between Bitcoin tip and the precommitted target.
+pub const MIN_GENESIS_PRECOMMIT_BLOCK_LEAD: u64 = 144;
 
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
@@ -435,17 +461,17 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
 pub const TRANSACTION_PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed discriminator for the sole genesis-native block format.
-pub const BLOCK_FORMAT_VERSION: u16 = 2;
+pub const BLOCK_FORMAT_VERSION: u16 = 4;
 
 /// Current schema version for all persisted structs.
 ///
 /// Increment this whenever any persisted struct changes its encoding.
-pub const SCHEMA_VERSION: u8 = 4;
+pub const SCHEMA_VERSION: u8 = 5;
 
 /// Maximum length of a validator-advertised P2P network address.
 ///
 /// The field is deliberately stored as a bounded string so future schema
-/// versions can choose broader address forms, but v4 consensus validation only
+/// versions can choose broader address forms, but v5 consensus validation only
 /// accepts strict IP:port `SocketAddr` syntax.
 pub const MAX_VALIDATOR_NETWORK_ADDR_LEN: usize = 255;
 
@@ -748,8 +774,8 @@ mod tests {
     }
 
     #[test]
-    fn proposer_v2_wire_constants_are_pinned() {
-        assert_eq!(BLOCK_FORMAT_VERSION, 2);
+    fn proposer_wire_constants_are_pinned() {
+        assert_eq!(BLOCK_FORMAT_VERSION, 4);
         assert_eq!(MAX_STANDARD_VRF_OUTPUT_BYTES, 64);
         assert_eq!(MAX_STANDARD_VRF_PROOF_BYTES, 80);
         assert_eq!(

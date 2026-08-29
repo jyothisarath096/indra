@@ -908,6 +908,16 @@ mod tests {
         cold_seed[0] = cold_seed[0].wrapping_add(1);
         let (cold_pubkey, cold_keypair) = make_test_keypair(cold_seed);
         let validator_id = staking_delegator_id_for_test(&validator_pubkey);
+        let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
+        let vrf_pk = vrf_keypair.public_key();
+        let challenge = StakingOp::vrf_possession_challenge(
+            &state.chain_id,
+            &validator_id,
+            &Bytes32::from(vrf_pk),
+            0,
+        )
+        .unwrap();
+        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf_keypair, &challenge);
         let deposit_utxo_id = state
             .utxos
             .insert(
@@ -926,7 +936,9 @@ mod tests {
                 commission_bps: 1_000,
                 deposit_utxo_id,
                 validator_pubkey,
-                vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
+                vrf_pk,
+                vrf_possession_output: indra_core::types::primitives::Bytes64(vrf_output.0),
+                vrf_possession_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
                 cold_pubkey: indra_core::types::crypto::ColdHybridPubKey {
                     classical_pk: cold_pubkey.classical_pk,
                     pq_pk: cold_pubkey.pq_pk,
@@ -1597,6 +1609,8 @@ mod tests {
             .saturating_add(state.fee_reward_pool)
     }
 
+    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
+
     fn signed_vote(
         keypair: &HybridKeypair,
         validator_id: Bytes32,
@@ -1605,12 +1619,33 @@ mod tests {
         step: VoteStep,
         block_hash: Bytes32,
     ) -> VoteV1 {
+        signed_vote_with_snapshot_root(
+            keypair,
+            validator_id,
+            height,
+            round,
+            step,
+            block_hash,
+            TEST_SNAPSHOT_ROOT,
+        )
+    }
+
+    fn signed_vote_with_snapshot_root(
+        keypair: &HybridKeypair,
+        validator_id: Bytes32,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+        snapshot_root: Bytes32,
+    ) -> VoteV1 {
         let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
             height,
             round,
             step,
             &block_hash,
             &validator_id,
+            &snapshot_root,
             DEFAULT_CHAIN_ID,
         );
         let sig = keypair.sign(&signing_bytes).unwrap();
@@ -1620,6 +1655,7 @@ mod tests {
             step,
             block_hash,
             validator_id,
+            snapshot_root,
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
                 pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
@@ -1752,13 +1788,14 @@ mod tests {
                         .find(|(key, _)| key.identity_id() == entry.validator_id)
                         .map(|(_, keypair)| keypair)
                         .expect("test snapshot validator seed must be known");
-                    signed_vote(
+                    signed_vote_with_snapshot_root(
                         &keypair,
                         entry.validator_id,
                         height - 1,
                         0,
                         VoteStep::Precommit,
                         state.tip_hash,
+                        snapshot.snapshot_root,
                     )
                 })
                 .collect();
@@ -1766,6 +1803,7 @@ mod tests {
                 height: height - 1,
                 round: 0,
                 block_hash: state.tip_hash,
+                snapshot_root: snapshot.snapshot_root,
                 signer_bitfield: {
                     let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                     for position in 0..votes.len() {
@@ -1802,7 +1840,7 @@ mod tests {
                 value_hash: Bytes32::ZERO,
                 base_fee: state.base_fee,
                 proposer_round: 0,
-                polc_round: indra_core::types::block::NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::from([0x91; 32]),
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: state.election_seed,
@@ -2464,6 +2502,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: state.tip_hash,
+            snapshot_root: snapshot.snapshot_root,
             signer_bitfield: {
                 let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                 bits[0] = 1;
@@ -4227,6 +4266,7 @@ fn verify_vote_sig_with_keys(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
+        &vote.snapshot_root,
         chain_id,
     );
     let pk = HybridPublicKey {

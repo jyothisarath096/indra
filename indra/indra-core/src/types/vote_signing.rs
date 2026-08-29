@@ -14,6 +14,7 @@ pub fn vote_signing_bytes(
     step: VoteStep,
     block_hash: &Bytes32,
     validator_id: &Bytes32,
+    snapshot_root: &Bytes32,
     chain_id: &str,
 ) -> Vec<u8> {
     let chain_bytes = chain_id.as_bytes();
@@ -26,6 +27,7 @@ pub fn vote_signing_bytes(
     step.encode(&mut buf);
     block_hash.encode(&mut buf);
     validator_id.encode(&mut buf);
+    snapshot_root.encode(&mut buf);
     buf
 }
 
@@ -39,16 +41,18 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            &Bytes32::ZERO,
-            &Bytes32::ZERO,
+            &Bytes32::from([0x5A; 32]),
+            &Bytes32::from([0x5A; 32]),
+            &Bytes32::from([0x5A; 32]),
             "indra-testnet-1",
         );
         let bytes_mainnet = vote_signing_bytes(
             1,
             0,
             VoteStep::Precommit,
+            &Bytes32::from([0x5A; 32]),
             &Bytes32::ZERO,
-            &Bytes32::ZERO,
+            &Bytes32::from([0x5A; 32]),
             "indra-mainnet-1",
         );
         assert_ne!(
@@ -65,6 +69,7 @@ mod tests {
             VoteStep::Precommit,
             &Bytes32::ZERO,
             &Bytes32::ZERO,
+            &Bytes32::from([0x5A; 32]),
             "indra-testnet-1",
         );
         let second = vote_signing_bytes(
@@ -73,6 +78,30 @@ mod tests {
             VoteStep::Precommit,
             &Bytes32([1; 32]),
             &Bytes32::ZERO,
+            &Bytes32::from([0x5A; 32]),
+            "indra-testnet-1",
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn vote_signing_bytes_bind_snapshot_root() {
+        let first = vote_signing_bytes(
+            1,
+            0,
+            VoteStep::Precommit,
+            &Bytes32::ZERO,
+            &Bytes32::ZERO,
+            &Bytes32::from([1; 32]),
+            "indra-testnet-1",
+        );
+        let second = vote_signing_bytes(
+            1,
+            0,
+            VoteStep::Precommit,
+            &Bytes32::ZERO,
+            &Bytes32::ZERO,
+            &Bytes32::from([2; 32]),
             "indra-testnet-1",
         );
         assert_ne!(first, second);

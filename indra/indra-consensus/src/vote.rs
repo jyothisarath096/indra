@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{has_strict_two_thirds_quorum, muldiv, Bytes32},
+    primitives::{has_strict_two_thirds_quorum, muldiv, validate_consensus_round, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
@@ -64,6 +64,7 @@ pub struct VoteCollector {
     step: VoteStep,
     chain_id: String,
     voters: Vec<RegisteredVoter>,
+    snapshot_root: Bytes32,
     total_stake: u64,
     // validator_id → (vote, stake)
     received: BTreeMap<Bytes32, (VoteV1, u64)>,
@@ -76,6 +77,7 @@ impl VoteCollector {
         round: u32,
         step: VoteStep,
         chain_id: String,
+        snapshot_root: Bytes32,
         voters: Vec<RegisteredVoter>,
     ) -> Self {
         let total_stake = voters
@@ -87,6 +89,7 @@ impl VoteCollector {
             round,
             step,
             chain_id,
+            snapshot_root,
             voters,
             total_stake,
             received: BTreeMap::new(),
@@ -103,8 +106,9 @@ impl VoteCollector {
     ///
     /// Returns the current decision after this vote.
     pub fn add_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
+        validate_round(vote.round)?;
         self.validate_dimensions_membership_and_duplicate(&vote)?;
-        verify_vote_authority(&vote, &self.chain_id, &self.voters)?;
+        verify_vote_authority(&vote, &self.chain_id, &self.snapshot_root, &self.voters)?;
         self.add_verified_vote(vote)
     }
 
@@ -116,6 +120,7 @@ impl VoteCollector {
     /// twice. Structural dimensions and duplicate admission remain enforced
     /// here.
     pub fn add_verified_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
+        validate_round(vote.round)?;
         self.validate_dimensions_membership_and_duplicate(&vote)?;
         let voter = self
             .voters
@@ -139,6 +144,11 @@ impl VoteCollector {
         if vote.step != self.step {
             return Err(ConsensusError::CryptoError {
                 detail: "vote step mismatch".to_string(),
+            });
+        }
+        if vote.snapshot_root != self.snapshot_root {
+            return Err(ConsensusError::CryptoError {
+                detail: "vote snapshot root mismatch".to_string(),
             });
         }
 
@@ -208,8 +218,15 @@ impl VoteCollector {
 pub fn verify_vote_authority(
     vote: &VoteV1,
     chain_id: &str,
+    expected_snapshot_root: &Bytes32,
     voters: &[RegisteredVoter],
 ) -> ConsensusResult<()> {
+    validate_round(vote.round)?;
+    if vote.snapshot_root != *expected_snapshot_root {
+        return Err(ConsensusError::CryptoError {
+            detail: "vote snapshot root mismatch".to_string(),
+        });
+    }
     let voter = voters
         .iter()
         .find(|v| v.validator_id == vote.validator_id)
@@ -220,6 +237,7 @@ pub fn verify_vote_authority(
         vote.step,
         &vote.block_hash,
         &vote.validator_id,
+        &vote.snapshot_root,
         chain_id,
     );
     let sig_classical: [u8; 64] =
@@ -266,12 +284,21 @@ pub fn produce_vote(
     step: VoteStep,
     block_hash: Bytes32,
     validator_id: Bytes32,
+    snapshot_root: Bytes32,
     chain_id: &str,
     keypair: &HybridKeypair,
 ) -> ConsensusResult<VoteV1> {
+    validate_round(round)?;
     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
-    let signing_bytes =
-        vote_signing_bytes(height, round, step, &block_hash, &validator_id, chain_id);
+    let signing_bytes = vote_signing_bytes(
+        height,
+        round,
+        step,
+        &block_hash,
+        &validator_id,
+        &snapshot_root,
+        chain_id,
+    );
     let sig = keypair.sign(&signing_bytes)?;
     Ok(VoteV1 {
         height,
@@ -279,6 +306,7 @@ pub fn produce_vote(
         step,
         block_hash,
         validator_id,
+        snapshot_root,
         signature: CoreHybridSignature {
             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
                 .map_err(|_| ConsensusError::CryptoError {
@@ -293,6 +321,14 @@ pub fn produce_vote(
     })
 }
 
+fn validate_round(round: u32) -> ConsensusResult<()> {
+    validate_consensus_round(round)
+        .map(|_| ())
+        .map_err(|error| ConsensusError::InvalidRound {
+            detail: error.to_string(),
+        })
+}
+
 /// Produce the canonical bytes a vote signature covers.
 pub fn vote_signing_bytes(
     height: u64,
@@ -300,6 +336,7 @@ pub fn vote_signing_bytes(
     step: VoteStep,
     block_hash: &Bytes32,
     validator_id: &Bytes32,
+    snapshot_root: &Bytes32,
     chain_id: &str,
 ) -> Vec<u8> {
     indra_core::types::vote_signing::vote_signing_bytes(
@@ -308,6 +345,7 @@ pub fn vote_signing_bytes(
         step,
         block_hash,
         validator_id,
+        snapshot_root,
         chain_id,
     )
 }
@@ -317,6 +355,8 @@ mod tests {
     use super::*;
     use indra_core::types::{primitives::DEFAULT_CHAIN_ID, vote::VoteStep};
     use indra_crypto::hybrid::HybridKeypair;
+
+    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
 
     fn voter(seed: u8, stake: u64) -> (RegisteredVoter, HybridKeypair) {
         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[seed; 32]);
@@ -342,6 +382,7 @@ mod tests {
             0,
             VoteStep::Precommit,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
 
@@ -351,6 +392,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -358,6 +400,28 @@ mod tests {
         let decision = collector.add_vote(vote).unwrap();
 
         assert!(matches!(decision, VoteDecision::QuorumReached { .. }));
+    }
+
+    #[test]
+    fn vote_production_rejects_round_limit_and_above() {
+        let (voter, keypair) = voter(0x71, 10_000);
+        for round in [
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            assert!(produce_vote(
+                1,
+                round,
+                VoteStep::Prevote,
+                TEST_SNAPSHOT_ROOT,
+                voter.validator_id,
+                TEST_SNAPSHOT_ROOT,
+                DEFAULT_CHAIN_ID,
+                &keypair,
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -369,6 +433,7 @@ mod tests {
             0,
             VoteStep::Prevote,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
 
@@ -379,6 +444,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -398,6 +464,7 @@ mod tests {
             0,
             VoteStep::Prevote,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
 
@@ -407,6 +474,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -426,6 +494,7 @@ mod tests {
             0,
             VoteStep::Prevote,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v],
         );
 
@@ -435,6 +504,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             stranger.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &stranger_kp,
         )
@@ -451,6 +521,7 @@ mod tests {
             0,
             VoteStep::Prevote,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
 
@@ -460,6 +531,7 @@ mod tests {
             VoteStep::Prevote,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -482,6 +554,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             "indra-testnet-1",
             &kp,
         )
@@ -491,6 +564,7 @@ mod tests {
             0,
             VoteStep::Precommit,
             "indra-mainnet-1".to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v],
         );
 
@@ -513,6 +587,7 @@ mod tests {
             0,
             VoteStep::Precommit,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
@@ -523,6 +598,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v1.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp1,
         )
@@ -533,6 +609,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v2.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp2,
         )
@@ -557,6 +634,7 @@ mod tests {
             0,
             VoteStep::Precommit,
             DEFAULT_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
@@ -566,6 +644,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v1.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp1,
         )
@@ -576,6 +655,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v2.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp2,
         )
@@ -586,6 +666,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v3.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp3,
         )

@@ -2,18 +2,17 @@
 use crate::{
     codec::Encode,
     error::{IndraError, IndraResult},
-    sortition::{evaluate, priority, CertifiedLogInterval},
+    sortition::{evaluate, priority},
     types::{
-        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1, NO_POLC_ROUND},
+        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1},
         consensus_snapshot::ConsensusSnapshot,
-        primitives::{Bytes32, Bytes64},
+        primitives::{validate_consensus_round, Bytes32, Bytes64},
     },
 };
 use indra_crypto::{
     verify_hybrid, vrf_verify, ClassicalPublicKey, HybridPublicKey, PqPublicKey, VrfOutput,
     VrfProof,
 };
-use num_bigint::BigUint;
 use sha2::{Digest, Sha512};
 
 /// Evidence that authorization, eligibility, and priority were independently verified.
@@ -41,6 +40,7 @@ pub fn proposer_vrf_alpha(
     snapshot_root: &Bytes32,
     proposer_id: &Bytes32,
 ) -> IndraResult<Vec<u8>> {
+    validate_consensus_round(round)?;
     let n = u16::try_from(chain_id.len()).map_err(|_| IndraError::LengthExceeded {
         field: "chain_id",
         max: u16::MAX as usize,
@@ -144,10 +144,7 @@ pub fn verify_proposal<'a>(
     let proof = h.proposer_vrf_proof.as_slice().to_vec();
     vrf_verify(&entry.vrf_pk, &alpha, &VrfOutput(output), &VrfProof(proof))
         .map_err(|_| IndraError::VrfProofInvalid)?;
-    let log = CertifiedLogInterval {
-        lo: BigUint::from_bytes_be(&snapshot.sortition_log_lo),
-        hi: BigUint::from_bytes_be(&snapshot.sortition_log_hi),
-    };
+    let log = snapshot.sortition_log_interval()?;
     let result = evaluate(
         &log,
         entry.consensus_weight_spark,
@@ -204,7 +201,12 @@ pub fn verify_proposal<'a>(
             "value-entropy origin was not eligible".into(),
         ));
     }
-    if h.polc_round == NO_POLC_ROUND
+    validate_consensus_round(h.proposer_round)?;
+    validate_consensus_round(h.value_entropy.origin_round)?;
+    if let Some(polc_round) = h.polc_round {
+        validate_consensus_round(polc_round)?;
+    }
+    if h.polc_round.is_none()
         && (h.value_entropy.origin_proposer_id != h.proposer_id
             || h.value_entropy.origin_round != h.proposer_round
             || h.value_entropy.vrf_output.as_slice() != h.proposer_vrf_output.as_slice()

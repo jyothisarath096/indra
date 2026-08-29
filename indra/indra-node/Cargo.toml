@@ -6,6 +6,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+audit-harness = []
+
 [dependencies]
 hex.workspace = true
 sha2.workspace = true

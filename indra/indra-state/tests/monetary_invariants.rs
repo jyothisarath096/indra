@@ -1,7 +1,7 @@
 //! Consensus monetary invariants for the transparent-value transaction format.
 
 use indra_core::types::{
-    block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
+    block::{BlockHeaderVNext, BlockVNext},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, LIFETIME_SUPPLY_CAP_SPARK, MAX_QC_SIZE_BYTES,
@@ -77,7 +77,8 @@ fn validator(owner: &HybridPubKey) -> ValidatorEntry {
 fn state() -> (ChainState, HybridPubKey, HybridKeypair) {
     let (owner, pair) = keypair([9; 32]);
     let mut state = ChainState::new_genesis();
-    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.active_slot_coefficient_numerator =
+        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state.validators.upsert(validator(&owner)).unwrap();
     state.finalize_genesis().unwrap();
     // Isolate value conservation and dust from fee-market policy.
@@ -136,7 +137,7 @@ fn block(state: &ChainState, tx: TransactionV1) -> BlockVNext {
             value_hash: Bytes32::ZERO,
             base_fee: state.base_fee,
             proposer_round: 0,
-            polc_round: NO_POLC_ROUND,
+            polc_round: None,
             proposer_id: Bytes32::from([0x83; 32]),
             vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: state.election_seed,

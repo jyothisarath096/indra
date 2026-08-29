@@ -698,8 +698,9 @@ any governance action regardless of support level:
 - Exact cumulative era/block reward schedule and genesis-fixed reward budget
 - Exact strict BFT quorum predicate — `signed_stake * 3 > total_stake * 2`,
   evaluated with checked `u128` intermediates; it is not a rounded BPS parameter
-- `active_slot_coefficient_numerator` (`F`) — immutable genesis-selected
-  numerator for proposer sortition, constrained to `1..=2^63`
+- `active_slot_coefficient_numerator` (`F`) — fixed by the initial mainnet
+  protocol to `6917529027641081856` (`f = 3/8`); it is not configurable at
+  genesis, runtime, or through governance
 - `max_active_validators` — automatic per stake phases
 - Cryptographic algorithms (ML-DSA-87, ML-KEM-1024)
 
@@ -817,7 +818,8 @@ Network:  10 Mbps stable upload and download
 Uptime:   No minimum — validators earn proportional to uptime
           Brief downtime loses rewards; persistent inactivity triggers
           liveness penalties after the configured threshold
-OS:       macOS 12+, Ubuntu 20.04+, Windows 10+ (64-bit)
+OS:       macOS 12+ ARM64, Linux x86-64, or Linux ARM64
+          (exact qualified targets: docs/CONSENSUS_BUILD_MATRIX.md)
 ```
 
 Default (pruned) mode retains the last 50,000 blocks (~300 MB) plus

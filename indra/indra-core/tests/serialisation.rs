@@ -69,7 +69,7 @@ fn dummy_header() -> BlockHeaderVNext {
         value_hash: Bytes32::from([0x34u8; 32]),
         base_fee: 100,
         proposer_round: 0,
-        polc_round: indra_core::types::block::NO_POLC_ROUND,
+        polc_round: None,
         proposer_id: Bytes32::from([0x43u8; 32]),
         vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
         election_seed: indra_core::types::primitives::Bytes64([0x45; 64]),
@@ -140,6 +140,7 @@ fn vote_round_trip() {
         step: VoteStep::Prevote,
         block_hash: Bytes32::from([0x77u8; 32]),
         validator_id: Bytes32::from([0x88u8; 32]),
+        snapshot_root: Bytes32::from([0x89u8; 32]),
         signature: sig(),
     };
     assert_eq!(v, VoteV1::decode_exact(&v.encode_to_vec()).unwrap());
@@ -172,6 +173,7 @@ fn quorum_certificate_round_trip() {
         height: 42,
         round: 0,
         block_hash: Bytes32::from([0xFFu8; 32]),
+        snapshot_root: Bytes32::from([0xFEu8; 32]),
         signer_bitfield: [0b10101010u8; SIGNER_BITFIELD_BYTES],
         pq_signatures: vec![],
         classical_signatures: vec![],

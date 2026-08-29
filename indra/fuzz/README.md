@@ -19,6 +19,11 @@ cargo +nightly fuzz run transaction_deserialization -- -max_total_time=60
 cargo +nightly fuzz run public_json_rpc -- -max_total_time=60
 cargo +nightly fuzz run governance_parsing -- -max_total_time=60
 cargo +nightly fuzz run p2p_gossip_parsing -- -max_total_time=60
+cargo +nightly fuzz run vrf_verify_arbitrary -- -max_total_time=60 -max_len=8192
+cargo +nightly fuzz run vrf_valid_proof_mutation -- -max_total_time=60 -max_len=4129
+cargo +nightly fuzz run vrf_public_key_validation -- -max_total_time=60 -max_len=32
+cargo +nightly fuzz run vrf_prove_verify_roundtrip -- -max_total_time=60 -max_len=4128
+cargo +nightly fuzz run vrf_proof_framing -- -max_total_time=60 -max_len=8192
 ```
 
 For CI smoke coverage, use `-max_total_time=30 -timeout=10` for each target.

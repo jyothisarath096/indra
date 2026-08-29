@@ -3,7 +3,7 @@
 use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    sortition::{certified_log, validate_f},
+    sortition::{certified_log, validate_mainnet_f, CertifiedLogInterval},
     types::{
         block::VrfSuiteV1,
         primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
@@ -142,7 +142,7 @@ impl ConsensusSnapshot {
         entries: Vec<ConsensusSnapshotEntry>,
         active_slot_coefficient_numerator: u64,
     ) -> IndraResult<Self> {
-        validate_f(active_slot_coefficient_numerator)?;
+        validate_mainnet_f(active_slot_coefficient_numerator)?;
         let log = certified_log(active_slot_coefficient_numerator)?;
         let sortition_log_lo = encode_q768(&log.lo)?;
         let sortition_log_hi = encode_q768(&log.hi)?;
@@ -188,6 +188,21 @@ impl ConsensusSnapshot {
             .map(|position| (position, &self.entries[position]))
     }
 
+    /// Decode the state-root-committed sortition certificate.
+    ///
+    /// Callers must consume this certificate rather than independently
+    /// recreating it from `active_slot_coefficient_numerator`.
+    pub fn sortition_log_interval(&self) -> IndraResult<CertifiedLogInterval> {
+        let interval = CertifiedLogInterval {
+            lo: num_bigint::BigUint::from_bytes_be(&self.sortition_log_lo),
+            hi: num_bigint::BigUint::from_bytes_be(&self.sortition_log_hi),
+        };
+        if interval.lo == num_bigint::BigUint::default() || interval.hi < interval.lo {
+            return invalid("malformed stored sortition logarithm certificate");
+        }
+        Ok(interval)
+    }
+
     /// Validate all canonical content and stored derived fields.
     pub fn validate(&self) -> IndraResult<()> {
         if self.format_version != CONSENSUS_SNAPSHOT_FORMAT_VERSION {
@@ -196,11 +211,10 @@ impl ConsensusSnapshot {
         if self.entries.is_empty() {
             return invalid("snapshot is empty");
         }
-        validate_f(self.active_slot_coefficient_numerator)?;
-        let log = certified_log(self.active_slot_coefficient_numerator)?;
-        if self.sortition_log_lo != encode_q768(&log.lo)?
-            || self.sortition_log_hi != encode_q768(&log.hi)?
-        {
+        validate_mainnet_f(self.active_slot_coefficient_numerator)?;
+        let stored_log = self.sortition_log_interval()?;
+        let expected_log = certified_log(self.active_slot_coefficient_numerator)?;
+        if stored_log != expected_log {
             return invalid("stored sortition logarithm certificate does not match F");
         }
         if self.entries.len() > MAX_ACTIVE_VALIDATORS {
@@ -336,6 +350,7 @@ fn invalid_error(reason: String) -> IndraError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     use indra_crypto::{ClassicalKeypair, PqKeypair, VrfKeypair};
 
     fn test_snapshot(
@@ -343,7 +358,12 @@ mod tests {
         source_boundary_height: u64,
         entries: Vec<ConsensusSnapshotEntry>,
     ) -> IndraResult<ConsensusSnapshot> {
-        ConsensusSnapshot::new(activation_height, source_boundary_height, entries, 1)
+        ConsensusSnapshot::new(
+            activation_height,
+            source_boundary_height,
+            entries,
+            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
     }
 
     fn entry(id: u8, weight: u64, key_seed: u8) -> ConsensusSnapshotEntry {
@@ -378,9 +398,19 @@ mod tests {
             300,
             &entries,
             total_weight_spark,
-            1,
-            encode_q768(&certified_log(1).unwrap().lo).unwrap(),
-            encode_q768(&certified_log(1).unwrap().hi).unwrap(),
+            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            encode_q768(
+                &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
+                    .unwrap()
+                    .lo,
+            )
+            .unwrap(),
+            encode_q768(
+                &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
+                    .unwrap()
+                    .hi,
+            )
+            .unwrap(),
         );
         ConsensusSnapshot {
             format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
@@ -388,9 +418,19 @@ mod tests {
             source_boundary_height: 300,
             entries,
             total_weight_spark,
-            active_slot_coefficient_numerator: 1,
-            sortition_log_lo: encode_q768(&certified_log(1).unwrap().lo).unwrap(),
-            sortition_log_hi: encode_q768(&certified_log(1).unwrap().hi).unwrap(),
+            active_slot_coefficient_numerator: MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            sortition_log_lo: encode_q768(
+                &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
+                    .unwrap()
+                    .lo,
+            )
+            .unwrap(),
+            sortition_log_hi: encode_q768(
+                &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
+                    .unwrap()
+                    .hi,
+            )
+            .unwrap(),
             snapshot_root,
         }
     }
@@ -410,7 +450,64 @@ mod tests {
         assert_eq!(bytes.len(), original_snapshot.encoded_len());
         let decoded = ConsensusSnapshot::decode_exact(&bytes).unwrap();
         assert_eq!(decoded, original_snapshot);
+        assert_eq!(
+            decoded.sortition_log_interval().unwrap(),
+            certified_log(decoded.active_slot_coefficient_numerator).unwrap()
+        );
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn mainnet_snapshot_rejects_every_non_protocol_f_even_with_recomputed_root() {
+        let preferred = MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+        assert!(ConsensusSnapshot::new(301, 300, vec![entry(1, 1_000, 11)], preferred).is_ok());
+
+        for invalid_f in [preferred - 1, preferred + 1, 1, 1u64 << 63] {
+            let mut invalid = snapshot();
+            let certificate = certified_log(invalid_f).unwrap();
+            invalid.active_slot_coefficient_numerator = invalid_f;
+            invalid.sortition_log_lo = encode_q768(&certificate.lo).unwrap();
+            invalid.sortition_log_hi = encode_q768(&certificate.hi).unwrap();
+            invalid.snapshot_root = compute_snapshot_root(
+                invalid.format_version,
+                invalid.activation_height,
+                invalid.source_boundary_height,
+                invalid.entries(),
+                invalid.total_weight_spark,
+                invalid.active_slot_coefficient_numerator,
+                invalid.sortition_log_lo,
+                invalid.sortition_log_hi,
+            );
+            assert!(
+                invalid.validate().is_err(),
+                "accepted non-mainnet F {invalid_f}"
+            );
+            assert!(ConsensusSnapshot::decode_exact(&invalid.encode_to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_tampered_or_malformed_sortition_certificate() {
+        let mut tampered = snapshot();
+        tampered.sortition_log_lo[127] ^= 1;
+        tampered.snapshot_root = compute_snapshot_root(
+            tampered.format_version,
+            tampered.activation_height,
+            tampered.source_boundary_height,
+            tampered.entries(),
+            tampered.total_weight_spark,
+            tampered.active_slot_coefficient_numerator,
+            tampered.sortition_log_lo,
+            tampered.sortition_log_hi,
+        );
+        assert!(tampered.validate().is_err());
+        assert!(ConsensusSnapshot::decode_exact(&tampered.encode_to_vec()).is_err());
+
+        let mut malformed = snapshot();
+        malformed.sortition_log_lo = [0xff; 128];
+        malformed.sortition_log_hi = [0; 128];
+        assert!(malformed.sortition_log_interval().is_err());
+        assert!(malformed.validate().is_err());
     }
 
     #[test]

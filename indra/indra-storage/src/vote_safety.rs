@@ -11,13 +11,17 @@ use std::path::{Path, PathBuf};
 
 use indra_core::{
     codec::{ByteReader, Decode, Encode},
-    types::{block::BlockProposalVNext, primitives::Bytes32, vote::VoteV1},
+    types::{
+        block::BlockProposalVNext,
+        primitives::{validate_consensus_round, Bytes32},
+        vote::VoteV1,
+    },
 };
 
 use crate::atomic::{crc32, write_atomic_synced};
 use crate::error::StorageResult;
 
-const SAFETY_FORMAT_VERSION: u8 = 1;
+const SAFETY_FORMAT_VERSION: u8 = 3;
 const MAX_PERSISTED_POLC_VOTES: usize = 200;
 const MAX_SAFETY_FILE_BYTES: u64 = 25_165_824;
 
@@ -85,6 +89,30 @@ impl VoteSafetyStore {
         step: u8,
         consensus_lock: Option<&PersistedConsensusLock>,
     ) -> StorageResult<()> {
+        validate_consensus_round(round)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+        if let VoteSafetyLoadResult::Record(existing) = self.load() {
+            let existing_slot = (existing.height, existing.round, existing.step);
+            let requested_slot = (height, round, step);
+            if requested_slot <= existing_slot {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "vote safety slot is not strictly later than persisted slot",
+                )
+                .into());
+            }
+        }
+        if let Some(lock) = consensus_lock {
+            validate_consensus_round(lock.round)
+                .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+            if lock.polc_votes.iter().any(|vote| vote.round != lock.round) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "persisted PoLC vote round differs from lock round",
+                )
+                .into());
+            }
+        }
         if consensus_lock.is_some_and(|lock| lock.polc_votes.len() > MAX_PERSISTED_POLC_VOTES) {
             return Err(
                 Error::new(ErrorKind::InvalidInput, "PoLC vote count exceeds maximum").into(),
@@ -187,7 +215,9 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
         return Err(format!("unsupported safety format version {version}"));
     }
     let height = u64::decode(&mut reader).map_err(|error| error.to_string())?;
-    let round = u32::decode(&mut reader).map_err(|error| error.to_string())?;
+    let round =
+        validate_consensus_round(u32::decode(&mut reader).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     let step = u8::decode(&mut reader).map_err(|error| error.to_string())?;
     if step > 1 {
         return Err(format!("invalid vote step {step}"));
@@ -196,7 +226,10 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
         0 => None,
         1 => {
             let lock_height = u64::decode(&mut reader).map_err(|error| error.to_string())?;
-            let lock_round = u32::decode(&mut reader).map_err(|error| error.to_string())?;
+            let lock_round = validate_consensus_round(
+                u32::decode(&mut reader).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
             let block_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
             let value_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
             let block_len = u32::decode(&mut reader).map_err(|error| error.to_string())? as usize;
@@ -216,6 +249,9 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
                 let vote_bytes = reader.read_bytes(len).map_err(|error| error.to_string())?;
                 polc_votes
                     .push(VoteV1::decode_exact(vote_bytes).map_err(|error| error.to_string())?);
+            }
+            if polc_votes.iter().any(|vote| vote.round != lock_round) {
+                return Err("persisted PoLC vote round differs from lock round".into());
             }
             Some(PersistedConsensusLock {
                 height: lock_height,
@@ -270,6 +306,31 @@ mod tests {
     }
 
     #[test]
+    fn same_signing_slot_is_rejected_on_second_record() {
+        let path = tmp_path("same_slot");
+        let store = VoteSafetyStore::open(&path);
+        store.record(1, 0, 0, None).unwrap();
+        assert!(store.record(1, 0, 0, None).is_err());
+        assert!(store.record(1, 0, 1, None).is_ok());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn signing_slot_ordering_matrix() {
+        let path = tmp_path("matrix");
+        let store = VoteSafetyStore::open(&path);
+        assert!(store.record(10, 5, 0, None).is_ok());
+        assert!(store.record(10, 5, 0, None).is_err());
+        assert!(store.record(10, 5, 1, None).is_ok());
+        assert!(store.record(10, 5, 0, None).is_err());
+        assert!(store.record(10, 4, 1, None).is_err());
+        assert!(store.record(9, 9, 1, None).is_err());
+        assert!(store.record(10, 6, 0, None).is_ok());
+        assert!(store.record(11, 0, 0, None).is_ok());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn old_format_is_rejected_without_legacy_decoder() {
         let path = tmp_path("old_format");
         fs::write(&path, [0u8; 17]).unwrap();
@@ -320,6 +381,40 @@ mod tests {
             panic!("expected valid vote safety record")
         };
         assert_eq!((loaded.height, loaded.round, loaded.step), (100, 15, 1));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn vote_safety_enforces_finite_round_domain_on_write_and_load() {
+        let path = tmp_path("round_domain");
+        let store = VoteSafetyStore::open(&path);
+        for round in [0, indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
+            store.record(1, round, 0, None).unwrap();
+            assert!(matches!(
+                store.load(),
+                VoteSafetyLoadResult::Record(record) if record.round == round
+            ));
+        }
+        for round in [
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            assert!(store.record(1, round, 0, None).is_err());
+
+            // Recompute the CRC so this exercises semantic persisted-state
+            // validation rather than corrupted-byte handling.
+            let record = VoteSafetyRecord {
+                height: 1,
+                round,
+                step: 0,
+                consensus_lock: None,
+            };
+            let mut bytes = encode_record(&record);
+            bytes.extend_from_slice(&crc32(&bytes).to_le_bytes());
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(store.load(), VoteSafetyLoadResult::Corrupt(_)));
+        }
         let _ = fs::remove_file(path);
     }
 }

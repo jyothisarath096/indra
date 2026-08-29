@@ -51,6 +51,8 @@ pub struct VoteV1 {
     pub block_hash: Bytes32,
     /// Validator's identity.
     pub validator_id: Bytes32,
+    /// Root of the immutable consensus snapshot governing `height`.
+    pub snapshot_root: Bytes32,
     /// Hybrid signature over the canonical vote signing bytes.
     pub signature: HybridSignature,
 }
@@ -62,26 +64,29 @@ impl Encode for VoteV1 {
         self.step.encode(buf);
         self.block_hash.encode(buf);
         self.validator_id.encode(buf);
+        self.snapshot_root.encode(buf);
         self.signature.encode(buf);
     }
     fn encoded_len(&self) -> usize {
-        8 + 4 + 1 + 32 + 32 + self.signature.encoded_len()
+        8 + 4 + 1 + 32 + 32 + 32 + self.signature.encoded_len()
     }
 }
 
 impl Decode for VoteV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         let height = u64::decode(r)?;
-        let round = u32::decode(r)?;
+        let round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
         let step = VoteStep::decode(r)?;
         let block_hash = Bytes32::decode(r)?;
         let validator_id = Bytes32::decode(r)?;
+        let snapshot_root = Bytes32::decode(r)?;
         Ok(Self {
             height,
             round,
             step,
             block_hash,
             validator_id,
+            snapshot_root,
             signature: HybridSignature::decode(r)?,
         })
     }
@@ -107,6 +112,7 @@ mod tests {
             step: VoteStep::Precommit,
             block_hash: Bytes32::from([0xAAu8; 32]),
             validator_id: Bytes32::from([0xBBu8; 32]),
+            snapshot_root: Bytes32::from([0xCCu8; 32]),
             signature: HybridSignature {
                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
                 pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
@@ -118,6 +124,24 @@ mod tests {
     fn vote_round_trip() {
         let v = dummy_vote();
         assert_eq!(v, VoteV1::decode_exact(&v.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn decoder_enforces_finite_round_domain() {
+        for round in [0, crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
+            let mut vote = dummy_vote();
+            vote.round = round;
+            assert!(VoteV1::decode_exact(&vote.encode_to_vec()).is_ok());
+        }
+        for round in [
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            let mut vote = dummy_vote();
+            vote.round = round;
+            assert!(VoteV1::decode_exact(&vote.encode_to_vec()).is_err());
+        }
     }
 
     #[test]

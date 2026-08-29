@@ -758,7 +758,7 @@ mod tests {
                 name: "cli-governance-test".into(),
                 hybrid_classical_pk: Some(hot_pubkey.classical_pk.0),
                 hybrid_pq_pk: Some(hot_pubkey.pq_pk.as_slice().to_vec()),
-                vrf_pk: Some([0x95; 32]),
+                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0x95; 32]).public_key()),
                 vrf_key_activation_epoch: 0,
                 pending_vrf_pk: None,
                 pending_vrf_activation_epoch: None,

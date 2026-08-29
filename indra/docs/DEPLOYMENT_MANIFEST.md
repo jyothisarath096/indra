@@ -32,14 +32,21 @@ The next deployment record must additionally publish the canonical genesis
 fingerprint, genesis block hash, state and consensus-snapshot roots, monetary
 ledger identity, active-slot coefficient, complete Bitcoin entropy descriptor
 and 80-byte header, and each validator's verified VRF proof of possession.
+The active-slot coefficient is not an operator choice: initial mainnet requires
+`f=3/8`, encoded as `active_slot_coefficient_numerator="6917529027641081856"`.
+Every other value is rejected by genesis and persisted-state validation.
 
-Genesis assembly is fail-closed on Bitcoin entropy verification. Operators run
-`indra-genesis build ... --bitcoin-cli /path/to/bitcoin-cli`; the tool queries a
-local Bitcoin Core node for the announced height on its active most-work chain,
-locally double-SHA-256 checks the returned 80-byte header against that block
-hash, verifies the configured Bitcoin network genesis hash, and requires the
-declared confirmation floor. `indra-genesis verify-bitcoin-entropy` repeats the
-same checks for an assembled manifest. There is no deadline or offline fallback.
+Genesis assembly uses the mandatory pre-target workflow: `commit-validator`,
+`precommit`, `freeze-authority`, and `finalize`. The precommit target must be at
+least 144 Bitcoin blocks beyond the current tip. Both the precommit and fully
+opened authority artifact/hash must be published through two independent witness
+channels before the target exists. `finalize` accepts no validator reveals and
+therefore leaves no post-target selective-abort decision. It and
+`verify-bitcoin-entropy` require
+agreement from at least two Bitcoin Core clients and exactly 100 declared
+confirmations (the observed depth may be greater). The removed one-shot `build`
+command always fails; there is no deadline, single-node, offline, or alternate-
+height fallback.
 
 ## Validators
 

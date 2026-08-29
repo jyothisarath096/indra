@@ -53,6 +53,7 @@ fn genesis_entry(
     let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
     entry.vrf_possession_output = hex::encode(output.0);
     entry.vrf_possession_proof = hex::encode(proof.0);
+    entry.genesis_commitment_nonce = hex::encode([tag.wrapping_add(96); 32]);
     entry
 }
 
@@ -71,7 +72,7 @@ fn mock_bitcoin_cli(dir: &std::path::Path) -> PathBuf {
     displayed_hash.reverse();
     let displayed_hash = hex::encode(displayed_hash);
     let script = format!(
-        "#!/bin/sh\ncase \"$1:$2\" in\n  getblockhash:0) echo {} ;;\n  getblockhash:1) echo {} ;;\n  getblockheader:{}) echo {} ;;\n  getblockcount:) echo 200 ;;\n  *) echo unexpected bitcoin-cli arguments >&2; exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1:$2\" in\n  getblockhash:0) echo {} ;;\n  getblockhash:344) echo {} ;;\n  getblockheader:{}) echo {} ;;\n  getblockcount:) echo ${{BITCOIN_MOCK_TIP:-443}} ;;\n  *) echo unexpected bitcoin-cli arguments >&2; exit 1 ;;\nesac\n",
         "11".repeat(32),
         displayed_hash,
         displayed_hash,
@@ -440,19 +441,48 @@ fn build_test_genesis(
     chain_id: &str,
     validators: Vec<indra_cli::GenesisEntry>,
 ) -> indra_cli::GenesisConfig {
+    let source = indra_node::genesis::BitcoinPowEntropySourceV1 {
+        scheme: 1,
+        network_genesis_hash: hex::encode([0x11; 32]),
+        announced_height: 1,
+        header_codec: 1,
+        extraction_algorithm: 1,
+        minimum_confirmations: 100,
+        reorg_policy: 1,
+    };
+    let settings = indra_node::GenesisSettings {
+        chain_id: chain_id.into(),
+        active_slot_coefficient_numerator:
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        bitcoin_pow_entropy_source: source.clone(),
+        bitcoin_pow_entropy_header: hex::encode([0x22; 80]),
+        genesis_precommit_hash: String::new(),
+    };
+    let node_validators = validators
+        .iter()
+        .map(|entry| indra_node::GenesisValidator {
+            name: entry.name.clone(),
+            validator_id: entry.validator_id.clone(),
+            hybrid_classical_pk: entry.hybrid_classical_pk.clone(),
+            hybrid_pq_pk: entry.hybrid_pq_pk.clone(),
+            vrf_pk: entry.vrf_pk.clone(),
+            vrf_possession_output: entry.vrf_possession_output.clone(),
+            vrf_possession_proof: entry.vrf_possession_proof.clone(),
+            cold_hybrid_classical_pk: entry.cold_hybrid_classical_pk.clone(),
+            cold_hybrid_pq_pk: entry.cold_hybrid_pq_pk.clone(),
+            cold_key_version: entry.cold_key_version,
+            cold_nonce: entry.cold_nonce,
+            stake: entry.stake,
+            genesis_commitment_nonce: entry.genesis_commitment_nonce.clone(),
+        })
+        .collect::<Vec<_>>();
+    let precommit =
+        indra_node::genesis::genesis_precommit_hash(&settings, &node_validators).unwrap();
     build_genesis_config(
         chain_id,
-        1u64 << 63,
-        indra_node::genesis::BitcoinPowEntropySourceV1 {
-            scheme: 1,
-            network_genesis_hash: hex::encode([0x11; 32]),
-            announced_height: 1,
-            header_codec: 1,
-            extraction_algorithm: 1,
-            minimum_confirmations: 100,
-            reorg_policy: 1,
-        },
+        source,
         hex::encode([0x22; 80]),
+        hex::encode(precommit.0),
         validators,
     )
     .unwrap()
@@ -490,7 +520,6 @@ fn genesis_rejects_3_validators() {
 
     assert!(build_genesis_config(
         "test",
-        1u64 << 63,
         indra_node::genesis::BitcoinPowEntropySourceV1 {
             scheme: 1,
             network_genesis_hash: hex::encode([0x11; 32]),
@@ -501,6 +530,7 @@ fn genesis_rejects_3_validators() {
             reorg_policy: 1,
         },
         hex::encode([0x22; 80]),
+        hex::encode([0x33; 32]),
         validators,
     )
     .is_err());
@@ -513,28 +543,10 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("genesis.toml");
     let bitcoin_cli = mock_bitcoin_cli(&dir);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
-    command.args([
-        "build",
-        "--chain-id",
-        "indra-testnet-artifact-test",
-        "--active-slot-coefficient-numerator",
-        "9223372036854775808",
-        "--bitcoin-network-genesis-hash",
-        "1111111111111111111111111111111111111111111111111111111111111111",
-        "--bitcoin-height",
-        "1",
-        "--bitcoin-header",
-        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
-        "--bitcoin-minimum-confirmations",
-        "100",
-        "--bitcoin-cli",
-        bitcoin_cli.to_str().unwrap(),
-        "--output",
-        path.to_str().unwrap(),
-    ]);
     let mut validator_inputs = Vec::new();
-    let mut expected_cold_public = Vec::new();
+    let mut commitment_paths = Vec::new();
+    let mut reveal_paths = Vec::new();
+    let mut expected_cold_public = std::collections::BTreeMap::new();
     for i in 0..4u8 {
         let keys = generate_from_master_seed(format!("v{i}"), [i + 1; 32]).unwrap();
         let hot_path = dir.join(format!("hot-{i}.json"));
@@ -546,10 +558,13 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         let cold_public = cold_public.as_complete_hybrid();
         let classical_hex = hex::encode(cold_public.classical.0);
         let pq_hex = hex::encode(cold_public.pq.0);
-        expected_cold_public.push((classical_hex.clone(), pq_hex.clone()));
         let cold_path = dir.join(format!("cold-{i}.json"));
         let proof_path = dir.join(format!("vrf-proof-{i}.json"));
         let validator_id = Bytes32::from(keys.public.validator_id);
+        expected_cold_public.insert(
+            hex::encode(validator_id.0),
+            (classical_hex.clone(), pq_hex.clone()),
+        );
         let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
         let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
             "indra-testnet-artifact-test",
@@ -602,61 +617,313 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
             )
             .unwrap();
         }
-        command.arg("--validator").arg(format!(
-            "v{i},{stake},{},{},{}",
-            hot_path.display(),
-            cold_path.display(),
-            proof_path.display()
-        ));
+        let commitment_path = dir.join(format!("commitment-{i}.json"));
+        let reveal_path = dir.join(format!("reveal-{i}.json"));
+        let committed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+            .args([
+                "commit-validator",
+                "--chain-id",
+                "indra-testnet-artifact-test",
+                "--validator",
+                &format!(
+                    "v{i},{stake},{},{},{}",
+                    hot_path.display(),
+                    cold_path.display(),
+                    proof_path.display()
+                ),
+                "--commitment-output",
+                commitment_path.to_str().unwrap(),
+                "--reveal-output",
+                reveal_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            committed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&committed.stderr)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&reveal_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        commitment_paths.push(commitment_path);
+        reveal_paths.push(reveal_path);
         validator_inputs.push((hot_path, cold_path, proof_path));
     }
-    let build = command.output().unwrap();
+    let precommit_path = dir.join("precommit.json");
+    let mut precommit = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    precommit
+        .args([
+            "precommit",
+            "--chain-id",
+            "indra-testnet-artifact-test",
+            "--bitcoin-network-genesis-hash",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--bitcoin-height",
+            "344",
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            precommit_path.to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "200");
+    for commitment in &commitment_paths {
+        precommit.arg("--validator-commitment").arg(commitment);
+    }
+    let precommit = precommit.output().unwrap();
     assert!(
-        build.status.success(),
+        precommit.status.success(),
         "{}",
-        String::from_utf8_lossy(&build.stderr)
+        String::from_utf8_lossy(&precommit.stderr)
+    );
+
+    let too_soon_path = dir.join("too-soon-precommit.json");
+    let mut too_soon = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    too_soon
+        .args([
+            "precommit",
+            "--chain-id",
+            "indra-testnet-artifact-test",
+            "--bitcoin-network-genesis-hash",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--bitcoin-height",
+            "343",
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            too_soon_path.to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "200");
+    for commitment in &commitment_paths {
+        too_soon.arg("--validator-commitment").arg(commitment);
+    }
+    let too_soon = too_soon.output().unwrap();
+    assert!(!too_soon.status.success());
+    assert!(!too_soon_path.exists());
+
+    let precommit_text = std::fs::read_to_string(&precommit_path).unwrap();
+    assert!(!precommit_text.contains("vrf_pk"));
+    for reveal in &reveal_paths {
+        let reveal_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(reveal).unwrap()).unwrap();
+        let vrf_pk = reveal_json["validator"]["vrf_pk"].as_str().unwrap();
+        assert!(!precommit_text.contains(vrf_pk));
+    }
+
+    let mut changed_descriptor: serde_json::Value = serde_json::from_str(&precommit_text).unwrap();
+    changed_descriptor["bitcoin_descriptor"]["announced_height"] = 345u64.into();
+    let changed_path = dir.join("changed-precommit.json");
+    std::fs::write(
+        &changed_path,
+        serde_json::to_vec_pretty(&changed_descriptor).unwrap(),
+    )
+    .unwrap();
+    let rejected_changed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "finalize",
+            "--precommit",
+            changed_path.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            dir.join("changed-genesis.toml").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected_changed.status.success());
+    assert!(String::from_utf8_lossy(&rejected_changed.stderr)
+        .contains("precommit canonical bytes/hash mismatch"));
+
+    let authority_path = dir.join("frozen-authority.json");
+    let mut freeze = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    freeze
+        .args([
+            "freeze-authority",
+            "--precommit",
+            precommit_path.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            authority_path.to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "200");
+    for reveal in &reveal_paths {
+        freeze.arg("--validator-reveal").arg(reveal);
+    }
+    let frozen = freeze.output().unwrap();
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    let frozen_text = std::fs::read_to_string(&authority_path).unwrap();
+    let frozen_json: serde_json::Value = serde_json::from_str(&frozen_text).unwrap();
+    assert_eq!(frozen_json["validators"].as_array().unwrap().len(), 4);
+    for validator in frozen_json["validators"].as_array().unwrap() {
+        for field in [
+            "validator_id",
+            "stake",
+            "hybrid_classical_pk",
+            "hybrid_pq_pk",
+            "cold_hybrid_classical_pk",
+            "cold_hybrid_pq_pk",
+            "cold_key_version",
+            "cold_nonce",
+            "vrf_pk",
+            "genesis_commitment_nonce",
+        ] {
+            assert!(!validator[field].is_null(), "missing frozen field {field}");
+        }
+    }
+    for reveal in &reveal_paths {
+        let reveal_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(reveal).unwrap()).unwrap();
+        let validator_id = reveal_json["validator"]["validator_id"].as_str().unwrap();
+        assert!(frozen_text.contains(validator_id));
+    }
+
+    let late_authority = dir.join("late-authority.json");
+    let mut late_freeze = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+    late_freeze
+        .args([
+            "freeze-authority",
+            "--precommit",
+            precommit_path.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            late_authority.to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "344");
+    for reveal in &reveal_paths {
+        late_freeze.arg("--validator-reveal").arg(reveal);
+    }
+    let late_freeze = late_freeze.output().unwrap();
+    assert!(!late_freeze.status.success());
+    assert!(!late_authority.exists());
+
+    let post_target_reveal = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "finalize",
+            "--precommit",
+            precommit_path.to_str().unwrap(),
+            "--authority",
+            authority_path.to_str().unwrap(),
+            "--validator-reveal",
+            reveal_paths[0].to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            dir.join("post-target-reveal.toml").to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "443")
+        .output()
+        .unwrap();
+    assert!(!post_target_reveal.status.success());
+
+    let mut changed_authority = frozen_json;
+    changed_authority["validators"][0]["stake"] = (stake + 1).into();
+    let changed_authority_path = dir.join("changed-authority.json");
+    std::fs::write(
+        &changed_authority_path,
+        serde_json::to_vec_pretty(&changed_authority).unwrap(),
+    )
+    .unwrap();
+    let changed_authority_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "finalize",
+            "--precommit",
+            precommit_path.to_str().unwrap(),
+            "--authority",
+            changed_authority_path.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            dir.join("changed-authority.toml").to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "443")
+        .output()
+        .unwrap();
+    assert!(!changed_authority_result.status.success());
+
+    let finalized = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "finalize",
+            "--precommit",
+            precommit_path.to_str().unwrap(),
+            "--authority",
+            authority_path.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--bitcoin-cli",
+            bitcoin_cli.to_str().unwrap(),
+            "--output",
+            path.to_str().unwrap(),
+        ])
+        .env("BITCOIN_MOCK_TIP", "443")
+        .output()
+        .unwrap();
+    assert!(
+        finalized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finalized.stderr)
     );
     let manifest = indra_node::parse_genesis_manifest(path.to_str().unwrap()).unwrap();
-    for (validator, (classical, pq)) in manifest.validators.iter().zip(&expected_cold_public) {
+    for validator in &manifest.validators {
+        let (classical, pq) = expected_cold_public.get(&validator.validator_id).unwrap();
         assert_eq!(&validator.cold_hybrid_classical_pk, classical);
         assert_eq!(&validator.cold_hybrid_pq_pk, pq);
     }
 
     let malformed_path = dir.join("cold-malformed.json");
     std::fs::write(&malformed_path, r#"{"format":"not-a-cold-format"}"#).unwrap();
-    let malformed_genesis = dir.join("malformed-genesis.toml");
-    let mut malformed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
-    malformed.args([
-        "build",
-        "--chain-id",
-        "indra-testnet-artifact-test",
-        "--active-slot-coefficient-numerator",
-        "9223372036854775808",
-        "--bitcoin-network-genesis-hash",
-        "1111111111111111111111111111111111111111111111111111111111111111",
-        "--bitcoin-height",
-        "1",
-        "--bitcoin-header",
-        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
-        "--bitcoin-minimum-confirmations",
-        "100",
-        "--bitcoin-cli",
-        bitcoin_cli.to_str().unwrap(),
-        "--output",
-        malformed_genesis.to_str().unwrap(),
-    ]);
-    for (index, (hot, cold, proof)) in validator_inputs.iter().enumerate() {
-        let cold = if index == 0 { &malformed_path } else { cold };
-        malformed.arg("--validator").arg(format!(
-            "v{index},{stake},{},{},{}",
-            hot.display(),
-            cold.display(),
-            proof.display()
-        ));
-    }
-    let malformed = malformed.output().unwrap();
+    let malformed_commitment = dir.join("malformed-commitment.json");
+    let malformed_reveal = dir.join("malformed-reveal.json");
+    let malformed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "commit-validator",
+            "--chain-id",
+            "indra-testnet-artifact-test",
+            "--validator",
+            &format!(
+                "v0,{stake},{},{},{}",
+                validator_inputs[0].0.display(),
+                malformed_path.display(),
+                validator_inputs[0].2.display()
+            ),
+            "--commitment-output",
+            malformed_commitment.to_str().unwrap(),
+            "--reveal-output",
+            malformed_reveal.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
     assert!(!malformed.status.success());
-    assert!(!malformed_genesis.exists());
+    assert!(!malformed_commitment.exists());
+    assert!(!malformed_reveal.exists());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("unsupported cold-file format"));
 
     let validate = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
@@ -818,7 +1085,7 @@ fn test_build_and_decode_all_staking_ops() {
             deposit_utxo_id,
             &keypair,
             &cold,
-            [0xC3; 32],
+            &indra_crypto::VrfKeypair::from_seed(&[0xC3; 32]),
             1,
             chain_id,
         )

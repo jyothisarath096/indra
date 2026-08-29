@@ -32,7 +32,7 @@ pub struct VrfKeypair {
     pub public_key: [u8; 32],
 }
 fn expand(seed: &[u8; 32]) -> (Scalar, [u8; 32]) {
-    let h = Sha512::digest(seed);
+    let mut h = Sha512::digest(seed);
     let mut x = [0; 32];
     x.copy_from_slice(&h[..32]);
     x[0] &= 248;
@@ -40,16 +40,26 @@ fn expand(seed: &[u8; 32]) -> (Scalar, [u8; 32]) {
     x[31] |= 64;
     let mut p = [0; 32];
     p.copy_from_slice(&h[32..]);
-    (Scalar::from_bits(x), p)
+    let scalar = Scalar::from_bits(x);
+    // The digest and clamped bytes are transient copies derived from the
+    // secret seed; the returned scalar and nonce prefix remain live.
+    h.zeroize();
+    x.zeroize();
+    (scalar, p)
 }
 impl VrfKeypair {
     /// Derive from a 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let (x, _) = expand(seed);
-        Self {
+        let (mut x, mut prefix) = expand(seed);
+        let keypair = Self {
             seed: *seed,
             public_key: EdwardsPoint::mul_base(&x).compress().to_bytes(),
-        }
+        };
+        // Key generation needs neither secret-derived expansion value after
+        // the public key has been computed.
+        x.zeroize();
+        prefix.zeroize();
+        keypair
     }
     /// Return the canonical public key.
     pub fn public_key(&self) -> [u8; 32] {
@@ -79,10 +89,14 @@ fn nonce(prefix: &[u8; 32], h: &EdwardsPoint) -> Scalar {
     let mut d = Sha512::new();
     d.update(prefix);
     d.update(h.compress().as_bytes());
-    let o = d.finalize();
+    let mut o = d.finalize();
     let mut w = [0; 64];
     w.copy_from_slice(&o);
-    Scalar::from_bytes_mod_order_wide(&w)
+    let scalar = Scalar::from_bytes_mod_order_wide(&w);
+    // Both buffers contain the secret-derived deterministic nonce material.
+    o.zeroize();
+    w.zeroize();
+    scalar
 }
 fn cs(c: &[u8; 16]) -> Scalar {
     let mut b = [0; 32];
@@ -112,11 +126,11 @@ fn output(g: &EdwardsPoint) -> VrfOutput {
 }
 /// Produce an RFC proof and output.
 pub fn vrf_prove(kp: &VrfKeypair, alpha: &[u8]) -> (VrfOutput, VrfProof) {
-    let (x, mut prefix) = expand(&kp.seed);
+    let (mut x, mut prefix) = expand(&kp.seed);
     let y = EdwardsPoint::mul_base(&x);
     let h = h2c(&kp.public_key, alpha);
     let g = x * h;
-    let k = nonce(&prefix, &h);
+    let mut k = nonce(&prefix, &h);
     prefix.zeroize();
     let u = EdwardsPoint::mul_base(&k);
     let v = k * h;
@@ -126,7 +140,12 @@ pub fn vrf_prove(kp: &VrfKeypair, alpha: &[u8]) -> (VrfOutput, VrfProof) {
     pi.extend_from_slice(g.compress().as_bytes());
     pi.extend_from_slice(&c);
     pi.extend_from_slice(s.as_bytes());
-    (output(&g), VrfProof(pi))
+    let result = (output(&g), VrfProof(pi));
+    // x and k are the secret signing scalar and deterministic nonce. Public
+    // Gamma and the proof response s intentionally remain available.
+    x.zeroize();
+    k.zeroize();
+    result
 }
 /// Verify an RFC proof and its separately transmitted output.
 pub fn vrf_verify(
@@ -168,6 +187,78 @@ pub fn vrf_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curve25519_dalek_v5::constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION};
+    use curve25519_dalek_v5::traits::Identity;
+
+    fn fixture(seed: u8, alpha: &[u8]) -> (VrfKeypair, VrfOutput, VrfProof) {
+        let keypair = VrfKeypair::from_seed(&[seed; 32]);
+        let (output, proof) = vrf_prove(&keypair, alpha);
+        (keypair, output, proof)
+    }
+
+    fn proof_with_gamma(proof: &VrfProof, gamma: [u8; 32]) -> VrfProof {
+        let mut bytes = proof.0.clone();
+        bytes[..32].copy_from_slice(&gamma);
+        VrfProof(bytes)
+    }
+
+    fn proof_with_scalar(proof: &VrfProof, scalar: [u8; 32]) -> VrfProof {
+        let mut bytes = proof.0.clone();
+        bytes[48..80].copy_from_slice(&scalar);
+        VrfProof(bytes)
+    }
+
+    fn malformed_edwards_encoding() -> [u8; 32] {
+        // Find a deterministic string that is not the encoding of any Edwards point,
+        // avoiding an unexplained hard-coded byte sequence.
+        for counter in 0u64.. {
+            let digest = Sha512::digest(counter.to_le_bytes());
+            let mut candidate = [0u8; 32];
+            candidate.copy_from_slice(&digest[..32]);
+            if CompressedEdwardsY(candidate).decompress().is_none() {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    fn noncanonical_identity_encoding() -> [u8; 32] {
+        // y = p + 1 = 2^255 - 18 represents y = 1 modulo p (the identity),
+        // but is not the canonical field encoding. The high bit is the x sign.
+        let mut bytes = [0xff; 32];
+        bytes[0] = 0xee;
+        bytes[31] = 0x7f;
+        bytes
+    }
+
+    fn noncanonical_y_zero_encoding() -> [u8; 32] {
+        // y = p = 2^255 - 19 represents y = 0 modulo p. This is an alternate
+        // encoding of the canonical order-four torsion point with y = 0.
+        let mut bytes = [0xff; 32];
+        bytes[0] = 0xed;
+        bytes[31] = 0x7f;
+        bytes
+    }
+
+    fn scalar_group_order() -> [u8; 32] {
+        // q = 2^252 + 27742317777372353535851937790883648493, little-endian.
+        hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    fn add_little_endian(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut carry = 0u16;
+        for index in 0..32 {
+            let sum = u16::from(a[index]) + u16::from(b[index]) + carry;
+            out[index] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "test input unexpectedly overflowed 256 bits");
+        out
+    }
 
     fn assert_rfc_vector(
         seed_hex: &str,
@@ -226,5 +317,222 @@ mod tests {
         let mut wrong = o.clone();
         wrong.0[0] ^= 1;
         assert!(vrf_verify(&kp.public_key(), b"alpha", &wrong, &p).is_err())
+    }
+
+    #[test]
+    fn negative_public_key_rejection_is_complete_and_canonical() {
+        let identity = EdwardsPoint::identity().compress().to_bytes();
+        assert!(validate_vrf_public_key(&identity).is_err());
+
+        for (index, point) in EIGHT_TORSION.iter().enumerate() {
+            assert!(
+                validate_vrf_public_key(point.compress().as_bytes()).is_err(),
+                "accepted eight-torsion point {index}"
+            );
+        }
+
+        let malformed = malformed_edwards_encoding();
+        assert!(CompressedEdwardsY(malformed).decompress().is_none());
+        assert!(validate_vrf_public_key(&malformed).is_err());
+
+        for noncanonical in [
+            noncanonical_identity_encoding(),
+            noncanonical_y_zero_encoding(),
+        ] {
+            assert!(validate_vrf_public_key(&noncanonical).is_err());
+        }
+
+        let prime_order_plus_torsion = ED25519_BASEPOINT_POINT + EIGHT_TORSION[1];
+        assert!(!prime_order_plus_torsion.is_torsion_free());
+        assert!(validate_vrf_public_key(&prime_order_plus_torsion.compress().to_bytes()).is_err());
+    }
+
+    #[test]
+    fn negative_gamma_rejection_is_complete_and_canonical() {
+        let (keypair, output, proof) = fixture(0x21, b"gamma-rejection");
+        let public_key = keypair.public_key();
+
+        let identity = EdwardsPoint::identity().compress().to_bytes();
+        assert!(vrf_verify(
+            &public_key,
+            b"gamma-rejection",
+            &output,
+            &proof_with_gamma(&proof, identity)
+        )
+        .is_err());
+
+        for (index, point) in EIGHT_TORSION.iter().enumerate() {
+            assert!(
+                vrf_verify(
+                    &public_key,
+                    b"gamma-rejection",
+                    &output,
+                    &proof_with_gamma(&proof, point.compress().to_bytes())
+                )
+                .is_err(),
+                "accepted eight-torsion Gamma {index}"
+            );
+        }
+
+        for invalid in [
+            malformed_edwards_encoding(),
+            noncanonical_identity_encoding(),
+            noncanonical_y_zero_encoding(),
+        ] {
+            assert!(vrf_verify(
+                &public_key,
+                b"gamma-rejection",
+                &output,
+                &proof_with_gamma(&proof, invalid)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn negative_scalar_rejection_covers_group_order_and_noncanonical_values() {
+        let (keypair, output, proof) = fixture(0x22, b"scalar-rejection");
+        let q = scalar_group_order();
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let q_plus_one = add_little_endian(q, one);
+
+        for (label, scalar) in [("q", q), ("q+1", q_plus_one), ("all-ff", [0xff; 32])] {
+            assert!(
+                Option::<Scalar>::from(Scalar::from_canonical_bytes(scalar)).is_none(),
+                "{label} unexpectedly canonical"
+            );
+            assert!(
+                vrf_verify(
+                    &keypair.public_key(),
+                    b"scalar-rejection",
+                    &output,
+                    &proof_with_scalar(&proof, scalar)
+                )
+                .is_err(),
+                "accepted noncanonical scalar {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_proof_framing_and_component_mutation_fail_closed() {
+        let (keypair, output, proof) = fixture(0x23, b"proof-framing");
+        let public_key = keypair.public_key();
+
+        for len in 0..PROOF_BYTES {
+            assert!(
+                vrf_verify(
+                    &public_key,
+                    b"proof-framing",
+                    &output,
+                    &VrfProof(proof.0[..len].to_vec())
+                )
+                .is_err(),
+                "accepted truncated proof length {len}"
+            );
+        }
+        for bytes in [
+            {
+                let mut bytes = proof.0.clone();
+                bytes.push(0);
+                bytes
+            },
+            {
+                let mut bytes = proof.0.clone();
+                bytes.extend_from_slice(&[0xAA, 0x55]);
+                bytes
+            },
+        ] {
+            assert!(vrf_verify(&public_key, b"proof-framing", &output, &VrfProof(bytes)).is_err());
+        }
+
+        for range in [0..32, 32..48, 48..80] {
+            for index in range {
+                let mut altered = proof.0.clone();
+                altered[index] ^= 1;
+                assert!(
+                    vrf_verify(&public_key, b"proof-framing", &output, &VrfProof(altered)).is_err(),
+                    "accepted proof with altered byte {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn negative_context_and_output_binding_reject_cross_use() {
+        let (keypair_a, output_a, proof_a) = fixture(0x24, b"alpha-a");
+        let (keypair_b, output_b, proof_b) = fixture(0x25, b"alpha-a");
+
+        assert!(vrf_verify(&keypair_a.public_key(), b"wrong-alpha", &output_a, &proof_a).is_err());
+        assert!(vrf_verify(&keypair_b.public_key(), b"alpha-a", &output_a, &proof_a).is_err());
+        assert!(vrf_verify(&keypair_a.public_key(), b"alpha-a", &output_b, &proof_b).is_err());
+
+        let mut modified_output = output_a.clone();
+        modified_output.0[0] ^= 1;
+        assert!(vrf_verify(
+            &keypair_a.public_key(),
+            b"alpha-a",
+            &modified_output,
+            &proof_a
+        )
+        .is_err());
+        assert!(vrf_verify(&keypair_a.public_key(), b"alpha-a", &output_b, &proof_a).is_err());
+    }
+
+    #[test]
+    fn negative_uniqueness_and_alternate_representation_attempts_are_rejected() {
+        let (keypair, output, proof) = fixture(0x26, b"uniqueness");
+        let public_key = keypair.public_key();
+        vrf_verify(&public_key, b"uniqueness", &output, &proof).unwrap();
+
+        // No distinct one-bit mutation of any proof byte is another accepted proof
+        // for the fixed public key, alpha, and beta.
+        for index in 0..PROOF_BYTES {
+            for bit in 0..8 {
+                let mut alternate = proof.0.clone();
+                alternate[index] ^= 1 << bit;
+                assert_ne!(alternate, proof.0);
+                assert!(
+                    vrf_verify(&public_key, b"uniqueness", &output, &VrfProof(alternate)).is_err(),
+                    "accepted distinct mutation at byte {index}, bit {bit}"
+                );
+            }
+        }
+
+        // s + q denotes the same scalar mathematically, but its byte encoding is
+        // noncanonical and therefore must not be accepted as an alternate proof.
+        let mut canonical_s = [0u8; 32];
+        canonical_s.copy_from_slice(&proof.0[48..80]);
+        let same_scalar_noncanonical = add_little_endian(canonical_s, scalar_group_order());
+        assert!(
+            Option::<Scalar>::from(Scalar::from_canonical_bytes(same_scalar_noncanonical))
+                .is_none()
+        );
+        assert!(vrf_verify(
+            &public_key,
+            b"uniqueness",
+            &output,
+            &proof_with_scalar(&proof, same_scalar_noncanonical)
+        )
+        .is_err());
+
+        // Canonical y=0 and noncanonical y=p denote the same order-four Gamma;
+        // both representations are rejected rather than normalized.
+        let y_zero = EIGHT_TORSION
+            .iter()
+            .find(|point| point.compress().to_bytes()[..31] == [0u8; 31])
+            .expect("Dalek torsion table contains a y=0 point")
+            .compress()
+            .to_bytes();
+        for gamma in [y_zero, noncanonical_y_zero_encoding()] {
+            assert!(vrf_verify(
+                &public_key,
+                b"uniqueness",
+                &output,
+                &proof_with_gamma(&proof, gamma)
+            )
+            .is_err());
+        }
     }
 }

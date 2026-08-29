@@ -121,7 +121,8 @@ impl TestValidator {
 #[test]
 fn mempool_to_block_pipeline() {
     let mut state = ChainState::new_genesis();
-    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.active_slot_coefficient_numerator =
+        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
     let mut mempool = Mempool::default_config();
     let (owner_pubkey, owner_keypair) = make_user_keypair(0x55);
@@ -211,7 +212,11 @@ fn mempool_to_block_pipeline() {
             chain_id: state.chain_id.as_bytes().to_vec(),
             election_seed: state.election_seed,
             snapshot_root: state.consensus_snapshots[0].snapshot_root,
-            active_slot_coefficient_numerator: 1u64 << 63,
+            active_slot_coefficient_numerator:
+                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            sortition_log: state.consensus_snapshots[0]
+                .sortition_log_interval()
+                .unwrap(),
             height: 1,
             round,
             candidates: vec![ProposerCandidate {
@@ -269,6 +274,7 @@ fn full_consensus_round() {
         round,
         VoteStep::Precommit,
         DEFAULT_CHAIN_ID.to_string(),
+        Bytes32::ZERO,
         voters,
     );
 
@@ -279,6 +285,7 @@ fn full_consensus_round() {
             VoteStep::Precommit,
             block_hash,
             v.id,
+            Bytes32::ZERO,
             DEFAULT_CHAIN_ID,
             &v.hybrid_kp,
         )
@@ -303,6 +310,7 @@ fn full_consensus_round() {
         round,
         block_hash,
         DEFAULT_CHAIN_ID.to_string(),
+        Bytes32::ZERO,
         qc_validators.clone(),
     );
     for vote in collector.accepted_votes() {
@@ -373,6 +381,7 @@ fn qc_builder_quorum_detection() {
         0,
         block_hash,
         DEFAULT_CHAIN_ID.to_string(),
+        Bytes32::ZERO,
         qc_validators.clone(),
     );
 
@@ -386,6 +395,7 @@ fn qc_builder_quorum_detection() {
         VoteStep::Precommit,
         block_hash,
         v1.id,
+        Bytes32::ZERO,
         DEFAULT_CHAIN_ID,
         &v1.hybrid_kp,
     )
@@ -412,6 +422,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         .map(|(i, v)| v.as_qc_validator(i))
         .collect();
     let block_hash = Bytes32::from([0xEFu8; 32]);
+    let snapshot_root = Bytes32::from([0x5Au8; 32]);
     let height = 7u64;
     let round = 0u32;
 
@@ -429,6 +440,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
                 VoteStep::Precommit,
                 block_hash,
                 validator.id,
+                snapshot_root,
                 DEFAULT_CHAIN_ID,
                 &validator.hybrid_kp,
             )
@@ -452,6 +464,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         height,
         round,
         block_hash,
+        snapshot_root,
         signer_bitfield,
         pq_signatures,
         classical_signatures,

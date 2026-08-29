@@ -31,7 +31,7 @@ The following parameters are approved and normative in this revision:
 - Proposal collection uses the existing propose-phase timeout (currently eight seconds). No second election timer is introduced.
 - `election_seed[1] = election_seed[0]`; failed rounds do not evolve it.
 
-The sortition construction in Section 5.2 is approved as the Ouroboros Praos/Minotaur single-validator threshold. Its arithmetic and calibration rules are normative below; the actual active-slot coefficient `f` is selected during the genesis ceremony by the prescribed simulation and is immutable in this implementation. Any future governance-controlled change is separately gated on Topic 9 design and audit.
+The sortition construction in Section 5.2 is approved as the Ouroboros Praos/Minotaur single-validator threshold. Mainnet fixes `f = 3/8`, encoded exactly as `F = 6917529027641081856`; it is not runtime-, genesis-, or governance-configurable in the initial mainnet protocol. Changing it requires a protocol version change and renewed grinding/liveness analysis.
 
 ## 2. Current problems and security objectives
 
@@ -220,7 +220,7 @@ This is the Praos threshold formalized and reused by Minotaur [Ouroboros Praos](
 
 #### 5.2.1 Protocol representation and admitted domain
 
-`f` is encoded canonically as `F/2^64`, where `F` is the required genesis-config field `active_slot_coefficient_numerator`. In genesis TOML it is a quoted canonical ASCII decimal string: digits only, no sign, whitespace, or leading zeroes. This string form is required because TOML's signed integer domain cannot represent the admitted upper endpoint `2^63`. After parsing, consensus and snapshot encodings use `u64_le`. Genesis validation requires `1 <= F <= 2^63`; thus `0 < f <= 1/2`. This is an arithmetic/liveness safety domain, not the selection of an operational value. It bounds the series argument, keeps the expected number of eligible validators appropriate for one-proposer BFT, and permits one fixed proof of cost/error. The selected `F` is immutable in this implementation and is copied into and state-root committed by every `ConsensusSnapshot`.
+`f` is encoded canonically as `F/2^64`. The Q768 arithmetic helper retains the audited mathematical domain `1 <= F <= 2^63`, but that domain does not define deployable consensus configuration. Initial mainnet admits exactly `F = 6917529027641081856`, so `f = 3/8`. Genesis TOML records that exact value as a quoted canonical ASCII decimal string; consensus and snapshot encodings use `u64_le`. Genesis, snapshot construction/decoding, and persisted-state restoration reject every other value rather than rewriting or migrating it. The exact `F` is copied into and state-root committed by every `ConsensusSnapshot`.
 
 There is deliberately no governance operation, feature flag, or runtime override for `F`. A governance-controlled parameter-change mechanism is a tracked future design item, to be considered only after Topic 9 audits the governance commit-reveal subsystem; it must define advance publication and snapshot-epoch activation before implementation. Its absence here is intentional, not an implied permission to mutate `F` out of band.
 
@@ -313,7 +313,7 @@ A direct Python 3 reference prototype executing the exact operation schedule abo
 
 #### 5.2.5 Calibration methodology for `f`
 
-No value of `F` is selected here. Candidate values within `0 < f <= 1/2` must be simulated across every validator count from 1 to 200, observed and adversarial stake distributions, network-latency/loss traces, and Byzantine withholding up to but not including one-third stake.
+The Phase-7 calibration fixed mainnet at `f = 3/8` (`F = 6917529027641081856`) after sweeping the mathematical domain across validator counts, stake distributions, offline stake, and Byzantine withholding up to one-third stake. The following methodology remains the required basis for any future protocol-version proposal to change that value.
 
 For Byzantine fraction `beta`, the ideal probability that no honest stake is eligible in one round is `(1-f)^(1-beta)`, and for `r` independent rounds it is `(1-f)^((1-beta)r)`. Calibration must choose and publish targets for:
 
@@ -324,7 +324,9 @@ For Byzantine fraction `beta`, the ideal probability that no honest stake is eli
 - Byzantine withholding and targeted loss scenarios;
 - all partitions and mergers of identical aggregate stake, requiring ideal probabilities to agree and implementation/discretization differences to remain below the `2^-504` aggregate bound.
 
-Selection minimizes latency subject to the published bandwidth/contention ceiling and safety/liveness assumptions. It must not copy Cardano mainnet's coefficient: INDRA has different validator count, timeout, network, and economics. The simulation code, seeds, input distributions, raw results, and chosen `F` must be committed to the genesis record before validator keys and genesis state are finalized.
+Selection minimizes latency subject to the published bandwidth/contention ceiling and safety/liveness assumptions. It must not copy another network's coefficient: INDRA has different validator count, timeout, network, and economics. Mainnet configuration cannot select another value; any change requires a new protocol version plus a newly published analysis and redeployment/upgrade boundary.
+
+Publish/withhold grinding (L2-GR-01) remains an accepted, bounded residual at `f = 3/8`. The election seed is therefore consensus sortition entropy only and MUST NOT be exposed or reused as general-purpose application randomness.
 
 ### 5.3 Full-width priority and proposal timing
 
@@ -389,6 +391,31 @@ new choice; it removes the erroneous choice of replacing the entropy whenever
 the same value is re-enveloped. A proposer cannot substitute arbitrary entropy:
 the retained origin proof and stake-threshold result are reverified at every
 proposal trust boundary.
+
+#### 6.0.1 VRF-007 stable-value commitment addendum
+
+The stable value identity commits the complete immutable entropy record rather
+than relying on a verifier's ephemeral memory of the first proposal. Define:
+
+```text
+entropy_commitment =
+    SHA-256("INDRA-PROPOSAL-ENTROPY-COMMIT-v1" ||
+            canonical_encode(ProposalEntropyV1))
+```
+
+and include `entropy_commitment` as a fixed 32-byte input to the canonical
+`value_hash` preimage. Canonical encoding length-prefixes the bounded VRF output
+and proof and uses the protocol codec's unique little-endian representation for
+`origin_round`; the other fields are fixed width. Consequently every mutation
+of origin identity, origin round, output, or proof changes the stable value
+identity. Current-round proposer identity, round, VRF output, VRF proof, and
+priority remain excluded, so a legitimate later-round envelope for unchanged
+entropy retains the same stable value identity.
+
+Live proposal admission recomputes projected state, validator, and stable-value
+commitments before staging a proposal or permitting vote/lock mutation. This is
+required because a peer-supplied `value_hash` is only a claim until the complete
+value transition has been projected.
 
 This is a breaking header change in the existing batched redeploy wave:
 
@@ -492,7 +519,7 @@ BlockHeaderVNext {
     value_hash: Bytes32,
     base_fee: u64,
     proposer_round: u32,
-    polc_round: u32,
+    polc_round: Option<u32>, // None or Some(0..=1023), canonical 0/1 presence tag
     quorum_certificate: VariableBytes<MAX_QC_SIZE_BYTES>,
 
     proposer_id: Bytes32,
@@ -500,10 +527,16 @@ BlockHeaderVNext {
     election_seed: Bytes64,
     proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
     proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+    value_entropy: ProposalEntropyV1,
     sortition_claim: SortitionClaimV1, // PraosThreshold = 1
     proposer_priority: Bytes64,
 }
 ```
+
+Consensus rounds have one finite normative domain: `0 <= round < 1024`.
+Round 1023 is final; exhausting it without a commit is a deterministic fatal
+`RoundLimitExceeded` condition, never wraparound or reset at the same height.
+The explicit optional PoLC encoding has no sentinel or legacy decoder.
 
 Removed:
 
@@ -584,7 +617,7 @@ BitcoinPowEntropySourceV1 {
     announced_height: u64,          // u64_le
     header_codec: u8,               // 1 = Bitcoin80ByteHeader
     extraction_algorithm: u8,       // 1 = DoubleSha256
-    minimum_confirmations: u32,     // u32_le, must be >= 100
+    minimum_confirmations: u32,     // u32_le, must equal 100
     reorg_policy: u8,               // 1 = SameHeightRestartConfirmations
 }
 ```
@@ -598,7 +631,7 @@ external_entropy_source_id = SHA-256(
 )
 ```
 
-The signed genesis record separately retains the exact consensus-serialized 80-byte source header. Unknown enum values, display-reversed hashes, a confirmation depth below 100, or any noncanonical/trailing encoding are rejected.
+The signed genesis record separately retains the exact consensus-serialized 80-byte source header. Unknown enum values, display-reversed hashes, a declared confirmation depth other than exactly 100, or any noncanonical/trailing encoding are rejected.
 
 ```text
 election_seed[0] = SHA-512(
@@ -609,20 +642,26 @@ election_seed[0] = SHA-512(
 )
 ```
 
-Each variable field has one canonical genesis encoding specified by the source descriptor, so the concatenation is unambiguous. The concrete source and future height are operational genesis-time choices, not hardcoded constants. The public commitment must precede finalization of validator VRF keys; otherwise validators could grind keys after learning the seed. `election_seed[1] = election_seed[0]` exactly, with no additional derivation.
+Each variable field has one canonical genesis encoding specified by the source descriptor, so the concatenation is unambiguous. The concrete source and future height are operational ceremony choices, but become immutable in `GenesisPrecommitV1`. The precommit target must satisfy `target_height >= current_tip + MIN_GENESIS_PRECOMMIT_BLOCK_LEAD`, where the initial mainnet constant is 144 Bitcoin blocks. `election_seed[1] = election_seed[0]` exactly, with no additional derivation.
+
+Genesis uses a mandatory pre-target commit/open/freeze ceremony: (A) hidden validator commitments and the complete descriptor are aggregated and publicly witnessed; (B) every validator reveals before the target exists; (C) the tool verifies the exact complete opening and emits a fully opened, frozen authority artifact while two Bitcoin Core nodes still report `tip < target`; (D) that artifact and hash are externally witnessed; (E) only then may the exact committed Bitcoin target header appear; (F) the same-height active-chain header reaches 100 confirmations; and (G) final genesis is assembled without any further validator input. `GenesisValidatorCommitmentV1` binds validator ID, self-stake, complete hot and cold hybrid public keys, cold-key version/nonce, VRF public key, fixed VRF suite, activation epoch zero, and a 32-byte hiding nonce. `GenesisPrecommitV1` binds the chain ID, complete descriptor, block/snapshot/ceremony versions, fixed mainnet `F`, and the strictly sorted set of validator commitments. Canonical binary transcripts—not JSON or TOML—are hashed under `INDRA-GENESIS-VALIDATOR-COMMIT-v1` and `INDRA-GENESIS-PRECOMMIT-v1`; these grammars are unchanged by the authority-freeze correction.
+
+The precommit artifact contains commitments, not raw VRF or hybrid keys. Its hash and canonical bytes must be published through at least two independent public witness channels. Before the target, every revealed validator must open exactly one precommitted commitment, the opened set must equal the committed set, and the fully opened frozen-authority artifact must also be published through two independent witness channels. Local timestamps and recorded node tips are informational evidence, not proof of chronology; external witnessing supplies the temporal evidence. Finalization accepts the original precommit and frozen authority but no reveal arguments. Consequently no validator or coordinator decision capable of changing membership, identity, stake, hybrid keys, cold keys/version, VRF keys, suite, or activation/version material remains after the target is observed.
+
+An incomplete opening is detected before the target and invalidates that ceremony. Operators may not treat an unwitnessed/incomplete ceremony as a randomness trial, wait for its target, and then selectively publish or restart only after seeing whether the result was favorable. A valid ceremony exists only once the complete frozen authority artifact has been externally witnessed before its target.
 
 For a Bitcoin source, the extraction rule is normative:
 
-1. During genesis assembly, obtain the consensus-serialized 80-byte block header at the announced height from independently operated fully validating Bitcoin nodes.
+1. During genesis assembly, obtain the consensus-serialized 80-byte block header at the exact precommitted height from at least two independently operated fully validating Bitcoin nodes, which must agree.
 2. During genesis assembly, verify its proof of work, height, ancestry to the descriptor's Bitcoin genesis hash, most-work-chain membership, and required confirmation depth. These publicly checkable external-chain facts are an operational genesis gate, not an INDRA consensus-code proof.
 3. Set `external_entropy_value = SHA-256(SHA-256(header_bytes))` as the raw 32 digest bytes produced by SHA-256, not RPC/display-reversed hexadecimal.
 4. Set `external_entropy_source_id` to the canonical descriptor encoding, including the network/genesis hash and announced height; the header itself is retained in the signed genesis record.
 
 Protocol version 2 supports this `BitcoinPowHeaderV1` source scheme. Using Ethereum, drand, or another structurally different beacon requires a separately specified source-scheme enum value and extraction/finality verifier before the ceremony precommitment; operators cannot improvise an unversioned parser. The particular supported network and future height remain ceremony choices.
 
-The confirmation-depth floor is the source chain's protocol/economic stale-block horizon. For Bitcoin it is **at least 100 blocks**, matching Bitcoin's consensus coinbase-maturity interval, which exists to prevent spending rewards from blocks later made stale [Bitcoin developer guide](https://developer.bitcoin.org/devguide/block_chain.html). This is a protocol-grounded floor, not a claim of deterministic Bitcoin finality. Ceremony operators must perform and publish a cost analysis and may require a greater depth where the value of biasing INDRA sortition could exceed the cost of the corresponding source-chain reorganization.
+The declared confirmation depth is exactly **100 blocks**, matching Bitcoin's consensus coinbase-maturity interval [Bitcoin developer guide](https://developer.bitcoin.org/devguide/block_chain.html). Observed depth may exceed 100, but no manifest or CLI override can declare 99, 101, or another value. This is a protocol-grounded choice, not a claim of deterministic Bitcoin finality; changing it requires a protocol change and renewed analysis.
 
-There is no deadline fallback. If the announced height has not produced a block by the planned genesis time, genesis waits. The source, height, and extraction rule may not be changed after observing candidate entropy; changing them requires aborting the ceremony, publishing a new precommitment before its newly selected future event, and refinalizing validator VRF keys afterward.
+There is no deadline fallback. If the announced height has not produced a block by the planned genesis time, genesis waits. The source, height, extraction rule, confirmation depth, and reorg policy cannot change without invalidating the published precommitment. A replacement ceremony requires fresh hidden validator commitments and another target at least 144 blocks in the future.
 
 Before the required depth, a source-chain reorganization discards the displaced candidate, selects the block at the **same announced height** on the new canonical chain, and restarts the confirmation count. A reorganization detected after the depth but before INDRA genesis launch aborts finalization and applies the same rule. Once INDRA genesis has launched, its signed genesis entropy is immutable; a later source-chain reorganization is recorded as a ceremony incident but cannot rewrite INDRA genesis.
 
@@ -644,10 +683,14 @@ Persisting one ML-DSA-87 signature per block creates material storage growth. Im
 MAX_STANDARD_VRF_OUTPUT_BYTES = 64
 MAX_STANDARD_VRF_PROOF_BYTES  = 80
 VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 = 1
-BlockHeader protocol version: 1 -> 2
+BlockHeader protocol version: 2 -> 3
 ```
 
-The old value is the repository's current `BLOCK_FORMAT_VERSION: u16 = 1`; the new value is exactly one greater. This is a wire break, not a compatibility discriminator: after clean redeploy only version 2 is decoded.
+VRF-007 changes stable-value consensus semantics without adding a header field,
+so the block protocol version increments from 2 to 3. This is a wire and
+consensus break, not a compatibility discriminator: after clean redeploy only
+version 4 is decoded. There is no fallback for the version-3 PoLC sentinel or
+earlier value-hash formats.
 
 ## 8. Invariants and required verification tests
 
@@ -683,7 +726,7 @@ Implementation is not complete until all of the following are permanent tests:
 | Targeted DoS after eligibility reveal | Residual | Proof is revealed with proposal, minimizing but not eliminating the attack window. |
 | Multiple eligible proposers | Intentional | Deterministic full-width priority plus BFT voting resolves competition. |
 | No eligible proposer | Probabilistic | Existing propose timeout advances the round without changing the seed; ideal probability is `1-f`, with `F` selected by the published calibration. |
-| Sortition arithmetic/model | Resolved construction; operational coefficient pending simulation | Praos threshold uses certified downward-rounded Q768 intervals; the selected `F` must be justified by the Section 5.2.5 simulation record. |
+| Sortition arithmetic/model | Resolved; mainnet `f=3/8` | Praos threshold uses certified downward-rounded Q768 intervals. Mainnet accepts only `F=6917529027641081856`; changing it requires a protocol version and renewed analysis. |
 | Genesis/key-registration grinding | Bounded operationally and in consensus | Precommitted future external entropy plus snapshot-delayed, proof-of-possession-bound VRF-key activation; external-source producer/reorg risk remains. |
 | Election seed used as application randomness | Forbidden | Consensus entropy retains a proposer publish/withhold bit and is not a general randomness beacon. |
 

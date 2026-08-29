@@ -138,11 +138,12 @@ impl StoredKeyMaterial {
                 public,
                 classical_seed,
                 ml_dsa_seed,
-                ..
+                vrf_seed,
             } => Ok(SigningMaterial::Hot {
                 public: *public,
                 classical_seed: *classical_seed,
                 ml_dsa_seed: *ml_dsa_seed,
+                vrf_seed: *vrf_seed,
             }),
             Self::Cold { .. } => Err(IndraError::WrongKeyRole),
         }
@@ -193,6 +194,7 @@ pub(crate) enum SigningMaterial {
         public: IndraPublicKeyInfo,
         classical_seed: [u8; CLASSICAL_SK_BYTES],
         ml_dsa_seed: [u8; PQ_SK_BYTES],
+        vrf_seed: [u8; BYTES32_LEN],
     },
     Cold {
         classical_seed: [u8; CLASSICAL_SK_BYTES],
@@ -206,6 +208,7 @@ impl SigningMaterial {
             public,
             classical_seed,
             ml_dsa_seed,
+            ..
         } = self
         else {
             return Err(IndraError::WrongKeyRole);
@@ -236,6 +239,13 @@ impl SigningMaterial {
         }
     }
 
+    pub(crate) fn vrf_keypair(&self) -> Result<indra_crypto::VrfKeypair, IndraError> {
+        match self {
+            Self::Hot { vrf_seed, .. } => Ok(indra_crypto::VrfKeypair::from_seed(vrf_seed)),
+            Self::Cold { .. } => Err(IndraError::WrongKeyRole),
+        }
+    }
+
     pub(crate) fn classical_seed(&self) -> [u8; CLASSICAL_SK_BYTES] {
         match self {
             Self::Hot { classical_seed, .. } => *classical_seed,
@@ -257,10 +267,12 @@ impl Drop for SigningMaterial {
             Self::Hot {
                 classical_seed,
                 ml_dsa_seed,
+                vrf_seed,
                 ..
             } => {
                 classical_seed.zeroize();
                 ml_dsa_seed.zeroize();
+                vrf_seed.zeroize();
             }
             Self::Cold {
                 classical_seed,

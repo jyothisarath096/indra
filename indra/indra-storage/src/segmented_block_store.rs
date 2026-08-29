@@ -524,7 +524,7 @@ mod tests {
     use super::*;
     use indra_core::{
         types::{
-            block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+            block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
             primitives::{Bytes64, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES},
         },
         ProtocolVersion, VariableBytes,
@@ -551,7 +551,7 @@ mod tests {
                     value_hash: indra_core::Bytes32::ZERO,
                     base_fee: 1,
                     proposer_round: 0,
-                    polc_round: NO_POLC_ROUND,
+                    polc_round: None,
                     proposer_id: indra_core::Bytes32::from([0x77; 32]),
                     vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                     election_seed: Bytes64([0x78; 64]),

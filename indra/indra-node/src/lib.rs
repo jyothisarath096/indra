@@ -46,6 +46,8 @@ pub mod rpc_snapshot;
 pub mod slash;
 pub mod state_root;
 pub mod sync;
+#[cfg(feature = "audit-harness")]
+pub mod audit_harness;
 
 pub use config::NodeConfig;
 pub use config_file::{KeysData, NodeConfigFile};

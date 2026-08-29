@@ -12,7 +12,9 @@ use indra_core::{
     codec::Encode,
     types::{
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
-        primitives::{Bytes32, ProtocolVersion, VariableBytes, TRANSACTION_PROTOCOL_VERSION},
+        primitives::{
+            Bytes32, Bytes64, ProtocolVersion, VariableBytes, TRANSACTION_PROTOCOL_VERSION,
+        },
         stake_position::PositionCustodyV1,
         staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
         transaction::{InputV1, OutputV1, TransactionV1},
@@ -20,7 +22,7 @@ use indra_core::{
 };
 use indra_crypto::{
     hybrid::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair},
-    sha256, PaymentAddressV1,
+    sha256, PaymentAddressV1, VrfKeypair,
 };
 use zeroize::Zeroize;
 
@@ -338,10 +340,20 @@ pub fn build_register_validator_op_with_cold(
     deposit_utxo_id: Bytes32,
     keypair: &HybridKeypair,
     cold_keypair: &ColdHybridKeypair,
-    vrf_pk: [u8; 32],
+    vrf_keypair: &VrfKeypair,
     nonce: u64,
     chain_id: &str,
 ) -> CliResult<BuiltStakingOp> {
+    let validator_pubkey = hybrid_pubkey_from_keypair(keypair)?;
+    let vrf_pk = vrf_keypair.public_key();
+    let challenge = StakingOp::vrf_possession_challenge(
+        chain_id,
+        &validator_pubkey.identity_id(),
+        &Bytes32::from(vrf_pk),
+        0,
+    )
+    .map_err(|error| CliError::Transaction(error.to_string()))?;
+    let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(vrf_keypair, &challenge);
     let cold_public = cold_keypair.public_key();
     let cold_public = cold_public.as_complete_hybrid();
     let cold_pubkey = ColdHybridPubKey {
@@ -353,8 +365,11 @@ pub fn build_register_validator_op_with_cold(
         body: StakingOpBody::RegisterValidator {
             commission_bps,
             deposit_utxo_id,
-            validator_pubkey: hybrid_pubkey_from_keypair(keypair)?,
+            validator_pubkey,
             vrf_pk,
+            vrf_possession_output: Bytes64(vrf_output.0),
+            vrf_possession_proof: VariableBytes::from_slice(&vrf_proof.0)
+                .map_err(|_| CliError::Transaction("VRF possession proof too large".into()))?,
             cold_pubkey,
             cold_signature: dummy_signature()?,
         },
@@ -865,7 +880,7 @@ mod tests {
             deposit_utxo_id,
             &keypair,
             &test_cold_keypair(0x91),
-            [0xAA; 32],
+            &VrfKeypair::from_seed(&[0xAA; 32]),
             9,
             DEFAULT_CHAIN_ID,
         )
@@ -879,7 +894,8 @@ mod tests {
                 deposit_utxo_id: id,
                 vrf_pk,
                 ..
-            } if id == deposit_utxo_id && vrf_pk == [0xAA; 32]
+            } if id == deposit_utxo_id
+                && vrf_pk == VrfKeypair::from_seed(&[0xAA; 32]).public_key()
         ));
     }
 
@@ -1076,7 +1092,7 @@ mod tests {
                 deposit_utxo_id,
                 &keypair,
                 &test_cold_keypair(0x92),
-                [0x11; 32],
+                &VrfKeypair::from_seed(&[0x11; 32]),
                 42,
                 DEFAULT_CHAIN_ID,
             )
@@ -1144,7 +1160,7 @@ mod tests {
                 deposit_utxo_id,
                 &keypair,
                 &test_cold_keypair(0x93),
-                [0x12; 32],
+                &VrfKeypair::from_seed(&[0x12; 32]),
                 1,
                 DEFAULT_CHAIN_ID,
             )

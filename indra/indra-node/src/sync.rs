@@ -493,6 +493,27 @@ impl SyncState {
         self.provisional.as_ref()
     }
 
+    /// Validate the authenticated source binding for the outstanding
+    /// provisional-QC request before any QC decoding or cryptographic work.
+    pub fn accept_provisional_qc_response(
+        &self,
+        validator_id: Bytes32,
+        peer: SocketAddr,
+        height: u64,
+    ) -> Result<(), &'static str> {
+        let provisional = self
+            .provisional
+            .as_ref()
+            .ok_or("no provisional QC request")?;
+        if provisional.source_validator_id != validator_id || provisional.source != peer {
+            return Err("response source does not match provisional QC requester");
+        }
+        if provisional.block.block.header.height != height {
+            return Err("response height does not match provisional QC request");
+        }
+        Ok(())
+    }
+
     /// Consume the staged block once its own QC has been verified.
     pub fn take_provisional(&mut self) -> Option<ProvisionalSyncBlock> {
         self.provisional.take()
@@ -1126,12 +1147,8 @@ pub(crate) fn project_and_verify_block_state_root(
         });
     }
 
-    // Skip value_hash verification for legacy blocks produced before the
-    // value_hash feature was introduced. These blocks store Bytes32::ZERO.
     let actual_value_hash = block.compute_value_hash(projected.total_supply);
-    if block.header.value_hash != indra_core::Bytes32::ZERO
-        && actual_value_hash != block.header.value_hash
-    {
+    if actual_value_hash != block.header.value_hash {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
             reason: format!(
@@ -1307,6 +1324,7 @@ mod tests {
             election_seed: state.election_seed,
             snapshot_root: snapshot.snapshot_root,
             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
+            sortition_log: snapshot.sortition_log_interval().unwrap(),
             height,
             round,
             candidates: snapshot
@@ -1335,7 +1353,7 @@ mod tests {
         prev_qc_bytes: Vec<u8>,
     ) -> indra_core::types::block::BlockProposalVNext {
         let proposer = VrfKeypair::from_seed(&[proposer_seed; 32]);
-        let election = (round..round.saturating_add(4_096))
+        let election = (round..indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT)
             .find_map(|candidate_round| {
                 let election = build_election(state, state.height + 1, candidate_round);
                 let candidate = election
@@ -1388,6 +1406,7 @@ mod tests {
         hybrid: &HybridKeypair,
         pq_pk: Vec<u8>,
         stake: u64,
+        snapshot_root: Bytes32,
     ) -> Vec<u8> {
         let vote = produce_vote(
             height,
@@ -1395,6 +1414,7 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            snapshot_root,
             DEFAULT_CHAIN_ID,
             hybrid,
         )
@@ -1404,6 +1424,7 @@ mod tests {
             round,
             value_hash,
             DEFAULT_CHAIN_ID,
+            snapshot_root,
             &[QcValidator {
                 validator_id,
                 position: 0,
@@ -1437,6 +1458,7 @@ mod tests {
                     VoteStep::Precommit,
                     block_hash,
                     validator_id,
+                    snapshot.snapshot_root,
                     DEFAULT_CHAIN_ID,
                     signer,
                 )
@@ -1448,6 +1470,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            snapshot.snapshot_root,
             &validators,
             votes.iter().collect(),
         )
@@ -1684,6 +1707,10 @@ mod tests {
                 &hybrid,
                 hybrid.public_key().pq.0.to_vec(),
                 10_000,
+                actual_state
+                    .snapshot_for_consensus_height(block.header.height)
+                    .unwrap()
+                    .snapshot_root,
             );
         }
     }
@@ -1727,6 +1754,10 @@ mod tests {
                 &hybrid,
                 hybrid.public_key().pq.0.to_vec(),
                 10_000,
+                state
+                    .snapshot_for_consensus_height(block.header.height)
+                    .unwrap()
+                    .snapshot_root,
             );
         }
     }
@@ -1746,6 +1777,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(state.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut mempool = Mempool::default_config();
         let timestamp_secs = 1_999_999_999;
@@ -1993,6 +2028,10 @@ mod tests {
                 &hybrid,
                 pq_pk.clone(),
                 10_000,
+                state
+                    .snapshot_for_consensus_height(block.header.height)
+                    .unwrap()
+                    .snapshot_root,
             );
             assert_eq!(state.height, i);
         }
@@ -2233,6 +2272,41 @@ mod tests {
     }
 
     #[test]
+    fn provisional_qc_response_requires_selected_peer_and_height() {
+        let peer: SocketAddr = "127.0.0.1:30109".parse().unwrap();
+        let wrong_peer: SocketAddr = "127.0.0.1:30110".parse().unwrap();
+        let id = Bytes32::from([0xA9; 32]);
+        let wrong_id = Bytes32::from([0xAA; 32]);
+        let now = Instant::now();
+        let state = crate::genesis::canonical_test_genesis();
+        let block = make_block(&state);
+        let height = block.header.height;
+        let prepared = PreparedSyncBlock {
+            block_hash: block.header.block_hash(),
+            pre_height: state.height,
+            pre_tip_hash: state.tip_hash,
+            state,
+            epoch_record: None,
+            effects: CanonicalStateEffects::default(),
+        };
+        let mut sync = SyncState::follower(0);
+        sync.stage_provisional(block, prepared, id, peer, now);
+        assert!(sync
+            .accept_provisional_qc_response(wrong_id, wrong_peer, height)
+            .is_err());
+        assert!(sync
+            .accept_provisional_qc_response(id, peer, height + 1)
+            .is_err());
+        assert!(sync
+            .accept_provisional_qc_response(id, peer, height)
+            .is_ok());
+        sync.clear_provisional();
+        assert!(sync
+            .accept_provisional_qc_response(id, peer, height)
+            .is_err());
+    }
+
+    #[test]
     fn disconnect_clears_selected_peer_and_outstanding_request() {
         let peer: SocketAddr = "127.0.0.1:30107".parse().unwrap();
         let id = Bytes32::from([0xA7; 32]);
@@ -2307,6 +2381,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(real.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut after_real = state.clone();
         apply_verified_test(&mut after_real, &real, 0).unwrap();
@@ -2337,6 +2415,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         *qc.last_mut().unwrap() ^= 0x01;
         let mut after_block = state.clone();
@@ -2349,6 +2431,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut carrier = make_strict_block(&after_block, 0xB2, 0, valid_qc);
         replace_qc_and_reauthorize(&mut carrier, qc, 0xB2, after_block.chain_id.as_bytes());
@@ -2391,6 +2477,11 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             stake,
+            source
+                .state
+                .snapshot_for_consensus_height(1)
+                .unwrap()
+                .snapshot_root,
         );
         let mut block2 = make_strict_block(&source.state, 0x42, 0, qc1);
         authorize_test_proposal(
@@ -2408,6 +2499,11 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             stake,
+            source
+                .state
+                .snapshot_for_consensus_height(2)
+                .unwrap()
+                .snapshot_root,
         );
         indra_storage::save_last_qc(&source.config.state_dir(), &qc2).unwrap();
         let genesis_path = source_dir.join("genesis.toml");
@@ -2455,6 +2551,10 @@ mod tests {
                 &hybrid,
                 hybrid.public_key().pq.0.to_vec(),
                 10_000,
+                builder
+                    .snapshot_for_consensus_height(block.header.height)
+                    .unwrap()
+                    .snapshot_root,
             );
             apply_verified_test(&mut builder, &block, 0).unwrap();
             blocks.push(block);
@@ -2667,6 +2767,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut block2 = make_strict_block(&state, 0x12, 0, valid_qc);
         replace_qc_and_reauthorize(&mut block2, vec![], 0x12, state.chain_id.as_bytes());
@@ -2695,6 +2799,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let valid_qc = build_qc_bytes(
             block1.header.height,
@@ -2704,6 +2812,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut block2 = make_strict_block(&state, 0x14, 0, valid_qc);
         replace_qc_and_reauthorize(&mut block2, wrong_qc_bytes, 0x14, state.chain_id.as_bytes());
@@ -2738,6 +2850,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let valid_qc = build_qc_bytes(
             block1.header.height,
@@ -2747,6 +2863,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut block2 = make_strict_block(&state, 0x15, 0, valid_qc);
         replace_qc_and_reauthorize(
@@ -2784,6 +2904,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let block2 = make_strict_block(&state, 0x16, 0, qc_bytes);
 
@@ -2803,6 +2927,10 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let mut qc_bytes = valid_qc.clone();
         qc_bytes.push(0xA5);
@@ -2843,6 +2971,7 @@ mod tests {
             &hybrid,
             hybrid.public_key().pq.0.to_vec(),
             10_000,
+            snapshot.snapshot_root,
         ))
         .unwrap();
         qc.classical_signatures[0].classical_sig = VariableBytes::from_slice(&[0xEE; 64]).unwrap();
@@ -2931,6 +3060,7 @@ mod tests {
             0,
             VoteStep::Precommit,
             DEFAULT_CHAIN_ID.to_string(),
+            snapshot.snapshot_root,
             voters,
         );
         let a_vote = produce_vote(
@@ -2939,6 +3069,7 @@ mod tests {
             VoteStep::Precommit,
             block_h_hash,
             a_id,
+            snapshot.snapshot_root,
             DEFAULT_CHAIN_ID,
             &a,
         )
@@ -2953,6 +3084,7 @@ mod tests {
             VoteStep::Precommit,
             block_h_hash,
             b_id,
+            snapshot.snapshot_root,
             DEFAULT_CHAIN_ID,
             &b,
         )
@@ -2970,6 +3102,7 @@ mod tests {
             0,
             block_h_hash,
             DEFAULT_CHAIN_ID,
+            snapshot.snapshot_root,
             &crate::engine::NodeEngine::qc_validators_for_height(u64::MAX, &snapshot),
             vec![&a_vote, &b_vote],
         )
@@ -3085,6 +3218,10 @@ mod tests {
             &hybrid,
             pq_pk,
             10_000,
+            state
+                .snapshot_for_consensus_height(block1.header.height)
+                .unwrap()
+                .snapshot_root,
         );
         let block2 = make_strict_block(&state, 0x31, 0, qc_bytes);
 

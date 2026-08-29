@@ -7,7 +7,7 @@
 //!   cargo test -p indra-state --test audit_phase2 -- --ignored
 
 use indra_core::types::{
-    block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
+    block::{BlockHeaderVNext, BlockVNext},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
         Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -37,7 +37,8 @@ fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
 
 fn finalized_genesis() -> ChainState {
     let mut state = ChainState::new_genesis();
-    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.active_slot_coefficient_numerator =
+        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     let seed = [0xF0; 32];
     let (public, _) = keypair(seed);
     let validator_id = public.identity_id();
@@ -189,7 +190,7 @@ fn block_with_transactions(state: &ChainState, transactions: Vec<TransactionV1>)
             value_hash: Bytes32::ZERO,
             base_fee: state.base_fee,
             proposer_round: 0,
-            polc_round: NO_POLC_ROUND,
+            polc_round: None,
             proposer_id: Bytes32::from([0x81; 32]),
             vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: state.election_seed,

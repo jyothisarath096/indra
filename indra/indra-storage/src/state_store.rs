@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(StateStore::cleanup_failure_count(), before + 1);
     }
     use indra_core::{
-        types::block::{BlockHeaderVNext, BlockVNext, NO_POLC_ROUND},
+        types::block::{BlockHeaderVNext, BlockVNext},
         types::primitives::DUST_LIMIT_SPARK,
         Bytes32, ProtocolVersion, VariableBytes,
     };
@@ -603,7 +603,8 @@ mod tests {
 
     fn finalized_test_state() -> ChainState {
         let mut state = ChainState::new_genesis();
-        state.active_slot_coefficient_numerator = 1u64 << 63;
+        state.active_slot_coefficient_numerator =
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state.validators.upsert(test_validator()).unwrap();
         state.finalize_genesis().unwrap();
         state
@@ -815,6 +816,7 @@ mod tests {
                 indra_core::types::vote::VoteStep::Precommit,
                 &state.tip_hash,
                 &entry.validator_id,
+                &snapshot.snapshot_root,
                 &state.chain_id,
             );
             let signature = keypair.sign(&bytes).unwrap();
@@ -822,6 +824,7 @@ mod tests {
                 height: state.height,
                 round: 0,
                 block_hash: state.tip_hash,
+                snapshot_root: snapshot.snapshot_root,
                 signer_bitfield: {
                     let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
                     bits[0] = 1;
@@ -850,7 +853,7 @@ mod tests {
                 value_hash: Bytes32::ZERO,
                 base_fee: state.base_fee,
                 proposer_round: 0,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::from([0x84; 32]),
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: state.election_seed,

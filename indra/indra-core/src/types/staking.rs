@@ -146,6 +146,10 @@ pub enum StakingOpBody {
         validator_pubkey: HybridPubKey,
         /// Validator's VRF public key for proposer election.
         vrf_pk: [u8; 32],
+        /// RFC 9381 output proving possession of the submitted VRF secret key.
+        vrf_possession_output: Bytes64,
+        /// RFC 9381 proof over the canonical registration possession challenge.
+        vrf_possession_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
         /// Proposed independent cold hybrid public key.
         cold_pubkey: ColdHybridPubKey,
         /// Complete cold hybrid signature over the dual authorization message.
@@ -364,6 +368,8 @@ impl StakingOp {
             deposit_utxo_id,
             validator_pubkey,
             vrf_pk,
+            vrf_possession_output,
+            vrf_possession_proof,
             cold_pubkey,
             ..
         } = &self.body
@@ -377,6 +383,8 @@ impl StakingOp {
         deposit_utxo_id.encode(&mut payload);
         validator_pubkey.encode(&mut payload);
         payload.extend_from_slice(vrf_pk);
+        vrf_possession_output.encode(&mut payload);
+        vrf_possession_proof.encode(&mut payload);
         cold_pubkey.encode(&mut payload);
         1u64.encode(&mut payload);
 
@@ -643,6 +651,8 @@ impl Encode for StakingOpBody {
                 deposit_utxo_id,
                 validator_pubkey,
                 vrf_pk,
+                vrf_possession_output,
+                vrf_possession_proof,
                 cold_pubkey,
                 cold_signature,
             } => {
@@ -651,6 +661,8 @@ impl Encode for StakingOpBody {
                 deposit_utxo_id.encode(buf);
                 validator_pubkey.encode(buf);
                 buf.extend_from_slice(vrf_pk);
+                vrf_possession_output.encode(buf);
+                vrf_possession_proof.encode(buf);
                 cold_pubkey.encode(buf);
                 cold_signature.encode(buf);
             }
@@ -760,6 +772,8 @@ impl Encode for StakingOpBody {
             }
             StakingOpBody::RegisterValidator {
                 validator_pubkey,
+                vrf_possession_output,
+                vrf_possession_proof,
                 cold_pubkey,
                 cold_signature,
                 ..
@@ -767,6 +781,8 @@ impl Encode for StakingOpBody {
                 4 + 32
                     + validator_pubkey.encoded_len()
                     + 32
+                    + vrf_possession_output.encoded_len()
+                    + vrf_possession_proof.encoded_len()
                     + cold_pubkey.encoded_len()
                     + cold_signature.encoded_len()
             }
@@ -844,6 +860,8 @@ impl Decode for StakingOpBody {
                 let deposit_utxo_id = Bytes32::decode(r)?;
                 let validator_pubkey = HybridPubKey::decode(r)?;
                 let vrf_pk = r.read_bytes32()?;
+                let vrf_possession_output = Bytes64::decode(r)?;
+                let vrf_possession_proof = VariableBytes::decode(r)?;
                 let cold_pubkey = ColdHybridPubKey::decode(r)?;
                 let cold_signature = HybridSignature::decode(r)?;
                 Ok(StakingOpBody::RegisterValidator {
@@ -851,6 +869,8 @@ impl Decode for StakingOpBody {
                     deposit_utxo_id,
                     validator_pubkey,
                     vrf_pk,
+                    vrf_possession_output,
+                    vrf_possession_proof,
                     cold_pubkey,
                     cold_signature,
                 })
@@ -1073,6 +1093,8 @@ mod tests {
                 deposit_utxo_id: Bytes32::from([0x44; 32]),
                 validator_pubkey: dummy_pubkey(),
                 vrf_pk: [4u8; 32],
+                vrf_possession_output: Bytes64([5u8; 64]),
+                vrf_possession_proof: VariableBytes::from_slice(&[6u8; 80]).unwrap(),
                 cold_pubkey: dummy_cold_pubkey(),
                 cold_signature: dummy_signature(),
             }),
@@ -1105,6 +1127,34 @@ mod tests {
             let encoded = op.encode_to_vec();
             assert_eq!(StakingOp::decode_exact(&encoded).unwrap(), op);
         }
+    }
+
+    #[test]
+    fn register_validator_round_trip_preserves_vrf_possession_fields() {
+        let expected_output = Bytes64([0xA5; 64]);
+        let expected_proof = VariableBytes::from_slice(&[0x5A; 80]).unwrap();
+        let body = StakingOpBody::RegisterValidator {
+            commission_bps: 1_000,
+            deposit_utxo_id: Bytes32::from([0x44; 32]),
+            validator_pubkey: dummy_pubkey(),
+            vrf_pk: [0x33; 32],
+            vrf_possession_output: expected_output,
+            vrf_possession_proof: expected_proof.clone(),
+            cold_pubkey: dummy_cold_pubkey(),
+            cold_signature: dummy_signature(),
+        };
+
+        let decoded = StakingOpBody::decode_exact(&body.encode_to_vec()).unwrap();
+        let StakingOpBody::RegisterValidator {
+            vrf_possession_output,
+            vrf_possession_proof,
+            ..
+        } = decoded
+        else {
+            panic!("decoded wrong staking operation variant");
+        };
+        assert_eq!(vrf_possession_output, expected_output);
+        assert_eq!(vrf_possession_proof, expected_proof);
     }
 
     #[test]
@@ -1212,6 +1262,8 @@ mod tests {
             deposit_utxo_id: Bytes32::from([0x99; 32]),
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [9u8; 32],
+            vrf_possession_output: Bytes64([10u8; 64]),
+            vrf_possession_proof: VariableBytes::from_slice(&[11u8; 80]).unwrap(),
             cold_pubkey: dummy_cold_pubkey(),
             cold_signature: dummy_signature(),
         });
@@ -1290,6 +1342,8 @@ mod tests {
             deposit_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
+            vrf_possession_output: Bytes64([0u8; 64]),
+            vrf_possession_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
             cold_pubkey: dummy_cold_pubkey(),
             cold_signature: dummy_signature(),
         });
@@ -1310,6 +1364,8 @@ mod tests {
             deposit_utxo_id: Bytes32::ZERO,
             validator_pubkey: dummy_pubkey(),
             vrf_pk: [0u8; 32],
+            vrf_possession_output: Bytes64([0u8; 64]),
+            vrf_possession_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
             cold_pubkey: dummy_cold_pubkey(),
             cold_signature: dummy_signature(),
         });

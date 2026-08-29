@@ -510,7 +510,10 @@ dependencies = [
 name = "indra-fuzz"
 version = "0.0.0"
 dependencies = [
+ "curve25519-dalek 5.0.0",
+ "hex",
  "indra-core",
+ "indra-crypto",
  "indra-network",
  "indra-rpc",
  "indra-state",

@@ -11,10 +11,13 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1.0"
+hex = "0.4"
 indra-core = { path = "../indra-core" }
 indra-network = { path = "../indra-network" }
 indra-rpc = { path = "../indra-rpc" }
 indra-state = { path = "../indra-state" }
+indra-crypto = { path = "../indra-crypto" }
+curve25519-dalek-v5 = { package = "curve25519-dalek", version = "5.0", default-features = false, features = ["alloc"] }
 
 [[bin]]
 name = "transaction_deserialization"
@@ -40,6 +43,41 @@ bench = false
 [[bin]]
 name = "p2p_gossip_parsing"
 path = "fuzz_targets/p2p_gossip_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrf_verify_arbitrary"
+path = "fuzz_targets/vrf_verify_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrf_valid_proof_mutation"
+path = "fuzz_targets/vrf_valid_proof_mutation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrf_public_key_validation"
+path = "fuzz_targets/vrf_public_key_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrf_prove_verify_roundtrip"
+path = "fuzz_targets/vrf_prove_verify_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrf_proof_framing"
+path = "fuzz_targets/vrf_proof_framing.rs"
 test = false
 doc = false
 bench = false

@@ -81,9 +81,6 @@ impl Decode for SortitionClaimV1 {
     }
 }
 
-/// Sentinel value meaning a proposal did not carry a prior PoLC round.
-pub const NO_POLC_ROUND: u32 = u32::MAX;
-
 /// Immutable, independently-verifiable entropy carried by one consensus value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalEntropyV1 {
@@ -98,6 +95,17 @@ pub struct ProposalEntropyV1 {
 }
 
 impl ProposalEntropyV1 {
+    /// Canonical commitment used by the round-stable consensus value identity.
+    ///
+    /// The versioned domain is deliberately distinct from the seed-evolution
+    /// transcript. The canonical codec makes every component unambiguous,
+    /// including the bounded VRF output and proof lengths.
+    pub fn commitment(&self) -> Bytes32 {
+        let mut material = b"INDRA-PROPOSAL-ENTROPY-COMMIT-v1".to_vec();
+        self.encode(&mut material);
+        Bytes32::from(sha256(&material))
+    }
+
     /// Empty form used only by the height-zero genesis anchor.
     pub fn genesis() -> Self {
         Self {
@@ -123,9 +131,11 @@ impl Encode for ProposalEntropyV1 {
 
 impl Decode for ProposalEntropyV1 {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+        let origin_proposer_id = Bytes32::decode(r)?;
+        let origin_round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
         Ok(Self {
-            origin_proposer_id: Bytes32::decode(r)?,
-            origin_round: u32::decode(r)?,
+            origin_proposer_id,
+            origin_round,
             vrf_output: VariableBytes::decode(r)?,
             vrf_proof: VariableBytes::decode(r)?,
         })
@@ -166,8 +176,8 @@ pub struct BlockHeaderVNext {
     pub proposer_round: u32,
     /// Round whose prevote quorum justified re-proposing this value.
     ///
-    /// `NO_POLC_ROUND` means no prior PoLC was attached.
-    pub polc_round: u32,
+    /// `None` means no prior PoLC was attached; `Some(r)` is a legal PoLC round.
+    pub polc_round: Option<u32>,
     /// Quorum certificate for the PREVIOUS block (proving it was finalised).
     pub quorum_certificate: VariableBytes<MAX_QC_SIZE_BYTES>,
     /// Snapshot identity of the proposer.
@@ -202,16 +212,18 @@ impl BlockHeaderVNext {
         state_root: Bytes32,
         validator_set_root: Bytes32,
         mempool_set_root: Bytes32,
+        value_entropy: &ProposalEntropyV1,
         base_fee: u64,
         total_supply: u64,
     ) -> Bytes32 {
-        let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 8 + 8);
+        let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 8);
         height.encode(&mut buf);
         prev_hash.encode(&mut buf);
         timestamp.encode(&mut buf);
         state_root.encode(&mut buf);
         validator_set_root.encode(&mut buf);
         mempool_set_root.encode(&mut buf);
+        value_entropy.commitment().encode(&mut buf);
         base_fee.encode(&mut buf);
         total_supply.encode(&mut buf);
         Bytes32::from(sha256(&buf))
@@ -230,7 +242,13 @@ impl Encode for BlockHeaderVNext {
         self.base_fee.encode(buf);
         self.proposer_round.encode(buf);
         self.quorum_certificate.encode(buf);
-        self.polc_round.encode(buf);
+        match self.polc_round {
+            None => 0u8.encode(buf),
+            Some(round) => {
+                1u8.encode(buf);
+                round.encode(buf);
+            }
+        }
         self.value_hash.encode(buf);
         self.proposer_id.encode(buf);
         self.vrf_suite.encode(buf);
@@ -250,7 +268,8 @@ impl Encode for BlockHeaderVNext {
             + 32
             + 32
             + 8
-            + 4
+            + 1
+            + usize::from(self.polc_round.is_some()) * 4
             + 4
             + self.quorum_certificate.encoded_len()
             + 32
@@ -272,18 +291,34 @@ impl Decode for BlockHeaderVNext {
                 version: protocol_version.0,
             });
         }
+        let height = u64::decode(r)?;
+        let prev_hash = Bytes32::decode(r)?;
+        let timestamp = u64::decode(r)?;
+        let state_root = Bytes32::decode(r)?;
+        let validator_set_root = Bytes32::decode(r)?;
+        let mempool_set_root = Bytes32::decode(r)?;
+        let base_fee = u64::decode(r)?;
+        let proposer_round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
+        let quorum_certificate = VariableBytes::decode(r)?;
+        let polc_round = match u8::decode(r)? {
+            0 => None,
+            1 => Some(crate::types::primitives::validate_consensus_round(
+                u32::decode(r)?,
+            )?),
+            byte => return Err(crate::error::IndraError::InvalidBool { byte }),
+        };
         let header = Self {
             protocol_version,
-            height: u64::decode(r)?,
-            prev_hash: Bytes32::decode(r)?,
-            timestamp: u64::decode(r)?,
-            state_root: Bytes32::decode(r)?,
-            validator_set_root: Bytes32::decode(r)?,
-            mempool_set_root: Bytes32::decode(r)?,
-            base_fee: u64::decode(r)?,
-            proposer_round: u32::decode(r)?,
-            quorum_certificate: VariableBytes::decode(r)?,
-            polc_round: u32::decode(r)?,
+            height,
+            prev_hash,
+            timestamp,
+            state_root,
+            validator_set_root,
+            mempool_set_root,
+            base_fee,
+            proposer_round,
+            quorum_certificate,
+            polc_round,
             value_hash: Bytes32::decode(r)?,
             proposer_id: Bytes32::decode(r)?,
             vrf_suite: VrfSuiteV1::decode(r)?,
@@ -369,6 +404,13 @@ pub struct BlockProposalVNext {
 impl BlockProposalVNext {
     /// Exact full-block authorization transcript.
     pub fn signing_bytes(&self, chain_id: &[u8]) -> IndraResult<Vec<u8>> {
+        crate::types::primitives::validate_consensus_round(self.block.header.proposer_round)?;
+        crate::types::primitives::validate_consensus_round(
+            self.block.header.value_entropy.origin_round,
+        )?;
+        if let Some(round) = self.block.header.polc_round {
+            crate::types::primitives::validate_consensus_round(round)?;
+        }
         let n = u16::try_from(chain_id.len()).map_err(|_| {
             crate::error::IndraError::LengthExceeded {
                 field: "chain_id",
@@ -429,6 +471,7 @@ impl BlockVNext {
             self.header.state_root,
             self.header.validator_set_root,
             self.header.mempool_set_root,
+            &self.header.value_entropy,
             self.header.base_fee,
             total_supply,
         )
@@ -451,7 +494,7 @@ mod tests {
             value_hash: Bytes32::from([0x34u8; 32]),
             base_fee: 100,
             proposer_round: 0,
-            polc_round: NO_POLC_ROUND,
+            polc_round: None,
             proposer_id: Bytes32::from([0x43u8; 32]),
             vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: Bytes64([0x42; 64]),
@@ -515,13 +558,14 @@ mod tests {
             h.state_root,
             h.validator_set_root,
             h.mempool_set_root,
+            &h.value_entropy,
             h.base_fee,
             123,
         );
 
         let mut changed = h.clone();
         changed.proposer_round = 7;
-        changed.polc_round = 3;
+        changed.polc_round = Some(3);
         changed.proposer_vrf_output = VariableBytes::from_slice(&[0x55u8; 64]).unwrap();
 
         let changed_hash = BlockHeaderVNext::compute_value_hash(
@@ -531,11 +575,59 @@ mod tests {
             changed.state_root,
             changed.validator_set_root,
             changed.mempool_set_root,
+            &changed.value_entropy,
             changed.base_fee,
             123,
         );
 
         assert_eq!(base, changed_hash);
+    }
+
+    #[test]
+    fn value_hash_commits_every_immutable_entropy_component() {
+        let base = dummy_header();
+        let hash = |entropy: &ProposalEntropyV1| {
+            BlockHeaderVNext::compute_value_hash(
+                base.height,
+                base.prev_hash,
+                base.timestamp,
+                base.state_root,
+                base.validator_set_root,
+                base.mempool_set_root,
+                entropy,
+                base.base_fee,
+                123,
+            )
+        };
+        let original = hash(&base.value_entropy);
+
+        let mut changed = base.value_entropy.clone();
+        changed.origin_proposer_id.0[0] ^= 1;
+        assert_ne!(original, hash(&changed));
+
+        let mut changed = base.value_entropy.clone();
+        changed.origin_round += 1;
+        assert_ne!(original, hash(&changed));
+
+        let mut changed = base.value_entropy.clone();
+        let mut output = changed.vrf_output.as_slice().to_vec();
+        output[0] ^= 1;
+        changed.vrf_output = VariableBytes::new(output).unwrap();
+        assert_ne!(original, hash(&changed));
+
+        let mut changed = base.value_entropy.clone();
+        let mut proof = changed.vrf_proof.as_slice().to_vec();
+        proof[0] ^= 1;
+        changed.vrf_proof = VariableBytes::new(proof).unwrap();
+        assert_ne!(original, hash(&changed));
+    }
+
+    #[test]
+    fn entropy_commitment_is_canonical_across_exact_round_trip() {
+        let entropy = dummy_header().value_entropy;
+        let decoded = ProposalEntropyV1::decode_exact(&entropy.encode_to_vec()).unwrap();
+        assert_eq!(entropy, decoded);
+        assert_eq!(entropy.commitment(), decoded.commitment());
     }
 
     #[test]
@@ -586,5 +678,33 @@ mod tests {
         changed.block.header.timestamp += 1;
         assert_ne!(baseline, changed.signing_bytes(b"indra-test").unwrap());
         assert_ne!(baseline, proposal.signing_bytes(b"other-chain").unwrap());
+    }
+
+    #[test]
+    fn block_and_entropy_decoders_enforce_finite_round_domain() {
+        for round in [0, crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
+            let mut header = dummy_header();
+            header.proposer_round = round;
+            header.value_entropy.origin_round = round;
+            header.polc_round = Some(round);
+            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_ok());
+        }
+        for round in [
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            let mut header = dummy_header();
+            header.proposer_round = round;
+            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+
+            let mut header = dummy_header();
+            header.value_entropy.origin_round = round;
+            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+
+            let mut header = dummy_header();
+            header.polc_round = Some(round);
+            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+        }
     }
 }

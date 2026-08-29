@@ -63,7 +63,7 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockVNe
             value_hash: Bytes32::ZERO,
             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
             proposer_round: 0,
-            polc_round: indra_core::types::block::NO_POLC_ROUND,
+            polc_round: None,
             proposer_id: Bytes32::ZERO,
             vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: Bytes64([0; 64]),

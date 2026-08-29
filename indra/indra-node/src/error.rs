@@ -43,6 +43,17 @@ pub enum NodeError {
     #[error("consensus error: {0}")]
     Consensus(#[from] indra_consensus::ConsensusError),
 
+    /// The finite consensus-round domain was exhausted without a commit.
+    #[error(
+        "consensus round limit exceeded at height {height}: round {round} is the final legal round"
+    )]
+    RoundLimitExceeded {
+        /// Height that failed to commit.
+        height: u64,
+        /// Final legal round.
+        round: u32,
+    },
+
     /// A cryptographic error.
     #[error("crypto error: {0}")]
     Crypto(#[from] indra_crypto::CryptoError),

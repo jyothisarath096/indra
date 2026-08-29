@@ -31,7 +31,8 @@ const TEST_INPUT_VALUE: u64 = 1_000_000;
 
 fn new_test_state() -> ChainState {
     let mut state = ChainState::new_genesis();
-    state.active_slot_coefficient_numerator = 1u64 << 63;
+    state.active_slot_coefficient_numerator =
+        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state
 }
 
@@ -255,7 +256,7 @@ fn make_block(state: &ChainState, txs: Vec<TransactionV1>) -> BlockVNext {
             value_hash: Bytes32::ZERO,
             base_fee: state.base_fee,
             proposer_round: 0,
-            polc_round: indra_core::types::block::NO_POLC_ROUND,
+            polc_round: None,
             proposer_id: Bytes32::from([0x82; 32]),
             vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: state.election_seed,
@@ -349,6 +350,7 @@ fn qc_bytes_for_signers(
                 VoteStep::Precommit,
                 &state.tip_hash,
                 validator_id,
+                &snapshot.snapshot_root,
                 &state.chain_id,
             );
             (*validator_id, keypair.sign(&bytes).unwrap())
@@ -358,6 +360,7 @@ fn qc_bytes_for_signers(
         height: certified_height,
         round: 0,
         block_hash: state.tip_hash,
+        snapshot_root: snapshot.snapshot_root,
         signer_bitfield,
         pq_signatures: signed
             .iter()

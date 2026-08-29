@@ -82,6 +82,21 @@ pub fn validate_f(f: u64) -> IndraResult<()> {
         Ok(())
     }
 }
+
+/// Enforce the sole active-slot coefficient admitted by mainnet consensus.
+///
+/// `validate_f` intentionally remains broader for arithmetic audit coverage;
+/// production genesis and persisted consensus objects must call this function.
+pub fn validate_mainnet_f(f: u64) -> IndraResult<()> {
+    if f != crate::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR {
+        Err(IndraError::InvalidSortition(format!(
+            "mainnet active_slot_coefficient_numerator must equal {}",
+            crate::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR
+        )))
+    } else {
+        Ok(())
+    }
+}
 /// Compute the 256-term cached logarithm and analytic positive tail.
 pub fn certified_log(f: u64) -> IndraResult<CertifiedLogInterval> {
     validate_f(f)?;
@@ -317,5 +332,15 @@ mod tests {
     fn invalid_f() {
         assert!(certified_log(0).is_err());
         assert!(certified_log((1 << 63) + 1).is_err())
+    }
+
+    #[test]
+    fn mainnet_f_is_exact_while_math_domain_remains_broad() {
+        let preferred = crate::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+        assert!(validate_mainnet_f(preferred).is_ok());
+        for invalid in [preferred - 1, preferred + 1, 1, MAX_F] {
+            assert!(validate_mainnet_f(invalid).is_err());
+            assert!(validate_f(invalid).is_ok());
+        }
     }
 }

@@ -230,6 +230,18 @@ impl PeerRateLimiter {
         Self::with_default_buckets()
     }
 
+    /// Construct the authenticated-validator limiter with a non-refilling
+    /// vote bucket so peer-manager burst-boundary tests do not depend on wall
+    /// clock time while awaiting actor delivery.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_frozen_vote_bucket() -> Self {
+        let mut limiter = Self::with_default_buckets();
+        limiter
+            .count_buckets
+            .insert(MessageClass::Vote, TokenBucket::new(0, 80));
+        limiter
+    }
+
     fn with_default_buckets() -> Self {
         let mut count_buckets = HashMap::new();
         count_buckets.insert(MessageClass::Vote, TokenBucket::new(20, 80));
@@ -337,6 +349,7 @@ mod tests {
             step: VoteStep::Prevote,
             block_hash: Bytes32::ZERO,
             validator_id: Bytes32::ZERO,
+            snapshot_root: Bytes32::ZERO,
             signature: dummy_signature(),
         })
     }
@@ -391,6 +404,19 @@ mod tests {
         assert!(!bucket.try_consume(1));
         bucket.last_refill = Instant::now() - Duration::from_millis(100);
         assert!(bucket.try_consume(1));
+    }
+
+    #[test]
+    fn vote_bucket_first_full_token_refills_after_fifty_milliseconds() {
+        let mut before_boundary = TokenBucket::new(20, 80);
+        assert!(before_boundary.try_consume(80));
+        before_boundary.last_refill = Instant::now() - Duration::from_millis(49);
+        assert!(!before_boundary.try_consume(1));
+
+        let mut at_boundary = TokenBucket::new(20, 80);
+        assert!(at_boundary.try_consume(80));
+        at_boundary.last_refill = Instant::now() - Duration::from_millis(50);
+        assert!(at_boundary.try_consume(1));
     }
 
     #[test]

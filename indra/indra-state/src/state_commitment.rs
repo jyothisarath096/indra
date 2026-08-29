@@ -457,7 +457,7 @@ mod tests {
                 0,
             )
             .unwrap()],
-            1,
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
         )
         .unwrap()
     }

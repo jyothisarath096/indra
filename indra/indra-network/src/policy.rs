@@ -281,6 +281,226 @@ pub struct CooldownTracker<K> {
     maximum: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct BoundedCooldownValue {
+    cooldown: CooldownEntry,
+    generation: u64,
+    retention_deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct BoundedCooldownOrderEntry<K> {
+    key: K,
+    generation: u64,
+    retention_deadline: Instant,
+}
+
+/// Capacity- and idle-retention-bounded cooldown state for attacker-controlled
+/// identities.
+///
+/// Lookups do not refresh failure recency. Only a recorded failure advances the
+/// exponential cooldown and the retention deadline. Capacity eviction is
+/// deterministic: expired history is reclaimed first, then the
+/// least-recently-failed live identity is removed.
+pub struct BoundedCooldownTracker<K> {
+    values: HashMap<K, BoundedCooldownValue>,
+    order: VecDeque<BoundedCooldownOrderEntry<K>>,
+    capacity: usize,
+    minimum: Duration,
+    maximum: Duration,
+    retention_ttl: Duration,
+    next_generation: u64,
+    evictions: u64,
+}
+
+impl<K: Clone + Eq + Hash> BoundedCooldownTracker<K> {
+    /// Construct a bounded tracker with an explicit idle-retention policy.
+    pub fn new(
+        capacity: usize,
+        minimum: Duration,
+        maximum: Duration,
+        retention_ttl: Duration,
+    ) -> Self {
+        Self {
+            values: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+            minimum,
+            maximum,
+            retention_ttl,
+            next_generation: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Record a failure and return the cooldown applied to this attempt.
+    pub fn record_failure_at(&mut self, key: K, now: Instant) -> Duration {
+        self.prune_expired(now);
+        let current = self
+            .values
+            .get(&key)
+            .map(|value| value.cooldown.next_delay)
+            .unwrap_or(self.minimum);
+
+        if !self.values.contains_key(&key) {
+            while self.values.len() >= self.capacity {
+                if !self.evict_oldest_live() {
+                    break;
+                }
+                self.evictions = self.evictions.saturating_add(1);
+            }
+            if self.capacity == 0 {
+                return current;
+            }
+        }
+
+        let generation = self.allocate_generation();
+        let retention_deadline = now + self.retention_ttl;
+        self.values.insert(
+            key.clone(),
+            BoundedCooldownValue {
+                cooldown: CooldownEntry {
+                    retry_at: now + current,
+                    next_delay: (current * 2).min(self.maximum),
+                },
+                generation,
+                retention_deadline,
+            },
+        );
+        self.order.push_back(BoundedCooldownOrderEntry {
+            key,
+            generation,
+            retention_deadline,
+        });
+        self.compact_order_if_needed();
+        current
+    }
+
+    /// Return whether `key` is still inside its active retry cooldown.
+    ///
+    /// This operation may reclaim idle-expired metadata but never refreshes
+    /// recency, generation, or retention.
+    pub fn blocked_at(&mut self, key: &K, now: Instant) -> bool {
+        self.prune_expired(now);
+        self.values
+            .get(key)
+            .is_some_and(|value| now < value.cooldown.retry_at)
+    }
+
+    /// Reset exactly one identity after successful authentication.
+    pub fn reset(&mut self, key: &K) {
+        self.values.remove(key);
+        self.compact_order_if_needed();
+    }
+
+    /// Reclaim failure metadata whose idle-retention deadline has elapsed.
+    pub fn prune_expired(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|entry| entry.retention_deadline <= now)
+        {
+            let entry = self.order.pop_front().expect("front exists");
+            if self.values.get(&entry.key).is_some_and(|value| {
+                value.generation == entry.generation && value.retention_deadline <= now
+            }) {
+                self.values.remove(&entry.key);
+            }
+        }
+        self.compact_order_if_needed();
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.reindex_generations();
+        }
+        self.next_generation += 1;
+        self.next_generation
+    }
+
+    fn reindex_generations(&mut self) {
+        let mut live = Vec::with_capacity(self.values.len());
+        for entry in &self.order {
+            if self
+                .values
+                .get(&entry.key)
+                .is_some_and(|value| value.generation == entry.generation)
+            {
+                live.push((entry.key.clone(), entry.retention_deadline));
+            }
+        }
+        self.order.clear();
+        for (index, (key, retention_deadline)) in live.into_iter().enumerate() {
+            let generation = (index as u64) + 1;
+            if let Some(value) = self.values.get_mut(&key) {
+                value.generation = generation;
+            }
+            self.order.push_back(BoundedCooldownOrderEntry {
+                key,
+                generation,
+                retention_deadline,
+            });
+        }
+        self.next_generation = self.values.len() as u64;
+    }
+
+    fn evict_oldest_live(&mut self) -> bool {
+        while let Some(entry) = self.order.pop_front() {
+            if self
+                .values
+                .get(&entry.key)
+                .is_some_and(|value| value.generation == entry.generation)
+            {
+                self.values.remove(&entry.key);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len() <= self.capacity.saturating_mul(2) {
+            return;
+        }
+        let mut live = self
+            .values
+            .iter()
+            .map(|(key, value)| BoundedCooldownOrderEntry {
+                key: key.clone(),
+                generation: value.generation,
+                retention_deadline: value.retention_deadline,
+            })
+            .collect::<Vec<_>>();
+        live.sort_by_key(|entry| entry.generation);
+        self.order = live.into();
+    }
+
+    /// Number of live cooldown identities.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether no retained cooldown metadata remains.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Configured live-identity hard cap.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of deterministic capacity evictions.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Number of bounded ordering records retained.
+    pub fn bookkeeping_len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 impl<K: Eq + Hash> CooldownTracker<K> {
     /// Create a tracker with inclusive minimum and maximum delays.
     pub fn new(minimum: Duration, maximum: Duration) -> Self {
@@ -561,6 +781,170 @@ mod tests {
         );
         tracker.reset(&"peer");
         assert!(!tracker.blocked_at(&"peer", start));
+    }
+
+    fn bounded_cooldown(capacity: usize) -> BoundedCooldownTracker<u32> {
+        BoundedCooldownTracker::new(
+            capacity,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn bounded_cooldown_enforces_capacity_and_oldest_failure_eviction() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(4_096);
+        for key in 0..4_096 {
+            tracker.record_failure_at(key, start);
+        }
+        assert_eq!(tracker.len(), 4_096);
+        assert_eq!(tracker.capacity(), 4_096);
+
+        tracker.record_failure_at(4_096, start + Duration::from_millis(1));
+        assert_eq!(tracker.len(), 4_096);
+        assert_eq!(tracker.evictions(), 1);
+        assert!(!tracker.blocked_at(&0, start + Duration::from_millis(1)));
+        assert!(tracker.blocked_at(&4_096, start + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn bounded_cooldown_stays_bounded_under_original_attack_scale() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(4_096);
+        let mut maximum_live = 0;
+        let mut maximum_bookkeeping = 0;
+        for key in 0..200_000 {
+            tracker.record_failure_at(key, start);
+            maximum_live = maximum_live.max(tracker.len());
+            maximum_bookkeeping = maximum_bookkeeping.max(tracker.bookkeeping_len());
+        }
+        assert_eq!(maximum_live, 4_096);
+        assert!(maximum_bookkeeping <= 8_192);
+        assert_eq!(tracker.len(), 4_096);
+        assert!(tracker.bookkeeping_len() <= 8_192);
+    }
+
+    #[test]
+    fn bounded_cooldown_escalates_and_separates_retry_from_retention() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(8);
+        let expected = [2, 4, 8, 16, 32, 60, 60];
+        for (index, seconds) in expected.into_iter().enumerate() {
+            assert_eq!(
+                tracker.record_failure_at(1, start + Duration::from_millis(index as u64)),
+                Duration::from_secs(seconds)
+            );
+        }
+
+        let mut retry_tracker = bounded_cooldown(8);
+        assert_eq!(
+            retry_tracker.record_failure_at(2, start),
+            Duration::from_secs(2)
+        );
+        assert!(!retry_tracker.blocked_at(&2, start + Duration::from_secs(2)));
+        assert_eq!(retry_tracker.len(), 1, "failure history remains retained");
+        assert_eq!(
+            retry_tracker.record_failure_at(2, start + Duration::from_secs(59)),
+            Duration::from_secs(4),
+            "retained history continues exponential backoff"
+        );
+    }
+
+    #[test]
+    fn bounded_cooldown_reclaims_idle_metadata_at_retention_deadline() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(8);
+        tracker.record_failure_at(1, start);
+        assert_eq!(tracker.len(), 1);
+        tracker.prune_expired(start + Duration::from_secs(59));
+        assert_eq!(tracker.len(), 1);
+        tracker.prune_expired(start + Duration::from_secs(60));
+        assert_eq!(tracker.len(), 0);
+        assert_eq!(
+            tracker.record_failure_at(1, start + Duration::from_secs(60)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn bounded_cooldown_reset_is_exact_and_stale_records_are_safe() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(3);
+        tracker.record_failure_at(1, start);
+        tracker.record_failure_at(2, start + Duration::from_secs(1));
+        tracker.record_failure_at(1, start + Duration::from_secs(10));
+        tracker.reset(&2);
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.blocked_at(&1, start + Duration::from_secs(10)));
+        assert!(!tracker.blocked_at(&2, start + Duration::from_secs(10)));
+
+        tracker.prune_expired(start + Duration::from_secs(60));
+        assert_eq!(tracker.len(), 1, "stale generation must not remove refresh");
+        tracker.prune_expired(start + Duration::from_secs(70));
+        assert_eq!(tracker.len(), 0);
+    }
+
+    #[test]
+    fn bounded_cooldown_refresh_changes_deterministic_eviction_order() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(2);
+        tracker.record_failure_at(1, start);
+        tracker.record_failure_at(2, start + Duration::from_millis(1));
+        tracker.record_failure_at(1, start + Duration::from_millis(2));
+        tracker.record_failure_at(3, start + Duration::from_millis(3));
+        assert!(tracker.blocked_at(&1, start + Duration::from_millis(3)));
+        assert!(!tracker.blocked_at(&2, start + Duration::from_millis(3)));
+        assert!(tracker.blocked_at(&3, start + Duration::from_millis(3)));
+        assert_eq!(tracker.evictions(), 1);
+    }
+
+    #[test]
+    fn bounded_cooldown_generation_wrap_reindexes_safely() {
+        let start = Instant::now();
+        let mut tracker = bounded_cooldown(3);
+        tracker.record_failure_at(1, start);
+        tracker.record_failure_at(2, start + Duration::from_millis(1));
+        tracker.next_generation = u64::MAX;
+        tracker.record_failure_at(1, start + Duration::from_millis(2));
+        tracker.record_failure_at(3, start + Duration::from_millis(3));
+        tracker.record_failure_at(4, start + Duration::from_millis(4));
+        assert!(tracker.blocked_at(&1, start + Duration::from_millis(4)));
+        assert!(!tracker.blocked_at(&2, start + Duration::from_millis(4)));
+        assert!(tracker.blocked_at(&3, start + Duration::from_millis(4)));
+        assert!(tracker.blocked_at(&4, start + Duration::from_millis(4)));
+        assert_eq!(tracker.len(), 3);
+        assert!(tracker.bookkeeping_len() <= 6);
+    }
+
+    #[test]
+    fn bounded_cooldown_concurrent_mutex_updates_never_exceed_bounds() {
+        use std::sync::{Arc, Mutex};
+
+        for round in 0..100u32 {
+            let tracker = Arc::new(Mutex::new(bounded_cooldown(4_096)));
+            let mut threads = Vec::new();
+            for worker in 0..8u32 {
+                let tracker = Arc::clone(&tracker);
+                threads.push(std::thread::spawn(move || {
+                    let now = Instant::now();
+                    for offset in 0..128u32 {
+                        let key = round * 10_000 + worker * 128 + offset;
+                        let mut guard = tracker.lock().unwrap();
+                        guard.record_failure_at(key, now);
+                        assert!(guard.len() <= 4_096);
+                        assert!(guard.bookkeeping_len() <= 8_192);
+                    }
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            let guard = tracker.lock().unwrap();
+            assert!(guard.len() <= 4_096);
+            assert!(guard.bookkeeping_len() <= 8_192);
+        }
     }
 
     #[test]

@@ -733,6 +733,16 @@ impl ValidatorSet {
                 "pending VRF key and activation epoch must be present together".into(),
             ));
         }
+
+        // Current authoritative VRF key must always be valid.
+        if let Some(current) = entry.vrf_pk {
+            indra_crypto::validate_vrf_public_key(&current).map_err(|error| {
+                crate::error::StateError::InvalidStakingOp(format!(
+                    "malformed current VRF key: {error}"
+                ))
+            })?;
+        }
+
         if let Some(pending) = entry.pending_vrf_pk {
             indra_crypto::validate_vrf_public_key(&pending).map_err(|error| {
                 crate::error::StateError::InvalidStakingOp(format!(

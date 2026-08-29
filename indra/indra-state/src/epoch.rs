@@ -1214,7 +1214,8 @@ mod tests {
 
     fn new_test_state() -> ChainState {
         let mut state = ChainState::new_genesis();
-        state.active_slot_coefficient_numerator = 1u64 << 63;
+        state.active_slot_coefficient_numerator =
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state
     }
 

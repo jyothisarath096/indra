@@ -358,7 +358,13 @@ mod tests {
     }
 
     fn snapshot(count: u8) -> ConsensusSnapshot {
-        ConsensusSnapshot::new(301, 300, (1..=count).map(entry).collect(), 1).unwrap()
+        ConsensusSnapshot::new(
+            301,
+            300,
+            (1..=count).map(entry).collect(),
+            crate::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
+        .unwrap()
     }
 
     #[test]

@@ -19,9 +19,9 @@ use fs2::available_space;
 use indra_core::codec::Encode;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
-    DNS_SEED_HOSTS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS, MAX_PEER_LIST_SIZE,
-    MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS, PEER_TABLE_SAVE_INTERVAL_SECS,
-    TARGET_OUTBOUND_PEERS,
+    DNS_SEED_HOSTS, MAX_ACTIVE_VALIDATORS, MAX_INBOUND_PEERS, MAX_OBSERVER_CONNECTIONS,
+    MAX_PEER_LIST_SIZE, MIN_PRUNE_KEEP_BLOCKS, OBSERVER_PORT, PEER_LIST_INTERVAL_SECS,
+    PEER_TABLE_SAVE_INTERVAL_SECS, TARGET_OUTBOUND_PEERS,
 };
 use indra_crypto::sha256;
 use indra_crypto::{PqKeypair, PqPublicKey};
@@ -29,8 +29,8 @@ use indra_network::{
     message::{Message, PeerListEntry},
     observer::NODE_TYPE_FULL,
     perform_handshake_initiator, perform_handshake_responder, perform_observer_handshake_responder,
-    read_frame_plain_limited, spawn_peer_manager, write_frame_plain, BoundedTtlSet,
-    CooldownTracker, HandshakeConfig, NetworkCommand, NetworkEvent, NetworkGroup,
+    read_frame_plain_limited, spawn_peer_manager, write_frame_plain, BoundedCooldownTracker,
+    BoundedTtlSet, CooldownTracker, HandshakeConfig, NetworkCommand, NetworkEvent, NetworkGroup,
     ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, RelayValidatorKey, TokenBucket,
 };
 use indra_node::{
@@ -71,6 +71,12 @@ const PEER_LIST_SEEN_TTL: Duration = Duration::from_secs(30);
 const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
 const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
 const MAX_INBOUND_PER_IP: u8 = 3;
+/// Reviewed hard resource bound for attacker-controlled pre-auth cooldown state.
+const PRE_AUTH_COOLDOWN_CAPACITY: usize = 4_096;
+const PRE_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
+/// Per-validator address-history bound for authenticated reconnect cooldowns.
+const POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY: usize = 16;
+const POST_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
 
 fn unix_timestamp_secs() -> u64 {
@@ -196,15 +202,105 @@ enum OutboundCooldownKey {
 }
 
 struct InboundCooldowns {
-    pre_auth: CooldownTracker<PreAuthInboundKey>,
-    post_auth: CooldownTracker<PostAuthInboundKey>,
+    pre_auth: BoundedCooldownTracker<PreAuthInboundKey>,
+    post_auth: PostAuthCooldowns,
+}
+
+/// Authenticated reconnect cooldowns are isolated per validator. Address churn
+/// may evict only that validator's oldest address history, never another
+/// validator's state.
+struct PostAuthCooldowns {
+    by_validator: HashMap<indra_core::Bytes32, BoundedCooldownTracker<IpAddr>>,
+}
+
+impl PostAuthCooldowns {
+    fn new() -> Self {
+        Self {
+            by_validator: HashMap::new(),
+        }
+    }
+
+    fn tracker_mut(
+        &mut self,
+        validator_id: indra_core::Bytes32,
+        now: Instant,
+    ) -> Option<&mut BoundedCooldownTracker<IpAddr>> {
+        if !self.by_validator.contains_key(&validator_id) {
+            if self.by_validator.len() >= MAX_ACTIVE_VALIDATORS {
+                let expired = self
+                    .by_validator
+                    .iter_mut()
+                    .filter_map(|(id, tracker)| {
+                        tracker.prune_expired(now);
+                        tracker.is_empty().then_some(*id)
+                    })
+                    .collect::<Vec<_>>();
+                for id in expired {
+                    self.by_validator.remove(&id);
+                }
+            }
+            if self.by_validator.len() >= MAX_ACTIVE_VALIDATORS {
+                return None;
+            }
+        }
+        Some(self.by_validator.entry(validator_id).or_insert_with(|| {
+            BoundedCooldownTracker::new(
+                POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY,
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+                POST_AUTH_COOLDOWN_RETENTION,
+            )
+        }))
+    }
+
+    fn record_failure_at(&mut self, key: PostAuthInboundKey, now: Instant) -> Duration {
+        self.tracker_mut(key.validator_id, now)
+            .map(|tracker| tracker.record_failure_at(key.ip, now))
+            .unwrap_or(Duration::from_secs(2))
+    }
+
+    fn blocked_at(&mut self, key: &PostAuthInboundKey, now: Instant) -> bool {
+        self.by_validator
+            .get_mut(&key.validator_id)
+            .is_some_and(|tracker| tracker.blocked_at(&key.ip, now))
+    }
+
+    fn reset(&mut self, key: &PostAuthInboundKey) {
+        if let Some(tracker) = self.by_validator.get_mut(&key.validator_id) {
+            tracker.reset(&key.ip);
+            if tracker.len() == 0 {
+                self.by_validator.remove(&key.validator_id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_validator
+            .values()
+            .map(BoundedCooldownTracker::len)
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn bookkeeping_len(&self) -> usize {
+        self.by_validator
+            .values()
+            .map(BoundedCooldownTracker::bookkeeping_len)
+            .sum()
+    }
 }
 
 impl InboundCooldowns {
     fn new() -> Self {
         Self {
-            pre_auth: CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60)),
-            post_auth: CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60)),
+            pre_auth: BoundedCooldownTracker::new(
+                PRE_AUTH_COOLDOWN_CAPACITY,
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+                PRE_AUTH_COOLDOWN_RETENTION,
+            ),
+            post_auth: PostAuthCooldowns::new(),
         }
     }
 }
@@ -2475,96 +2571,103 @@ fn main() {
                                 }
                             }
                             Message::QCResponse { height, qc_bytes } => {
-                                let pending = driver.lock().unwrap().sync().provisional().cloned();
-                                if let Some(pending) = pending {
-                                    if pending.block.block.header.height != *height {
+                                let pending = {
+                                    let d = driver.lock().unwrap();
+                                    let Some(pending) = d.sync().provisional().cloned() else {
+                                        continue;
+                                    };
+                                    if d.sync()
+                                        .accept_provisional_qc_response(validator_id, addr, *height)
+                                        .is_err()
+                                    {
                                         gossip.score_peer(
                                             validator_id,
                                             indra_network::peer::ScoreEvent::InvalidMessage,
                                         );
                                         continue;
                                     }
-                                    let verified = {
-                                        let d = driver.lock().unwrap();
-                                        indra_node::sync::verify_network_direct_provisional_qc(
-                                            &pending.block,
-                                            qc_bytes,
-                                            &d.engine.state,
-                                            d.engine.network_qc_verifier(),
-                                        )
-                                    };
-                                    match verified {
-                                        Ok(()) => {
-                                            let mut d = driver.lock().unwrap();
-                                            let finalized = d
-                                                .sync_mut()
-                                                .take_provisional()
-                                                .expect("verified provisional exists");
-                                            match d.engine.commit_prepared_sync_block(
-                                                &finalized.block,
-                                                finalized.prepared,
-                                            ) {
-                                                Ok(()) => {
-                                                    if let Err(error) = d.promote_verified_sync_qc(
-                                                        *height,
-                                                        qc_bytes.clone(),
-                                                    ) {
-                                                        eprintln!(
+                                    pending
+                                };
+                                let verified = {
+                                    let d = driver.lock().unwrap();
+                                    indra_node::sync::verify_network_direct_provisional_qc(
+                                        &pending.block,
+                                        qc_bytes,
+                                        &d.engine.state,
+                                        d.engine.network_qc_verifier(),
+                                    )
+                                };
+                                match verified {
+                                    Ok(()) => {
+                                        let mut d = driver.lock().unwrap();
+                                        let finalized = d
+                                            .sync_mut()
+                                            .take_provisional()
+                                            .expect("verified provisional exists");
+                                        match d.engine.commit_prepared_sync_block(
+                                            &finalized.block,
+                                            finalized.prepared,
+                                        ) {
+                                            Ok(()) => {
+                                                if let Err(error) = d.promote_verified_sync_qc(
+                                                    *height,
+                                                    qc_bytes.clone(),
+                                                ) {
+                                                    eprintln!(
                                                             "[sync] finalized block {} but failed to persist its QC: {}",
                                                             height, error
                                                         );
-                                                        write_sync_recovery_diagnostic(
-                                                            &sync_diagnostic_dir,
-                                                            *height,
-                                                            d.engine.state.tip_hash,
-                                                        );
-                                                        continue;
-                                                    }
-                                                    d.sync_mut().on_block_imported(*height);
-                                                    d.refresh_registered_voters();
-                                                    d.reset_round();
-                                                    sync_cooldowns.reset(&validator_id);
-                                                    record_block_commit(
-                                                        &metrics_state,
-                                                        &last_block_timestamp,
+                                                    write_sync_recovery_diagnostic(
+                                                        &sync_diagnostic_dir,
+                                                        *height,
+                                                        d.engine.state.tip_hash,
                                                     );
-                                                    let _ = height_tx.send(());
+                                                    continue;
                                                 }
-                                                Err(error) => {
-                                                    eprintln!(
+                                                d.sync_mut().on_block_imported(*height);
+                                                d.refresh_registered_voters();
+                                                d.reset_round();
+                                                sync_cooldowns.reset(&validator_id);
+                                                record_block_commit(
+                                                    &metrics_state,
+                                                    &last_block_timestamp,
+                                                );
+                                                let _ = height_tx.send(());
+                                            }
+                                            Err(error) => {
+                                                eprintln!(
                                                         "[sync] QC-finalized block {} failed durable commit: {}",
                                                         height, error
                                                     );
-                                                    write_sync_recovery_diagnostic(
-                                                        &sync_diagnostic_dir,
-                                                        finalized.block.block.header.height,
-                                                        d.engine.state.tip_hash,
-                                                    );
-                                                }
+                                                write_sync_recovery_diagnostic(
+                                                    &sync_diagnostic_dir,
+                                                    finalized.block.block.header.height,
+                                                    d.engine.state.tip_hash,
+                                                );
                                             }
-                                            drop(d);
-                                            broadcast_status(&driver, &gossip);
                                         }
-                                        Err(error) => {
-                                            eprintln!(
-                                                "[sync] invalid requested QC for height {} from {}: {}",
-                                                height, addr, error
-                                            );
-                                            gossip.score_peer(
-                                                validator_id,
-                                                indra_network::peer::ScoreEvent::InvalidMessage,
-                                            );
-                                            sync_cooldowns
-                                                .record_failure_at(validator_id, Instant::now());
-                                            driver
-                                                .lock()
-                                                .unwrap()
-                                                .sync_mut()
-                                                .source_failed(validator_id, addr);
-                                        }
+                                        drop(d);
+                                        broadcast_status(&driver, &gossip);
                                     }
-                                    continue;
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[sync] invalid requested QC for height {} from {}: {}",
+                                            height, addr, error
+                                        );
+                                        gossip.score_peer(
+                                            validator_id,
+                                            indra_network::peer::ScoreEvent::InvalidMessage,
+                                        );
+                                        sync_cooldowns
+                                            .record_failure_at(validator_id, Instant::now());
+                                        driver
+                                            .lock()
+                                            .unwrap()
+                                            .sync_mut()
+                                            .source_failed(validator_id, addr);
+                                    }
                                 }
+                                continue;
                             }
                             Message::StakingOp(op) => {
                                 let key = op_relay_key(&msg).expect("staking relay key");
@@ -3485,7 +3588,12 @@ fn main() {
                                 };
                                 {
                                     let mut d = driver.lock().unwrap();
-                                    d.on_precommit_timeout();
+                                    if let Err(error) = d.on_precommit_timeout() {
+                                        eprintln!(
+                                            "[consensus] FATAL: deterministic round exhaustion: {error}"
+                                        );
+                                        return;
+                                    }
                                     if d.current_round() != old_round && d.current_round() > 0 {
                                         eprintln!(
                                             "[timing] t={}ms ROUND ADVANCED to {} at height={}",
@@ -3712,8 +3820,8 @@ fn broadcast_driver_message(gossip: &Arc<NetworkBridge>, _action: &DriverAction,
 fn process_driver_actions(
     driver: &Arc<Mutex<ConsensusDriver>>,
     gossip: &Arc<NetworkBridge>,
-    height_tx: &std::sync::mpsc::Sender<()>,
-    handshake_config: &Arc<RwLock<HandshakeConfig>>,
+    _height_tx: &std::sync::mpsc::Sender<()>,
+    _handshake_config: &Arc<RwLock<HandshakeConfig>>,
     previous_height: u64,
     actions: Vec<DriverAction>,
     metrics_state: &Arc<MetricsState>,
@@ -3721,38 +3829,6 @@ fn process_driver_actions(
 ) {
     let mut recorded_commit = false;
     for action in actions {
-        if let DriverAction::ActivateBufferedProposal(block) = action {
-            let actions2 = driver.lock().unwrap().process(DriverEvent::InboundBlock {
-                from: None,
-                proposal: block,
-            });
-            process_driver_actions(
-                driver,
-                gossip,
-                height_tx,
-                handshake_config,
-                previous_height,
-                actions2,
-                metrics_state,
-                last_block_timestamp,
-            );
-            let new_height = driver.lock().unwrap().height();
-            if new_height > previous_height {
-                refresh_handshake_and_relay_config(
-                    &driver.lock().unwrap().engine,
-                    handshake_config,
-                    gossip,
-                );
-                if !recorded_commit {
-                    record_block_commit(metrics_state, last_block_timestamp);
-                    recorded_commit = true;
-                }
-                let _ = height_tx.send(());
-                broadcast_status(driver, gossip);
-            }
-            continue;
-        }
-
         if let DriverAction::RequestQC { height } = &action {
             let peers: Vec<SocketAddr> = gossip.connected_addrs();
             eprintln!(
@@ -5575,6 +5651,29 @@ fn decode_node_rpc_transaction(
 mod tests {
     use super::*;
 
+    fn seal_genesis_fixture(content: &str) -> String {
+        let placeholder = hex::encode([0u8; 32]);
+        let provisional = content
+            .replacen(
+                "[genesis]\n",
+                &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
+                1,
+            )
+            .replacen(
+                "[[validators]]\n",
+                &format!(
+                    "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
+                    hex::encode([0x70u8; 32])
+                ),
+                1,
+            );
+        let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
+        let hash =
+            indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
+                .unwrap();
+        provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
+    }
+
     #[test]
     fn initialized_rpc_credentials_are_atomic_and_mode_0600_regardless_of_umask() {
         const CHILD_ENV: &str = "INDRA_PRIVATE_CONFIG_UMASK_CHILD";
@@ -5649,7 +5748,7 @@ mod tests {
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
                 hex::encode(validator_id.0),
                 hex::encode(classical.public_key().0),
                 hex::encode(pq.public_key().0),
@@ -5659,6 +5758,7 @@ mod tests {
                 hex::encode(cold_classical.public_key().0),
                 hex::encode(cold_pq.public_key().0),
             );
+        let genesis = seal_genesis_fixture(&genesis);
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
         config.validator_seed = Some(seed);
@@ -5748,9 +5848,17 @@ mod tests {
             .status = indra_state::ValidatorStatus::Registered;
         let live_only_id = add_active_proposer_candidate(&mut driver, [0xD2; 32]);
 
-        let decision_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
-        let construction_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
-        let driver_election = driver.proposer_election_for_height(u64::MAX, 7).unwrap();
+        // Seed 0xD1 is deterministically eligible at legal round 3 under the
+        // mainnet f=3/8 snapshot. Eligibility is fixture machinery here; the
+        // invariant under test is identical snapshot authority at every caller.
+        const ELIGIBLE_ROUND: u32 = 3;
+        let decision_election =
+            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
+        let construction_election =
+            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
+        let driver_election = driver
+            .proposer_election_for_height(u64::MAX, ELIGIBLE_ROUND)
+            .unwrap();
 
         assert_same_election(&decision_election, &construction_election);
         assert_same_election(&decision_election, &driver_election);
@@ -6173,6 +6281,347 @@ mod tests {
                 .record_failure_at(key, now + Duration::from_secs(2)),
             Duration::from_secs(4)
         );
+    }
+
+    fn pre_auth_key(ip: IpAddr) -> PreAuthInboundKey {
+        PreAuthInboundKey {
+            group: NetworkGroup::from_ip(ip),
+            ip,
+        }
+    }
+
+    #[test]
+    fn pre_auth_ipv4_churn_remains_strictly_bounded() {
+        let now = Instant::now();
+        let mut cooldowns = InboundCooldowns::new();
+        for raw in 1..=100_000u32 {
+            cooldowns
+                .pre_auth
+                .record_failure_at(pre_auth_key(IpAddr::V4(raw.into())), now);
+            assert!(cooldowns.pre_auth.len() <= PRE_AUTH_COOLDOWN_CAPACITY);
+            assert!(cooldowns.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
+        }
+        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
+    }
+
+    #[test]
+    fn pre_auth_ipv6_same_group_original_attack_scale_is_bounded() {
+        let now = Instant::now();
+        let mut cooldowns = InboundCooldowns::new();
+        let prefix =
+            u128::from_be_bytes([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut maximum_live = 0;
+        let mut maximum_bookkeeping = 0;
+        for suffix in 1..=200_000u128 {
+            let ip = IpAddr::V6((prefix | suffix).into());
+            let key = pre_auth_key(ip);
+            assert_eq!(key.group, NetworkGroup::V6([0x20, 0x01, 0x0d, 0xb8]));
+            cooldowns.pre_auth.record_failure_at(key, now);
+            maximum_live = maximum_live.max(cooldowns.pre_auth.len());
+            maximum_bookkeeping = maximum_bookkeeping.max(cooldowns.pre_auth.bookkeeping_len());
+        }
+        assert_eq!(maximum_live, PRE_AUTH_COOLDOWN_CAPACITY);
+        assert!(maximum_bookkeeping <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
+        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
+    }
+
+    #[test]
+    fn pre_auth_saturation_allows_approved_self_eviction_without_growth() {
+        let now = Instant::now();
+        let attacker_a = pre_auth_key("2001:db8::1".parse().unwrap());
+        let mut cooldowns = InboundCooldowns::new();
+        cooldowns.pre_auth.record_failure_at(attacker_a, now);
+        assert!(cooldowns.pre_auth.blocked_at(&attacker_a, now));
+
+        let prefix =
+            u128::from_be_bytes([0x20, 0x01, 0x0d, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for suffix in 1..=PRE_AUTH_COOLDOWN_CAPACITY as u128 {
+            let ip = IpAddr::V6((prefix | suffix).into());
+            cooldowns
+                .pre_auth
+                .record_failure_at(pre_auth_key(ip), now + Duration::from_millis(1));
+        }
+        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
+        assert!(cooldowns.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
+        assert!(!cooldowns
+            .pre_auth
+            .blocked_at(&attacker_a, now + Duration::from_millis(1)));
+        assert_eq!(
+            cooldowns
+                .pre_auth
+                .record_failure_at(attacker_a, now + Duration::from_millis(1)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn pre_auth_recent_legitimate_source_survives_older_churn() {
+        let now = Instant::now();
+        let legitimate = pre_auth_key("203.0.113.9".parse().unwrap());
+        let mut cooldowns = InboundCooldowns::new();
+        cooldowns.pre_auth.record_failure_at(legitimate, now);
+        for raw in 1..PRE_AUTH_COOLDOWN_CAPACITY as u32 {
+            cooldowns.pre_auth.record_failure_at(
+                pre_auth_key(IpAddr::V4(raw.into())),
+                now + Duration::from_millis(1),
+            );
+        }
+        cooldowns
+            .pre_auth
+            .record_failure_at(legitimate, now + Duration::from_millis(2));
+        cooldowns.pre_auth.record_failure_at(
+            pre_auth_key("198.51.100.250".parse().unwrap()),
+            now + Duration::from_millis(3),
+        );
+        assert!(cooldowns
+            .pre_auth
+            .blocked_at(&legitimate, now + Duration::from_millis(3)));
+    }
+
+    #[test]
+    fn pre_auth_failure_success_event_order_is_last_event_wins() {
+        let now = Instant::now();
+        let key = pre_auth_key("198.51.100.8".parse().unwrap());
+        let mut cooldowns = InboundCooldowns::new();
+
+        cooldowns.pre_auth.record_failure_at(key, now);
+        cooldowns.pre_auth.reset(&key);
+        assert!(!cooldowns.pre_auth.blocked_at(&key, now));
+
+        cooldowns.pre_auth.reset(&key);
+        cooldowns.pre_auth.record_failure_at(key, now);
+        assert!(cooldowns.pre_auth.blocked_at(&key, now));
+    }
+
+    #[test]
+    fn pre_auth_mutex_concurrency_is_bounded_for_one_hundred_runs() {
+        for run in 0..100u128 {
+            let cooldowns = Arc::new(Mutex::new(InboundCooldowns::new()));
+            let mut workers = Vec::new();
+            for worker in 0..4u128 {
+                let cooldowns = Arc::clone(&cooldowns);
+                workers.push(std::thread::spawn(move || {
+                    let now = Instant::now();
+                    for offset in 1..=64u128 {
+                        let suffix = run * 1_000 + worker * 64 + offset;
+                        let prefix = u128::from_be_bytes([
+                            0x20, 0x01, 0x0d, 0xba, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ]);
+                        let mut guard = cooldowns.lock().unwrap();
+                        guard.pre_auth.record_failure_at(
+                            pre_auth_key(IpAddr::V6((prefix | suffix).into())),
+                            now,
+                        );
+                        assert!(guard.pre_auth.len() <= PRE_AUTH_COOLDOWN_CAPACITY);
+                        assert!(guard.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn post_auth_address_churn_is_bounded_per_validator() {
+        let now = Instant::now();
+        let validator = indra_core::Bytes32::from([0x42; 32]);
+        let mut cooldowns = InboundCooldowns::new();
+        let prefix =
+            u128::from_be_bytes([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for suffix in 1..=200_000u128 {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: validator,
+                    ip: IpAddr::V6((prefix | suffix).into()),
+                },
+                now,
+            );
+            assert!(cooldowns.post_auth.len() <= POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY);
+            assert!(
+                cooldowns.post_auth.bookkeeping_len()
+                    <= 2 * POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY
+            );
+        }
+        assert_eq!(
+            cooldowns.post_auth.len(),
+            POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY
+        );
+    }
+
+    #[test]
+    fn post_auth_validator_buckets_are_isolated_and_exact_reset_only() {
+        let now = Instant::now();
+        let validator_a = indra_core::Bytes32::from([0x51; 32]);
+        let validator_b = indra_core::Bytes32::from([0x52; 32]);
+        let mut cooldowns = InboundCooldowns::new();
+        let a_old = PostAuthInboundKey {
+            validator_id: validator_a,
+            ip: "2001:db8:1::1".parse().unwrap(),
+        };
+        let a_recent = PostAuthInboundKey {
+            validator_id: validator_a,
+            ip: "2001:db8:1::2".parse().unwrap(),
+        };
+        let b_key = PostAuthInboundKey {
+            validator_id: validator_b,
+            ip: "2001:db8:2::1".parse().unwrap(),
+        };
+        cooldowns.post_auth.record_failure_at(a_old, now);
+        cooldowns
+            .post_auth
+            .record_failure_at(a_recent, now + Duration::from_millis(1));
+        cooldowns
+            .post_auth
+            .record_failure_at(b_key, now + Duration::from_millis(2));
+        cooldowns.post_auth.reset(&a_old);
+        assert!(!cooldowns.post_auth.blocked_at(&a_old, now));
+        assert!(cooldowns.post_auth.blocked_at(&a_recent, now));
+        assert!(cooldowns.post_auth.blocked_at(&b_key, now));
+
+        for suffix in 3..=(POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY as u128 + 2) {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: validator_a,
+                    ip: format!("2001:db8:1::{suffix}").parse().unwrap(),
+                },
+                now + Duration::from_secs(1),
+            );
+        }
+        assert!(cooldowns.post_auth.blocked_at(&b_key, now));
+        assert!(
+            cooldowns.post_auth.len()
+                <= MAX_ACTIVE_VALIDATORS * POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY
+        );
+    }
+
+    #[test]
+    fn post_auth_validator_namespace_is_hard_bounded() {
+        let now = Instant::now();
+        let mut cooldowns = InboundCooldowns::new();
+        for byte in 0..=u8::try_from(MAX_ACTIVE_VALIDATORS).unwrap() {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, byte)),
+                },
+                now,
+            );
+        }
+        assert!(cooldowns.post_auth.by_validator.len() <= MAX_ACTIVE_VALIDATORS);
+        assert!(
+            cooldowns.post_auth.len()
+                <= MAX_ACTIVE_VALIDATORS * POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY
+        );
+        assert!(
+            cooldowns.post_auth.bookkeeping_len()
+                <= 2 * MAX_ACTIVE_VALIDATORS * POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY
+        );
+    }
+
+    #[test]
+    fn post_auth_expired_namespaces_are_reclaimed_for_new_authority() {
+        let now = Instant::now();
+        let later = now + POST_AUTH_COOLDOWN_RETENTION + Duration::from_secs(1);
+        let mut cooldowns = InboundCooldowns::new();
+        for byte in 0..MAX_ACTIVE_VALIDATORS as u8 {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    ip: "192.0.2.1".parse().unwrap(),
+                },
+                now,
+            );
+        }
+        let new_validator = indra_core::Bytes32::from([0xee; 32]);
+        cooldowns.post_auth.record_failure_at(
+            PostAuthInboundKey {
+                validator_id: new_validator,
+                ip: "192.0.2.2".parse().unwrap(),
+            },
+            later,
+        );
+        assert!(cooldowns
+            .post_auth
+            .by_validator
+            .contains_key(&new_validator));
+        assert!(cooldowns.post_auth.len() <= POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY);
+        assert!(cooldowns.post_auth.by_validator.len() <= MAX_ACTIVE_VALIDATORS);
+    }
+
+    #[test]
+    fn post_auth_nonexpired_namespace_saturation_does_not_evict_live_state() {
+        let now = Instant::now();
+        let mut cooldowns = InboundCooldowns::new();
+        for byte in 0..MAX_ACTIVE_VALIDATORS as u8 {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    ip: IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, byte)),
+                },
+                now,
+            );
+        }
+        let extra = indra_core::Bytes32::from([0xef; 32]);
+        cooldowns.post_auth.record_failure_at(
+            PostAuthInboundKey {
+                validator_id: extra,
+                ip: "192.0.2.9".parse().unwrap(),
+            },
+            now,
+        );
+        assert!(!cooldowns.post_auth.by_validator.contains_key(&extra));
+        assert_eq!(
+            cooldowns.post_auth.by_validator.len(),
+            MAX_ACTIVE_VALIDATORS
+        );
+        assert!(cooldowns.post_auth.blocked_at(
+            &PostAuthInboundKey {
+                validator_id: indra_core::Bytes32::from([0; 32]),
+                ip: "198.51.100.0".parse().unwrap(),
+            },
+            now,
+        ));
+    }
+
+    #[test]
+    fn post_auth_partial_rotation_reclaims_only_expired_namespaces() {
+        let now = Instant::now();
+        let later = now + POST_AUTH_COOLDOWN_RETENTION + Duration::from_secs(1);
+        let mut cooldowns = InboundCooldowns::new();
+        for byte in 0..100u8 {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    ip: "192.0.2.1".parse().unwrap(),
+                },
+                now,
+            );
+        }
+        for byte in 100..200u8 {
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from([byte; 32]),
+                    ip: "192.0.2.1".parse().unwrap(),
+                },
+                later,
+            );
+        }
+        for byte in 0..100u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0xf0;
+            id[1] = byte;
+            cooldowns.post_auth.record_failure_at(
+                PostAuthInboundKey {
+                    validator_id: indra_core::Bytes32::from(id),
+                    ip: "192.0.2.2".parse().unwrap(),
+                },
+                later,
+            );
+        }
+        assert_eq!(cooldowns.post_auth.by_validator.len(), 200);
+        assert!(cooldowns.post_auth.len() <= 100 * POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY + 100);
     }
 
     #[test]
@@ -7137,7 +7586,7 @@ mod tests {
                 value_hash: indra_core::Bytes32::from([0x14; 32]),
                 base_fee: 101,
                 proposer_round: 0,
-                polc_round: indra_core::types::block::NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: indra_core::Bytes32::from([0x15; 32]),
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: indra_core::types::primitives::Bytes64([0x15; 64]),
@@ -7520,7 +7969,6 @@ mod tests {
     fn request_proposal_test_block() -> indra_core::types::block::BlockProposalVNext {
         use indra_core::types::block::{
             BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
-            NO_POLC_ROUND,
         };
         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
 
@@ -7536,7 +7984,7 @@ mod tests {
                 value_hash: Bytes32::from([0xAA; 32]),
                 base_fee: 1,
                 proposer_round: 3,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::from([0x05; 32]),
                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: indra_core::types::primitives::Bytes64([0x05; 64]),
@@ -7569,7 +8017,6 @@ mod tests {
     fn block_response_test_block(height: u64) -> indra_core::types::block::BlockProposalVNext {
         use indra_core::types::block::{
             BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
-            NO_POLC_ROUND,
         };
         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
 
@@ -7585,7 +8032,7 @@ mod tests {
                 value_hash: Bytes32::from([0x05; 32]),
                 base_fee: 1,
                 proposer_round: 0,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::ZERO,
                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: indra_core::types::primitives::Bytes64::ZERO,

@@ -7,9 +7,9 @@
 use indra_core::types::{
     crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
-        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_VALIDATORS, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
-        MIN_COMMISSION_BPS, STAKING_REWARD_TX_IDX,
+        Bytes32, Bytes64, VariableBytes, COMMISSION_CHANGE_DELAY_EPOCHS, DUST_LIMIT_SPARK,
+        MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STANDARD_VRF_PROOF_BYTES, MAX_VALIDATORS,
+        MINIMUM_VALIDATOR_SELF_STAKE_SPARK, MIN_COMMISSION_BPS, STAKING_REWARD_TX_IDX,
     },
     staking::{validate_network_addr_string, StakingOp, StakingOpBody},
     transaction::OutputV1,
@@ -390,6 +390,8 @@ fn apply_staking_op_mode(
             deposit_utxo_id,
             validator_pubkey,
             vrf_pk,
+            vrf_possession_output,
+            vrf_possession_proof,
             cold_pubkey,
             ..
         } => apply_register_validator(
@@ -398,7 +400,10 @@ fn apply_staking_op_mode(
             *deposit_utxo_id,
             validator_pubkey,
             *vrf_pk,
+            vrf_possession_output,
+            vrf_possession_proof,
             cold_pubkey,
+            chain_id,
             current_height,
         ),
         StakingOpBody::SetCommission {
@@ -693,7 +698,10 @@ fn apply_register_validator(
     deposit_utxo_id: Bytes32,
     validator_pubkey: &HybridPubKey,
     vrf_pk: [u8; 32],
+    vrf_possession_output: &Bytes64,
+    vrf_possession_proof: &VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
     cold_pubkey: &ColdHybridPubKey,
+    chain_id: &str,
     current_height: u64,
 ) -> StateResult<()> {
     if commission_bps < MIN_COMMISSION_BPS
@@ -704,7 +712,25 @@ fn apply_register_validator(
         ));
     }
 
+    // Reject malformed VRF public keys before they can enter live validator state.
+    indra_crypto::validate_vrf_public_key(&vrf_pk)
+        .map_err(|e| StateError::InvalidStakingOp(e.to_string()))?;
+
     let validator_id = validator_pubkey.identity_id();
+    let challenge =
+        StakingOp::vrf_possession_challenge(chain_id, &validator_id, &Bytes32::from(vrf_pk), 0)
+            .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
+    indra_crypto::vrf_verify(
+        &vrf_pk,
+        &challenge,
+        &indra_crypto::VrfOutput(vrf_possession_output.0),
+        &indra_crypto::VrfProof(vrf_possession_proof.as_slice().to_vec()),
+    )
+    .map_err(|_| {
+        StateError::InvalidStakingOp(
+            "validator-registration VRF secret-key possession proof is invalid".into(),
+        )
+    })?;
     if state.validators.get(&validator_id).is_some() {
         return Err(StateError::ValidatorAlreadyRegistered);
     }
@@ -1591,6 +1617,36 @@ mod tests {
         )
     }
 
+    fn test_vrf_public_key(seed: u8) -> [u8; 32] {
+        indra_crypto::VrfKeypair::from_seed(&[seed; 32]).public_key()
+    }
+
+    fn test_registration_vrf_pop(
+        chain_id: &str,
+        validator_pubkey: &HybridPubKey,
+        seed: u8,
+    ) -> (
+        [u8; 32],
+        Bytes64,
+        VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+    ) {
+        let keypair = indra_crypto::VrfKeypair::from_seed(&[seed; 32]);
+        let vrf_pk = keypair.public_key();
+        let challenge = StakingOp::vrf_possession_challenge(
+            chain_id,
+            &validator_pubkey.identity_id(),
+            &Bytes32::from(vrf_pk),
+            0,
+        )
+        .unwrap();
+        let (output, proof) = indra_crypto::vrf_prove(&keypair, &challenge);
+        (
+            vrf_pk,
+            Bytes64(output.0),
+            VariableBytes::from_slice(&proof.0).unwrap(),
+        )
+    }
+
     fn pubkey_from_keypair(keypair: &HybridKeypair) -> HybridPubKey {
         let public = keypair.public_key();
         HybridPubKey {
@@ -1789,14 +1845,25 @@ mod tests {
         nonce: u64,
         chain_id: &str,
         vrf_pk: [u8; 32],
-        _bond_seed: u8,
+        vrf_prover: &indra_crypto::VrfKeypair,
     ) -> StakingOp {
+        let validator_pubkey = pubkey_from_keypair(hot_keypair);
+        let challenge = StakingOp::vrf_possession_challenge(
+            chain_id,
+            &validator_pubkey.identity_id(),
+            &Bytes32::from(vrf_pk),
+            0,
+        )
+        .unwrap();
+        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(vrf_prover, &challenge);
         let mut op = StakingOp {
             body: StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
                 deposit_utxo_id,
-                validator_pubkey: pubkey_from_keypair(hot_keypair),
+                validator_pubkey,
                 vrf_pk,
+                vrf_possession_output: Bytes64(vrf_output.0),
+                vrf_possession_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
                 cold_pubkey: cold_pubkey_from_keypair(cold_keypair),
                 cold_signature: dummy_signature(),
             },
@@ -1818,6 +1885,32 @@ mod tests {
         };
         *slot = cold_signature;
         op
+    }
+
+    fn resign_register_op(
+        op: &mut StakingOp,
+        hot_keypair: &HybridKeypair,
+        cold_keypair: &HybridKeypair,
+        chain_id: &str,
+    ) {
+        if let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body {
+            *cold_signature = dummy_signature();
+        }
+        op.signature = dummy_signature();
+        let message = op
+            .register_validator_dual_signing_bytes(chain_id)
+            .unwrap()
+            .unwrap();
+        op.signature = wire_signature(&hot_keypair.sign(&message).unwrap());
+        let cold_signature = wire_signature(&cold_keypair.sign(&message).unwrap());
+        let StakingOpBody::RegisterValidator {
+            cold_signature: slot,
+            ..
+        } = &mut op.body
+        else {
+            unreachable!()
+        };
+        *slot = cold_signature;
     }
 
     fn dual_signed_rotate_op(
@@ -1889,7 +1982,7 @@ mod tests {
             name: format!("validator-{seed}"),
             hybrid_classical_pk: Some(pubkey.classical_pk.0),
             hybrid_pq_pk: Some(pubkey.pq_pk.as_slice().to_vec()),
-            vrf_pk: Some([seed; 32]),
+            vrf_pk: Some(test_vrf_public_key(seed)),
             vrf_key_activation_epoch: 0,
             pending_vrf_pk: None,
             pending_vrf_activation_epoch: None,
@@ -1947,7 +2040,8 @@ mod tests {
     #[test]
     fn vrf_rotation_is_snapshot_delayed_and_public_key_squatting_is_rejected() {
         let mut state = ChainState::new_genesis();
-        state.active_slot_coefficient_numerator = 1u64 << 63;
+        state.active_slot_coefficient_numerator =
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         let (validator_id, signer) = make_active_validator(&mut state, 31);
         let old_vrf = indra_crypto::VrfKeypair::from_seed(&[31; 32]).public_key();
         state.validators.get_mut(&validator_id).unwrap().vrf_pk = Some(old_vrf);
@@ -2309,8 +2403,8 @@ mod tests {
             &attacker_cold,
             1,
             &state.chain_id,
-            [0x5F; 32],
-            0x5D,
+            test_vrf_public_key(0x5F),
+            &indra_crypto::VrfKeypair::from_seed(&[0x5F; 32]),
         );
         let chain_id = state.chain_id.clone();
 
@@ -2519,12 +2613,16 @@ mod tests {
             MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             0xB2,
         );
+        let (vrf_pk, vrf_possession_output, vrf_possession_proof) =
+            test_registration_vrf_pop(&state.chain_id, &validator_pubkey, 0xB2);
         let op = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
                 deposit_utxo_id,
                 validator_pubkey,
-                vrf_pk: [0xB2; 32],
+                vrf_pk,
+                vrf_possession_output,
+                vrf_possession_proof,
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2731,12 +2829,16 @@ mod tests {
         let mut state = ChainState::new_genesis();
         let validator_keypair = keypair(0x44);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
+        let (vrf_pk, vrf_possession_output, vrf_possession_proof) =
+            test_registration_vrf_pop(&state.chain_id, &validator_pubkey, 0x44);
         let op = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
                 deposit_utxo_id: Bytes32::from([0xFE; 32]),
                 validator_pubkey,
-                vrf_pk: [0x44; 32],
+                vrf_pk,
+                vrf_possession_output,
+                vrf_possession_proof,
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2764,12 +2866,16 @@ mod tests {
             MINIMUM_VALIDATOR_SELF_STAKE_SPARK - 1,
             0xA2,
         );
+        let (vrf_pk, vrf_possession_output, vrf_possession_proof) =
+            test_registration_vrf_pop(&state.chain_id, &validator_pubkey, 0x45);
         let op = signed_op(
             StakingOpBody::RegisterValidator {
                 commission_bps: 1_000,
                 deposit_utxo_id,
                 validator_pubkey,
-                vrf_pk: [0x45; 32],
+                vrf_pk,
+                vrf_possession_output,
+                vrf_possession_proof,
                 cold_pubkey: cold_pubkey_from_keypair(&derived_test_cold_keypair(
                     &validator_keypair,
                 )),
@@ -2892,8 +2998,8 @@ mod tests {
             &cold,
             1,
             &state.chain_id,
-            [bond_seed.wrapping_add(1); 32],
-            bond_seed,
+            test_vrf_public_key(bond_seed.wrapping_add(1)),
+            &indra_crypto::VrfKeypair::from_seed(&[bond_seed.wrapping_add(1); 32]),
         );
         (op, deposit_utxo_id, validator_id)
     }
@@ -3072,8 +3178,8 @@ mod tests {
                 &cold,
                 1,
                 &state.chain_id,
-                [0x8F + owner_kind; 32],
-                0x8E + owner_kind,
+                test_vrf_public_key(0x8F + owner_kind),
+                &indra_crypto::VrfKeypair::from_seed(&[0x8F + owner_kind; 32]),
             );
             let before = state.clone();
             let chain_id = state.chain_id.clone();
@@ -3197,5 +3303,245 @@ mod tests {
             state.utxos.get(&refunds[0]).unwrap().output.value_spark,
             400_000
         );
+    }
+
+    #[test]
+    fn register_validator_with_malformed_vrf_key_poisoning_snapshot_regression() {
+        let mut state = ChainState::new_genesis();
+
+        // Existing test helpers: create a legitimate hot/cold validator identity.
+        let hot = mixed_keypair(0xA1, 0xA2);
+        let cold = mixed_keypair(0xA3, 0xA4);
+
+        let cold_owner = pubkey_from_keypair(&cold);
+
+        let deposit_utxo_id = insert_delegator_utxo(
+            &mut state,
+            cold_owner,
+            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            0xA5,
+        );
+
+        // Regression for VRF-001: initial validator registration must reject
+        // malformed VRF public keys before they can enter validator state.
+        let malformed_vrf_pk = [0u8; 32];
+
+        assert!(
+            indra_crypto::validate_vrf_public_key(&malformed_vrf_pk).is_err(),
+            "test precondition: chosen VRF key must be invalid"
+        );
+
+        let op = dual_signed_register_op(
+            deposit_utxo_id,
+            &hot,
+            &cold,
+            1,
+            &state.chain_id,
+            malformed_vrf_pk,
+            &indra_crypto::VrfKeypair::from_seed(&[0xA5; 32]),
+        );
+
+        let chain_id = state.chain_id.clone();
+        let before = state.clone();
+
+        let err = apply_staking_op(&mut state, &op, &chain_id, 1)
+            .expect_err("malformed VRF key must be rejected at registration");
+
+        assert!(
+            matches!(err, StateError::InvalidStakingOp(_)),
+            "unexpected error type: {err}"
+        );
+
+        assert_eq!(
+            state, before,
+            "failed validator registration must leave state unchanged"
+        );
+    }
+
+    #[test]
+    fn register_validator_rejects_foreign_vrf_key_without_secret_possession() {
+        let mut state = ChainState::new_genesis();
+
+        // Attacker controls these legitimate validator hot/cold identities.
+        let attacker_hot = mixed_keypair(0xC1, 0xC2);
+        let attacker_cold = mixed_keypair(0xC3, 0xC4);
+
+        let attacker_cold_owner = pubkey_from_keypair(&attacker_cold);
+
+        let deposit_utxo_id = insert_delegator_utxo(
+            &mut state,
+            attacker_cold_owner,
+            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            0xC5,
+        );
+
+        // This VRF key belongs to a completely independent party.
+        // The attacker knows only the public key.
+        let victim_vrf_keypair = indra_crypto::VrfKeypair::from_seed(&[0xD1; 32]);
+
+        let victim_vrf_pk = victim_vrf_keypair.public_key();
+
+        // Precondition: unlike VRF-001, this is a perfectly valid VRF key.
+        indra_crypto::validate_vrf_public_key(&victim_vrf_pk)
+            .expect("victim VRF public key must be valid");
+
+        let op = dual_signed_register_op(
+            deposit_utxo_id,
+            &attacker_hot,
+            &attacker_cold,
+            1,
+            &state.chain_id,
+            victim_vrf_pk,
+            &indra_crypto::VrfKeypair::from_seed(&[0xC5; 32]),
+        );
+
+        let chain_id = state.chain_id.clone();
+
+        let before = state.clone();
+        let error = apply_staking_op(&mut state, &op, &chain_id, 1)
+            .expect_err("foreign VRF key without its secret-key proof must be rejected");
+        assert!(matches!(error, StateError::InvalidStakingOp(message)
+            if message.contains("possession proof is invalid")));
+        assert_eq!(
+            state, before,
+            "failed PoP verification must not mutate state"
+        );
+    }
+
+    #[test]
+    fn register_validator_accepts_correct_vrf_possession_proof() {
+        let mut state = ChainState::new_genesis();
+        let hot = mixed_keypair(0xD2, 0xD3);
+        let cold = mixed_keypair(0xD4, 0xD5);
+        let deposit_utxo_id = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&cold),
+            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            0xD6,
+        );
+        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xD7; 32]);
+        let op = dual_signed_register_op(
+            deposit_utxo_id,
+            &hot,
+            &cold,
+            1,
+            &state.chain_id,
+            vrf.public_key(),
+            &vrf,
+        );
+        let chain_id = state.chain_id.clone();
+
+        apply_staking_op(&mut state, &op, &chain_id, 1)
+            .expect("matching VRF secret-key possession proof must register");
+        assert_eq!(
+            state
+                .validators
+                .get(&pubkey_from_keypair(&hot).identity_id())
+                .unwrap()
+                .vrf_pk,
+            Some(vrf.public_key())
+        );
+    }
+
+    #[test]
+    fn register_validator_rejects_vrf_proof_after_public_key_is_altered() {
+        let mut state = ChainState::new_genesis();
+        let hot = mixed_keypair(0xD8, 0xD9);
+        let cold = mixed_keypair(0xDA, 0xDB);
+        let deposit_utxo_id = insert_delegator_utxo(
+            &mut state,
+            pubkey_from_keypair(&cold),
+            MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+            0xDC,
+        );
+        let original_vrf = indra_crypto::VrfKeypair::from_seed(&[0xDD; 32]);
+        let mut op = dual_signed_register_op(
+            deposit_utxo_id,
+            &hot,
+            &cold,
+            1,
+            &state.chain_id,
+            original_vrf.public_key(),
+            &original_vrf,
+        );
+        let altered_vrf = indra_crypto::VrfKeypair::from_seed(&[0xDE; 32]);
+        let StakingOpBody::RegisterValidator { vrf_pk, .. } = &mut op.body else {
+            unreachable!()
+        };
+        *vrf_pk = altered_vrf.public_key();
+        let chain_id = state.chain_id.clone();
+        resign_register_op(&mut op, &hot, &cold, &chain_id);
+        let before = state.clone();
+
+        assert!(matches!(
+            apply_staking_op(&mut state, &op, &chain_id, 1),
+            Err(StateError::InvalidStakingOp(message))
+                if message.contains("possession proof is invalid")
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn register_validator_vrf_proof_binds_chain_and_validator_identity_context() {
+        for wrong_identity in [false, true] {
+            let mut state = ChainState::new_genesis();
+            let hot = mixed_keypair(0xE0, 0xE1);
+            let cold = mixed_keypair(0xE2, 0xE3);
+            let validator_pubkey = pubkey_from_keypair(&hot);
+            let deposit_utxo_id = insert_delegator_utxo(
+                &mut state,
+                pubkey_from_keypair(&cold),
+                MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                0xE4,
+            );
+            let vrf = indra_crypto::VrfKeypair::from_seed(&[0xE5; 32]);
+            let mut op = dual_signed_register_op(
+                deposit_utxo_id,
+                &hot,
+                &cold,
+                1,
+                &state.chain_id,
+                vrf.public_key(),
+                &vrf,
+            );
+            let wrong_chain = if wrong_identity {
+                state.chain_id.as_str()
+            } else {
+                "indra-wrong-chain"
+            };
+            let wrong_validator_id = if wrong_identity {
+                Bytes32::from([0xE6; 32])
+            } else {
+                validator_pubkey.identity_id()
+            };
+            let challenge = StakingOp::vrf_possession_challenge(
+                wrong_chain,
+                &wrong_validator_id,
+                &Bytes32::from(vrf.public_key()),
+                0,
+            )
+            .unwrap();
+            let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+            let StakingOpBody::RegisterValidator {
+                vrf_possession_output,
+                vrf_possession_proof,
+                ..
+            } = &mut op.body
+            else {
+                unreachable!()
+            };
+            *vrf_possession_output = Bytes64(output.0);
+            *vrf_possession_proof = VariableBytes::from_slice(&proof.0).unwrap();
+            let chain_id = state.chain_id.clone();
+            resign_register_op(&mut op, &hot, &cold, &chain_id);
+            let before = state.clone();
+
+            assert!(matches!(
+                apply_staking_op(&mut state, &op, &chain_id, 1),
+                Err(StateError::InvalidStakingOp(message))
+                    if message.contains("possession proof is invalid")
+            ));
+            assert_eq!(state, before);
+        }
     }
 }

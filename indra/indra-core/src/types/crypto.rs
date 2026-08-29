@@ -60,6 +60,21 @@ impl Decode for HybridSignature {
     }
 }
 
+pub(crate) fn decode_fixed_signature<const N: usize>(
+    r: &mut ByteReader<'_>,
+    field: &'static str,
+) -> IndraResult<VariableBytes<N>> {
+    let actual = r.read_u32_le()? as usize;
+    if actual != N {
+        return Err(crate::error::IndraError::InvalidLength {
+            field,
+            expected: N,
+            actual,
+        });
+    }
+    VariableBytes::from_slice(r.read_bytes(N)?)
+}
+
 impl HybridSignature {
     /// Convert the wire signature into the crypto-layer representation.
     pub fn to_crypto_sig(&self) -> Result<indra_crypto::HybridSignature, String> {
@@ -250,7 +265,7 @@ impl Decode for PQVoteSig {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             validator_id: Bytes32::decode(r)?,
-            pq_sig: VariableBytes::decode(r)?,
+            pq_sig: decode_fixed_signature::<{ indra_crypto::PQ_SIG_BYTES }>(r, "QC PQ signature")?,
         })
     }
 }
@@ -270,6 +285,54 @@ mod tests {
             s,
             HybridSignature::decode_exact(&s.encode_to_vec()).unwrap()
         );
+    }
+
+    fn encoded_hybrid_signature(classical_len: usize, pq_len: usize) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        (classical_len as u32).encode(&mut encoded);
+        encoded.extend(std::iter::repeat_n(0xAA, classical_len));
+        (pq_len as u32).encode(&mut encoded);
+        encoded.extend(std::iter::repeat_n(0xBB, pq_len));
+        encoded
+    }
+
+    #[test]
+    fn exact_length_invalid_hybrid_signature_is_structural_but_not_cryptographic() {
+        let encoded = encoded_hybrid_signature(
+            indra_crypto::CLASSICAL_SIG_BYTES,
+            indra_crypto::PQ_SIG_BYTES,
+        );
+        let wire = HybridSignature::decode_exact(&encoded).unwrap();
+        let signature = wire.to_crypto_sig().unwrap();
+        let keypair = indra_crypto::HybridKeypair::new(
+            indra_crypto::ClassicalKeypair::from_seed(&[0x31; 32]),
+            indra_crypto::PqKeypair::from_seed(&[0xA7; 32]).unwrap(),
+        );
+        assert!(
+            indra_crypto::verify_hybrid(b"L3-NET-04", &signature, &keypair.public_key()).is_err()
+        );
+    }
+
+    #[test]
+    fn hybrid_signature_oversize_and_truncation_are_structural_errors() {
+        let mut oversized_classical = encoded_hybrid_signature(
+            indra_crypto::CLASSICAL_SIG_BYTES + 1,
+            indra_crypto::PQ_SIG_BYTES,
+        );
+        assert!(HybridSignature::decode_exact(&oversized_classical).is_err());
+
+        let oversized_pq = encoded_hybrid_signature(
+            indra_crypto::CLASSICAL_SIG_BYTES,
+            indra_crypto::PQ_SIG_BYTES + 1,
+        );
+        assert!(HybridSignature::decode_exact(&oversized_pq).is_err());
+
+        oversized_classical = encoded_hybrid_signature(
+            indra_crypto::CLASSICAL_SIG_BYTES,
+            indra_crypto::PQ_SIG_BYTES,
+        );
+        oversized_classical.pop();
+        assert!(HybridSignature::decode_exact(&oversized_classical).is_err());
     }
 
     #[test]
@@ -296,5 +359,19 @@ mod tests {
             pq_sig: VariableBytes::from_slice(&[0xCCu8; 4627]).unwrap(),
         };
         assert_eq!(s, PQVoteSig::decode_exact(&s.encode_to_vec()).unwrap());
+    }
+
+    #[test]
+    fn qc_pq_signature_decode_requires_exact_length() {
+        for len in [
+            0,
+            indra_crypto::PQ_SIG_BYTES - 1,
+            indra_crypto::PQ_SIG_BYTES + 1,
+        ] {
+            let mut encoded = Bytes32::ZERO.encode_to_vec();
+            (len as u32).encode(&mut encoded);
+            encoded.extend(std::iter::repeat_n(0xCC, len));
+            assert!(PQVoteSig::decode_exact(&encoded).is_err());
+        }
     }
 }

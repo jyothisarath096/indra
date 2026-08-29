@@ -72,8 +72,13 @@ cargo --version
 ```bash
 git clone https://github.com/jyothisarath096/indra
 cd indra
-cargo build --release
+cargo build --release --locked
 ```
+
+Validator release builds are restricted to the pinned toolchain, targets,
+features, and flags in
+[`docs/CONSENSUS_BUILD_MATRIX.md`](docs/CONSENSUS_BUILD_MATRIX.md). A platform
+that can compile the workspace is not thereby consensus-qualified.
 
 ---
 

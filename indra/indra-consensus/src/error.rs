@@ -44,6 +44,13 @@ pub enum ConsensusError {
     #[error("cannot elect proposer: validator set is empty")]
     EmptyValidatorSet,
 
+    /// A consensus round is outside the finite protocol domain.
+    #[error("invalid consensus round: {detail}")]
+    InvalidRound {
+        /// Stable diagnostic from the authoritative core validator.
+        detail: String,
+    },
+
     /// The given validator is not in the active set.
     #[error("validator not found in active set")]
     ValidatorNotFound,

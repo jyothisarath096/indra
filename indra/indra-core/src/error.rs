@@ -32,6 +32,17 @@ pub enum IndraError {
         actual: usize,
     },
 
+    /// A protocol-fixed byte field did not have its required exact length.
+    #[error("field '{field}' length {actual} does not equal required length {expected}")]
+    InvalidLength {
+        /// Name of the field.
+        field: &'static str,
+        /// Required byte length.
+        expected: usize,
+        /// Actual encoded byte length.
+        actual: usize,
+    },
+
     /// A bool byte was not 0x00 or 0x01.
     #[error("invalid bool byte: 0x{byte:02x} (expected 0x00 or 0x01)")]
     InvalidBool {
@@ -161,6 +172,15 @@ pub enum IndraError {
     /// Praos sortition parameter or certified-arithmetic failure.
     #[error("invalid proposer sortition: {0}")]
     InvalidSortition(String),
+
+    /// A consensus round lies outside the finite protocol domain.
+    #[error("invalid consensus round {round}; maximum legal round is {max}")]
+    InvalidConsensusRound {
+        /// Rejected round.
+        round: u32,
+        /// Highest legal round.
+        max: u32,
+    },
 
     /// QC below the required quorum threshold.
     #[error("QC below 2/3 threshold: {weight_bps} bps")]

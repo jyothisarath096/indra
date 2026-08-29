@@ -70,7 +70,7 @@ pub use observer::{
 };
 pub use peer::{PeerInfo, PeerStatus, PeerTable};
 pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
-pub use policy::{BanStore, BoundedTtlSet, CooldownTracker, NetworkGroup};
+pub use policy::{BanStore, BoundedCooldownTracker, BoundedTtlSet, CooldownTracker, NetworkGroup};
 pub use rate_limit::{
     GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket,
 };

@@ -1,3 +1,4 @@
+use curve25519_dalek_v5::{constants::EIGHT_TORSION, edwards::EdwardsPoint, traits::Identity};
 use indra_core::{
     codec::Encode,
     types::{
@@ -10,6 +11,7 @@ use indra_core::{
         transaction::{InputV1, OutputV1, TransactionV1},
     },
 };
+use indra_crypto::{vrf_prove, VrfKeypair};
 use indra_network::{Message, MessageType};
 use std::{fs, io, path::Path};
 
@@ -85,12 +87,53 @@ fn governance_payloads() -> Vec<GovernancePayload> {
     ]
 }
 
+fn vrf_vectors() -> Vec<([u8; 32], Vec<u8>)> {
+    vec![
+        (
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            vec![],
+        ),
+        (
+            hex::decode("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            vec![0x72],
+        ),
+        (
+            hex::decode("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            vec![0xaf, 0x82],
+        ),
+    ]
+}
+
+fn verification_seed(pk: &[u8; 32], alpha: &[u8], beta: &[u8; 64], proof: &[u8]) -> Vec<u8> {
+    let mut seed = Vec::with_capacity(98 + alpha.len() + proof.len());
+    seed.extend_from_slice(pk);
+    seed.extend_from_slice(beta);
+    seed.extend_from_slice(&(alpha.len() as u16).to_le_bytes());
+    seed.extend_from_slice(alpha);
+    seed.extend_from_slice(proof);
+    seed
+}
+
 fn main() -> io::Result<()> {
     for corpus in [
         "fuzz/corpus/transaction_deserialization",
         "fuzz/corpus/public_json_rpc",
         "fuzz/corpus/governance_parsing",
         "fuzz/corpus/p2p_gossip_parsing",
+        "fuzz/corpus/vrf_verify_arbitrary",
+        "fuzz/corpus/vrf_valid_proof_mutation",
+        "fuzz/corpus/vrf_public_key_validation",
+        "fuzz/corpus/vrf_prove_verify_roundtrip",
+        "fuzz/corpus/vrf_proof_framing",
     ] {
         match fs::remove_dir_all(corpus) {
             Ok(()) => {}
@@ -203,5 +246,73 @@ fn main() -> io::Result<()> {
             &[message_type as u8],
         )?;
     }
+
+    for (index, (seed, alpha)) in vrf_vectors().into_iter().enumerate() {
+        let keypair = VrfKeypair::from_seed(&seed);
+        let (output, proof) = vrf_prove(&keypair, &alpha);
+        write(
+            format!("fuzz/corpus/vrf_verify_arbitrary/rfc_{index}"),
+            &verification_seed(&keypair.public_key, &alpha, &output.0, &proof.0),
+        )?;
+        write(
+            format!("fuzz/corpus/vrf_public_key_validation/rfc_{index}"),
+            &keypair.public_key,
+        )?;
+        write(
+            format!("fuzz/corpus/vrf_proof_framing/rfc_{index}"),
+            &proof.0,
+        )?;
+        let mut roundtrip = seed.to_vec();
+        roundtrip.extend_from_slice(&alpha);
+        write(
+            format!("fuzz/corpus/vrf_prove_verify_roundtrip/rfc_{index}"),
+            &roundtrip,
+        )?;
+        for selector in 0..6u8 {
+            let mut mutation = seed.to_vec();
+            mutation.push(selector);
+            mutation.extend_from_slice(&alpha);
+            write(
+                format!("fuzz/corpus/vrf_valid_proof_mutation/rfc_{index}_{selector}"),
+                &mutation,
+            )?;
+        }
+
+        let mut noncanonical_scalar = proof.0.clone();
+        noncanonical_scalar[48..80].copy_from_slice(&[
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ]);
+        for (name, malformed) in [
+            ("truncated", proof.0[..79].to_vec()),
+            ("overlong", [proof.0.clone(), vec![0]].concat()),
+            ("noncanonical_scalar", noncanonical_scalar),
+        ] {
+            write(
+                format!("fuzz/corpus/vrf_verify_arbitrary/rfc_{index}_{name}"),
+                &verification_seed(&keypair.public_key, &alpha, &output.0, &malformed),
+            )?;
+            write(
+                format!("fuzz/corpus/vrf_proof_framing/rfc_{index}_{name}"),
+                &malformed,
+            )?;
+        }
+    }
+
+    let identity = EdwardsPoint::identity().compress().to_bytes();
+    write("fuzz/corpus/vrf_public_key_validation/identity", &identity)?;
+    for (index, point) in EIGHT_TORSION.iter().enumerate() {
+        write(
+            format!("fuzz/corpus/vrf_public_key_validation/torsion_{index}"),
+            point.compress().as_bytes(),
+        )?;
+    }
+    let mut noncanonical_identity = [0xff; 32];
+    noncanonical_identity[0] = 0xee;
+    noncanonical_identity[31] = 0x7f;
+    write(
+        "fuzz/corpus/vrf_public_key_validation/noncanonical_identity",
+        &noncanonical_identity,
+    )?;
     Ok(())
 }

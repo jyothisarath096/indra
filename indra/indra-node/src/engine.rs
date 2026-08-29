@@ -25,7 +25,7 @@ use indra_consensus::{
 };
 use indra_core::codec::Decode;
 use indra_core::types::{
-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+    block::{BlockProposalVNext, BlockVNext},
     crypto::HybridPubKey,
     governance::GovernanceOpV2,
     primitives::{
@@ -1254,6 +1254,14 @@ impl NodeEngine {
         prev_qc_bytes: Vec<u8>,
         polc_round: Option<u32>,
     ) -> NodeResult<BlockProposalVNext> {
+        if let Some(round) = polc_round {
+            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
+                NodeError::BlockInvalid {
+                    height: self.state.height + 1,
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         ensure_disk_writable(&self.config.data_dir)?;
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && prev_qc_bytes.is_empty() {
@@ -1295,6 +1303,20 @@ impl NodeEngine {
         timestamp: u64,
         last_qc: Vec<u8>,
     ) -> NodeResult<BlockProposalVNext> {
+        indra_core::types::primitives::validate_consensus_round(new_round).map_err(|error| {
+            NodeError::BlockInvalid {
+                height: self.state.height + 1,
+                reason: error.to_string(),
+            }
+        })?;
+        if let Some(round) = valid_round {
+            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
+                NodeError::BlockInvalid {
+                    height: self.state.height + 1,
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         ensure_disk_writable(&self.config.data_dir)?;
         let proposal_height = self.state.height + 1;
         if proposal_height > 1 && last_qc.is_empty() {
@@ -1325,7 +1347,7 @@ impl NodeEngine {
         let mut block = original_block.clone();
         block.header.timestamp = timestamp;
         block.header.proposer_round = new_round;
-        block.header.polc_round = valid_round.unwrap_or(NO_POLC_ROUND);
+        block.header.polc_round = valid_round;
         block.header.proposer_id = slot.proposer_id;
         block.header.vrf_suite = indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2;
         block.header.election_seed = election.election_seed;
@@ -1545,12 +1567,17 @@ impl NodeEngine {
             .hybrid_keypair
             .as_ref()
             .ok_or(NodeError::NotValidator)?;
+        let snapshot_root = self
+            .state
+            .snapshot_for_consensus_height(height)?
+            .snapshot_root;
         produce_vote(
             height,
             round,
             step,
             block_hash,
             validator_id,
+            snapshot_root,
             &self.state.chain_id,
             hybrid_keypair,
         )
@@ -1856,7 +1883,8 @@ mod tests {
         GovernanceActionType, GovernanceOpV2, GovernancePayload,
     };
     use indra_core::types::primitives::{
-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, TRANSACTION_PROTOCOL_VERSION,
+        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
+        TRANSACTION_PROTOCOL_VERSION,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::stake_position::{
@@ -1993,7 +2021,7 @@ mod tests {
         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
@@ -2003,6 +2031,7 @@ mod tests {
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
+        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
         std::fs::write(&genesis_path, genesis).unwrap();
         genesis_path.to_string_lossy().to_string()
     }
@@ -2331,6 +2360,7 @@ mod tests {
                 step_1,
                 hash_1,
                 validator_id,
+                Bytes32::ZERO,
                 &engine.state.chain_id,
                 keypair,
             )
@@ -2341,6 +2371,7 @@ mod tests {
                 step_2,
                 hash_2,
                 validator_id,
+                Bytes32::ZERO,
                 &engine.state.chain_id,
                 keypair,
             )
@@ -2388,6 +2419,7 @@ mod tests {
                     election_seed: state.election_seed,
                     snapshot_root: snapshot.snapshot_root,
                     active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
+                    sortition_log: snapshot.sortition_log_interval().unwrap(),
                     height,
                     round,
                     candidates: candidates.clone(),
@@ -2441,6 +2473,7 @@ mod tests {
             election_seed: state.election_seed,
             snapshot_root: snapshot.snapshot_root,
             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
+            sortition_log: snapshot.sortition_log_interval().unwrap(),
             height,
             round,
             candidates: snapshot
@@ -2460,7 +2493,7 @@ mod tests {
         height: u64,
         vrf: &VrfKeypair,
     ) -> ProposerElection {
-        (0..4_096)
+        (0..MAX_ROUNDS_PER_HEIGHT)
             .find_map(|round| {
                 let election = test_election(state, height, round);
                 let candidate = election
@@ -2499,6 +2532,7 @@ mod tests {
         value_hash: Bytes32,
         classical_seed: [u8; 32],
         pq_seed: [u8; 32],
+        snapshot_root: Bytes32,
     ) -> Vec<u8> {
         let classical = ClassicalKeypair::from_seed(&classical_seed);
         let pq = PqKeypair::from_seed(&pq_seed).unwrap();
@@ -2512,6 +2546,7 @@ mod tests {
             VoteStep::Precommit,
             value_hash,
             validator_id,
+            snapshot_root,
             &DEFAULT_CHAIN_ID,
             &hybrid,
         )
@@ -2521,6 +2556,7 @@ mod tests {
             round,
             value_hash,
             DEFAULT_CHAIN_ID,
+            snapshot_root,
             &[QcValidator {
                 validator_id,
                 position: 0,
@@ -2647,6 +2683,7 @@ mod tests {
                         VoteStep::Prevote,
                         Bytes32::from([height as u8; 32]),
                         validator_id,
+                        snapshot.snapshot_root,
                         DEFAULT_CHAIN_ID,
                         &signer,
                     )
@@ -2656,6 +2693,7 @@ mod tests {
                         0,
                         VoteStep::Prevote,
                         DEFAULT_CHAIN_ID.to_string(),
+                        snapshot.snapshot_root,
                         voters,
                     );
                     collector.add_vote(vote).unwrap()
@@ -2692,6 +2730,7 @@ mod tests {
                     VoteStep::Precommit,
                     block_hash,
                     validator_id,
+                    snapshot.snapshot_root,
                     DEFAULT_CHAIN_ID,
                     signer,
                 )
@@ -2703,6 +2742,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            snapshot.snapshot_root,
             &validators,
             votes.iter().collect(),
         )
@@ -3747,6 +3787,11 @@ mod tests {
                 block.header.block_hash(),
                 [0x42u8; 32],
                 [0x42u8; 32],
+                engine
+                    .state
+                    .snapshot_for_consensus_height(height)
+                    .unwrap()
+                    .snapshot_root,
             );
             assert_eq!(engine.state.height, height);
         }
@@ -3779,6 +3824,11 @@ mod tests {
                     block.header.block_hash(),
                     [0x42; 32],
                     [0x42; 32],
+                    engine
+                        .state
+                        .snapshot_for_consensus_height(height)
+                        .unwrap()
+                        .snapshot_root,
                 );
             }
             engine.state.clone()
@@ -3826,6 +3876,11 @@ mod tests {
                 engine.state.tip_hash,
                 [0x42u8; 32],
                 [0x42u8; 32],
+                engine
+                    .state
+                    .snapshot_for_consensus_height(engine.state.height)
+                    .unwrap()
+                    .snapshot_root,
             );
             let second = make_strict_block(&engine.state, [0x42u8; 32], parent_qc);
             let mut projected = engine.state.clone();
@@ -4002,6 +4057,11 @@ mod tests {
                     block.header.block_hash(),
                     [0x42u8; 32],
                     [0x42u8; 32],
+                    engine
+                        .state
+                        .snapshot_for_consensus_height(height)
+                        .unwrap()
+                        .snapshot_root,
                 );
                 assert_eq!(engine.state.height, height);
             }
@@ -4036,6 +4096,11 @@ mod tests {
                     block.header.block_hash(),
                     [0x42u8; 32],
                     [0x42u8; 32],
+                    engine
+                        .state
+                        .snapshot_for_consensus_height(height)
+                        .unwrap()
+                        .snapshot_root,
                 );
                 assert_eq!(engine.state.height, height);
             }
@@ -4108,6 +4173,7 @@ mod tests {
             )
             .replace(&hex::encode(old_output.0), &hex::encode(new_output.0))
             .replace(&hex::encode(old_proof.0), &hex::encode(new_proof.0));
+        genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
         std::fs::write(genesis_path, genesis).unwrap();
 
         {
@@ -4132,14 +4198,13 @@ mod tests {
             engine.write_chain_manifest().unwrap();
         }
         let genesis_path = manifest_config.genesis_path.as_ref().unwrap();
-        let genesis = std::fs::read_to_string(genesis_path).unwrap().replace(
-            "active_slot_coefficient_numerator = \"9223372036854775808\"",
-            "active_slot_coefficient_numerator = \"1\"",
-        );
+        let genesis = std::fs::read_to_string(genesis_path)
+            .unwrap()
+            .replace("stake = 1000000000000", "stake = 1000000000001");
         std::fs::write(genesis_path, genesis).unwrap();
         assert!(matches!(
             NodeEngine::init(manifest_config),
-            Err(NodeError::GenesisMismatch)
+            Err(NodeError::ValidatorConfigIncomplete { .. })
         ));
         let _ = std::fs::remove_dir_all(&manifest_dir);
 
@@ -4193,6 +4258,11 @@ mod tests {
                     block.header.block_hash(),
                     [0x42u8; 32],
                     [0x42u8; 32],
+                    engine
+                        .state
+                        .snapshot_for_consensus_height(height)
+                        .unwrap()
+                        .snapshot_root,
                 );
             }
             make_strict_block(&engine.state, [0x42u8; 32], last_qc)
@@ -4294,7 +4364,7 @@ mod tests {
         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         let genesis = format!(
-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
             hex::encode(validator_id),
             hex::encode(classical.public_key().0),
             hex::encode(pq.public_key().0),
@@ -4304,6 +4374,7 @@ mod tests {
             hex::encode(cold_public.classical.0),
             hex::encode(cold_public.pq.0),
         );
+        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
         config.validator_seed = Some([0x11; 32]);
@@ -4378,7 +4449,35 @@ mod tests {
             Some(VrfKeypair::from_seed(&[0x99u8; 32]).public_key());
 
         crate::genesis::finalize_test_genesis(&mut engine.state);
-        let election = test_election(&engine.state, 1, 0);
+        // This fixed fixture is eligible at round 13 under the registered key.
+        // Keeping the round explicit separates the key-binding invariant from
+        // probabilistic eligibility-search helper behavior.
+        let election = test_election(&engine.state, 1, 13);
+        let registered_vrf = VrfKeypair::from_seed(&[0x99; 32]);
+        let foreign_local_vrf = VrfKeypair::from_seed(&[0x42; 32]);
+        let alpha = election.vrf_input(&local_id).unwrap();
+        let (foreign_output, foreign_proof) = indra_crypto::vrf_prove(&foreign_local_vrf, &alpha);
+        assert!(indra_crypto::vrf_verify(
+            &foreign_local_vrf.public_key(),
+            &alpha,
+            &foreign_output,
+            &foreign_proof,
+        )
+        .is_ok());
+        assert!(indra_crypto::vrf_verify(
+            &registered_vrf.public_key(),
+            &alpha,
+            &foreign_output,
+            &foreign_proof,
+        )
+        .is_err());
+        assert!(
+            compute_proposer_vrf(local_id, &registered_vrf, &election)
+                .unwrap()
+                .eligible,
+            "the snapshot-registered VRF key fixture must be eligible at round 13"
+        );
+        assert!(compute_proposer_vrf(local_id, &foreign_local_vrf, &election).is_err());
 
         assert!(
             !engine.is_proposer(&election),
@@ -4908,7 +5007,8 @@ mod tests {
         assert_eq!(engine.governance_mempool, vec![governance]);
         assert_eq!(engine.pending_slashes.len(), 1);
 
-        let election = test_election(&engine.state, 1, 0);
+        let election =
+            first_eligible_test_election(&engine.state, 1, &VrfKeypair::from_seed(&[0x42; 32]));
         let template = BlockTemplate {
             proposer_vrf_keypair: VrfKeypair::from_seed(&[0x42; 32]),
             prev_qc_bytes: vec![],

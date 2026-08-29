@@ -8,7 +8,7 @@ use crate::{
     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        crypto::PQVoteSig,
+        crypto::{decode_fixed_signature, PQVoteSig},
         primitives::{
             Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS,
         },
@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 pub const SIGNER_BITFIELD_BYTES: usize = MAX_VALIDATORS.div_ceil(8);
 /// QC format version for pre-hybrid PQ-only signatures.
 /// QC format version for hybrid PQ + Ed25519 signatures.
-pub const QC_FORMAT_HYBRID: u8 = 2;
+pub const QC_FORMAT_HYBRID: u8 = 3;
 
 /// Ed25519 vote signature carried inside a hybrid quorum certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +49,10 @@ impl Decode for ClassicalVoteSig {
     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
         Ok(Self {
             validator_id: Bytes32::decode(r)?,
-            classical_sig: VariableBytes::decode(r)?,
+            classical_sig: decode_fixed_signature::<{ indra_crypto::CLASSICAL_SIG_BYTES }>(
+                r,
+                "QC classical signature",
+            )?,
         })
     }
 }
@@ -63,6 +66,8 @@ pub struct QuorumCertificateV1 {
     pub round: u32,
     /// Certified full block hash.
     pub block_hash: Bytes32,
+    /// Root of the immutable consensus snapshot governing `height`.
+    pub snapshot_root: Bytes32,
     /// Bitfield: bit i = 1 → validator at slot i signed.
     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],
     /// Individual ML-DSA-87 signatures for included validators.
@@ -105,6 +110,12 @@ impl VerifiedQc {
 /// Failure from authoritative QC verification against a frozen snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QcVerificationError {
+    /// QC round lies outside the finite consensus domain.
+    #[error("QC contains an invalid consensus round")]
+    InvalidRound,
+    /// QC names a snapshot other than the supplied governing snapshot.
+    #[error("QC snapshot root does not match the governing snapshot")]
+    SnapshotRootMismatch,
     /// A set bit has no corresponding snapshot member.
     #[error("QC signer bitfield references an absent validator")]
     UnknownSignerPosition,
@@ -135,6 +146,11 @@ pub fn verify_qc_against_snapshot(
     snapshot: &ConsensusSnapshot,
     chain_id: &str,
 ) -> Result<VerifiedQc, QcVerificationError> {
+    crate::types::primitives::validate_consensus_round(qc.round)
+        .map_err(|_| QcVerificationError::InvalidRound)?;
+    if qc.snapshot_root != snapshot.snapshot_root {
+        return Err(QcVerificationError::SnapshotRootMismatch);
+    }
     let mut signers = Vec::new();
     for (byte_index, byte) in qc.signer_bitfield.iter().copied().enumerate() {
         for bit_index in 0..8 {
@@ -188,6 +204,7 @@ pub fn verify_qc_against_snapshot(
             VoteStep::Precommit,
             &qc.block_hash,
             &signer.validator_id,
+            &qc.snapshot_root,
             chain_id,
         );
         let pq_signature = pq
@@ -255,6 +272,7 @@ impl Encode for QuorumCertificateV1 {
         self.height.encode(buf);
         self.round.encode(buf);
         self.block_hash.encode(buf);
+        self.snapshot_root.encode(buf);
         buf.extend_from_slice(&self.signer_bitfield);
         encode_list(&self.pq_signatures, buf);
         encode_list(&self.classical_signatures, buf);
@@ -262,6 +280,7 @@ impl Encode for QuorumCertificateV1 {
     fn encoded_len(&self) -> usize {
         1 + 8
             + 4
+            + 32
             + 32
             + SIGNER_BITFIELD_BYTES
             + list_encoded_len(&self.pq_signatures)
@@ -276,8 +295,9 @@ impl Decode for QuorumCertificateV1 {
             return Err(IndraError::InvalidQcFormat { format });
         }
         let height = u64::decode(r)?;
-        let round = u32::decode(r)?;
+        let round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
         let block_hash = Bytes32::decode(r)?;
+        let snapshot_root = Bytes32::decode(r)?;
         let bf_bytes = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield.copy_from_slice(bf_bytes);
@@ -287,6 +307,7 @@ impl Decode for QuorumCertificateV1 {
             height,
             round,
             block_hash,
+            snapshot_root,
             signer_bitfield,
             pq_signatures,
             classical_signatures,
@@ -304,6 +325,7 @@ mod tests {
             height: 1_000,
             round: 0,
             block_hash: Bytes32::from([0x77u8; 32]),
+            snapshot_root: Bytes32::from([0x88u8; 32]),
             signer_bitfield: [0b11111111u8; SIGNER_BITFIELD_BYTES],
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -325,6 +347,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x01; 32]),
+            snapshot_root: Bytes32::from([0x02; 32]),
             signer_bitfield: [0u8; SIGNER_BITFIELD_BYTES],
             pq_signatures: vec![],
             classical_signatures: vec![ClassicalVoteSig {
@@ -339,6 +362,20 @@ mod tests {
         let decoded = QuorumCertificateV1::decode_exact(&encoded).unwrap();
         assert_eq!(decoded.classical_signatures.len(), 1);
         assert_eq!(decoded, qc);
+    }
+
+    #[test]
+    fn qc_classical_signature_decode_requires_exact_length() {
+        for len in [
+            0,
+            indra_crypto::CLASSICAL_SIG_BYTES - 1,
+            indra_crypto::CLASSICAL_SIG_BYTES + 1,
+        ] {
+            let mut encoded = Bytes32::ZERO.encode_to_vec();
+            (len as u32).encode(&mut encoded);
+            encoded.extend(std::iter::repeat_n(0xDD, len));
+            assert!(ClassicalVoteSig::decode_exact(&encoded).is_err());
+        }
     }
 
     #[test]
@@ -403,6 +440,24 @@ mod tests {
     fn bitfield_size_is_correct() {
         // ceil(1500/8) = 188
         assert_eq!(SIGNER_BITFIELD_BYTES, 188);
+    }
+
+    #[test]
+    fn decoder_enforces_finite_round_domain() {
+        for round in [0, crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
+            let mut qc = dummy_qc();
+            qc.round = round;
+            assert!(QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).is_ok());
+        }
+        for round in [
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            let mut qc = dummy_qc();
+            qc.round = round;
+            assert!(QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).is_err());
+        }
     }
 
     #[test]

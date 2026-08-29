@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, Bytes32, VariableBytes,
-        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
+        has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, validate_consensus_round,
+        Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
@@ -42,6 +42,7 @@ pub struct QcBuilder {
     round: u32,
     block_hash: Bytes32,
     chain_id: String,
+    snapshot_root: Bytes32,
     validators: Vec<QcValidator>,
     total_stake: u64,
     votes: BTreeMap<Bytes32, VoteV1>,
@@ -54,6 +55,7 @@ impl QcBuilder {
         round: u32,
         block_hash: Bytes32,
         chain_id: String,
+        snapshot_root: Bytes32,
         validators: Vec<QcValidator>,
     ) -> Self {
         let total_stake = validators
@@ -65,6 +67,7 @@ impl QcBuilder {
             round,
             block_hash,
             chain_id,
+            snapshot_root,
             validators,
             total_stake,
             votes: BTreeMap::new(),
@@ -76,6 +79,7 @@ impl QcBuilder {
         if vote.height == self.height
             && vote.round == self.round
             && vote.block_hash == self.block_hash
+            && vote.snapshot_root == self.snapshot_root
         {
             self.votes.insert(vote.validator_id, vote);
         }
@@ -97,6 +101,7 @@ impl QcBuilder {
 
     /// Build the QC if quorum has been reached.
     pub fn build(&self) -> ConsensusResult<QuorumCertificateV1> {
+        validate_round(self.round)?;
         let stake_bps = self.current_stake_bps();
         let voted_stake = self
             .votes
@@ -115,6 +120,7 @@ impl QcBuilder {
             self.round,
             self.block_hash,
             &self.chain_id,
+            self.snapshot_root,
             &self.validators,
             self.votes.values().collect(),
         )
@@ -127,10 +133,19 @@ pub fn build_qc(
     round: u32,
     block_hash: Bytes32,
     chain_id: &str,
+    snapshot_root: Bytes32,
     validators: &[QcValidator],
     votes: Vec<&VoteV1>,
 ) -> ConsensusResult<QuorumCertificateV1> {
-    build_qc_from_votes(height, round, block_hash, chain_id, validators, votes)
+    build_qc_from_votes(
+        height,
+        round,
+        block_hash,
+        chain_id,
+        snapshot_root,
+        validators,
+        votes,
+    )
 }
 
 fn build_qc_from_votes(
@@ -138,9 +153,11 @@ fn build_qc_from_votes(
     round: u32,
     block_hash: Bytes32,
     _chain_id: &str,
+    snapshot_root: Bytes32,
     validators: &[QcValidator],
     votes: Vec<&VoteV1>,
 ) -> ConsensusResult<QuorumCertificateV1> {
+    validate_round(round)?;
     let by_id: HashMap<Bytes32, &QcValidator> =
         validators.iter().map(|v| (v.validator_id, v)).collect();
 
@@ -148,6 +165,11 @@ fn build_qc_from_votes(
     let mut pq_sigs = Vec::new();
     let mut classical_sigs = Vec::new();
     for vote in &votes {
+        if vote.snapshot_root != snapshot_root {
+            return Err(ConsensusError::CryptoError {
+                detail: "mixed or incorrect snapshot roots in QC votes".to_string(),
+            });
+        }
         let Some(validator) = by_id.get(&vote.validator_id) else {
             continue;
         };
@@ -186,6 +208,7 @@ fn build_qc_from_votes(
         height,
         round,
         block_hash,
+        snapshot_root,
         signer_bitfield,
         pq_signatures: pq_sigs,
         classical_signatures: classical_sigs,
@@ -261,6 +284,7 @@ pub fn verify_qc(
     total_stake: u64,
     chain_id: &str,
 ) -> ConsensusResult<()> {
+    validate_round(qc.round)?;
     let signers = signer_validators(qc, validators)?;
     let signed_stake = signers
         .iter()
@@ -316,6 +340,7 @@ pub fn verify_qc(
             VoteStep::Precommit,
             &qc.block_hash,
             &validator.validator_id,
+            &qc.snapshot_root,
             chain_id,
         );
         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
@@ -371,6 +396,14 @@ pub fn verify_qc(
     Ok(())
 }
 
+fn validate_round(round: u32) -> ConsensusResult<()> {
+    validate_consensus_round(round)
+        .map(|_| ())
+        .map_err(|error| ConsensusError::InvalidRound {
+            detail: error.to_string(),
+        })
+}
+
 /// Verify a QC with full hybrid signature enforcement.
 ///
 /// Both ML-DSA-87 (PQ) and
@@ -390,7 +423,16 @@ mod tests {
     use super::*;
     use crate::vote::produce_vote;
     use indra_core::types::primitives::DEFAULT_CHAIN_ID;
+    use indra_core::types::{
+        block::VrfSuiteV1,
+        consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
+        primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        qc::verify_qc_against_snapshot,
+    };
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::VrfKeypair;
+
+    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
 
     fn make_validator(seed: u8, position: usize, stake: u64) -> (QcValidator, HybridKeypair) {
         let classical = ClassicalKeypair::from_seed(&[seed; 32]);
@@ -409,6 +451,107 @@ mod tests {
     }
 
     #[test]
+    fn qc_is_cryptographically_bound_to_one_snapshot_root() {
+        let (validator, signer) = make_validator(0x61, 0, 1);
+        let public = signer.public_key();
+        let vrf_pk = VrfKeypair::from_seed(&[0x62; 32]).public_key();
+        let entry = |weight| {
+            ConsensusSnapshotEntry::new(
+                validator.validator_id,
+                weight,
+                public.classical.0,
+                public.pq.0,
+                vrf_pk,
+                VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                0,
+            )
+            .unwrap()
+        };
+        let snapshot_a = ConsensusSnapshot::new(
+            1,
+            0,
+            vec![entry(1)],
+            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
+        .unwrap();
+        let snapshot_b = ConsensusSnapshot::new(
+            1,
+            0,
+            vec![entry(2)],
+            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
+        .unwrap();
+        assert_ne!(snapshot_a.snapshot_root, snapshot_b.snapshot_root);
+
+        let block_hash = Bytes32::from([0x63; 32]);
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            validator.validator_id,
+            snapshot_a.snapshot_root,
+            DEFAULT_CHAIN_ID,
+            &signer,
+        )
+        .unwrap();
+        let qc = build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            snapshot_a.snapshot_root,
+            &[validator],
+            vec![&vote],
+        )
+        .unwrap();
+
+        assert!(verify_qc_against_snapshot(&qc, &snapshot_a, DEFAULT_CHAIN_ID).is_ok());
+        assert!(verify_qc_against_snapshot(&qc, &snapshot_b, DEFAULT_CHAIN_ID).is_err());
+    }
+
+    #[test]
+    fn qc_builder_rejects_mixed_snapshot_votes_before_quorum() {
+        let (a, a_key) = make_validator(0x64, 0, 5);
+        let (b, b_key) = make_validator(0x65, 1, 5);
+        let block_hash = Bytes32::from([0x66; 32]);
+        let root_a = Bytes32::from([0xA1; 32]);
+        let root_b = Bytes32::from([0xB2; 32]);
+        let vote_a = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            a.validator_id,
+            root_a,
+            DEFAULT_CHAIN_ID,
+            &a_key,
+        )
+        .unwrap();
+        let vote_b = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            block_hash,
+            b.validator_id,
+            root_b,
+            DEFAULT_CHAIN_ID,
+            &b_key,
+        )
+        .unwrap();
+        assert!(build_qc(
+            1,
+            0,
+            block_hash,
+            DEFAULT_CHAIN_ID,
+            root_a,
+            &[a, b],
+            vec![&vote_a, &vote_b],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn build_qc_single_validator() {
         let (v, kp) = make_validator(0x01, 0, 10_000);
         let block_hash = Bytes32::from([0xAAu8; 32]);
@@ -418,6 +561,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -427,6 +571,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
@@ -434,6 +579,38 @@ mod tests {
         assert_eq!(qc.height, 1);
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.signer_count(), 1);
+    }
+
+    #[test]
+    fn qc_construction_rejects_round_limit_and_above() {
+        let (validator, keypair) = make_validator(0x72, 0, 10_000);
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Precommit,
+            TEST_SNAPSHOT_ROOT,
+            validator.validator_id,
+            TEST_SNAPSHOT_ROOT,
+            DEFAULT_CHAIN_ID,
+            &keypair,
+        )
+        .unwrap();
+        for round in [
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
+            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
+            u32::MAX,
+        ] {
+            assert!(build_qc(
+                1,
+                round,
+                TEST_SNAPSHOT_ROOT,
+                DEFAULT_CHAIN_ID,
+                TEST_SNAPSHOT_ROOT,
+                std::slice::from_ref(&validator),
+                vec![&vote],
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -446,6 +623,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -455,6 +633,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
@@ -473,6 +652,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -483,6 +663,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            snapshot_root: TEST_SNAPSHOT_ROOT,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -508,6 +689,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -517,6 +699,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
@@ -542,6 +725,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -551,6 +735,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
@@ -569,6 +754,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -578,6 +764,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
@@ -602,6 +789,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v1.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp1,
         )
@@ -611,6 +799,7 @@ mod tests {
             0,
             block_hash,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &[v1.clone(), v2.clone()],
             vec![&vote],
         )
@@ -631,6 +820,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            snapshot_root: TEST_SNAPSHOT_ROOT,
             signer_bitfield,
             pq_signatures: vec![PQVoteSig {
                 validator_id: v.validator_id,
@@ -656,6 +846,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash: Bytes32::from([0x11u8; 32]),
+            snapshot_root: TEST_SNAPSHOT_ROOT,
             signer_bitfield,
             pq_signatures: vec![],
             classical_signatures: vec![],
@@ -679,6 +870,7 @@ mod tests {
             VoteStep::Precommit,
             block_hash,
             v.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &kp,
         )
@@ -690,6 +882,7 @@ mod tests {
             height: 1,
             round: 0,
             block_hash,
+            snapshot_root: TEST_SNAPSHOT_ROOT,
             signer_bitfield,
             pq_signatures: vec![
                 PQVoteSig {
@@ -748,6 +941,7 @@ mod tests {
             VoteStep::Precommit,
             hash_a,
             byzantine.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &byzantine_key,
         )
@@ -758,6 +952,7 @@ mod tests {
             VoteStep::Precommit,
             hash_a,
             honest_a.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &honest_a_key,
         )
@@ -768,6 +963,7 @@ mod tests {
             VoteStep::Precommit,
             hash_b,
             byzantine.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &byzantine_key,
         )
@@ -778,6 +974,7 @@ mod tests {
             VoteStep::Precommit,
             hash_b,
             honest_b.validator_id,
+            TEST_SNAPSHOT_ROOT,
             DEFAULT_CHAIN_ID,
             &honest_b_key,
         )
@@ -788,6 +985,7 @@ mod tests {
             round,
             hash_a,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &validators,
             vec![&byzantine_a, &honest_a_vote],
         )
@@ -797,6 +995,7 @@ mod tests {
             round,
             hash_b,
             DEFAULT_CHAIN_ID,
+            TEST_SNAPSHOT_ROOT,
             &validators,
             vec![&byzantine_b, &honest_b_vote],
         )

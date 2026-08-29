@@ -11,7 +11,7 @@ use indra_core::{
         SLASH_REWARD_TX_IDX, STAKING_REWARD_TX_IDX, STAKING_TX_IDX,
     },
     types::{
-        block::{BlockVNext, NO_POLC_ROUND},
+        block::BlockVNext,
         epoch_record::EpochRecord,
         governance::{compute_proposal_id, GovernanceOpV2, GovernancePayload},
         staking::{StakingOp, StakingOpBody},
@@ -939,12 +939,8 @@ fn get_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String
     }
 }
 
-fn polc_round_json(polc_round: u32) -> String {
-    if polc_round == NO_POLC_ROUND {
-        "null".to_string()
-    } else {
-        polc_round.to_string()
-    }
+fn polc_round_json(polc_round: Option<u32>) -> String {
+    polc_round.map_or_else(|| "null".to_string(), |round| round.to_string())
 }
 
 fn block_rpc_json(block: &BlockVNext) -> String {
@@ -2944,7 +2940,7 @@ mod tests {
                 value_hash: Bytes32::from([byte.wrapping_add(3); 32]),
                 base_fee: 100 + height,
                 proposer_round: byte as u32,
-                polc_round: NO_POLC_ROUND,
+                polc_round: None,
                 proposer_id: Bytes32::from([byte.wrapping_add(3); 32]),
                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
                 election_seed: indra_core::types::primitives::Bytes64([byte; 64]),
@@ -3794,8 +3790,20 @@ mod tests {
             )
             .unwrap()
         };
-        let previous = ConsensusSnapshot::new(601, 600, vec![entry(2_000_000_000)], 1).unwrap();
-        let current = ConsensusSnapshot::new(901, 900, vec![entry(3_000_000_000)], 1).unwrap();
+        let previous = ConsensusSnapshot::new(
+            601,
+            600,
+            vec![entry(2_000_000_000)],
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
+        .unwrap();
+        let current = ConsensusSnapshot::new(
+            901,
+            900,
+            vec![entry(3_000_000_000)],
+            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        )
+        .unwrap();
         let previous_root = hex::encode(previous.snapshot_root.0);
         let current_root = hex::encode(current.snapshot_root.0);
         engine.height = 950;

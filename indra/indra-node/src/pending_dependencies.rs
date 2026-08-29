@@ -579,6 +579,8 @@ mod tests {
                 deposit_utxo_id: deposit,
                 validator_pubkey: pubkey(0x13),
                 vrf_pk: [0x55; 32],
+                vrf_possession_output: indra_core::Bytes64([0x56; 64]),
+                vrf_possession_proof: indra_core::VariableBytes::from_slice(&[0x57; 80]).unwrap(),
                 cold_pubkey: cold.clone(),
                 cold_signature: signature(),
             }),

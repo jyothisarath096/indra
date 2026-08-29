@@ -19,9 +19,9 @@ use indra_core::types::{
 
 use indra_core::types::primitives::{
     Bytes32, Bytes64, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
-    INITIAL_BASE_FEE_SPARK_PER_KB, MAX_CHAIN_ID_BYTES, MAX_STAKE_POSITIONS_PER_VALIDATOR,
-    MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION, MAX_TRANCHES_PER_VALIDATOR,
-    MAX_TRANCHES_TOTAL,
+    INITIAL_BASE_FEE_SPARK_PER_KB, MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, MAX_CHAIN_ID_BYTES,
+    MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
+    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
 };
 use indra_core::types::stake_position::{
     ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTrancheV1,
@@ -362,7 +362,7 @@ impl Decode for ChainState {
             snapshots
         };
         let active_slot_coefficient_numerator = u64::decode(r)?;
-        indra_core::sortition::validate_f(active_slot_coefficient_numerator)?;
+        indra_core::sortition::validate_mainnet_f(active_slot_coefficient_numerator)?;
         let election_seed = Bytes64::decode(r)?;
         let genesis_entropy_record_hash = Bytes32::decode(r)?;
         let election_seed_version = u8::decode(r)?;
@@ -550,7 +550,7 @@ impl ChainState {
             utxos: UtxoSet::new(),
             validators: ValidatorSet::new(),
             consensus_snapshots: Vec::new(),
-            active_slot_coefficient_numerator: 0,
+            active_slot_coefficient_numerator: MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
             election_seed: Bytes64::ZERO,
             genesis_entropy_record_hash: Bytes32::ZERO,
             election_seed_version: 1,
@@ -822,10 +822,9 @@ impl ChainState {
 
     /// Finalize genesis authority after the validator set has been populated.
     pub fn finalize_genesis(&mut self) -> crate::error::StateResult<()> {
-        #[cfg(test)]
-        if self.active_slot_coefficient_numerator == 0 {
-            self.active_slot_coefficient_numerator = 1u64 << 63;
-        }
+        indra_core::sortition::validate_mainnet_f(self.active_slot_coefficient_numerator).map_err(
+            |error| crate::error::StateError::InvalidConsensusSnapshot(error.to_string()),
+        )?;
         if self.height != 0 || !self.consensus_snapshots.is_empty() {
             return Err(crate::error::StateError::InvalidConsensusSnapshot(
                 "genesis snapshot initialization requires pristine height-zero snapshot state"
@@ -1906,6 +1905,33 @@ mod tests {
         assert!(state.utxos.is_empty());
         assert!(state.validators.is_empty());
         assert!(state.consensus_snapshots.is_empty());
+        assert_eq!(
+            state.active_slot_coefficient_numerator,
+            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR
+        );
+    }
+
+    #[test]
+    fn persisted_state_rejects_every_non_mainnet_f() {
+        let preferred = MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+        for invalid_f in [preferred - 1, preferred + 1, 1, 1u64 << 63] {
+            let mut invalid = ChainState::new_genesis();
+            invalid.active_slot_coefficient_numerator = invalid_f;
+            assert!(
+                ChainState::decode_exact(&invalid.encode_to_vec()).is_err(),
+                "accepted persisted non-mainnet F {invalid_f}"
+            );
+            assert!(invalid.finalize_genesis().is_err());
+        }
+
+        let finalized = snapshot_state();
+        assert_eq!(
+            finalized
+                .snapshot_for_consensus_height(1)
+                .unwrap()
+                .active_slot_coefficient_numerator,
+            preferred
+        );
     }
 
     #[test]
@@ -1988,6 +2014,10 @@ mod tests {
             indra_core::types::vote::VoteStep::Precommit,
             &block_hash,
             &revoked,
+            &state
+                .snapshot_for_consensus_height(10)
+                .unwrap()
+                .snapshot_root,
             &state.chain_id,
         );
         let revoked_keypair = indra_crypto::HybridKeypair::new(
@@ -2001,6 +2031,10 @@ mod tests {
             height: 10,
             round: 0,
             block_hash,
+            snapshot_root: state
+                .snapshot_for_consensus_height(10)
+                .unwrap()
+                .snapshot_root,
             signer_bitfield,
             pq_signatures: vec![indra_core::types::crypto::PQVoteSig {
                 validator_id: revoked,
