@@ -1,0 +1,7 @@
+Inspected indra_core::sortition::{certified_log,mul,phi,evaluate} in optimized release assembly.
+aarch64-apple-darwin assembly sha256: 8fbc676c8da59ef30d5c5c0de533a99cbaea8cc53a2c92ca9124650a635f95d5
+aarch64-unknown-linux-musl assembly sha256: 673ffe24efd460694a0afed916ca3cd0ad0b21cf1cb6bee63f3eb2212ab9fa2f
+x86_64-unknown-linux-musl assembly sha256: b5865fe4e7195cf998aab3b4a15a3e65328eb15398f6ae9a8a94c51abfa2a283
+AArch64 searched: fadd fsub fmul fdiv fcmp fcsel fsqrt scvtf ucvtf frint. Counts: all zero.
+x86-64 searched: addss addsd subss subsd mulss mulsd divss divsd sqrtss sqrtsd cvtsi2ss cvtsi2sd cvttss2si cvttsd2si. Counts: all zero.
+SIMD integer instructions were not classified as floating point merely because they use vector registers.

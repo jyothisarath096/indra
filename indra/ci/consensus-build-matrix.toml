@@ -1,0 +1,44 @@
+schema_version = 1
+protocol_block_format_version = 2
+
+[toolchain]
+rustc_version = "1.93.1"
+rustc_commit = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf"
+cargo_version = "1.93.1"
+cargo_commit = "083ac5135f967fd9dc906ab057a2315861c7a80d"
+llvm_version = "21.1.8"
+
+[build]
+profile = "release"
+command = "cargo build --workspace --release --locked --target <target>"
+default_features_only = true
+allowed_workspace_features = []
+rustflags = ""
+target_cpu = "target default"
+target_features = "target default"
+runtime_cpu_dispatch = "allowed only for semantically byte-identical primitive implementations"
+cargo_lock_sha256 = "5479dc079feaa81055de2a26ef585c9778b5257ace77d5e805229bc2679ab7b7"
+
+[[platform]]
+name = "macOS ARM64"
+os = "macOS"
+architecture = "arm64"
+target = "aarch64-apple-darwin"
+minimum_os = "12.0"
+linkage = "platform default"
+
+[[platform]]
+name = "Linux x86-64"
+os = "Linux"
+architecture = "x86_64"
+target = "x86_64-unknown-linux-musl"
+minimum_os = "kernel/runtime compatible with the static release artifact"
+linkage = "static musl"
+
+[[platform]]
+name = "Linux AArch64"
+os = "Linux"
+architecture = "aarch64"
+target = "aarch64-unknown-linux-musl"
+minimum_os = "kernel/runtime compatible with the static release artifact"
+linkage = "static musl"

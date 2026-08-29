@@ -1,0 +1,3410 @@
+diff --git a/indra/docs/DEPLOYMENT_MANIFEST.md b/indra/docs/DEPLOYMENT_MANIFEST.md
+index 433c34b7..f64f79e0 100644
+--- a/indra/docs/DEPLOYMENT_MANIFEST.md
++++ b/indra/docs/DEPLOYMENT_MANIFEST.md
+@@ -32,14 +32,21 @@ The next deployment record must additionally publish the canonical genesis
+ fingerprint, genesis block hash, state and consensus-snapshot roots, monetary
+ ledger identity, active-slot coefficient, complete Bitcoin entropy descriptor
+ and 80-byte header, and each validator's verified VRF proof of possession.
+-
+-Genesis assembly is fail-closed on Bitcoin entropy verification. Operators run
+-`indra-genesis build ... --bitcoin-cli /path/to/bitcoin-cli`; the tool queries a
+-local Bitcoin Core node for the announced height on its active most-work chain,
+-locally double-SHA-256 checks the returned 80-byte header against that block
+-hash, verifies the configured Bitcoin network genesis hash, and requires the
+-declared confirmation floor. `indra-genesis verify-bitcoin-entropy` repeats the
+-same checks for an assembled manifest. There is no deadline or offline fallback.
++The active-slot coefficient is not an operator choice: initial mainnet requires
++`f=3/8`, encoded as `active_slot_coefficient_numerator="6917529027641081856"`.
++Every other value is rejected by genesis and persisted-state validation.
++
++Genesis assembly uses the mandatory pre-target workflow: `commit-validator`,
++`precommit`, `freeze-authority`, and `finalize`. The precommit target must be at
++least 144 Bitcoin blocks beyond the current tip. Both the precommit and fully
++opened authority artifact/hash must be published through two independent witness
++channels before the target exists. `finalize` accepts no validator reveals and
++therefore leaves no post-target selective-abort decision. It and
++`verify-bitcoin-entropy` require
++agreement from at least two Bitcoin Core clients and exactly 100 declared
++confirmations (the observed depth may be greater). The removed one-shot `build`
++command always fails; there is no deadline, single-node, offline, or alternate-
++height fallback.
+ 
+ ## Validators
+ 
+diff --git a/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md b/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
+index 0d44a74a..fba67ab6 100644
+--- a/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
++++ b/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
+@@ -31,7 +31,7 @@ The following parameters are approved and normative in this revision:
+ - Proposal collection uses the existing propose-phase timeout (currently eight seconds). No second election timer is introduced.
+ - `election_seed[1] = election_seed[0]`; failed rounds do not evolve it.
+ 
+-The sortition construction in Section 5.2 is approved as the Ouroboros Praos/Minotaur single-validator threshold. Its arithmetic and calibration rules are normative below; the actual active-slot coefficient `f` is selected during the genesis ceremony by the prescribed simulation and is immutable in this implementation. Any future governance-controlled change is separately gated on Topic 9 design and audit.
++The sortition construction in Section 5.2 is approved as the Ouroboros Praos/Minotaur single-validator threshold. Mainnet fixes `f = 3/8`, encoded exactly as `F = 6917529027641081856`; it is not runtime-, genesis-, or governance-configurable in the initial mainnet protocol. Changing it requires a protocol version change and renewed grinding/liveness analysis.
+ 
+ ## 2. Current problems and security objectives
+ 
+@@ -220,7 +220,7 @@ This is the Praos threshold formalized and reused by Minotaur [Ouroboros Praos](
+ 
+ #### 5.2.1 Protocol representation and admitted domain
+ 
+-`f` is encoded canonically as `F/2^64`, where `F` is the required genesis-config field `active_slot_coefficient_numerator`. In genesis TOML it is a quoted canonical ASCII decimal string: digits only, no sign, whitespace, or leading zeroes. This string form is required because TOML's signed integer domain cannot represent the admitted upper endpoint `2^63`. After parsing, consensus and snapshot encodings use `u64_le`. Genesis validation requires `1 <= F <= 2^63`; thus `0 < f <= 1/2`. This is an arithmetic/liveness safety domain, not the selection of an operational value. It bounds the series argument, keeps the expected number of eligible validators appropriate for one-proposer BFT, and permits one fixed proof of cost/error. The selected `F` is immutable in this implementation and is copied into and state-root committed by every `ConsensusSnapshot`.
++`f` is encoded canonically as `F/2^64`. The Q768 arithmetic helper retains the audited mathematical domain `1 <= F <= 2^63`, but that domain does not define deployable consensus configuration. Initial mainnet admits exactly `F = 6917529027641081856`, so `f = 3/8`. Genesis TOML records that exact value as a quoted canonical ASCII decimal string; consensus and snapshot encodings use `u64_le`. Genesis, snapshot construction/decoding, and persisted-state restoration reject every other value rather than rewriting or migrating it. The exact `F` is copied into and state-root committed by every `ConsensusSnapshot`.
+ 
+ There is deliberately no governance operation, feature flag, or runtime override for `F`. A governance-controlled parameter-change mechanism is a tracked future design item, to be considered only after Topic 9 audits the governance commit-reveal subsystem; it must define advance publication and snapshot-epoch activation before implementation. Its absence here is intentional, not an implied permission to mutate `F` out of band.
+ 
+@@ -313,7 +313,7 @@ A direct Python 3 reference prototype executing the exact operation schedule abo
+ 
+ #### 5.2.5 Calibration methodology for `f`
+ 
+-No value of `F` is selected here. Candidate values within `0 < f <= 1/2` must be simulated across every validator count from 1 to 200, observed and adversarial stake distributions, network-latency/loss traces, and Byzantine withholding up to but not including one-third stake.
++The Phase-7 calibration fixed mainnet at `f = 3/8` (`F = 6917529027641081856`) after sweeping the mathematical domain across validator counts, stake distributions, offline stake, and Byzantine withholding up to one-third stake. The following methodology remains the required basis for any future protocol-version proposal to change that value.
+ 
+ For Byzantine fraction `beta`, the ideal probability that no honest stake is eligible in one round is `(1-f)^(1-beta)`, and for `r` independent rounds it is `(1-f)^((1-beta)r)`. Calibration must choose and publish targets for:
+ 
+@@ -324,7 +324,9 @@ For Byzantine fraction `beta`, the ideal probability that no honest stake is eli
+ - Byzantine withholding and targeted loss scenarios;
+ - all partitions and mergers of identical aggregate stake, requiring ideal probabilities to agree and implementation/discretization differences to remain below the `2^-504` aggregate bound.
+ 
+-Selection minimizes latency subject to the published bandwidth/contention ceiling and safety/liveness assumptions. It must not copy Cardano mainnet's coefficient: INDRA has different validator count, timeout, network, and economics. The simulation code, seeds, input distributions, raw results, and chosen `F` must be committed to the genesis record before validator keys and genesis state are finalized.
++Selection minimizes latency subject to the published bandwidth/contention ceiling and safety/liveness assumptions. It must not copy another network's coefficient: INDRA has different validator count, timeout, network, and economics. Mainnet configuration cannot select another value; any change requires a new protocol version plus a newly published analysis and redeployment/upgrade boundary.
++
++Publish/withhold grinding (L2-GR-01) remains an accepted, bounded residual at `f = 3/8`. The election seed is therefore consensus sortition entropy only and MUST NOT be exposed or reused as general-purpose application randomness.
+ 
+ ### 5.3 Full-width priority and proposal timing
+ 
+@@ -390,6 +392,31 @@ the same value is re-enveloped. A proposer cannot substitute arbitrary entropy:
+ the retained origin proof and stake-threshold result are reverified at every
+ proposal trust boundary.
+ 
++#### 6.0.1 VRF-007 stable-value commitment addendum
++
++The stable value identity commits the complete immutable entropy record rather
++than relying on a verifier's ephemeral memory of the first proposal. Define:
++
++```text
++entropy_commitment =
++    SHA-256("INDRA-PROPOSAL-ENTROPY-COMMIT-v1" ||
++            canonical_encode(ProposalEntropyV1))
++```
++
++and include `entropy_commitment` as a fixed 32-byte input to the canonical
++`value_hash` preimage. Canonical encoding length-prefixes the bounded VRF output
++and proof and uses the protocol codec's unique little-endian representation for
++`origin_round`; the other fields are fixed width. Consequently every mutation
++of origin identity, origin round, output, or proof changes the stable value
++identity. Current-round proposer identity, round, VRF output, VRF proof, and
++priority remain excluded, so a legitimate later-round envelope for unchanged
++entropy retains the same stable value identity.
++
++Live proposal admission recomputes projected state, validator, and stable-value
++commitments before staging a proposal or permitting vote/lock mutation. This is
++required because a peer-supplied `value_hash` is only a claim until the complete
++value transition has been projected.
++
+ This is a breaking header change in the existing batched redeploy wave:
+ 
+ ```text
+@@ -492,7 +519,7 @@ BlockHeaderVNext {
+     value_hash: Bytes32,
+     base_fee: u64,
+     proposer_round: u32,
+-    polc_round: u32,
++    polc_round: Option<u32>, // None or Some(0..=1023), canonical 0/1 presence tag
+     quorum_certificate: VariableBytes<MAX_QC_SIZE_BYTES>,
+ 
+     proposer_id: Bytes32,
+@@ -500,11 +527,17 @@ BlockHeaderVNext {
+     election_seed: Bytes64,
+     proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+     proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
++    value_entropy: ProposalEntropyV1,
+     sortition_claim: SortitionClaimV1, // PraosThreshold = 1
+     proposer_priority: Bytes64,
+ }
+ ```
+ 
++Consensus rounds have one finite normative domain: `0 <= round < 1024`.
++Round 1023 is final; exhausting it without a commit is a deterministic fatal
++`RoundLimitExceeded` condition, never wraparound or reset at the same height.
++The explicit optional PoLC encoding has no sentinel or legacy decoder.
++
+ Removed:
+ 
+ - `election_result_hash`;
+@@ -584,7 +617,7 @@ BitcoinPowEntropySourceV1 {
+     announced_height: u64,          // u64_le
+     header_codec: u8,               // 1 = Bitcoin80ByteHeader
+     extraction_algorithm: u8,       // 1 = DoubleSha256
+-    minimum_confirmations: u32,     // u32_le, must be >= 100
++    minimum_confirmations: u32,     // u32_le, must equal 100
+     reorg_policy: u8,               // 1 = SameHeightRestartConfirmations
+ }
+ ```
+@@ -598,7 +631,7 @@ external_entropy_source_id = SHA-256(
+ )
+ ```
+ 
+-The signed genesis record separately retains the exact consensus-serialized 80-byte source header. Unknown enum values, display-reversed hashes, a confirmation depth below 100, or any noncanonical/trailing encoding are rejected.
++The signed genesis record separately retains the exact consensus-serialized 80-byte source header. Unknown enum values, display-reversed hashes, a declared confirmation depth other than exactly 100, or any noncanonical/trailing encoding are rejected.
+ 
+ ```text
+ election_seed[0] = SHA-512(
+@@ -609,20 +642,26 @@ election_seed[0] = SHA-512(
+ )
+ ```
+ 
+-Each variable field has one canonical genesis encoding specified by the source descriptor, so the concatenation is unambiguous. The concrete source and future height are operational genesis-time choices, not hardcoded constants. The public commitment must precede finalization of validator VRF keys; otherwise validators could grind keys after learning the seed. `election_seed[1] = election_seed[0]` exactly, with no additional derivation.
++Each variable field has one canonical genesis encoding specified by the source descriptor, so the concatenation is unambiguous. The concrete source and future height are operational ceremony choices, but become immutable in `GenesisPrecommitV1`. The precommit target must satisfy `target_height >= current_tip + MIN_GENESIS_PRECOMMIT_BLOCK_LEAD`, where the initial mainnet constant is 144 Bitcoin blocks. `election_seed[1] = election_seed[0]` exactly, with no additional derivation.
++
++Genesis uses a mandatory pre-target commit/open/freeze ceremony: (A) hidden validator commitments and the complete descriptor are aggregated and publicly witnessed; (B) every validator reveals before the target exists; (C) the tool verifies the exact complete opening and emits a fully opened, frozen authority artifact while two Bitcoin Core nodes still report `tip < target`; (D) that artifact and hash are externally witnessed; (E) only then may the exact committed Bitcoin target header appear; (F) the same-height active-chain header reaches 100 confirmations; and (G) final genesis is assembled without any further validator input. `GenesisValidatorCommitmentV1` binds validator ID, self-stake, complete hot and cold hybrid public keys, cold-key version/nonce, VRF public key, fixed VRF suite, activation epoch zero, and a 32-byte hiding nonce. `GenesisPrecommitV1` binds the chain ID, complete descriptor, block/snapshot/ceremony versions, fixed mainnet `F`, and the strictly sorted set of validator commitments. Canonical binary transcripts—not JSON or TOML—are hashed under `INDRA-GENESIS-VALIDATOR-COMMIT-v1` and `INDRA-GENESIS-PRECOMMIT-v1`; these grammars are unchanged by the authority-freeze correction.
++
++The precommit artifact contains commitments, not raw VRF or hybrid keys. Its hash and canonical bytes must be published through at least two independent public witness channels. Before the target, every revealed validator must open exactly one precommitted commitment, the opened set must equal the committed set, and the fully opened frozen-authority artifact must also be published through two independent witness channels. Local timestamps and recorded node tips are informational evidence, not proof of chronology; external witnessing supplies the temporal evidence. Finalization accepts the original precommit and frozen authority but no reveal arguments. Consequently no validator or coordinator decision capable of changing membership, identity, stake, hybrid keys, cold keys/version, VRF keys, suite, or activation/version material remains after the target is observed.
++
++An incomplete opening is detected before the target and invalidates that ceremony. Operators may not treat an unwitnessed/incomplete ceremony as a randomness trial, wait for its target, and then selectively publish or restart only after seeing whether the result was favorable. A valid ceremony exists only once the complete frozen authority artifact has been externally witnessed before its target.
+ 
+ For a Bitcoin source, the extraction rule is normative:
+ 
+-1. During genesis assembly, obtain the consensus-serialized 80-byte block header at the announced height from independently operated fully validating Bitcoin nodes.
++1. During genesis assembly, obtain the consensus-serialized 80-byte block header at the exact precommitted height from at least two independently operated fully validating Bitcoin nodes, which must agree.
+ 2. During genesis assembly, verify its proof of work, height, ancestry to the descriptor's Bitcoin genesis hash, most-work-chain membership, and required confirmation depth. These publicly checkable external-chain facts are an operational genesis gate, not an INDRA consensus-code proof.
+ 3. Set `external_entropy_value = SHA-256(SHA-256(header_bytes))` as the raw 32 digest bytes produced by SHA-256, not RPC/display-reversed hexadecimal.
+ 4. Set `external_entropy_source_id` to the canonical descriptor encoding, including the network/genesis hash and announced height; the header itself is retained in the signed genesis record.
+ 
+ Protocol version 2 supports this `BitcoinPowHeaderV1` source scheme. Using Ethereum, drand, or another structurally different beacon requires a separately specified source-scheme enum value and extraction/finality verifier before the ceremony precommitment; operators cannot improvise an unversioned parser. The particular supported network and future height remain ceremony choices.
+ 
+-The confirmation-depth floor is the source chain's protocol/economic stale-block horizon. For Bitcoin it is **at least 100 blocks**, matching Bitcoin's consensus coinbase-maturity interval, which exists to prevent spending rewards from blocks later made stale [Bitcoin developer guide](https://developer.bitcoin.org/devguide/block_chain.html). This is a protocol-grounded floor, not a claim of deterministic Bitcoin finality. Ceremony operators must perform and publish a cost analysis and may require a greater depth where the value of biasing INDRA sortition could exceed the cost of the corresponding source-chain reorganization.
++The declared confirmation depth is exactly **100 blocks**, matching Bitcoin's consensus coinbase-maturity interval [Bitcoin developer guide](https://developer.bitcoin.org/devguide/block_chain.html). Observed depth may exceed 100, but no manifest or CLI override can declare 99, 101, or another value. This is a protocol-grounded choice, not a claim of deterministic Bitcoin finality; changing it requires a protocol change and renewed analysis.
+ 
+-There is no deadline fallback. If the announced height has not produced a block by the planned genesis time, genesis waits. The source, height, and extraction rule may not be changed after observing candidate entropy; changing them requires aborting the ceremony, publishing a new precommitment before its newly selected future event, and refinalizing validator VRF keys afterward.
++There is no deadline fallback. If the announced height has not produced a block by the planned genesis time, genesis waits. The source, height, extraction rule, confirmation depth, and reorg policy cannot change without invalidating the published precommitment. A replacement ceremony requires fresh hidden validator commitments and another target at least 144 blocks in the future.
+ 
+ Before the required depth, a source-chain reorganization discards the displaced candidate, selects the block at the **same announced height** on the new canonical chain, and restarts the confirmation count. A reorganization detected after the depth but before INDRA genesis launch aborts finalization and applies the same rule. Once INDRA genesis has launched, its signed genesis entropy is immutable; a later source-chain reorganization is recorded as a ceremony incident but cannot rewrite INDRA genesis.
+ 
+@@ -644,10 +683,14 @@ Persisting one ML-DSA-87 signature per block creates material storage growth. Im
+ MAX_STANDARD_VRF_OUTPUT_BYTES = 64
+ MAX_STANDARD_VRF_PROOF_BYTES  = 80
+ VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 = 1
+-BlockHeader protocol version: 1 -> 2
++BlockHeader protocol version: 2 -> 3
+ ```
+ 
+-The old value is the repository's current `BLOCK_FORMAT_VERSION: u16 = 1`; the new value is exactly one greater. This is a wire break, not a compatibility discriminator: after clean redeploy only version 2 is decoded.
++VRF-007 changes stable-value consensus semantics without adding a header field,
++so the block protocol version increments from 2 to 3. This is a wire and
++consensus break, not a compatibility discriminator: after clean redeploy only
++version 4 is decoded. There is no fallback for the version-3 PoLC sentinel or
++earlier value-hash formats.
+ 
+ ## 8. Invariants and required verification tests
+ 
+@@ -683,7 +726,7 @@ Implementation is not complete until all of the following are permanent tests:
+ | Targeted DoS after eligibility reveal | Residual | Proof is revealed with proposal, minimizing but not eliminating the attack window. |
+ | Multiple eligible proposers | Intentional | Deterministic full-width priority plus BFT voting resolves competition. |
+ | No eligible proposer | Probabilistic | Existing propose timeout advances the round without changing the seed; ideal probability is `1-f`, with `F` selected by the published calibration. |
+-| Sortition arithmetic/model | Resolved construction; operational coefficient pending simulation | Praos threshold uses certified downward-rounded Q768 intervals; the selected `F` must be justified by the Section 5.2.5 simulation record. |
++| Sortition arithmetic/model | Resolved; mainnet `f=3/8` | Praos threshold uses certified downward-rounded Q768 intervals. Mainnet accepts only `F=6917529027641081856`; changing it requires a protocol version and renewed analysis. |
+ | Genesis/key-registration grinding | Bounded operationally and in consensus | Precommitted future external entropy plus snapshot-delayed, proof-of-possession-bound VRF-key activation; external-source producer/reorg risk remains. |
+ | Election seed used as application randomness | Forbidden | Consensus entropy retains a proposer publish/withhold bit and is not a general randomness beacon. |
+ 
+diff --git a/indra/genesis.toml.example b/indra/genesis.toml.example
+index c25f1e71..039e3c9e 100644
+--- a/indra/genesis.toml.example
++++ b/indra/genesis.toml.example
+@@ -8,11 +8,16 @@
+ #    offline cold-key Shamir ceremony. No private material is sent to the
+ #    coordinator.
+ #
+-# 2. Each validator shares only their inspectable hot public metadata and the
+-#    public cold-ceremony manifest with the genesis coordinator.
++# 2. Each validator runs `indra-genesis commit-validator`. Only the resulting
++#    commitment artifact is published before the future Bitcoin target; the
++#    reveal artifact remains private until that target header is fixed.
+ #
+-# 3. The coordinator runs `indra-genesis build`; operators compare the output
+-#    of `indra-genesis inspect` on every machine before starting any node.
++# 3. The coordinator runs `indra-genesis precommit` at least 144 Bitcoin blocks
++#    before the target and publishes it through two independent witness channels.
++#    All validators reveal immediately; `indra-genesis freeze-authority` verifies
++#    the complete set while the target is still in the future. The opened artifact
++#    is also externally witnessed before the target. At 100 confirmations,
++#    `finalize` consumes that artifact and accepts no validator reveal input.
+ #
+ # 4. Each validator runs:
+ #      indra-node --genesis genesis.toml --keys keys.json --data-dir ./data
+@@ -21,8 +26,10 @@
+ 
+ [genesis]
+ chain_id     = "indra-testnet-1"
+-active_slot_coefficient_numerator = "9223372036854775808"
++# Initial mainnet protocol constant: f=3/8. Any other value is rejected.
++active_slot_coefficient_numerator = "6917529027641081856"
+ bitcoin_pow_entropy_header = "<160 lowercase hex characters from the verified Bitcoin header>"
++genesis_precommit_hash = "<64 lowercase hex characters from the published precommit artifact>"
+ 
+ [genesis.bitcoin_pow_entropy_source]
+ scheme = 1
+@@ -48,6 +55,7 @@ cold_hybrid_classical_pk = "aabbcc..." # 64 hex chars
+ cold_hybrid_pq_pk        = "aabbcc..." # exact ML-DSA-87 public-key length
+ cold_key_version         = 1
+ cold_nonce               = 0
++genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
+ # Genesis validator stake in Spark (1 INDRA = 100,000,000 Spark)
+ # Genesis validators are exempt from minimum stake requirements.
+ # stake = 100000000000 -> 1,000 INDRA per genesis validator
+@@ -68,6 +76,7 @@ cold_hybrid_classical_pk = "112233..."
+ cold_hybrid_pq_pk        = "112233..."
+ cold_key_version         = 1
+ cold_nonce               = 0
++genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
+ stake               = 100000000000
+ 
+ [[validators]]
+@@ -82,6 +91,7 @@ cold_hybrid_classical_pk = "334455..."
+ cold_hybrid_pq_pk        = "334455..."
+ cold_key_version         = 1
+ cold_nonce               = 0
++genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
+ stake               = 100000000000
+ 
+ [[validators]]
+@@ -96,4 +106,5 @@ cold_hybrid_classical_pk = "556677..."
+ cold_hybrid_pq_pk        = "556677..."
+ cold_key_version         = 1
+ cold_nonce               = 0
++genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
+ stake               = 100000000000
+diff --git a/indra/indra-cli/src/bin/genesis.rs b/indra/indra-cli/src/bin/genesis.rs
+index a8c7706f..7e72e249 100644
+--- a/indra/indra-cli/src/bin/genesis.rs
++++ b/indra/indra-cli/src/bin/genesis.rs
+@@ -2,8 +2,12 @@ use std::path::Path;
+ use std::process::Command;
+ 
+ use indra_cli::{build_genesis_config, entry_from_public_keys, with_cold_file};
++use indra_core::types::primitives::{
++    Bytes32, BITCOIN_GENESIS_CONFIRMATIONS, MIN_GENESIS_PRECOMMIT_BLOCK_LEAD,
++};
+ use indra_state::{compute_state_root, ChainState};
+-use serde::Deserialize;
++use rand::{rngs::OsRng, RngCore};
++use serde::{Deserialize, Serialize};
+ 
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -12,10 +16,56 @@ struct GenesisVrfProofFile {
+     vrf_possession_proof: String,
+ }
+ 
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ValidatorCommitmentArtifact {
++    version: u8,
++    commitment: String,
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ValidatorRevealArtifact {
++    version: u8,
++    commitment: String,
++    validator: indra_cli::GenesisEntry,
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct GenesisPrecommitArtifact {
++    version: u8,
++    chain_id: String,
++    bitcoin_descriptor: indra_node::genesis::BitcoinPowEntropySourceV1,
++    validator_commitments: Vec<String>,
++    canonical_bytes: String,
++    precommit_hash: String,
++    created_unix_seconds_informational_only: u64,
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct GenesisAuthorityArtifact {
++    version: u8,
++    precommit_hash: String,
++    vrf_suite: u8,
++    activation_epoch: u64,
++    validator_commitments: Vec<String>,
++    validators: Vec<indra_cli::GenesisEntry>,
++    canonical_bytes: String,
++    authority_hash: String,
++    bitcoin_tip_at_freeze_informational_only: u64,
++    created_unix_seconds_informational_only: u64,
++}
++
+ fn main() {
+     let args: Vec<String> = std::env::args().collect();
+     let result = match args.get(1).map(String::as_str) {
+-        Some("build") => build(&args[2..]),
++        Some("commit-validator") => commit_validator(&args[2..]),
++        Some("precommit") => precommit(&args[2..]),
++        Some("freeze-authority") => freeze_authority(&args[2..]),
++        Some("finalize") => finalize(&args[2..]),
++        Some("build") => Err("legacy one-shot genesis build is removed; use commit-validator, precommit, freeze-authority, then finalize".into()),
+         Some("create-vrf-proof") => create_vrf_proof(&args[2..]),
+         Some("verify-bitcoin-entropy") => verify_bitcoin_entropy_command(&args[2..]),
+         Some("validate") => validate(&args[2..]),
+@@ -76,83 +126,462 @@ fn repeated(args: &[String], flag: &str) -> Vec<String> {
+         .collect()
+ }
+ 
+-fn build(args: &[String]) -> Result<(), String> {
++fn entry_to_validator(entry: &indra_cli::GenesisEntry) -> indra_node::GenesisValidator {
++    indra_node::GenesisValidator {
++        name: entry.name.clone(),
++        validator_id: entry.validator_id.clone(),
++        hybrid_classical_pk: entry.hybrid_classical_pk.clone(),
++        hybrid_pq_pk: entry.hybrid_pq_pk.clone(),
++        vrf_pk: entry.vrf_pk.clone(),
++        vrf_possession_output: entry.vrf_possession_output.clone(),
++        vrf_possession_proof: entry.vrf_possession_proof.clone(),
++        cold_hybrid_classical_pk: entry.cold_hybrid_classical_pk.clone(),
++        cold_hybrid_pq_pk: entry.cold_hybrid_pq_pk.clone(),
++        cold_key_version: entry.cold_key_version,
++        cold_nonce: entry.cold_nonce,
++        stake: entry.stake,
++        genesis_commitment_nonce: entry.genesis_commitment_nonce.clone(),
++    }
++}
++
++fn write_new_json(path: &str, value: &impl Serialize) -> Result<(), String> {
++    if Path::new(path).exists() {
++        return Err(format!("{path} already exists; refusing to overwrite"));
++    }
++    let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
++    std::fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))
++}
++
++#[cfg(unix)]
++fn write_new_private_json(path: &str, value: &impl Serialize) -> Result<(), String> {
++    use std::io::Write;
++    use std::os::unix::fs::OpenOptionsExt;
++
++    let path = Path::new(path);
++    if path.exists() {
++        return Err(format!(
++            "{} already exists; refusing to overwrite",
++            path.display()
++        ));
++    }
++    let parent = path.parent().unwrap_or_else(|| Path::new("."));
++    let mut suffix = [0u8; 16];
++    OsRng.fill_bytes(&mut suffix);
++    let temporary = parent.join(format!(".indra-genesis-reveal-{}.tmp", hex::encode(suffix)));
++    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(&temporary)
++        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
++    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
++        let _ = std::fs::remove_file(&temporary);
++        return Err(format!("cannot write {}: {error}", temporary.display()));
++    }
++    std::fs::rename(&temporary, path).map_err(|error| {
++        let _ = std::fs::remove_file(&temporary);
++        format!("cannot install {}: {error}", path.display())
++    })
++}
++
++fn commit_validator(args: &[String]) -> Result<(), String> {
+     let chain_id = required(args, "--chain-id")?;
+-    let f_text = required(args, "--active-slot-coefficient-numerator")?;
+-    if f_text.is_empty()
+-        || !f_text.bytes().all(|byte| byte.is_ascii_digit())
+-        || (f_text.len() > 1 && f_text.starts_with('0'))
++    let spec = required(args, "--validator")?;
++    let commitment_output = required(args, "--commitment-output")?;
++    let reveal_output = required(args, "--reveal-output")?;
++    let parts: Vec<&str> = spec.split(',').collect();
++    if parts.len() != 5 {
++        return Err(
++            "--validator must be NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON,VRF_PROOF_JSON"
++                .into(),
++        );
++    }
++    let stake = parts[1]
++        .parse::<u64>()
++        .map_err(|_| "invalid validator stake")?;
++    let hot_json = std::fs::read_to_string(parts[2]).map_err(|e| e.to_string())?;
++    let (_, public) = indra_cli::inspect_public_metadata(&hot_json).map_err(|e| e.to_string())?;
++    let cold_json = std::fs::read_to_string(parts[3]).map_err(|e| e.to_string())?;
++    let proof: GenesisVrfProofFile =
++        serde_json::from_str(&std::fs::read_to_string(parts[4]).map_err(|e| e.to_string())?)
++            .map_err(|e| e.to_string())?;
++    let mut entry = with_cold_file(entry_from_public_keys(parts[0], &public, stake), &cold_json)
++        .map_err(|e| e.to_string())?;
++    entry.vrf_possession_output = proof.vrf_possession_output;
++    entry.vrf_possession_proof = proof.vrf_possession_proof;
++    let mut nonce = [0u8; 32];
++    OsRng.fill_bytes(&mut nonce);
++    entry.genesis_commitment_nonce = hex::encode(nonce);
++    let commitment =
++        indra_node::genesis::genesis_validator_commitment(&chain_id, &entry_to_validator(&entry))?;
++    let commitment = hex::encode(commitment.0);
++    write_new_json(
++        &commitment_output,
++        &ValidatorCommitmentArtifact {
++            version: 1,
++            commitment: commitment.clone(),
++        },
++    )?;
++    write_new_private_json(
++        &reveal_output,
++        &ValidatorRevealArtifact {
++            version: 1,
++            commitment,
++            validator: entry,
++        },
++    )
++}
++
++fn bitcoin_clients(args: &[String]) -> Result<Vec<String>, String> {
++    let clients = repeated(args, "--bitcoin-cli");
++    if clients.len() < 2 {
++        return Err(
++            "at least two independently operated --bitcoin-cli clients are required".into(),
++        );
++    }
++    Ok(clients)
++}
++
++fn parse_commitment(value: &str) -> Result<Bytes32, String> {
++    if !value
++        .bytes()
++        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+     {
+-        return Err("--active-slot-coefficient-numerator must be canonical ASCII decimal".into());
++        return Err("commitment must use canonical lowercase hexadecimal".into());
+     }
+-    let active_slot_coefficient_numerator = f_text
++    let bytes = hex::decode(value).map_err(|_| "invalid commitment hex".to_string())?;
++    let array: [u8; 32] = bytes
++        .try_into()
++        .map_err(|_| "commitment must be 32 bytes".to_string())?;
++    Ok(Bytes32(array))
++}
++
++fn agreed_bitcoin_cli(clients: &[String], arguments: &[&str]) -> Result<String, String> {
++    let mut agreed: Option<String> = None;
++    for client in clients {
++        let value = run_bitcoin_cli(client, arguments)?;
++        if agreed.as_ref().is_some_and(|old| old != &value) {
++            return Err(format!(
++                "independent Bitcoin Core nodes disagree on {arguments:?}"
++            ));
++        }
++        agreed = Some(value);
++    }
++    agreed.ok_or_else(|| "no Bitcoin Core clients".into())
++}
++
++fn precommit(args: &[String]) -> Result<(), String> {
++    let chain_id = required(args, "--chain-id")?;
++    let target = required(args, "--bitcoin-height")?
+         .parse::<u64>()
+-        .map_err(|_| "--active-slot-coefficient-numerator is outside u64")?;
++        .map_err(|_| "invalid target height")?;
+     let network_genesis_hash = required(args, "--bitcoin-network-genesis-hash")?;
+-    let announced_height = required(args, "--bitcoin-height")?
++    let clients = bitcoin_clients(args)?;
++    let displayed_genesis = agreed_bitcoin_cli(&clients, &["getblockhash", "0"])?;
++    if reverse_hex_digest(&displayed_genesis, "network genesis hash")? != network_genesis_hash {
++        return Err("Bitcoin node network genesis does not match the precommit descriptor".into());
++    }
++    let tip = agreed_bitcoin_cli(&clients, &["getblockcount"])?
+         .parse::<u64>()
+-        .map_err(|_| "--bitcoin-height must be a u64")?;
+-    let bitcoin_pow_entropy_header = required(args, "--bitcoin-header")?;
+-    let minimum_confirmations = required(args, "--bitcoin-minimum-confirmations")?
+-        .parse::<u32>()
+-        .map_err(|_| "--bitcoin-minimum-confirmations must be a u32")?;
+-    let output = required(args, "--output")?;
+-    let bitcoin_cli_path = required(args, "--bitcoin-cli")?;
+-    let specs = repeated(args, "--validator");
+-    let mut validators = Vec::with_capacity(specs.len());
+-    for spec in specs {
+-        let parts: Vec<&str> = spec.split(',').collect();
+-        if parts.len() != 5 {
+-            return Err(
+-                "--validator must be NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON,VRF_PROOF_JSON"
+-                    .into(),
+-            );
+-        }
+-        let stake = parts[1]
+-            .parse::<u64>()
+-            .map_err(|_| format!("invalid stake in validator specification for {}", parts[0]))?;
+-        let hot_json = std::fs::read_to_string(parts[2])
+-            .map_err(|error| format!("cannot read hot public metadata {}: {error}", parts[2]))?;
+-        let (_, public) = indra_cli::inspect_public_metadata(&hot_json)
+-            .map_err(|error| format!("invalid hot keystore {}: {error}", parts[2]))?;
+-        let cold_json = std::fs::read_to_string(parts[3])
+-            .map_err(|error| format!("cannot read cold file {}: {error}", parts[3]))?;
+-        let proof_json = std::fs::read_to_string(parts[4])
+-            .map_err(|error| format!("cannot read VRF proof file {}: {error}", parts[4]))?;
+-        let proof: GenesisVrfProofFile = serde_json::from_str(&proof_json)
+-            .map_err(|error| format!("invalid VRF proof file {}: {error}", parts[4]))?;
+-        let mut entry =
+-            with_cold_file(entry_from_public_keys(parts[0], &public, stake), &cold_json)
+-                .map_err(|error| format!("invalid cold file {}: {error}", parts[3]))?;
+-        entry.vrf_possession_output = proof.vrf_possession_output;
+-        entry.vrf_possession_proof = proof.vrf_possession_proof;
+-        validators.push(entry);
++        .map_err(|_| "invalid Bitcoin tip")?;
++    let minimum = tip
++        .checked_add(MIN_GENESIS_PRECOMMIT_BLOCK_LEAD)
++        .ok_or("Bitcoin height overflow")?;
++    if target < minimum {
++        return Err(format!("target height must be at least current tip + {MIN_GENESIS_PRECOMMIT_BLOCK_LEAD} ({minimum})"));
++    }
++    let mut commitments = repeated(args, "--validator-commitment")
++        .into_iter()
++        .map(|path| {
++            let value: ValidatorCommitmentArtifact =
++                serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
++                    .map_err(|e| e.to_string())?;
++            if value.version != 1 {
++                return Err("unsupported validator commitment version".into());
++            }
++            Ok(value.commitment)
++        })
++        .collect::<Result<Vec<String>, String>>()?;
++    commitments.sort();
++    if commitments.len() < 4 {
++        return Err("at least four validator commitments are required".into());
+     }
+     let source = indra_node::genesis::BitcoinPowEntropySourceV1 {
+         scheme: 1,
+         network_genesis_hash,
+-        announced_height,
++        announced_height: target,
+         header_codec: 1,
+         extraction_algorithm: 1,
+-        minimum_confirmations,
++        minimum_confirmations: BITCOIN_GENESIS_CONFIRMATIONS,
+         reorg_policy: 1,
+     };
+-    let config = build_genesis_config(
+-        &chain_id,
+-        active_slot_coefficient_numerator,
+-        source,
+-        bitcoin_pow_entropy_header,
+-        validators,
++    let settings = indra_node::GenesisSettings {
++        chain_id: chain_id.clone(),
++        active_slot_coefficient_numerator:
++            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        bitcoin_pow_entropy_source: source.clone(),
++        bitcoin_pow_entropy_header: String::new(),
++        genesis_precommit_hash: String::new(),
++    };
++    let hashes = commitments
++        .iter()
++        .map(|value| parse_commitment(value))
++        .collect::<Result<Vec<_>, _>>()?;
++    let canonical =
++        indra_node::genesis::genesis_precommit_bytes_from_commitments(&settings, &hashes)?;
++    let hash = indra_node::genesis::genesis_precommit_hash_from_commitments(&settings, &hashes)?;
++    let created = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_err(|e| e.to_string())?
++        .as_secs();
++    let artifact = GenesisPrecommitArtifact {
++        version: 1,
++        chain_id,
++        bitcoin_descriptor: source,
++        validator_commitments: commitments,
++        canonical_bytes: hex::encode(canonical),
++        precommit_hash: hex::encode(hash.0),
++        created_unix_seconds_informational_only: created,
++    };
++    write_new_json(&required(args, "--output")?, &artifact)
++}
++
++fn read_precommit(path: &str) -> Result<GenesisPrecommitArtifact, String> {
++    let artifact: GenesisPrecommitArtifact =
++        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
++            .map_err(|e| e.to_string())?;
++    if artifact.version != 1 {
++        return Err("unsupported genesis precommit version".into());
++    }
++    if artifact
++        .validator_commitments
++        .windows(2)
++        .any(|pair| pair[0] >= pair[1])
++    {
++        return Err("precommit validator commitments must be strictly ascending".into());
++    }
++    let settings = indra_node::GenesisSettings {
++        chain_id: artifact.chain_id.clone(),
++        active_slot_coefficient_numerator:
++            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        bitcoin_pow_entropy_source: artifact.bitcoin_descriptor.clone(),
++        bitcoin_pow_entropy_header: String::new(),
++        genesis_precommit_hash: String::new(),
++    };
++    let hashes = artifact
++        .validator_commitments
++        .iter()
++        .map(|value| parse_commitment(value))
++        .collect::<Result<Vec<_>, _>>()?;
++    let bytes = indra_node::genesis::genesis_precommit_bytes_from_commitments(&settings, &hashes)?;
++    let hash = indra_node::genesis::genesis_precommit_hash_from_commitments(&settings, &hashes)?;
++    if hex::encode(&bytes) != artifact.canonical_bytes
++        || hex::encode(hash.0) != artifact.precommit_hash
++    {
++        return Err("precommit canonical bytes/hash mismatch".into());
++    }
++    Ok(artifact)
++}
++
++fn open_validator_reveals(
++    artifact: &GenesisPrecommitArtifact,
++    reveal_paths: Vec<String>,
++) -> Result<(Vec<indra_cli::GenesisEntry>, Vec<String>), String> {
++    let mut validators = Vec::new();
++    let mut opened = Vec::new();
++    for path in reveal_paths {
++        let reveal: ValidatorRevealArtifact =
++            serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
++                .map_err(|e| e.to_string())?;
++        if reveal.version != 1 {
++            return Err("unsupported validator reveal version".into());
++        }
++        let commitment = indra_node::genesis::genesis_validator_commitment(
++            &artifact.chain_id,
++            &entry_to_validator(&reveal.validator),
++        )?;
++        if hex::encode(commitment.0) != reveal.commitment {
++            return Err("validator reveal does not open its commitment".into());
++        }
++        opened.push(reveal.commitment.clone());
++        validators.push(reveal.validator);
++    }
++    opened.sort();
++    let mut expected = artifact.validator_commitments.clone();
++    expected.sort();
++    if opened != expected {
++        return Err("validator reveal membership does not exactly match precommitment".into());
++    }
++    validators.sort_by(|left, right| left.validator_id.cmp(&right.validator_id));
++    Ok((validators, opened))
++}
++
++fn authority_canonical_bytes(
++    precommit_hash: &str,
++    commitments: &[String],
++    bitcoin_tip_at_freeze: u64,
++) -> Result<Vec<u8>, String> {
++    let precommit = parse_commitment(precommit_hash)?;
++    let mut commitments = commitments
++        .iter()
++        .map(|value| parse_commitment(value))
++        .collect::<Result<Vec<_>, _>>()?;
++    commitments.sort_by_key(|value| value.0);
++    if commitments.windows(2).any(|pair| pair[0] == pair[1]) {
++        return Err("duplicate frozen validator commitment".into());
++    }
++    let mut bytes = b"INDRA-GENESIS-AUTHORITY-FROZEN-v1".to_vec();
++    bytes.push(1);
++    bytes.extend_from_slice(&precommit.0);
++    bytes.extend_from_slice(&bitcoin_tip_at_freeze.to_le_bytes());
++    bytes.push(1); // VrfSuiteV1::EcvrfEdwards25519Sha512Ell2
++    bytes.extend_from_slice(&0u64.to_le_bytes()); // genesis activation epoch
++    bytes.extend_from_slice(
++        &u16::try_from(commitments.len())
++            .map_err(|_| "too many frozen validator commitments")?
++            .to_be_bytes(),
++    );
++    for commitment in commitments {
++        bytes.extend_from_slice(&commitment.0);
++    }
++    Ok(bytes)
++}
++
++fn freeze_authority(args: &[String]) -> Result<(), String> {
++    let artifact = read_precommit(&required(args, "--precommit")?)?;
++    let clients = bitcoin_clients(args)?;
++    let tip = agreed_bitcoin_cli(&clients, &["getblockcount"])?
++        .parse::<u64>()
++        .map_err(|_| "invalid Bitcoin tip")?;
++    if tip >= artifact.bitcoin_descriptor.announced_height {
++        return Err("cannot freeze genesis authority after the Bitcoin target exists".into());
++    }
++    let (validators, opened) =
++        open_validator_reveals(&artifact, repeated(args, "--validator-reveal"))?;
++
++    // Independently run the complete genesis authority validator before the
++    // target. The zero header is only a structurally valid placeholder; it is
++    // replaced deterministically by the committed-height header at finalize.
++    let provisional = build_genesis_config(
++        &artifact.chain_id,
++        artifact.bitcoin_descriptor.clone(),
++        hex::encode([0u8; 80]),
++        artifact.precommit_hash.clone(),
++        validators.clone(),
+     )
+     .map_err(|error| error.to_string())?;
+-    verify_bitcoin_entropy(&config, &bitcoin_cli_path)?;
++    indra_node::parse_genesis_manifest_str(&provisional.to_toml())?;
++
++    let canonical = authority_canonical_bytes(&artifact.precommit_hash, &opened, tip)?;
++    let authority_hash = indra_crypto::sha256(&canonical);
++    let created = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_err(|error| error.to_string())?
++        .as_secs();
++    let frozen = GenesisAuthorityArtifact {
++        version: 1,
++        precommit_hash: artifact.precommit_hash,
++        vrf_suite: 1,
++        activation_epoch: 0,
++        validator_commitments: opened,
++        validators,
++        canonical_bytes: hex::encode(canonical),
++        authority_hash: hex::encode(authority_hash),
++        bitcoin_tip_at_freeze_informational_only: tip,
++        created_unix_seconds_informational_only: created,
++    };
++    write_new_json(&required(args, "--output")?, &frozen)
++}
++
++fn read_frozen_authority(
++    path: &str,
++    precommit: &GenesisPrecommitArtifact,
++) -> Result<GenesisAuthorityArtifact, String> {
++    let frozen: GenesisAuthorityArtifact =
++        serde_json::from_str(&std::fs::read_to_string(path).map_err(|error| error.to_string())?)
++            .map_err(|error| error.to_string())?;
++    if frozen.version != 1 {
++        return Err("unsupported frozen genesis authority version".into());
++    }
++    if frozen.vrf_suite != 1 || frozen.activation_epoch != 0 {
++        return Err("unsupported frozen genesis VRF suite or activation epoch".into());
++    }
++    if frozen.precommit_hash != precommit.precommit_hash
++        || frozen.validator_commitments != precommit.validator_commitments
++    {
++        return Err("frozen authority does not match the original precommitment".into());
++    }
++    if frozen.bitcoin_tip_at_freeze_informational_only
++        >= precommit.bitcoin_descriptor.announced_height
++    {
++        return Err("frozen authority records a Bitcoin tip at or beyond the target".into());
++    }
++    if frozen
++        .validators
++        .windows(2)
++        .any(|pair| pair[0].validator_id >= pair[1].validator_id)
++    {
++        return Err("frozen validators must be strictly ordered by validator ID".into());
++    }
++    let mut actual_commitments = frozen
++        .validators
++        .iter()
++        .map(|validator| {
++            indra_node::genesis::genesis_validator_commitment(
++                &precommit.chain_id,
++                &entry_to_validator(validator),
++            )
++            .map(|commitment| hex::encode(commitment.0))
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    actual_commitments.sort();
++    if actual_commitments != frozen.validator_commitments {
++        return Err("frozen validator material does not open the committed set".into());
++    }
++    let canonical = authority_canonical_bytes(
++        &frozen.precommit_hash,
++        &frozen.validator_commitments,
++        frozen.bitcoin_tip_at_freeze_informational_only,
++    )?;
++    if frozen.canonical_bytes != hex::encode(&canonical)
++        || frozen.authority_hash != hex::encode(indra_crypto::sha256(&canonical))
++    {
++        return Err("frozen authority canonical bytes/hash mismatch".into());
++    }
++    if frozen.validators.len() != frozen.validator_commitments.len() {
++        return Err("frozen authority membership is incomplete".into());
++    }
++    Ok(frozen)
++}
++
++fn finalize(args: &[String]) -> Result<(), String> {
++    if args.iter().any(|argument| argument == "--validator-reveal") {
++        return Err("finalize accepts no validator reveals; authority must be frozen before the Bitcoin target".into());
++    }
++    let artifact = read_precommit(&required(args, "--precommit")?)?;
++    let frozen = read_frozen_authority(&required(args, "--authority")?, &artifact)?;
++    let clients = bitcoin_clients(args)?;
++    let height = artifact.bitcoin_descriptor.announced_height.to_string();
++    let displayed_hash = agreed_bitcoin_cli(&clients, &["getblockhash", &height])?;
++    let header = agreed_bitcoin_cli(&clients, &["getblockheader", &displayed_hash, "false"])?;
++    let config = build_genesis_config(
++        &artifact.chain_id,
++        artifact.bitcoin_descriptor,
++        header,
++        artifact.precommit_hash,
++        frozen.validators,
++    )
++    .map_err(|e| e.to_string())?;
++    verify_bitcoin_entropy_multi(&config, &clients)?;
+     let rendered = config.to_toml();
+     indra_node::parse_genesis_manifest_str(&rendered)?;
++    let output = required(args, "--output")?;
+     if Path::new(&output).exists() {
+         return Err(format!("{output} already exists; refusing to overwrite"));
+     }
+-    std::fs::write(&output, rendered).map_err(|error| format!("cannot write {output}: {error}"))?;
+-    println!("Canonical genesis written to {output}");
++    std::fs::write(&output, rendered).map_err(|e| e.to_string())?;
++    println!("Canonical committed genesis written to {output}");
+     inspect_path(&output)
+ }
+ 
+@@ -229,18 +658,37 @@ fn verify_bitcoin_entropy(config: &indra_cli::GenesisConfig, binary: &str) -> Re
+     Ok(())
+ }
+ 
++fn verify_bitcoin_entropy_multi(
++    config: &indra_cli::GenesisConfig,
++    clients: &[String],
++) -> Result<(), String> {
++    let height = config
++        .bitcoin_pow_entropy_source
++        .announced_height
++        .to_string();
++    let displayed_hash = agreed_bitcoin_cli(clients, &["getblockhash", &height])?;
++    let _ = agreed_bitcoin_cli(clients, &["getblockheader", &displayed_hash, "false"])?;
++    let _ = agreed_bitcoin_cli(clients, &["getblockhash", "0"])?;
++    let _ = agreed_bitcoin_cli(clients, &["getblockcount"])?;
++    for client in clients {
++        verify_bitcoin_entropy(config, client)?;
++    }
++    Ok(())
++}
++
+ fn verify_bitcoin_entropy_command(args: &[String]) -> Result<(), String> {
+     let path = required(args, "--genesis")?;
+-    let binary = required(args, "--bitcoin-cli")?;
++    let clients = bitcoin_clients(args)?;
+     let manifest = indra_node::parse_genesis_manifest(&path)?;
+     let config = indra_cli::GenesisConfig {
+         chain_id: manifest.genesis.chain_id,
+         active_slot_coefficient_numerator: manifest.genesis.active_slot_coefficient_numerator,
+         bitcoin_pow_entropy_source: manifest.genesis.bitcoin_pow_entropy_source,
+         bitcoin_pow_entropy_header: manifest.genesis.bitcoin_pow_entropy_header,
++        genesis_precommit_hash: manifest.genesis.genesis_precommit_hash,
+         validators: Vec::new(),
+     };
+-    verify_bitcoin_entropy(&config, &binary)?;
++    verify_bitcoin_entropy_multi(&config, &clients)?;
+     println!("Bitcoin entropy source verified against the active most-work chain");
+     Ok(())
+ }
+@@ -327,12 +775,11 @@ fn print_artifacts(file_bytes: &[u8], state: &ChainState) -> Result<(), String>
+ 
+ fn print_help() {
+     println!("Usage:");
+-    println!("  indra-genesis build --chain-id ID --active-slot-coefficient-numerator F");
+-    println!("    --bitcoin-network-genesis-hash HEX32 --bitcoin-height HEIGHT");
+-    println!("    --bitcoin-header HEX80 --bitcoin-minimum-confirmations N");
+-    println!("    --bitcoin-cli /path/to/bitcoin-cli --output genesis.toml");
+-    println!("    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON,VRF_PROOF_JSON [--validator ...]");
+-    println!("  indra-genesis verify-bitcoin-entropy --genesis genesis.toml --bitcoin-cli /path/to/bitcoin-cli");
++    println!("  indra-genesis commit-validator --chain-id ID --validator NAME,STAKE,HOT,COLD,VRF_PROOF --commitment-output public.json --reveal-output private.json");
++    println!("  indra-genesis precommit --chain-id ID --bitcoin-network-genesis-hash HEX32 --bitcoin-height FUTURE_HEIGHT --bitcoin-cli NODE_A --bitcoin-cli NODE_B --validator-commitment public.json --output precommit.json");
++    println!("  indra-genesis freeze-authority --precommit precommit.json --bitcoin-cli NODE_A --bitcoin-cli NODE_B --validator-reveal private.json --output authority.json");
++    println!("  indra-genesis finalize --precommit precommit.json --authority authority.json --bitcoin-cli NODE_A --bitcoin-cli NODE_B --output genesis.toml");
++    println!("  indra-genesis verify-bitcoin-entropy --genesis genesis.toml --bitcoin-cli NODE_A --bitcoin-cli NODE_B");
+     println!("  indra-genesis create-vrf-proof --chain-id ID --hot-keys keys.json --output vrf-proof.json [password options]");
+     println!("  indra-genesis validate --genesis genesis.toml");
+     println!("  indra-genesis inspect --genesis genesis.toml");
+@@ -346,7 +793,8 @@ mod tests {
+     fn config() -> indra_cli::GenesisConfig {
+         indra_cli::GenesisConfig {
+             chain_id: "test".into(),
+-            active_slot_coefficient_numerator: 1,
++            active_slot_coefficient_numerator:
++                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+             bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1 {
+                 scheme: 1,
+                 network_genesis_hash: "11".repeat(32),
+@@ -357,10 +805,38 @@ mod tests {
+                 reorg_policy: 1,
+             },
+             bitcoin_pow_entropy_header: "22".repeat(80),
++            genesis_precommit_hash: "33".repeat(32),
+             validators: vec![],
+         }
+     }
+ 
++    #[test]
++    fn declared_confirmation_depth_is_exactly_100() {
++        let mut cfg = config();
++        cfg.bitcoin_pow_entropy_source.minimum_confirmations = 99;
++        assert!(
++            indra_node::genesis::derive_genesis_election_seed(&indra_node::GenesisSettings {
++                chain_id: cfg.chain_id.clone(),
++                active_slot_coefficient_numerator: cfg.active_slot_coefficient_numerator,
++                bitcoin_pow_entropy_source: cfg.bitcoin_pow_entropy_source.clone(),
++                bitcoin_pow_entropy_header: cfg.bitcoin_pow_entropy_header.clone(),
++                genesis_precommit_hash: cfg.genesis_precommit_hash.clone()
++            })
++            .is_err()
++        );
++        cfg.bitcoin_pow_entropy_source.minimum_confirmations = 101;
++        assert!(
++            indra_node::genesis::derive_genesis_election_seed(&indra_node::GenesisSettings {
++                chain_id: cfg.chain_id.clone(),
++                active_slot_coefficient_numerator: cfg.active_slot_coefficient_numerator,
++                bitcoin_pow_entropy_source: cfg.bitcoin_pow_entropy_source.clone(),
++                bitcoin_pow_entropy_header: cfg.bitcoin_pow_entropy_header.clone(),
++                genesis_precommit_hash: cfg.genesis_precommit_hash.clone()
++            })
++            .is_err()
++        );
++    }
++
+     fn mock(tip: u64, header: &str) -> std::path::PathBuf {
+         let header_bytes = hex::decode(header).unwrap();
+         let mut displayed_block_hash = indra_crypto::sha256(&indra_crypto::sha256(&header_bytes));
+diff --git a/indra/indra-cli/src/genesis_cmd.rs b/indra/indra-cli/src/genesis_cmd.rs
+index 4dace2ba..26915bc4 100644
+--- a/indra/indra-cli/src/genesis_cmd.rs
++++ b/indra/indra-cli/src/genesis_cmd.rs
+@@ -10,7 +10,7 @@
+ //! ```toml
+ //! [genesis]
+ //! chain_id     = "indra-testnet-1"
+-//! active_slot_coefficient_numerator = "9223372036854775808"
++//! active_slot_coefficient_numerator = "6917529027641081856"
+ //! bitcoin_pow_entropy_header = "<160 lowercase hex chars>"
+ //!
+ //! [genesis.bitcoin_pow_entropy_source]
+@@ -36,9 +36,10 @@
+ //! ```
+ 
+ use crate::error::{CliError, CliResult};
++use serde::{Deserialize, Serialize};
+ 
+ /// One validator entry in the genesis config.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct GenesisEntry {
+     /// Human-readable name (for display only).
+     pub name: String,
+@@ -64,6 +65,8 @@ pub struct GenesisEntry {
+     pub cold_nonce: u64,
+     /// Initial stake in Spark.
+     pub stake: u64,
++    /// Pre-target hiding nonce, revealed only during finalization.
++    pub genesis_commitment_nonce: String,
+ }
+ 
+ /// A complete genesis configuration.
+@@ -77,6 +80,8 @@ pub struct GenesisConfig {
+     pub bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
+     /// Exact Bitcoin 80-byte header, lowercase hexadecimal.
+     pub bitcoin_pow_entropy_header: String,
++    /// Externally witnessed canonical pre-target ceremony hash.
++    pub genesis_precommit_hash: String,
+     /// All initial validators.
+     pub validators: Vec<GenesisEntry>,
+ }
+@@ -93,9 +98,13 @@ impl GenesisConfig {
+             self.active_slot_coefficient_numerator
+         ));
+         out.push_str(&format!(
+-            "bitcoin_pow_entropy_header = \"{}\"\n\n",
++            "bitcoin_pow_entropy_header = \"{}\"\n",
+             self.bitcoin_pow_entropy_header
+         ));
++        out.push_str(&format!(
++            "genesis_precommit_hash = \"{}\"\n\n",
++            self.genesis_precommit_hash
++        ));
+         let source = &self.bitcoin_pow_entropy_source;
+         out.push_str("[genesis.bitcoin_pow_entropy_source]\n");
+         out.push_str(&format!("scheme = {}\n", source.scheme));
+@@ -150,7 +159,11 @@ impl GenesisConfig {
+                 v.cold_key_version
+             ));
+             out.push_str(&format!("cold_nonce               = {}\n", v.cold_nonce));
+-            out.push_str(&format!("stake               = {}  # Spark\n\n", v.stake));
++            out.push_str(&format!("stake               = {}  # Spark\n", v.stake));
++            out.push_str(&format!(
++                "genesis_commitment_nonce = \"{}\"\n\n",
++                v.genesis_commitment_nonce
++            ));
+         }
+ 
+         out
+@@ -208,16 +221,18 @@ fn toml_string(value: &str) -> String {
+ /// Build a genesis config from a list of entries.
+ pub fn build_genesis_config(
+     chain_id: &str,
+-    active_slot_coefficient_numerator: u64,
+     bitcoin_pow_entropy_source: indra_node::genesis::BitcoinPowEntropySourceV1,
+     bitcoin_pow_entropy_header: String,
++    genesis_precommit_hash: String,
+     validators: Vec<GenesisEntry>,
+ ) -> CliResult<GenesisConfig> {
+     let config = GenesisConfig {
+         chain_id: chain_id.to_string(),
+-        active_slot_coefficient_numerator,
++        active_slot_coefficient_numerator:
++            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+         bitcoin_pow_entropy_source,
+         bitcoin_pow_entropy_header,
++        genesis_precommit_hash,
+         validators,
+     };
+     config.validate()?;
+@@ -244,6 +259,7 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
+         cold_key_version: 1,
+         cold_nonce: 0,
+         stake,
++        genesis_commitment_nonce: String::new(),
+     }
+ }
+ 
+@@ -266,6 +282,7 @@ pub fn entry_from_public_keys(
+         cold_key_version: 1,
+         cold_nonce: 0,
+         stake,
++        genesis_commitment_nonce: String::new(),
+     }
+ }
+ 
+@@ -346,9 +363,8 @@ mod tests {
+     use crate::keygen::generate_from_master_seed;
+     use indra_core::types::primitives::DUST_LIMIT_SPARK;
+ 
+-    fn entropy() -> (u64, indra_node::genesis::BitcoinPowEntropySourceV1, String) {
++    fn entropy() -> (indra_node::genesis::BitcoinPowEntropySourceV1, String) {
+         (
+-            1u64 << 63,
+             indra_node::genesis::BitcoinPowEntropySourceV1 {
+                 scheme: 1,
+                 network_genesis_hash: hex::encode([0x11; 32]),
+@@ -363,8 +379,39 @@ mod tests {
+     }
+ 
+     fn build(chain_id: &str, validators: Vec<GenesisEntry>) -> CliResult<GenesisConfig> {
+-        let (f, source, header) = entropy();
+-        build_genesis_config(chain_id, f, source, header, validators)
++        let (source, header) = entropy();
++        let settings = indra_node::GenesisSettings {
++            chain_id: chain_id.into(),
++            active_slot_coefficient_numerator:
++                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++            bitcoin_pow_entropy_source: source.clone(),
++            bitcoin_pow_entropy_header: header.clone(),
++            genesis_precommit_hash: String::new(),
++        };
++        let opened = validators
++            .iter()
++            .map(|entry| indra_node::GenesisValidator {
++                name: entry.name.clone(),
++                validator_id: entry.validator_id.clone(),
++                hybrid_classical_pk: entry.hybrid_classical_pk.clone(),
++                hybrid_pq_pk: entry.hybrid_pq_pk.clone(),
++                vrf_pk: entry.vrf_pk.clone(),
++                vrf_possession_output: entry.vrf_possession_output.clone(),
++                vrf_possession_proof: entry.vrf_possession_proof.clone(),
++                cold_hybrid_classical_pk: entry.cold_hybrid_classical_pk.clone(),
++                cold_hybrid_pq_pk: entry.cold_hybrid_pq_pk.clone(),
++                cold_key_version: entry.cold_key_version,
++                cold_nonce: entry.cold_nonce,
++                stake: entry.stake,
++                genesis_commitment_nonce: entry.genesis_commitment_nonce.clone(),
++            })
++            .collect::<Vec<_>>();
++        let hash = hex::encode(
++            indra_node::genesis::genesis_precommit_hash(&settings, &opened)
++                .map_err(CliError::Genesis)?
++                .0,
++        );
++        build_genesis_config(chain_id, source, header, hash, validators)
+     }
+ 
+     fn test_validators(chain_id: &str, count: usize) -> Vec<GenesisEntry> {
+@@ -395,6 +442,7 @@ mod tests {
+                 let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+                 entry.vrf_possession_output = hex::encode(output.0);
+                 entry.vrf_possession_proof = hex::encode(proof.0);
++                entry.genesis_commitment_nonce = hex::encode([i as u8 + 121; 32]);
+                 entry
+             })
+             .collect()
+diff --git a/indra/indra-cli/tests/cli.rs b/indra/indra-cli/tests/cli.rs
+index 0b5509f2..057fba50 100644
+--- a/indra/indra-cli/tests/cli.rs
++++ b/indra/indra-cli/tests/cli.rs
+@@ -53,6 +53,7 @@ fn genesis_entry(
+     let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+     entry.vrf_possession_output = hex::encode(output.0);
+     entry.vrf_possession_proof = hex::encode(proof.0);
++    entry.genesis_commitment_nonce = hex::encode([tag.wrapping_add(96); 32]);
+     entry
+ }
+ 
+@@ -71,7 +72,7 @@ fn mock_bitcoin_cli(dir: &std::path::Path) -> PathBuf {
+     displayed_hash.reverse();
+     let displayed_hash = hex::encode(displayed_hash);
+     let script = format!(
+-        "#!/bin/sh\ncase \"$1:$2\" in\n  getblockhash:0) echo {} ;;\n  getblockhash:1) echo {} ;;\n  getblockheader:{}) echo {} ;;\n  getblockcount:) echo 200 ;;\n  *) echo unexpected bitcoin-cli arguments >&2; exit 1 ;;\nesac\n",
++        "#!/bin/sh\ncase \"$1:$2\" in\n  getblockhash:0) echo {} ;;\n  getblockhash:344) echo {} ;;\n  getblockheader:{}) echo {} ;;\n  getblockcount:) echo ${{BITCOIN_MOCK_TIP:-443}} ;;\n  *) echo unexpected bitcoin-cli arguments >&2; exit 1 ;;\nesac\n",
+         "11".repeat(32),
+         displayed_hash,
+         displayed_hash,
+@@ -440,19 +441,48 @@ fn build_test_genesis(
+     chain_id: &str,
+     validators: Vec<indra_cli::GenesisEntry>,
+ ) -> indra_cli::GenesisConfig {
++    let source = indra_node::genesis::BitcoinPowEntropySourceV1 {
++        scheme: 1,
++        network_genesis_hash: hex::encode([0x11; 32]),
++        announced_height: 1,
++        header_codec: 1,
++        extraction_algorithm: 1,
++        minimum_confirmations: 100,
++        reorg_policy: 1,
++    };
++    let settings = indra_node::GenesisSettings {
++        chain_id: chain_id.into(),
++        active_slot_coefficient_numerator:
++            indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        bitcoin_pow_entropy_source: source.clone(),
++        bitcoin_pow_entropy_header: hex::encode([0x22; 80]),
++        genesis_precommit_hash: String::new(),
++    };
++    let node_validators = validators
++        .iter()
++        .map(|entry| indra_node::GenesisValidator {
++            name: entry.name.clone(),
++            validator_id: entry.validator_id.clone(),
++            hybrid_classical_pk: entry.hybrid_classical_pk.clone(),
++            hybrid_pq_pk: entry.hybrid_pq_pk.clone(),
++            vrf_pk: entry.vrf_pk.clone(),
++            vrf_possession_output: entry.vrf_possession_output.clone(),
++            vrf_possession_proof: entry.vrf_possession_proof.clone(),
++            cold_hybrid_classical_pk: entry.cold_hybrid_classical_pk.clone(),
++            cold_hybrid_pq_pk: entry.cold_hybrid_pq_pk.clone(),
++            cold_key_version: entry.cold_key_version,
++            cold_nonce: entry.cold_nonce,
++            stake: entry.stake,
++            genesis_commitment_nonce: entry.genesis_commitment_nonce.clone(),
++        })
++        .collect::<Vec<_>>();
++    let precommit =
++        indra_node::genesis::genesis_precommit_hash(&settings, &node_validators).unwrap();
+     build_genesis_config(
+         chain_id,
+-        1u64 << 63,
+-        indra_node::genesis::BitcoinPowEntropySourceV1 {
+-            scheme: 1,
+-            network_genesis_hash: hex::encode([0x11; 32]),
+-            announced_height: 1,
+-            header_codec: 1,
+-            extraction_algorithm: 1,
+-            minimum_confirmations: 100,
+-            reorg_policy: 1,
+-        },
++        source,
+         hex::encode([0x22; 80]),
++        hex::encode(precommit.0),
+         validators,
+     )
+     .unwrap()
+@@ -490,7 +520,6 @@ fn genesis_rejects_3_validators() {
+ 
+     assert!(build_genesis_config(
+         "test",
+-        1u64 << 63,
+         indra_node::genesis::BitcoinPowEntropySourceV1 {
+             scheme: 1,
+             network_genesis_hash: hex::encode([0x11; 32]),
+@@ -501,6 +530,7 @@ fn genesis_rejects_3_validators() {
+             reorg_policy: 1,
+         },
+         hex::encode([0x22; 80]),
++        hex::encode([0x33; 32]),
+         validators,
+     )
+     .is_err());
+@@ -513,28 +543,10 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
+     std::fs::create_dir_all(&dir).unwrap();
+     let path = dir.join("genesis.toml");
+     let bitcoin_cli = mock_bitcoin_cli(&dir);
+-    let mut command = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+-    command.args([
+-        "build",
+-        "--chain-id",
+-        "indra-testnet-artifact-test",
+-        "--active-slot-coefficient-numerator",
+-        "9223372036854775808",
+-        "--bitcoin-network-genesis-hash",
+-        "1111111111111111111111111111111111111111111111111111111111111111",
+-        "--bitcoin-height",
+-        "1",
+-        "--bitcoin-header",
+-        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+-        "--bitcoin-minimum-confirmations",
+-        "100",
+-        "--bitcoin-cli",
+-        bitcoin_cli.to_str().unwrap(),
+-        "--output",
+-        path.to_str().unwrap(),
+-    ]);
+     let mut validator_inputs = Vec::new();
+-    let mut expected_cold_public = Vec::new();
++    let mut commitment_paths = Vec::new();
++    let mut reveal_paths = Vec::new();
++    let mut expected_cold_public = std::collections::BTreeMap::new();
+     for i in 0..4u8 {
+         let keys = generate_from_master_seed(format!("v{i}"), [i + 1; 32]).unwrap();
+         let hot_path = dir.join(format!("hot-{i}.json"));
+@@ -546,10 +558,13 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
+         let cold_public = cold_public.as_complete_hybrid();
+         let classical_hex = hex::encode(cold_public.classical.0);
+         let pq_hex = hex::encode(cold_public.pq.0);
+-        expected_cold_public.push((classical_hex.clone(), pq_hex.clone()));
+         let cold_path = dir.join(format!("cold-{i}.json"));
+         let proof_path = dir.join(format!("vrf-proof-{i}.json"));
+         let validator_id = Bytes32::from(keys.public.validator_id);
++        expected_cold_public.insert(
++            hex::encode(validator_id.0),
++            (classical_hex.clone(), pq_hex.clone()),
++        );
+         let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+         let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+             "indra-testnet-artifact-test",
+@@ -602,61 +617,313 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
+             )
+             .unwrap();
+         }
+-        command.arg("--validator").arg(format!(
+-            "v{i},{stake},{},{},{}",
+-            hot_path.display(),
+-            cold_path.display(),
+-            proof_path.display()
+-        ));
++        let commitment_path = dir.join(format!("commitment-{i}.json"));
++        let reveal_path = dir.join(format!("reveal-{i}.json"));
++        let committed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++            .args([
++                "commit-validator",
++                "--chain-id",
++                "indra-testnet-artifact-test",
++                "--validator",
++                &format!(
++                    "v{i},{stake},{},{},{}",
++                    hot_path.display(),
++                    cold_path.display(),
++                    proof_path.display()
++                ),
++                "--commitment-output",
++                commitment_path.to_str().unwrap(),
++                "--reveal-output",
++                reveal_path.to_str().unwrap(),
++            ])
++            .output()
++            .unwrap();
++        assert!(
++            committed.status.success(),
++            "{}",
++            String::from_utf8_lossy(&committed.stderr)
++        );
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(
++                std::fs::metadata(&reveal_path)
++                    .unwrap()
++                    .permissions()
++                    .mode()
++                    & 0o777,
++                0o600
++            );
++        }
++        commitment_paths.push(commitment_path);
++        reveal_paths.push(reveal_path);
+         validator_inputs.push((hot_path, cold_path, proof_path));
+     }
+-    let build = command.output().unwrap();
++    let precommit_path = dir.join("precommit.json");
++    let mut precommit = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
++    precommit
++        .args([
++            "precommit",
++            "--chain-id",
++            "indra-testnet-artifact-test",
++            "--bitcoin-network-genesis-hash",
++            "1111111111111111111111111111111111111111111111111111111111111111",
++            "--bitcoin-height",
++            "344",
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            precommit_path.to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "200");
++    for commitment in &commitment_paths {
++        precommit.arg("--validator-commitment").arg(commitment);
++    }
++    let precommit = precommit.output().unwrap();
++    assert!(
++        precommit.status.success(),
++        "{}",
++        String::from_utf8_lossy(&precommit.stderr)
++    );
++
++    let too_soon_path = dir.join("too-soon-precommit.json");
++    let mut too_soon = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
++    too_soon
++        .args([
++            "precommit",
++            "--chain-id",
++            "indra-testnet-artifact-test",
++            "--bitcoin-network-genesis-hash",
++            "1111111111111111111111111111111111111111111111111111111111111111",
++            "--bitcoin-height",
++            "343",
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            too_soon_path.to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "200");
++    for commitment in &commitment_paths {
++        too_soon.arg("--validator-commitment").arg(commitment);
++    }
++    let too_soon = too_soon.output().unwrap();
++    assert!(!too_soon.status.success());
++    assert!(!too_soon_path.exists());
++
++    let precommit_text = std::fs::read_to_string(&precommit_path).unwrap();
++    assert!(!precommit_text.contains("vrf_pk"));
++    for reveal in &reveal_paths {
++        let reveal_json: serde_json::Value =
++            serde_json::from_str(&std::fs::read_to_string(reveal).unwrap()).unwrap();
++        let vrf_pk = reveal_json["validator"]["vrf_pk"].as_str().unwrap();
++        assert!(!precommit_text.contains(vrf_pk));
++    }
++
++    let mut changed_descriptor: serde_json::Value = serde_json::from_str(&precommit_text).unwrap();
++    changed_descriptor["bitcoin_descriptor"]["announced_height"] = 345u64.into();
++    let changed_path = dir.join("changed-precommit.json");
++    std::fs::write(
++        &changed_path,
++        serde_json::to_vec_pretty(&changed_descriptor).unwrap(),
++    )
++    .unwrap();
++    let rejected_changed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++        .args([
++            "finalize",
++            "--precommit",
++            changed_path.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            dir.join("changed-genesis.toml").to_str().unwrap(),
++        ])
++        .output()
++        .unwrap();
++    assert!(!rejected_changed.status.success());
++    assert!(String::from_utf8_lossy(&rejected_changed.stderr)
++        .contains("precommit canonical bytes/hash mismatch"));
++
++    let authority_path = dir.join("frozen-authority.json");
++    let mut freeze = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
++    freeze
++        .args([
++            "freeze-authority",
++            "--precommit",
++            precommit_path.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            authority_path.to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "200");
++    for reveal in &reveal_paths {
++        freeze.arg("--validator-reveal").arg(reveal);
++    }
++    let frozen = freeze.output().unwrap();
++    assert!(
++        frozen.status.success(),
++        "{}",
++        String::from_utf8_lossy(&frozen.stderr)
++    );
++    let frozen_text = std::fs::read_to_string(&authority_path).unwrap();
++    let frozen_json: serde_json::Value = serde_json::from_str(&frozen_text).unwrap();
++    assert_eq!(frozen_json["validators"].as_array().unwrap().len(), 4);
++    for validator in frozen_json["validators"].as_array().unwrap() {
++        for field in [
++            "validator_id",
++            "stake",
++            "hybrid_classical_pk",
++            "hybrid_pq_pk",
++            "cold_hybrid_classical_pk",
++            "cold_hybrid_pq_pk",
++            "cold_key_version",
++            "cold_nonce",
++            "vrf_pk",
++            "genesis_commitment_nonce",
++        ] {
++            assert!(!validator[field].is_null(), "missing frozen field {field}");
++        }
++    }
++    for reveal in &reveal_paths {
++        let reveal_json: serde_json::Value =
++            serde_json::from_str(&std::fs::read_to_string(reveal).unwrap()).unwrap();
++        let validator_id = reveal_json["validator"]["validator_id"].as_str().unwrap();
++        assert!(frozen_text.contains(validator_id));
++    }
++
++    let late_authority = dir.join("late-authority.json");
++    let mut late_freeze = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
++    late_freeze
++        .args([
++            "freeze-authority",
++            "--precommit",
++            precommit_path.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            late_authority.to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "344");
++    for reveal in &reveal_paths {
++        late_freeze.arg("--validator-reveal").arg(reveal);
++    }
++    let late_freeze = late_freeze.output().unwrap();
++    assert!(!late_freeze.status.success());
++    assert!(!late_authority.exists());
++
++    let post_target_reveal = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++        .args([
++            "finalize",
++            "--precommit",
++            precommit_path.to_str().unwrap(),
++            "--authority",
++            authority_path.to_str().unwrap(),
++            "--validator-reveal",
++            reveal_paths[0].to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            dir.join("post-target-reveal.toml").to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "443")
++        .output()
++        .unwrap();
++    assert!(!post_target_reveal.status.success());
++
++    let mut changed_authority = frozen_json;
++    changed_authority["validators"][0]["stake"] = (stake + 1).into();
++    let changed_authority_path = dir.join("changed-authority.json");
++    std::fs::write(
++        &changed_authority_path,
++        serde_json::to_vec_pretty(&changed_authority).unwrap(),
++    )
++    .unwrap();
++    let changed_authority_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++        .args([
++            "finalize",
++            "--precommit",
++            precommit_path.to_str().unwrap(),
++            "--authority",
++            changed_authority_path.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            dir.join("changed-authority.toml").to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "443")
++        .output()
++        .unwrap();
++    assert!(!changed_authority_result.status.success());
++
++    let finalized = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++        .args([
++            "finalize",
++            "--precommit",
++            precommit_path.to_str().unwrap(),
++            "--authority",
++            authority_path.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--bitcoin-cli",
++            bitcoin_cli.to_str().unwrap(),
++            "--output",
++            path.to_str().unwrap(),
++        ])
++        .env("BITCOIN_MOCK_TIP", "443")
++        .output()
++        .unwrap();
+     assert!(
+-        build.status.success(),
++        finalized.status.success(),
+         "{}",
+-        String::from_utf8_lossy(&build.stderr)
++        String::from_utf8_lossy(&finalized.stderr)
+     );
+     let manifest = indra_node::parse_genesis_manifest(path.to_str().unwrap()).unwrap();
+-    for (validator, (classical, pq)) in manifest.validators.iter().zip(&expected_cold_public) {
++    for validator in &manifest.validators {
++        let (classical, pq) = expected_cold_public.get(&validator.validator_id).unwrap();
+         assert_eq!(&validator.cold_hybrid_classical_pk, classical);
+         assert_eq!(&validator.cold_hybrid_pq_pk, pq);
+     }
+ 
+     let malformed_path = dir.join("cold-malformed.json");
+     std::fs::write(&malformed_path, r#"{"format":"not-a-cold-format"}"#).unwrap();
+-    let malformed_genesis = dir.join("malformed-genesis.toml");
+-    let mut malformed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"));
+-    malformed.args([
+-        "build",
+-        "--chain-id",
+-        "indra-testnet-artifact-test",
+-        "--active-slot-coefficient-numerator",
+-        "9223372036854775808",
+-        "--bitcoin-network-genesis-hash",
+-        "1111111111111111111111111111111111111111111111111111111111111111",
+-        "--bitcoin-height",
+-        "1",
+-        "--bitcoin-header",
+-        "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+-        "--bitcoin-minimum-confirmations",
+-        "100",
+-        "--bitcoin-cli",
+-        bitcoin_cli.to_str().unwrap(),
+-        "--output",
+-        malformed_genesis.to_str().unwrap(),
+-    ]);
+-    for (index, (hot, cold, proof)) in validator_inputs.iter().enumerate() {
+-        let cold = if index == 0 { &malformed_path } else { cold };
+-        malformed.arg("--validator").arg(format!(
+-            "v{index},{stake},{},{},{}",
+-            hot.display(),
+-            cold.display(),
+-            proof.display()
+-        ));
+-    }
+-    let malformed = malformed.output().unwrap();
++    let malformed_commitment = dir.join("malformed-commitment.json");
++    let malformed_reveal = dir.join("malformed-reveal.json");
++    let malformed = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
++        .args([
++            "commit-validator",
++            "--chain-id",
++            "indra-testnet-artifact-test",
++            "--validator",
++            &format!(
++                "v0,{stake},{},{},{}",
++                validator_inputs[0].0.display(),
++                malformed_path.display(),
++                validator_inputs[0].2.display()
++            ),
++            "--commitment-output",
++            malformed_commitment.to_str().unwrap(),
++            "--reveal-output",
++            malformed_reveal.to_str().unwrap(),
++        ])
++        .output()
++        .unwrap();
+     assert!(!malformed.status.success());
+-    assert!(!malformed_genesis.exists());
++    assert!(!malformed_commitment.exists());
++    assert!(!malformed_reveal.exists());
+     assert!(String::from_utf8_lossy(&malformed.stderr).contains("unsupported cold-file format"));
+ 
+     let validate = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+@@ -818,7 +1085,7 @@ fn test_build_and_decode_all_staking_ops() {
+             deposit_utxo_id,
+             &keypair,
+             &cold,
+-            [0xC3; 32],
++            &indra_crypto::VrfKeypair::from_seed(&[0xC3; 32]),
+             1,
+             chain_id,
+         )
+diff --git a/indra/indra-core/src/types/primitives.rs b/indra/indra-core/src/types/primitives.rs
+index b010758f..fd72d958 100644
+--- a/indra/indra-core/src/types/primitives.rs
++++ b/indra/indra-core/src/types/primitives.rs
+@@ -51,11 +51,37 @@ pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
+ /// Hard floor on total round time — immutable, not governable.
+ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
+ 
+-/// Maximum logical rounds tracked per height when deriving proposer slots.
++/// Exclusive upper bound of the normative consensus-round domain.
+ ///
+-/// This is used only to derive a unique deterministic slot index from
+-/// `(height, round)` and is not a runtime cap on retries.
+-pub const MAX_ROUNDS_PER_HEIGHT: u64 = 1_024;
++/// Every proposal, vote, QC, PoLC, live transition, and persisted safety
++/// record must satisfy `round < MAX_ROUNDS_PER_HEIGHT`.
++pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1_024;
++
++/// Validate one consensus round against the authoritative protocol domain.
++pub fn validate_consensus_round(round: u32) -> IndraResult<u32> {
++    if round < MAX_ROUNDS_PER_HEIGHT {
++        Ok(round)
++    } else {
++        Err(IndraError::InvalidConsensusRound {
++            round,
++            max: MAX_ROUNDS_PER_HEIGHT - 1,
++        })
++    }
++}
++
++/// The sole active-slot coefficient numerator permitted by the initial
++/// mainnet protocol: `f = F / 2^64 = 3/8`.
++///
++/// Changing this value is a consensus-breaking protocol change and requires
++/// renewed grinding and liveness analysis. It is not a genesis-, runtime-, or
++/// governance-configurable parameter.
++pub const MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR: u64 = 6_917_529_027_641_081_856;
++
++/// Sole declared Bitcoin confirmation depth for mainnet genesis entropy.
++pub const BITCOIN_GENESIS_CONFIRMATIONS: u32 = 100;
++
++/// Minimum inclusive distance between Bitcoin tip and the precommitted target.
++pub const MIN_GENESIS_PRECOMMIT_BLOCK_LEAD: u64 = 144;
+ 
+ // ── Slashing ──────────────────────────────────────────────────────────────────
+ 
+@@ -435,17 +461,17 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
+ pub const TRANSACTION_PROTOCOL_VERSION: u16 = 3;
+ 
+ /// Fixed discriminator for the sole genesis-native block format.
+-pub const BLOCK_FORMAT_VERSION: u16 = 2;
++pub const BLOCK_FORMAT_VERSION: u16 = 4;
+ 
+ /// Current schema version for all persisted structs.
+ ///
+ /// Increment this whenever any persisted struct changes its encoding.
+-pub const SCHEMA_VERSION: u8 = 4;
++pub const SCHEMA_VERSION: u8 = 5;
+ 
+ /// Maximum length of a validator-advertised P2P network address.
+ ///
+ /// The field is deliberately stored as a bounded string so future schema
+-/// versions can choose broader address forms, but v4 consensus validation only
++/// versions can choose broader address forms, but v5 consensus validation only
+ /// accepts strict IP:port `SocketAddr` syntax.
+ pub const MAX_VALIDATOR_NETWORK_ADDR_LEN: usize = 255;
+ 
+@@ -748,8 +774,8 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn proposer_v2_wire_constants_are_pinned() {
+-        assert_eq!(BLOCK_FORMAT_VERSION, 2);
++    fn proposer_wire_constants_are_pinned() {
++        assert_eq!(BLOCK_FORMAT_VERSION, 4);
+         assert_eq!(MAX_STANDARD_VRF_OUTPUT_BYTES, 64);
+         assert_eq!(MAX_STANDARD_VRF_PROOF_BYTES, 80);
+         assert_eq!(
+diff --git a/indra/indra-node/src/bin/node.rs b/indra/indra-node/src/bin/node.rs
+index 3561a7d6..648f0009 100644
+--- a/indra/indra-node/src/bin/node.rs
++++ b/indra/indra-node/src/bin/node.rs
+@@ -3485,7 +3485,12 @@ fn main() {
+                                 };
+                                 {
+                                     let mut d = driver.lock().unwrap();
+-                                    d.on_precommit_timeout();
++                                    if let Err(error) = d.on_precommit_timeout() {
++                                        eprintln!(
++                                            "[consensus] FATAL: deterministic round exhaustion: {error}"
++                                        );
++                                        return;
++                                    }
+                                     if d.current_round() != old_round && d.current_round() > 0 {
+                                         eprintln!(
+                                             "[timing] t={}ms ROUND ADVANCED to {} at height={}",
+@@ -5575,6 +5580,29 @@ fn decode_node_rpc_transaction(
+ mod tests {
+     use super::*;
+ 
++    fn seal_genesis_fixture(content: &str) -> String {
++        let placeholder = hex::encode([0u8; 32]);
++        let provisional = content
++            .replacen(
++                "[genesis]\n",
++                &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
++                1,
++            )
++            .replacen(
++                "[[validators]]\n",
++                &format!(
++                    "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
++                    hex::encode([0x70u8; 32])
++                ),
++                1,
++            );
++        let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
++        let hash =
++            indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
++                .unwrap();
++        provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
++    }
++
+     #[test]
+     fn initialized_rpc_credentials_are_atomic_and_mode_0600_regardless_of_umask() {
+         const CHILD_ENV: &str = "INDRA_PRIVATE_CONFIG_UMASK_CHILD";
+@@ -5649,7 +5677,7 @@ mod tests {
+         let genesis_path = dir.join("genesis.toml");
+         std::fs::create_dir_all(&dir).unwrap();
+         let genesis = format!(
+-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+                 hex::encode(validator_id.0),
+                 hex::encode(classical.public_key().0),
+                 hex::encode(pq.public_key().0),
+@@ -5659,6 +5687,7 @@ mod tests {
+                 hex::encode(cold_classical.public_key().0),
+                 hex::encode(cold_pq.public_key().0),
+             );
++        let genesis = seal_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some(seed);
+@@ -5748,9 +5777,17 @@ mod tests {
+             .status = indra_state::ValidatorStatus::Registered;
+         let live_only_id = add_active_proposer_candidate(&mut driver, [0xD2; 32]);
+ 
+-        let decision_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
+-        let construction_election = proposer_election_for_slot(&driver, u64::MAX, 7).unwrap();
+-        let driver_election = driver.proposer_election_for_height(u64::MAX, 7).unwrap();
++        // Seed 0xD1 is deterministically eligible at legal round 3 under the
++        // mainnet f=3/8 snapshot. Eligibility is fixture machinery here; the
++        // invariant under test is identical snapshot authority at every caller.
++        const ELIGIBLE_ROUND: u32 = 3;
++        let decision_election =
++            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
++        let construction_election =
++            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
++        let driver_election = driver
++            .proposer_election_for_height(u64::MAX, ELIGIBLE_ROUND)
++            .unwrap();
+ 
+         assert_same_election(&decision_election, &construction_election);
+         assert_same_election(&decision_election, &driver_election);
+@@ -7137,7 +7174,7 @@ mod tests {
+                 value_hash: indra_core::Bytes32::from([0x14; 32]),
+                 base_fee: 101,
+                 proposer_round: 0,
+-                polc_round: indra_core::types::block::NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: indra_core::Bytes32::from([0x15; 32]),
+                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: indra_core::types::primitives::Bytes64([0x15; 64]),
+@@ -7520,7 +7557,6 @@ mod tests {
+     fn request_proposal_test_block() -> indra_core::types::block::BlockProposalVNext {
+         use indra_core::types::block::{
+             BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+-            NO_POLC_ROUND,
+         };
+         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
+ 
+@@ -7536,7 +7572,7 @@ mod tests {
+                 value_hash: Bytes32::from([0xAA; 32]),
+                 base_fee: 1,
+                 proposer_round: 3,
+-                polc_round: NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::from([0x05; 32]),
+                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: indra_core::types::primitives::Bytes64([0x05; 64]),
+@@ -7569,7 +7605,6 @@ mod tests {
+     fn block_response_test_block(height: u64) -> indra_core::types::block::BlockProposalVNext {
+         use indra_core::types::block::{
+             BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+-            NO_POLC_ROUND,
+         };
+         use indra_core::types::primitives::{Bytes32, ProtocolVersion, VariableBytes};
+ 
+@@ -7585,7 +7620,7 @@ mod tests {
+                 value_hash: Bytes32::from([0x05; 32]),
+                 base_fee: 1,
+                 proposer_round: 0,
+-                polc_round: NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::ZERO,
+                 vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: indra_core::types::primitives::Bytes64::ZERO,
+diff --git a/indra/indra-node/src/config.rs b/indra/indra-node/src/config.rs
+index 3040941a..9c05707a 100644
+--- a/indra/indra-node/src/config.rs
++++ b/indra/indra-node/src/config.rs
+@@ -191,12 +191,35 @@ impl NodeConfig {
+             .expect("local test VRF challenge");
+             let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+             let contents = format!(
+-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
++                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                 hex::encode(validator_id), hex::encode(hot_public.classical.0),
+                 hex::encode(hot_public.pq.0), hex::encode(vrf_public),
+                 hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
+                 hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
+             );
++            let contents = {
++                let placeholder = hex::encode([0u8; 32]);
++                let provisional = contents
++                    .replacen(
++                        "[genesis]\n",
++                        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
++                        1,
++                    )
++                    .replacen(
++                        "[[validators]]\n",
++                        &format!(
++                            "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
++                            hex::encode([0x70u8; 32])
++                        ),
++                        1,
++                    );
++                let manifest: crate::genesis::GenesisManifest = toml::from_str(&provisional)
++                    .expect("generated local-test genesis has the current schema");
++                let hash =
++                    crate::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
++                        .expect("generated local-test genesis precommit is canonical");
++                provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
++            };
+             std::fs::write(&genesis_path, contents).expect("write local-test genesis");
+         }
+         let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
+diff --git a/indra/indra-node/src/driver.rs b/indra/indra-node/src/driver.rs
+index 98aee15d..e0722c1e 100644
+--- a/indra/indra-node/src/driver.rs
++++ b/indra/indra-node/src/driver.rs
+@@ -17,8 +17,10 @@ use indra_consensus::{
+ };
+ use indra_core::codec::{Decode, Encode};
+ use indra_core::types::{
+-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+-    primitives::{has_strict_two_thirds_quorum, Bytes32},
++    block::{BlockProposalVNext, BlockVNext},
++    primitives::{
++        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ROUNDS_PER_HEIGHT,
++    },
+     proposal::verify_proposal,
+     qc::QuorumCertificateV1,
+     vote::{VoteStep, VoteV1},
+@@ -682,7 +684,7 @@ impl ConsensusDriver {
+     pub fn reset_round(&mut self) {
+         self.prune_future_proposals();
+         self.valid_proposal = None;
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -698,7 +700,7 @@ impl ConsensusDriver {
+         self.vote_collectors.clear();
+         self.round_advance_evidence.clear();
+         self.seen_round_votes.clear();
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -727,9 +729,14 @@ impl ConsensusDriver {
+         (height, round, step)
+     }
+ 
+-    fn start_round(&mut self, round: u32) {
++    fn start_round(&mut self, round: u32) -> NodeResult<()> {
++        validate_consensus_round(round).map_err(|error| NodeError::BlockInvalid {
++            height: self.next_height(),
++            reason: error.to_string(),
++        })?;
+         self.current_round = round;
+         self.current_phase = RoundPhase::Propose;
++        Ok(())
+     }
+ 
+     fn enter_precommit_phase(&mut self) {
+@@ -749,7 +756,7 @@ impl ConsensusDriver {
+             round,
+             self.engine.state.election_seed,
+             snapshot,
+-        )
++        )?
+         .election)
+     }
+ 
+@@ -807,6 +814,7 @@ impl ConsensusDriver {
+         &mut self,
+         lock: PersistedConsensusLock,
+     ) -> Result<(), String> {
++        validate_consensus_round(lock.round).map_err(|error| error.to_string())?;
+         if lock.height != self.next_height()
+             || lock.proposal.block.header.height != lock.height
+             || lock.proposal.block.header.block_hash() != lock.block_hash
+@@ -885,12 +893,28 @@ impl ConsensusDriver {
+                 }
+                 self.vote_safety_unavailable = None;
+                 if record.height == next_height && record.round >= self.current_round {
+-                    let safe_round = record.round.saturating_add(1);
++                    let safe_round = match record
++                        .round
++                        .checked_add(1)
++                        .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++                    {
++                        Some(round) => round,
++                        None => {
++                            let message = format!(
++                                "persisted vote at final legal round {} leaves no safe round at height {}",
++                                record.round, record.height
++                            );
++                            eprintln!("[vote_safety] CRITICAL: {message}");
++                            self.vote_safety_unavailable = Some(message);
++                            return;
++                        }
++                    };
+                     eprintln!(
+                         "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                         safe_round, record.height, record.round, record.step
+                     );
+-                    self.start_round(safe_round);
++                    self.start_round(safe_round)
++                        .expect("safe persisted round was validated above");
+                 }
+             }
+             VoteSafetyLoadResult::Corrupt(reason) => {
+@@ -921,7 +945,11 @@ impl ConsensusDriver {
+     fn prune_round_advance_evidence(&mut self) {
+         let height = self.next_height();
+         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
+-        let max_round = self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP);
++        let max_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
+         self.round_advance_evidence
+             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
+         if self.round_advance_evidence.len() > MAX_STALLED_HEIGHT_ENTRIES {
+@@ -1222,7 +1250,7 @@ impl ConsensusDriver {
+         };
+         let hash = block.header.block_hash();
+         let value_hash = block.header.value_hash;
+-        let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
++        let vote_hash = if block.header.polc_round.is_none() {
+             // Rule 2
+             if self.locked_round.is_none() || self.locked_value == Some(hash) {
+                 hash
+@@ -1231,7 +1259,7 @@ impl ConsensusDriver {
+             }
+         } else {
+             // Rule 3
+-            let valid_round = block.header.polc_round;
++            let valid_round = block.header.polc_round.expect("checked Some above");
+             if valid_round < self.current_round
+                 && self.has_quorum_for_value_hash(
+                     height,
+@@ -1351,6 +1379,16 @@ impl ConsensusDriver {
+         from: Option<SocketAddr>,
+         proposal: BlockProposalVNext,
+     ) -> Vec<DriverAction> {
++        if validate_consensus_round(proposal.block.header.proposer_round).is_err()
++            || validate_consensus_round(proposal.block.header.value_entropy.origin_round).is_err()
++            || proposal
++                .block
++                .header
++                .polc_round
++                .is_some_and(|round| validate_consensus_round(round).is_err())
++        {
++            return vec![DriverAction::None];
++        }
+         if !self.sync.is_caught_up() {
+             return vec![DriverAction::None];
+         }
+@@ -1428,8 +1466,20 @@ impl ConsensusDriver {
+             }
+         }
+ 
+-        let mut projected_state = self.engine.state.clone();
+-        if indra_state::apply_block(&mut projected_state, &verified, 0).is_err() {
++        // Admission must validate the commitments before staging the proposal:
++        // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
++        // without recomputing it would let a PoLC authorize different immutable
++        // value entropy under the same claimed identity.
++        let projected =
++            match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
++            {
++                Ok(projected) => projected,
++                Err(_) => return vec![DriverAction::None],
++            };
++        if projected.state_root != block.header.state_root
++            || projected.validator_set_root != block.header.validator_set_root
++            || projected.value_hash != block.header.value_hash
++        {
+             return vec![DriverAction::None];
+         }
+ 
+@@ -1507,9 +1557,16 @@ impl ConsensusDriver {
+     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+         let mut actions = Vec::new();
+ 
+-        if vote.height != self.next_height()
+-            || vote.round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+-        {
++        if validate_consensus_round(vote.round).is_err() {
++            return actions;
++        }
++
++        let maximum_jump_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
++        if vote.height != self.next_height() || vote.round > maximum_jump_round {
+             return actions;
+         }
+ 
+@@ -1611,7 +1668,13 @@ impl ConsensusDriver {
+         if !self.sync.is_caught_up()
+             || height != self.next_height()
+             || target_round <= self.current_round
+-            || target_round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
++            || validate_consensus_round(target_round).is_err()
++            || target_round
++                > self
++                    .current_round
++                    .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++                    .unwrap_or(u32::MAX)
++                    .min(MAX_ROUNDS_PER_HEIGHT - 1)
+         {
+             return Vec::new();
+         }
+@@ -1643,7 +1706,8 @@ impl ConsensusDriver {
+             "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
+             self.current_round, target_round, height, signed_stake, total_stake
+         );
+-        self.start_round(target_round);
++        self.start_round(target_round)
++            .expect("certified target round was validated before mutation");
+         self.apply_vote_safety();
+         self.prune_stalled_collections();
+         self.maybe_prevote_current_round_proposal()
+@@ -2021,7 +2085,7 @@ impl ConsensusDriver {
+                         "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
+                     );
+                 }
+-                self.start_round(0);
++                self.start_round(0).expect("round zero is always legal");
+                 actions.extend(self.activate_buffered_proposals_for_new_tip());
+ 
+                 self.vote_collectors
+@@ -2257,11 +2321,19 @@ impl ConsensusDriver {
+     }
+ 
+     /// Rule 10 — on precommit timeout, advance to the next round.
+-    pub fn on_precommit_timeout(&mut self) {
++    pub fn on_precommit_timeout(&mut self) -> NodeResult<()> {
+         if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Precommit {
+-            return;
++            return Ok(());
+         }
+-        self.start_round(self.current_round.saturating_add(1));
++        let next_round = self
++            .current_round
++            .checked_add(1)
++            .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++            .ok_or(NodeError::RoundLimitExceeded {
++                height: self.next_height(),
++                round: self.current_round,
++            })?;
++        self.start_round(next_round)
+     }
+ 
+     /// Current committed chain height.
+@@ -2314,7 +2386,7 @@ mod tests {
+                 value_hash: Bytes32::ZERO,
+                 base_fee: state.base_fee,
+                 proposer_round: 0,
+-                polc_round: NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::ZERO,
+                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: state.election_seed,
+@@ -2536,7 +2608,7 @@ mod tests {
+         let genesis_path = dir.join("genesis.toml");
+         std::fs::create_dir_all(&dir).unwrap();
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -2546,6 +2618,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, &genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some(seed);
+@@ -2560,7 +2633,8 @@ mod tests {
+             header[72..].copy_from_slice(&counter.to_le_bytes());
+             let settings = crate::genesis::GenesisSettings {
+                 chain_id: "indra-testnet-1".into(),
+-                active_slot_coefficient_numerator: 1u64 << 63,
++                active_slot_coefficient_numerator:
++                    indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+                 bitcoin_pow_entropy_source: crate::genesis::BitcoinPowEntropySourceV1 {
+                     scheme: 1,
+                     network_genesis_hash: hex::encode([0u8; 32]),
+@@ -2571,6 +2645,7 @@ mod tests {
+                     reorg_policy: 1,
+                 },
+                 bitcoin_pow_entropy_header: hex::encode(header),
++                genesis_precommit_hash: hex::encode([0x55; 32]),
+             };
+             driver.engine.state.election_seed =
+                 crate::genesis::derive_genesis_election_seed(&settings).unwrap();
+@@ -2616,7 +2691,7 @@ mod tests {
+         prev_qc_bytes: Vec<u8>,
+     ) -> indra_core::types::block::BlockProposalVNext {
+         let vrf = VrfKeypair::from_seed(&proposer_seed);
+-        let election = (round..round.saturating_add(4_096))
++        let election = (round..MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|candidate_round| {
+                 let election = driver
+                     .proposer_election_for_height(driver.height() + 1, candidate_round)
+@@ -2695,7 +2770,9 @@ mod tests {
+         // completed round-change that precedes delivery of that proposal; the
+         // round-evidence protocol itself has dedicated adversarial tests.
+         if proposal.header.proposer_round > driver.current_round() {
+-            driver.start_round(proposal.header.proposer_round);
++            driver
++                .start_round(proposal.header.proposer_round)
++                .expect("test proposal round must be legal");
+         }
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -2948,10 +3025,15 @@ mod tests {
+             2,
+             indra_core::types::primitives::Bytes64([0x55; 64]),
+             &snapshot,
+-        );
++        )
++        .unwrap();
+         let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
+         let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
+ 
++        assert_eq!(
++            vrf.election.sortition_log,
++            snapshot.sortition_log_interval().unwrap()
++        );
+         assert_eq!(vrf.election.candidates.len(), voters.len());
+         assert_eq!(voters.len(), qc.len());
+         for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+@@ -3069,7 +3151,8 @@ mod tests {
+                         0,
+                         Bytes64([(*height % 251) as u8; 64]),
+                         snapshot,
+-                    );
++                    )
++                    .unwrap();
+                     assert_eq!(voters.len(), validators.len());
+                     assert_eq!(validators.len(), authority.election.candidates.len());
+                     for ((voter, validator), candidate) in voters
+@@ -3173,10 +3256,10 @@ mod tests {
+ 
+         let mut block_a = make_block(&driver.engine.state);
+         block_a.header.proposer_round = 0;
+-        block_a.header.polc_round = NO_POLC_ROUND;
++        block_a.header.polc_round = None;
+         let mut block_b = block_a.clone();
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = 0;
++        block_b.header.polc_round = Some(0);
+ 
+         assert_eq!(block_a.header.value_hash, block_b.header.value_hash);
+         let hash_a = block_a.header.block_hash();
+@@ -3468,7 +3551,14 @@ mod tests {
+         let signer = install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
+         driver.refresh_registered_voters();
+ 
+-        let block = make_strict_block(&driver, [0x4Fu8; 32], 5, vec![]);
++        let target_round = (1..=8)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, 1, *round))
++            })
++            .expect("single-validator fixture must be eligible within the round-jump cap");
++        let block = make_strict_block(&driver, [0x4Fu8; 32], target_round, vec![]);
+         let block_hash = block.header.block_hash();
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -3480,12 +3570,12 @@ mod tests {
+         assert!(!actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+ 
+         let vote = indra_consensus::vote::produce_vote(
+             1,
+-            5,
++            target_round,
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             validator_id_for(&signer),
+@@ -3503,7 +3593,7 @@ mod tests {
+         assert!(actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+@@ -3570,12 +3660,87 @@ mod tests {
+         driver.current_phase = RoundPhase::Precommit;
+         driver.current_round = 3;
+ 
+-        driver.on_precommit_timeout();
++        driver.on_precommit_timeout().unwrap();
+         assert_eq!(driver.current_round(), 4);
+         assert_eq!(driver.current_phase(), RoundPhase::Propose);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn final_round_timeout_fails_closed_without_state_mutation() {
++        let (mut driver, dir) = local_driver([0x48u8; 32], "round_limit");
++        driver.current_round = MAX_ROUNDS_PER_HEIGHT - 2;
++        driver.current_phase = RoundPhase::Precommit;
++        driver.on_precommit_timeout().unwrap();
++        assert_eq!(driver.current_round(), MAX_ROUNDS_PER_HEIGHT - 1);
++        assert_eq!(driver.current_phase(), RoundPhase::Propose);
++
++        driver.current_phase = RoundPhase::Precommit;
++        let before = (
++            driver.current_round,
++            driver.current_phase,
++            driver.pending_blocks.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let error = driver.on_precommit_timeout().unwrap_err();
++        assert!(matches!(error, NodeError::RoundLimitExceeded { .. }));
++        assert_eq!(
++            before,
++            (
++                driver.current_round,
++                driver.current_phase,
++                driver.pending_blocks.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn invalid_high_round_vote_is_rejected_before_any_consensus_mutation() {
++        let (mut driver, dir) = local_driver([0x49u8; 32], "high_round_vote");
++        let signer = install_active_validator(&mut driver, [0x49u8; 32], "local");
++        driver.refresh_registered_voters();
++        let mut vote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&signer),
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        vote.round = MAX_ROUNDS_PER_HEIGHT;
++        let before = (
++            driver.seen_round_votes.len(),
++            driver.round_advance_evidence.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let actions = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9499".parse().unwrap(),
++            vote,
++        });
++        assert!(actions.is_empty());
++        assert_eq!(
++            before,
++            (
++                driver.seen_round_votes.len(),
++                driver.round_advance_evidence.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn process_status_cannot_advance_round_without_quorum_evidence() {
+         let (mut driver, dir) = local_driver([0x4Au8; 32], "status_round_advance");
+@@ -3921,6 +4086,23 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn restart_after_vote_in_final_round_fails_closed() {
++        let (mut driver, dir) = local_driver([0x4Cu8; 32], "final_round_restart");
++        driver
++            .vote_safety
++            .record(1, MAX_ROUNDS_PER_HEIGHT - 1, 1, None)
++            .unwrap();
++        let before = driver.current_round();
++        driver.apply_vote_safety();
++        assert_eq!(driver.current_round(), before);
++        assert!(driver
++            .vote_safety_unavailable
++            .as_deref()
++            .is_some_and(|reason| reason.contains("no safe round")));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn apply_vote_safety_ignores_old_height() {
+         let (mut driver, dir) = local_driver([0x4Eu8; 32], "vote_safety_old_height");
+@@ -4048,7 +4230,7 @@ mod tests {
+         // legitimately prevoted this conflicting full block hash.
+         let mut block_b = make_block(&restarted.engine.state);
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = NO_POLC_ROUND;
++        block_b.header.polc_round = None;
+         block_b.header.timestamp = block_b.header.timestamp.saturating_add(1);
+         block_b.header.value_hash = block_b.compute_value_hash(restarted.engine.state.total_supply);
+         let hash_b = block_b.header.block_hash();
+@@ -4120,6 +4302,42 @@ mod tests {
+         let _ = std::fs::remove_dir_all(dir);
+     }
+ 
++    #[test]
++    fn persisted_lock_above_round_cap_is_rejected_before_restore_mutation() {
++        let seed = [0x7Fu8; 32];
++        let (mut driver, dir) = local_driver(seed, "restart_rejects_high_lock_round");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        let proposal = make_strict_block(&driver, seed, 0, vec![]);
++        let block_hash = proposal.header.block_hash();
++        let prevote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            block_hash,
++            validator_id_for(&local),
++            DEFAULT_CHAIN_ID,
++            &local,
++        )
++        .unwrap();
++        let lock = PersistedConsensusLock {
++            height: 1,
++            round: MAX_ROUNDS_PER_HEIGHT,
++            block_hash,
++            value_hash: proposal.header.value_hash,
++            proposal,
++            polc_votes: vec![prevote],
++        };
++        assert!(driver.vote_safety.record(1, 0, 1, Some(&lock)).is_err());
++        let before = (driver.locked_round, driver.valid_round, driver.locked_value);
++        assert!(driver.verify_and_restore_consensus_lock(lock).is_err());
++        assert_eq!(
++            before,
++            (driver.locked_round, driver.valid_round, driver.locked_value)
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn lock_polc_is_durable_before_precommit_broadcast_is_returned() {
+         let (mut driver, dir) = local_driver([0x7Au8; 32], "lock_before_precommit");
+@@ -5235,7 +5453,7 @@ mod tests {
+         assert_eq!(valid_block.header.value_hash, value_hash);
+ 
+         let local_vrf = VrfKeypair::from_seed(&[0x73; 32]);
+-        let election = (original_round.saturating_add(1)..original_round.saturating_add(4_096))
++        let election = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver, height, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(
+@@ -5262,7 +5480,7 @@ mod tests {
+ 
+         assert_eq!(reproposed.header.value_hash, value_hash);
+         assert_eq!(reproposed.header.proposer_round, reproposal_round);
+-        assert_eq!(reproposed.header.polc_round, original_round);
++        assert_eq!(reproposed.header.polc_round, Some(original_round));
+ 
+         driver.current_round = reproposal_round;
+         driver.current_phase = RoundPhase::Propose;
+@@ -5345,6 +5563,96 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn vrf007_substituted_entropy_is_rejected_before_vote_or_lock_mutation() {
++        let seed = [0x7Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "vrf007_admission_order");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++
++        let height = driver.next_height();
++        let round_zero = election_for_round(&driver, height, 0);
++        let original = driver
++            .engine
++            .propose(&round_zero, 1_700_000_001, driver.last_qc_bytes(), None)
++            .unwrap();
++        let local_id = validator_id_for(&local);
++        let local_vrf = VrfKeypair::from_seed(&seed);
++        let later = (1..4_096)
++            .map(|round| election_for_round(&driver, height, round))
++            .find(|election| {
++                indra_consensus::proposer::compute_proposer_vrf(local_id, &local_vrf, election)
++                    .is_ok_and(|claim| claim.eligible)
++            })
++            .expect("test validator becomes eligible in a later round");
++        let mut substituted = driver
++            .engine
++            .repropose(
++                &original,
++                later.round,
++                Some(0),
++                &later,
++                original.header.timestamp,
++                driver.last_qc_bytes(),
++            )
++            .unwrap();
++
++        // Reproduce VRF-007 exactly: install another genuine eligible entropy
++        // proof but retain the old stable value identity and post-state roots.
++        substituted.block.header.value_entropy = indra_core::types::block::ProposalEntropyV1 {
++            origin_proposer_id: substituted.header.proposer_id,
++            origin_round: substituted.header.proposer_round,
++            vrf_output: substituted.header.proposer_vrf_output.clone(),
++            vrf_proof: substituted.header.proposer_vrf_proof.clone(),
++        };
++        reauthorize_test_proposal(
++            &mut substituted,
++            seed,
++            driver.engine.state.chain_id.as_bytes(),
++        );
++        assert_ne!(
++            original.header.value_entropy,
++            substituted.header.value_entropy
++        );
++        assert_eq!(original.header.value_hash, substituted.header.value_hash);
++        assert!(verify_live_proposal(&driver, &substituted).is_ok());
++        assert_ne!(
++            substituted.header.value_hash,
++            substituted.compute_value_hash(driver.engine.state.total_supply),
++            "the substituted entropy has a different canonical stable identity"
++        );
++
++        driver.current_round = later.round;
++        driver.current_phase = RoundPhase::Propose;
++        let pending_before = driver.pending_blocks.len();
++        let collectors_before = driver.vote_collectors.len();
++        let lock_before = (
++            driver.locked_round,
++            driver.locked_value,
++            driver.locked_value_hash,
++        );
++        let actions = driver.process(DriverEvent::InboundBlock {
++            from: None,
++            proposal: substituted,
++        });
++
++        assert!(actions
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert_eq!(driver.vote_collectors.len(), collectors_before);
++        assert_eq!(
++            (
++                driver.locked_round,
++                driver.locked_value,
++                driver.locked_value_hash
++            ),
++            lock_before
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn repropose_matches_clone_based_reference() {
+         let (mut driver, dir) = local_driver([0x78u8; 32], "repropose_clone_reference");
+@@ -5363,13 +5671,20 @@ mod tests {
+             )
+             .expect("initial proposal should succeed");
+ 
+-        let election_round_one = election_for_round(&driver, height, 1);
++        let reproposal_round = (1..4_096)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, height, *round))
++            })
++            .expect("test proposer must become eligible within bounded round search");
++        let election_round_one = election_for_round(&driver, height, reproposal_round);
+         let pre_state = driver.engine.state.clone();
+         let reproposed = driver
+             .engine
+             .repropose(
+                 &proposal,
+-                1,
++                reproposal_round,
+                 Some(0),
+                 &election_round_one,
+                 proposal.header.timestamp,
+@@ -5394,8 +5709,8 @@ mod tests {
+             reproposed.compute_value_hash(clone_reference.total_supply)
+         );
+         assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
+-        assert_eq!(reproposed.header.proposer_round, 1);
+-        assert_eq!(reproposed.header.polc_round, 0);
++        assert_eq!(reproposed.header.proposer_round, reproposal_round);
++        assert_eq!(reproposed.header.polc_round, Some(0));
+         assert_eq!(
+             driver.engine.state, pre_state,
+             "reproposal projection must roll back and leave real engine state untouched"
+@@ -5511,9 +5826,9 @@ mod tests {
+             value_hash
+         );
+ 
+-        driver_b.on_precommit_timeout();
++        driver_b.on_precommit_timeout().unwrap();
+         let b_vrf = VrfKeypair::from_seed(&[0x82; 32]);
+-        let election_round_one = (original_round.saturating_add(1)..4_096)
++        let election_round_one = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver_b, 1, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, election)
+diff --git a/indra/indra-node/src/engine.rs b/indra/indra-node/src/engine.rs
+index e3aadce4..b42961d2 100644
+--- a/indra/indra-node/src/engine.rs
++++ b/indra/indra-node/src/engine.rs
+@@ -25,7 +25,7 @@ use indra_consensus::{
+ };
+ use indra_core::codec::Decode;
+ use indra_core::types::{
+-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
++    block::{BlockProposalVNext, BlockVNext},
+     crypto::HybridPubKey,
+     governance::GovernanceOpV2,
+     primitives::{
+@@ -1254,6 +1254,14 @@ impl NodeEngine {
+         prev_qc_bytes: Vec<u8>,
+         polc_round: Option<u32>,
+     ) -> NodeResult<BlockProposalVNext> {
++        if let Some(round) = polc_round {
++            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
++                NodeError::BlockInvalid {
++                    height: self.state.height + 1,
++                    reason: error.to_string(),
++                }
++            })?;
++        }
+         ensure_disk_writable(&self.config.data_dir)?;
+         let proposal_height = self.state.height + 1;
+         if proposal_height > 1 && prev_qc_bytes.is_empty() {
+@@ -1295,6 +1303,20 @@ impl NodeEngine {
+         timestamp: u64,
+         last_qc: Vec<u8>,
+     ) -> NodeResult<BlockProposalVNext> {
++        indra_core::types::primitives::validate_consensus_round(new_round).map_err(|error| {
++            NodeError::BlockInvalid {
++                height: self.state.height + 1,
++                reason: error.to_string(),
++            }
++        })?;
++        if let Some(round) = valid_round {
++            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
++                NodeError::BlockInvalid {
++                    height: self.state.height + 1,
++                    reason: error.to_string(),
++                }
++            })?;
++        }
+         ensure_disk_writable(&self.config.data_dir)?;
+         let proposal_height = self.state.height + 1;
+         if proposal_height > 1 && last_qc.is_empty() {
+@@ -1325,7 +1347,7 @@ impl NodeEngine {
+         let mut block = original_block.clone();
+         block.header.timestamp = timestamp;
+         block.header.proposer_round = new_round;
+-        block.header.polc_round = valid_round.unwrap_or(NO_POLC_ROUND);
++        block.header.polc_round = valid_round;
+         block.header.proposer_id = slot.proposer_id;
+         block.header.vrf_suite = indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2;
+         block.header.election_seed = election.election_seed;
+@@ -1856,7 +1878,8 @@ mod tests {
+         GovernanceActionType, GovernanceOpV2, GovernancePayload,
+     };
+     use indra_core::types::primitives::{
+-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, TRANSACTION_PROTOCOL_VERSION,
++        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
++        TRANSACTION_PROTOCOL_VERSION,
+     };
+     use indra_core::types::slashing::SlashEvidenceV1;
+     use indra_core::types::stake_position::{
+@@ -1993,7 +2016,7 @@ mod tests {
+         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+         let genesis_path = dir.join("genesis.toml");
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -2003,6 +2026,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, genesis).unwrap();
+         genesis_path.to_string_lossy().to_string()
+     }
+@@ -2388,6 +2412,7 @@ mod tests {
+                     election_seed: state.election_seed,
+                     snapshot_root: snapshot.snapshot_root,
+                     active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++                    sortition_log: snapshot.sortition_log_interval().unwrap(),
+                     height,
+                     round,
+                     candidates: candidates.clone(),
+@@ -2441,6 +2466,7 @@ mod tests {
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot
+@@ -2460,7 +2486,7 @@ mod tests {
+         height: u64,
+         vrf: &VrfKeypair,
+     ) -> ProposerElection {
+-        (0..4_096)
++        (0..MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|round| {
+                 let election = test_election(state, height, round);
+                 let candidate = election
+@@ -4108,6 +4134,7 @@ mod tests {
+             )
+             .replace(&hex::encode(old_output.0), &hex::encode(new_output.0))
+             .replace(&hex::encode(old_proof.0), &hex::encode(new_proof.0));
++        genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(genesis_path, genesis).unwrap();
+ 
+         {
+@@ -4132,14 +4159,13 @@ mod tests {
+             engine.write_chain_manifest().unwrap();
+         }
+         let genesis_path = manifest_config.genesis_path.as_ref().unwrap();
+-        let genesis = std::fs::read_to_string(genesis_path).unwrap().replace(
+-            "active_slot_coefficient_numerator = \"9223372036854775808\"",
+-            "active_slot_coefficient_numerator = \"1\"",
+-        );
++        let genesis = std::fs::read_to_string(genesis_path)
++            .unwrap()
++            .replace("stake = 1000000000000", "stake = 1000000000001");
+         std::fs::write(genesis_path, genesis).unwrap();
+         assert!(matches!(
+             NodeEngine::init(manifest_config),
+-            Err(NodeError::GenesisMismatch)
++            Err(NodeError::ValidatorConfigIncomplete { .. })
+         ));
+         let _ = std::fs::remove_dir_all(&manifest_dir);
+ 
+@@ -4294,7 +4320,7 @@ mod tests {
+         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+         let genesis_path = dir.join("genesis.toml");
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -4304,6 +4330,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some([0x11; 32]);
+@@ -4378,7 +4405,35 @@ mod tests {
+             Some(VrfKeypair::from_seed(&[0x99u8; 32]).public_key());
+ 
+         crate::genesis::finalize_test_genesis(&mut engine.state);
+-        let election = test_election(&engine.state, 1, 0);
++        // This fixed fixture is eligible at round 13 under the registered key.
++        // Keeping the round explicit separates the key-binding invariant from
++        // probabilistic eligibility-search helper behavior.
++        let election = test_election(&engine.state, 1, 13);
++        let registered_vrf = VrfKeypair::from_seed(&[0x99; 32]);
++        let foreign_local_vrf = VrfKeypair::from_seed(&[0x42; 32]);
++        let alpha = election.vrf_input(&local_id).unwrap();
++        let (foreign_output, foreign_proof) = indra_crypto::vrf_prove(&foreign_local_vrf, &alpha);
++        assert!(indra_crypto::vrf_verify(
++            &foreign_local_vrf.public_key(),
++            &alpha,
++            &foreign_output,
++            &foreign_proof,
++        )
++        .is_ok());
++        assert!(indra_crypto::vrf_verify(
++            &registered_vrf.public_key(),
++            &alpha,
++            &foreign_output,
++            &foreign_proof,
++        )
++        .is_err());
++        assert!(
++            compute_proposer_vrf(local_id, &registered_vrf, &election)
++                .unwrap()
++                .eligible,
++            "the snapshot-registered VRF key fixture must be eligible at round 13"
++        );
++        assert!(compute_proposer_vrf(local_id, &foreign_local_vrf, &election).is_err());
+ 
+         assert!(
+             !engine.is_proposer(&election),
+@@ -4908,7 +4963,8 @@ mod tests {
+         assert_eq!(engine.governance_mempool, vec![governance]);
+         assert_eq!(engine.pending_slashes.len(), 1);
+ 
+-        let election = test_election(&engine.state, 1, 0);
++        let election =
++            first_eligible_test_election(&engine.state, 1, &VrfKeypair::from_seed(&[0x42; 32]));
+         let template = BlockTemplate {
+             proposer_vrf_keypair: VrfKeypair::from_seed(&[0x42; 32]),
+             prev_qc_bytes: vec![],
+diff --git a/indra/indra-node/src/genesis.rs b/indra/indra-node/src/genesis.rs
+index b9f0ee46..bd459ecc 100644
+--- a/indra/indra-node/src/genesis.rs
++++ b/indra/indra-node/src/genesis.rs
+@@ -21,10 +21,116 @@ use indra_core::types::{
+ };
+ use indra_crypto::sha256;
+ use indra_state::ChainState;
+-use serde::{de::Error as _, Deserialize, Deserializer};
++use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+ use sha2::{Digest, Sha512};
+ 
+ const GENESIS_VALIDATOR_UTXO_SPARK: u64 = 1_000_000_000_000;
++/// Canonical genesis ceremony artifact version.
++pub const GENESIS_CEREMONY_VERSION: u8 = 1;
++
++/// Hash one validator's complete genesis authority material and hiding nonce.
++pub fn genesis_validator_commitment(
++    chain_id: &str,
++    validator: &GenesisValidator,
++) -> Result<Bytes32, String> {
++    let mut material = b"INDRA-GENESIS-VALIDATOR-COMMIT-v1".to_vec();
++    let chain = chain_id.as_bytes();
++    let len = u16::try_from(chain.len()).map_err(|_| "genesis chain id too long")?;
++    material.extend_from_slice(&len.to_be_bytes());
++    material.extend_from_slice(chain);
++    material.extend_from_slice(&decode_hex_exact::<32>(
++        &validator.validator_id,
++        "validator_id",
++    )?);
++    material.extend_from_slice(&validator.stake.to_le_bytes());
++    material.extend_from_slice(&decode_hex_exact::<32>(
++        &validator.hybrid_classical_pk,
++        "hybrid_classical_pk",
++    )?);
++    material.extend_from_slice(&decode_hex_len(
++        &validator.hybrid_pq_pk,
++        indra_crypto::PQ_PK_BYTES,
++        "hybrid_pq_pk",
++    )?);
++    material.extend_from_slice(&decode_hex_exact::<32>(
++        &validator.cold_hybrid_classical_pk,
++        "cold_hybrid_classical_pk",
++    )?);
++    material.extend_from_slice(&decode_hex_len(
++        &validator.cold_hybrid_pq_pk,
++        indra_crypto::PQ_PK_BYTES,
++        "cold_hybrid_pq_pk",
++    )?);
++    material.extend_from_slice(&validator.cold_key_version.to_le_bytes());
++    material.extend_from_slice(&validator.cold_nonce.to_le_bytes());
++    material.extend_from_slice(&decode_hex_exact::<32>(&validator.vrf_pk, "vrf_pk")?);
++    material.push(VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 as u8);
++    material.extend_from_slice(&0u64.to_le_bytes());
++    material.extend_from_slice(&decode_hex_exact::<32>(
++        &validator.genesis_commitment_nonce,
++        "genesis_commitment_nonce",
++    )?);
++    Ok(Bytes32(sha256(&material)))
++}
++
++/// Compute the externally published pre-target commitment for a complete genesis.
++pub fn genesis_precommit_hash(
++    settings: &GenesisSettings,
++    validators: &[GenesisValidator],
++) -> Result<Bytes32, String> {
++    let commitments = validators
++        .iter()
++        .map(|validator| genesis_validator_commitment(&settings.chain_id, validator))
++        .collect::<Result<Vec<_>, _>>()?;
++    genesis_precommit_hash_from_commitments(settings, &commitments)
++}
++
++/// Compute a precommit from already-hidden validator commitments.
++pub fn genesis_precommit_hash_from_commitments(
++    settings: &GenesisSettings,
++    commitments: &[Bytes32],
++) -> Result<Bytes32, String> {
++    Ok(Bytes32(sha256(&genesis_precommit_bytes_from_commitments(
++        settings,
++        commitments,
++    )?)))
++}
++
++/// Return the injective canonical binary precommit artifact bytes.
++pub fn genesis_precommit_bytes_from_commitments(
++    settings: &GenesisSettings,
++    commitments: &[Bytes32],
++) -> Result<Vec<u8>, String> {
++    let mut commitments = commitments.to_vec();
++    commitments.sort_by_key(|commitment| commitment.0);
++    if commitments.len() > indra_core::types::primitives::MAX_ACTIVE_VALIDATORS {
++        return Err("too many genesis validator commitments".into());
++    }
++    if commitments.windows(2).any(|pair| pair[0] == pair[1]) {
++        return Err("duplicate genesis validator commitment".into());
++    }
++    indra_core::sortition::validate_mainnet_f(settings.active_slot_coefficient_numerator)
++        .map_err(|error| error.to_string())?;
++    settings.bitcoin_pow_entropy_source.canonical_bytes()?;
++    let mut material = b"INDRA-GENESIS-PRECOMMIT-v1".to_vec();
++    material.push(GENESIS_CEREMONY_VERSION);
++    let chain = settings.chain_id.as_bytes();
++    if chain.is_empty() || chain.len() > indra_core::types::primitives::MAX_CHAIN_ID_BYTES {
++        return Err("genesis chain id length is outside the canonical domain".into());
++    }
++    let len = u16::try_from(chain.len()).map_err(|_| "genesis chain id too long")?;
++    material.extend_from_slice(&len.to_be_bytes());
++    material.extend_from_slice(chain);
++    material.extend_from_slice(&settings.bitcoin_pow_entropy_source.canonical_bytes()?);
++    material.extend_from_slice(&indra_core::types::primitives::BLOCK_FORMAT_VERSION.to_le_bytes());
++    material.push(indra_core::types::consensus_snapshot::CONSENSUS_SNAPSHOT_FORMAT_VERSION);
++    material.extend_from_slice(&settings.active_slot_coefficient_numerator.to_le_bytes());
++    material.extend_from_slice(&(commitments.len() as u16).to_be_bytes());
++    for commitment in commitments {
++        material.extend_from_slice(&commitment.0);
++    }
++    Ok(material)
++}
+ 
+ /// Canonical structured genesis manifest.
+ #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+@@ -52,6 +158,8 @@ pub struct GenesisSettings {
+     pub bitcoin_pow_entropy_source: BitcoinPowEntropySourceV1,
+     /// Exact consensus-serialized 80-byte source header, lowercase hex.
+     pub bitcoin_pow_entropy_header: String,
++    /// Hash of the externally witnessed canonical pre-target ceremony artifact.
++    pub genesis_precommit_hash: String,
+ }
+ 
+ fn deserialize_canonical_decimal_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+@@ -71,7 +179,7 @@ where
+ }
+ 
+ /// Canonical protocol-v2 external entropy descriptor.
+-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct BitcoinPowEntropySourceV1 {
+     /// Descriptor scheme; protocol v2 requires 1.
+@@ -84,7 +192,7 @@ pub struct BitcoinPowEntropySourceV1 {
+     pub header_codec: u8,
+     /// Extraction algorithm; 1 means double SHA-256.
+     pub extraction_algorithm: u8,
+-    /// Required canonical-chain confirmations, at least 100.
++    /// Declared canonical-chain confirmations; mainnet requires exactly 100.
+     pub minimum_confirmations: u32,
+     /// Reorganization policy; 1 restarts at the same height.
+     pub reorg_policy: u8,
+@@ -99,8 +207,12 @@ impl BitcoinPowEntropySourceV1 {
+         {
+             return Err("unsupported Bitcoin entropy descriptor enum value".into());
+         }
+-        if self.minimum_confirmations < 100 {
+-            return Err("Bitcoin entropy source requires at least 100 confirmations".into());
++        if self.minimum_confirmations
++            != indra_core::types::primitives::BITCOIN_GENESIS_CONFIRMATIONS
++        {
++            return Err(
++                "Bitcoin entropy source requires exactly 100 declared confirmations".into(),
++            );
+         }
+         let genesis = decode_hex_exact::<32>(&self.network_genesis_hash, "network_genesis_hash")?;
+         let mut out = Vec::with_capacity(48);
+@@ -125,12 +237,16 @@ pub fn genesis_entropy_record_hash(settings: &GenesisSettings) -> Result<Bytes32
+     let mut preimage = b"INDRA-GENESIS-ENTROPY-RECORD-v1".to_vec();
+     preimage.extend_from_slice(&descriptor);
+     preimage.extend_from_slice(&header);
++    preimage.extend_from_slice(&decode_hex_exact::<32>(
++        &settings.genesis_precommit_hash,
++        "genesis_precommit_hash",
++    )?);
+     Ok(Bytes32::from(sha256(&preimage)))
+ }
+ 
+ /// Deterministically derive the signed genesis election seed.
+ pub fn derive_genesis_election_seed(settings: &GenesisSettings) -> Result<Bytes64, String> {
+-    indra_core::sortition::validate_f(settings.active_slot_coefficient_numerator)
++    indra_core::sortition::validate_mainnet_f(settings.active_slot_coefficient_numerator)
+         .map_err(|e| e.to_string())?;
+     let descriptor = settings.bitcoin_pow_entropy_source.canonical_bytes()?;
+     let header = decode_hex_exact::<80>(
+@@ -152,7 +268,7 @@ pub fn derive_genesis_election_seed(settings: &GenesisSettings) -> Result<Bytes6
+ }
+ 
+ /// One initial validator in the canonical genesis manifest.
+-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct GenesisValidator {
+     /// Human-readable operator label.
+@@ -179,6 +295,8 @@ pub struct GenesisValidator {
+     pub cold_nonce: u64,
+     /// Initial self-stake in Spark.
+     pub stake: u64,
++    /// Commitment nonce revealed after the Bitcoin target block is fixed.
++    pub genesis_commitment_nonce: String,
+ }
+ 
+ /// Optional non-consensus bootstrap address.
+@@ -201,6 +319,42 @@ pub fn parse_genesis_manifest_str(content: &str) -> Result<GenesisManifest, Stri
+     parse_genesis_manifest_str_with_minimum(content, 4)
+ }
+ 
++/// Upgrade an in-memory test fixture to the current ceremony format.
++#[cfg(test)]
++pub fn seal_test_genesis_fixture(content: &str) -> String {
++    if let Ok(manifest) = toml::from_str::<GenesisManifest>(content) {
++        let hash = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
++        return content.replacen(
++            &manifest.genesis.genesis_precommit_hash,
++            &hex::encode(hash.0),
++            1,
++        );
++    }
++    let placeholder = hex::encode([0u8; 32]);
++    let mut provisional = content.replacen(
++        "[genesis]\n",
++        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
++        1,
++    );
++    let validator_offsets = provisional
++        .match_indices("[[validators]]\n")
++        .map(|(offset, _)| offset)
++        .collect::<Vec<_>>();
++    for (validator_index, offset) in validator_offsets.into_iter().enumerate().rev() {
++        let insertion = offset + "[[validators]]\n".len();
++        provisional.insert_str(
++            insertion,
++            &format!(
++                "genesis_commitment_nonce = \"{}\"\n",
++                hex::encode([0x70u8.checked_add(validator_index as u8).unwrap(); 32])
++            ),
++        );
++    }
++    let manifest: GenesisManifest = toml::from_str(&provisional).unwrap();
++    let hash = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
++    provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
++}
++
+ fn parse_genesis_manifest_str_with_minimum(
+     content: &str,
+     minimum_validators: usize,
+@@ -355,6 +509,13 @@ fn validate_genesis_manifest_with_minimum(
+             ));
+         }
+     }
++    let committed = decode_hex_exact::<32>(
++        &manifest.genesis.genesis_precommit_hash,
++        "genesis_precommit_hash",
++    )?;
++    if genesis_precommit_hash(&manifest.genesis, &manifest.validators)?.0 != committed {
++        return Err("genesis validator material does not open the published precommitment".into());
++    }
+     Ok(())
+ }
+ 
+@@ -427,7 +588,7 @@ pub fn build_genesis_block(state: &ChainState) -> Result<BlockVNext, String> {
+             value_hash: fingerprint,
+             base_fee: INITIAL_BASE_FEE_SPARK_PER_KB,
+             proposer_round: 0,
+-            polc_round: indra_core::types::block::NO_POLC_ROUND,
++            polc_round: None,
+             proposer_id: Bytes32::ZERO,
+             vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+             election_seed: state.election_seed,
+@@ -472,7 +633,8 @@ pub fn build_genesis_state() -> ChainState {
+     use indra_state::{ValidatorEntry, ValidatorStatus};
+ 
+     let mut state = ChainState::new_genesis();
+-    state.active_slot_coefficient_numerator = 1;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.election_seed = Bytes64([0xA5; 64]);
+     let hot = HybridKeypair::new(
+         ClassicalKeypair::from_seed(&[0xD1; 32]),
+@@ -533,7 +695,8 @@ pub fn build_genesis_state() -> ChainState {
+ #[cfg(test)]
+ pub(crate) fn finalize_test_genesis(state: &mut ChainState) {
+     assert_eq!(state.height, 0, "test genesis must remain at height zero");
+-    state.active_slot_coefficient_numerator = 1u64 << 63;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.consensus_snapshots.clear();
+     state.reward_economic_snapshot = None;
+     state.slash_membership_roots.clear();
+@@ -545,11 +708,8 @@ pub(crate) fn finalize_test_genesis(state: &mut ChainState) {
+ #[cfg(test)]
+ pub(crate) fn canonical_test_genesis() -> ChainState {
+     let mut state = build_genesis_state();
+-    // Consensus tests need a practical chance of electing their sole
+-    // validator. The release manifest deliberately leaves F uncalibrated at
+-    // its conservative minimum; test fixtures exercise both protocol
+-    // endpoints explicitly and use the admitted maximum for liveness tests.
+-    state.active_slot_coefficient_numerator = 1u64 << 63;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.consensus_snapshots.clear();
+     state.reward_economic_snapshot = None;
+     state.slash_membership_roots.clear();
+@@ -765,13 +925,15 @@ mod tests {
+                     cold_key_version: 1,
+                     cold_nonce: 0,
+                     stake: 100_000_000_000,
++                    genesis_commitment_nonce: hex::encode([index + 51; 32]),
+                 }
+             })
+             .collect();
+-        GenesisManifest {
++        let mut manifest = GenesisManifest {
+             genesis: GenesisSettings {
+                 chain_id: "indra-testnet-new".into(),
+-                active_slot_coefficient_numerator: 1,
++                active_slot_coefficient_numerator:
++                    indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+                 bitcoin_pow_entropy_source: BitcoinPowEntropySourceV1 {
+                     scheme: 1,
+                     network_genesis_hash: hex::encode([0x11; 32]),
+@@ -782,17 +944,134 @@ mod tests {
+                     reorg_policy: 1,
+                 },
+                 bitcoin_pow_entropy_header: hex::encode([0x22; 80]),
++                genesis_precommit_hash: String::new(),
+             },
+             validators,
+             seeds: vec![],
++        };
++        manifest.genesis.genesis_precommit_hash = hex::encode(
++            genesis_precommit_hash(&manifest.genesis, &manifest.validators)
++                .unwrap()
++                .0,
++        );
++        manifest
++    }
++
++    #[test]
++    fn ceremony_commitment_binds_all_genesis_authority_material() {
++        let manifest = valid_manifest();
++        let baseline = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
++        let mutate = |f: fn(&mut GenesisValidator)| {
++            let mut changed = manifest.clone();
++            f(&mut changed.validators[0]);
++            assert_ne!(
++                baseline,
++                genesis_precommit_hash(&changed.genesis, &changed.validators).unwrap()
++            );
++        };
++        mutate(|v| v.stake += 1);
++        mutate(|v| v.validator_id.replace_range(..2, "ff"));
++        mutate(|v| v.hybrid_classical_pk.replace_range(..2, "ff"));
++        mutate(|v| v.hybrid_pq_pk.replace_range(..2, "ff"));
++        mutate(|v| v.cold_hybrid_classical_pk.replace_range(..2, "ff"));
++        mutate(|v| v.cold_hybrid_pq_pk.replace_range(..2, "ff"));
++        mutate(|v| v.cold_key_version += 1);
++        mutate(|v| v.cold_nonce += 1);
++        mutate(|v| v.vrf_pk.replace_range(..2, "ff"));
++        mutate(|v| v.genesis_commitment_nonce.replace_range(..2, "ff"));
++        let mut other_chain = manifest.clone();
++        other_chain.genesis.chain_id.push_str("-other");
++        assert_ne!(
++            baseline,
++            genesis_precommit_hash(&other_chain.genesis, &other_chain.validators).unwrap()
++        );
++        let mut other_height = manifest.clone();
++        other_height
++            .genesis
++            .bitcoin_pow_entropy_source
++            .announced_height += 1;
++        assert_ne!(
++            baseline,
++            genesis_precommit_hash(&other_height.genesis, &other_height.validators).unwrap()
++        );
++        let mut other_network = manifest.clone();
++        other_network
++            .genesis
++            .bitcoin_pow_entropy_source
++            .network_genesis_hash = hex::encode([0x12; 32]);
++        assert_ne!(
++            baseline,
++            genesis_precommit_hash(&other_network.genesis, &other_network.validators).unwrap()
++        );
++        let mut fewer = manifest.clone();
++        fewer.validators.pop();
++        assert_ne!(
++            baseline,
++            genesis_precommit_hash(&fewer.genesis, &fewer.validators).unwrap()
++        );
++        let mut reordered = manifest.clone();
++        reordered.validators.reverse();
++        assert_eq!(
++            baseline,
++            genesis_precommit_hash(&reordered.genesis, &reordered.validators).unwrap()
++        );
++    }
++
++    #[test]
++    fn four_thousand_ninety_six_post_target_vrf_keys_cannot_open_commitment() {
++        let manifest = valid_manifest();
++        let original =
++            genesis_validator_commitment(&manifest.genesis.chain_id, &manifest.validators[0])
++                .unwrap();
++        for index in 0u32..4096 {
++            let mut candidate = manifest.validators[0].clone();
++            let mut seed = [0u8; 32];
++            seed[..4].copy_from_slice(&index.to_le_bytes());
++            candidate.vrf_pk = hex::encode(indra_crypto::VrfKeypair::from_seed(&seed).public_key());
++            assert_ne!(
++                original,
++                genesis_validator_commitment(&manifest.genesis.chain_id, &candidate).unwrap()
++            );
+         }
+     }
+ 
++    #[test]
++    fn declared_bitcoin_depth_is_exactly_one_hundred() {
++        let mut manifest = valid_manifest();
++        manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .minimum_confirmations = 99;
++        assert!(manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .canonical_bytes()
++            .is_err());
++        manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .minimum_confirmations = 100;
++        assert!(manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .canonical_bytes()
++            .is_ok());
++        manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .minimum_confirmations = 101;
++        assert!(manifest
++            .genesis
++            .bitcoin_pow_entropy_source
++            .canonical_bytes()
++            .is_err());
++    }
++
+     fn render_manifest(manifest: &GenesisManifest, omit_cold: bool) -> String {
+         let s = &manifest.genesis.bitcoin_pow_entropy_source;
+-        let mut rendered = format!("[genesis]\nchain_id = \"{}\"\nactive_slot_coefficient_numerator = \"{}\"\nbitcoin_pow_entropy_header = \"{}\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = {}\nnetwork_genesis_hash = \"{}\"\nannounced_height = {}\nheader_codec = {}\nextraction_algorithm = {}\nminimum_confirmations = {}\nreorg_policy = {}\n", manifest.genesis.chain_id,manifest.genesis.active_slot_coefficient_numerator,manifest.genesis.bitcoin_pow_entropy_header,s.scheme,s.network_genesis_hash,s.announced_height,s.header_codec,s.extraction_algorithm,s.minimum_confirmations,s.reorg_policy);
++        let mut rendered = format!("[genesis]\nchain_id = \"{}\"\nactive_slot_coefficient_numerator = \"{}\"\nbitcoin_pow_entropy_header = \"{}\"\ngenesis_precommit_hash = \"{}\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = {}\nnetwork_genesis_hash = \"{}\"\nannounced_height = {}\nheader_codec = {}\nextraction_algorithm = {}\nminimum_confirmations = {}\nreorg_policy = {}\n", manifest.genesis.chain_id,manifest.genesis.active_slot_coefficient_numerator,manifest.genesis.bitcoin_pow_entropy_header,manifest.genesis.genesis_precommit_hash,s.scheme,s.network_genesis_hash,s.announced_height,s.header_codec,s.extraction_algorithm,s.minimum_confirmations,s.reorg_policy);
+         for validator in &manifest.validators {
+-            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk, validator.vrf_possession_output, validator.vrf_possession_proof));
++            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ngenesis_commitment_nonce = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk, validator.vrf_possession_output, validator.vrf_possession_proof, validator.genesis_commitment_nonce));
+             if !omit_cold {
+                 rendered.push_str(&format!(
+                     "cold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\n",
+@@ -824,9 +1103,31 @@ mod tests {
+     fn active_slot_coefficient_uses_strict_canonical_decimal_string() {
+         let manifest = valid_manifest();
+         let canonical = render_manifest(&manifest, false);
+-        for invalid in ["0", "01", "+1", "-1", " 1", "1 ", "1_0", "١"] {
++        let preferred = indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
++        let canonical_field = format!("active_slot_coefficient_numerator = \"{preferred}\"");
++        assert_eq!(
++            parse_genesis_manifest_str(&canonical)
++                .unwrap()
++                .genesis
++                .active_slot_coefficient_numerator,
++            preferred
++        );
++        for invalid in [
++            "0".to_string(),
++            "01".to_string(),
++            "+1".to_string(),
++            "-1".to_string(),
++            " 1".to_string(),
++            "1 ".to_string(),
++            "1_0".to_string(),
++            "١".to_string(),
++            (preferred - 1).to_string(),
++            (preferred + 1).to_string(),
++            "1".to_string(),
++            (1u64 << 63).to_string(),
++        ] {
+             let malformed = canonical.replace(
+-                "active_slot_coefficient_numerator = \"1\"",
++                &canonical_field,
+                 &format!("active_slot_coefficient_numerator = \"{invalid}\""),
+             );
+             assert!(
+@@ -835,22 +1136,10 @@ mod tests {
+             );
+         }
+         let numeric = canonical.replace(
+-            "active_slot_coefficient_numerator = \"1\"",
+-            "active_slot_coefficient_numerator = 1",
++            &canonical_field,
++            &format!("active_slot_coefficient_numerator = {preferred}"),
+         );
+         assert!(parse_genesis_manifest_str(&numeric).is_err());
+-
+-        let upper = canonical.replace(
+-            "active_slot_coefficient_numerator = \"1\"",
+-            "active_slot_coefficient_numerator = \"9223372036854775808\"",
+-        );
+-        assert_eq!(
+-            parse_genesis_manifest_str(&upper)
+-                .unwrap()
+-                .genesis
+-                .active_slot_coefficient_numerator,
+-            1u64 << 63
+-        );
+     }
+ 
+     #[test]
+@@ -1065,7 +1354,7 @@ mod tests {
+         .unwrap();
+         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+         let mut contents = format!(
+-            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"1\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
++            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+             hex::encode(validator_id.0),
+             hex::encode(classical_pk),
+             hex::encode(&pq_pk),
+@@ -1113,6 +1402,7 @@ mod tests {
+                 hex::encode(extra_cold_public.pq.0),
+             ));
+         }
++        let contents = seal_test_genesis_fixture(&contents);
+         std::fs::write(&path, contents).unwrap();
+ 
+         load_genesis_validators(path.to_str().unwrap(), &mut state).unwrap();
+diff --git a/indra/indra-node/tests/node.rs b/indra/indra-node/tests/node.rs
+index 58f518bb..41c8443d 100644
+--- a/indra/indra-node/tests/node.rs
++++ b/indra/indra-node/tests/node.rs
+@@ -65,7 +65,8 @@ fn temp_dir(suffix: &str) -> PathBuf {
+ 
+ fn anchored_genesis_state() -> ChainState {
+     let mut state = build_genesis_state();
+-    state.active_slot_coefficient_numerator = 1u64 << 63;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.consensus_snapshots.clear();
+     state.reward_economic_snapshot = None;
+     state.slash_membership_roots.clear();
+@@ -88,6 +89,7 @@ fn make_strict_block(
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot
+@@ -297,7 +299,7 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
+     let (vrf_possession_output, vrf_possession_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+     let genesis_path = dir.join("genesis.toml");
+     let genesis = format!(
+-        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+         name,
+         hex::encode(validator_id.0),
+         hex::encode(classical.public_key().0),
+@@ -308,6 +310,25 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
+         hex::encode(cold_public.classical.0),
+         hex::encode(cold_public.pq.0),
+     );
++    let placeholder = hex::encode([0u8; 32]);
++    let provisional = genesis
++        .replacen(
++            "[genesis]\n",
++            &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
++            1,
++        )
++        .replacen(
++            "[[validators]]\n",
++            &format!(
++                "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
++                hex::encode([0x70u8; 32])
++            ),
++            1,
++        );
++    let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
++    let hash = indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
++        .unwrap();
++    let genesis = provisional.replacen(&placeholder, &hex::encode(hash.0), 1);
+     std::fs::write(&genesis_path, genesis).unwrap();
+     genesis_path.to_string_lossy().to_string()
+ }

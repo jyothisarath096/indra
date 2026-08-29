@@ -1,0 +1,6 @@
+phase,initial, growth,max,reset,transition
+propose,8s,none,8s,round start/height,prevote nil or staged value
+prevote,3s,none,3s,phase start,precommit nil
+precommit,3s,none,3s,phase start,next round
+sync request,30s,none,30s,request completion,source rotation
+round,0..1023,driver controlled,1023,height transition,fail closed at final round

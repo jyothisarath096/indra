@@ -1,0 +1,5 @@
+NOT EXECUTED
+
+No distinct-validator shared-genesis fixture exists yet; authenticated
+cross-validator vote exchange and non-authority rejection were therefore not
+run.

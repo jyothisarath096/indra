@@ -1,0 +1,414 @@
+diff --git a/indra-core/src/error.rs b/indra-core/src/error.rs
+--- a/indra-core/src/error.rs
++++ b/indra-core/src/error.rs
+@@ -32,6 +32,17 @@
+         actual: usize,
+     },
+ 
++    /// A protocol-fixed byte field did not have its required exact length.
++    #[error("field '{field}' length {actual} does not equal required length {expected}")]
++    InvalidLength {
++        /// Name of the field.
++        field: &'static str,
++        /// Required byte length.
++        expected: usize,
++        /// Actual encoded byte length.
++        actual: usize,
++    },
++
+     /// A bool byte was not 0x00 or 0x01.
+     #[error("invalid bool byte: 0x{byte:02x} (expected 0x00 or 0x01)")]
+     InvalidBool {
+diff --git a/indra-core/src/types/crypto.rs b/indra-core/src/types/crypto.rs
+--- a/indra-core/src/types/crypto.rs
++++ b/indra-core/src/types/crypto.rs
+@@ -60,6 +60,21 @@
+     }
+ }
+ 
++pub(crate) fn decode_fixed_signature<const N: usize>(
++    r: &mut ByteReader<'_>,
++    field: &'static str,
++) -> IndraResult<VariableBytes<N>> {
++    let actual = r.read_u32_le()? as usize;
++    if actual != N {
++        return Err(crate::error::IndraError::InvalidLength {
++            field,
++            expected: N,
++            actual,
++        });
++    }
++    VariableBytes::from_slice(r.read_bytes(N)?)
++}
++
+ impl HybridSignature {
+     /// Convert the wire signature into the crypto-layer representation.
+     pub fn to_crypto_sig(&self) -> Result<indra_crypto::HybridSignature, String> {
+@@ -250,7 +265,7 @@
+     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+         Ok(Self {
+             validator_id: Bytes32::decode(r)?,
+-            pq_sig: VariableBytes::decode(r)?,
++            pq_sig: decode_fixed_signature::<{ indra_crypto::PQ_SIG_BYTES }>(r, "QC PQ signature")?,
+         })
+     }
+ }
+@@ -272,7 +287,55 @@
+         );
+     }
+ 
++    fn encoded_hybrid_signature(classical_len: usize, pq_len: usize) -> Vec<u8> {
++        let mut encoded = Vec::new();
++        (classical_len as u32).encode(&mut encoded);
++        encoded.extend(std::iter::repeat_n(0xAA, classical_len));
++        (pq_len as u32).encode(&mut encoded);
++        encoded.extend(std::iter::repeat_n(0xBB, pq_len));
++        encoded
++    }
++
+     #[test]
++    fn exact_length_invalid_hybrid_signature_is_structural_but_not_cryptographic() {
++        let encoded = encoded_hybrid_signature(
++            indra_crypto::CLASSICAL_SIG_BYTES,
++            indra_crypto::PQ_SIG_BYTES,
++        );
++        let wire = HybridSignature::decode_exact(&encoded).unwrap();
++        let signature = wire.to_crypto_sig().unwrap();
++        let keypair = indra_crypto::HybridKeypair::new(
++            indra_crypto::ClassicalKeypair::from_seed(&[0x31; 32]),
++            indra_crypto::PqKeypair::from_seed(&[0xA7; 32]).unwrap(),
++        );
++        assert!(
++            indra_crypto::verify_hybrid(b"L3-NET-04", &signature, &keypair.public_key()).is_err()
++        );
++    }
++
++    #[test]
++    fn hybrid_signature_oversize_and_truncation_are_structural_errors() {
++        let mut oversized_classical = encoded_hybrid_signature(
++            indra_crypto::CLASSICAL_SIG_BYTES + 1,
++            indra_crypto::PQ_SIG_BYTES,
++        );
++        assert!(HybridSignature::decode_exact(&oversized_classical).is_err());
++
++        let oversized_pq = encoded_hybrid_signature(
++            indra_crypto::CLASSICAL_SIG_BYTES,
++            indra_crypto::PQ_SIG_BYTES + 1,
++        );
++        assert!(HybridSignature::decode_exact(&oversized_pq).is_err());
++
++        oversized_classical = encoded_hybrid_signature(
++            indra_crypto::CLASSICAL_SIG_BYTES,
++            indra_crypto::PQ_SIG_BYTES,
++        );
++        oversized_classical.pop();
++        assert!(HybridSignature::decode_exact(&oversized_classical).is_err());
++    }
++
++    #[test]
+     fn cold_hybrid_pubkey_round_trip() {
+         let keypair =
+             indra_crypto::ColdHybridKeypair::from_independent_seeds([0x41; 32], [0x92; 32])
+@@ -297,4 +360,18 @@
+         };
+         assert_eq!(s, PQVoteSig::decode_exact(&s.encode_to_vec()).unwrap());
+     }
++
++    #[test]
++    fn qc_pq_signature_decode_requires_exact_length() {
++        for len in [
++            0,
++            indra_crypto::PQ_SIG_BYTES - 1,
++            indra_crypto::PQ_SIG_BYTES + 1,
++        ] {
++            let mut encoded = Bytes32::ZERO.encode_to_vec();
++            (len as u32).encode(&mut encoded);
++            encoded.extend(std::iter::repeat_n(0xCC, len));
++            assert!(PQVoteSig::decode_exact(&encoded).is_err());
++        }
++    }
+ }
+diff --git a/indra-core/src/types/qc.rs b/indra-core/src/types/qc.rs
+--- a/indra-core/src/types/qc.rs
++++ b/indra-core/src/types/qc.rs
+@@ -8,7 +8,7 @@
+     codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+     error::{IndraError, IndraResult},
+     types::{
+-        crypto::PQVoteSig,
++        crypto::{decode_fixed_signature, PQVoteSig},
+         primitives::{
+             Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS,
+         },
+@@ -49,7 +49,10 @@
+     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+         Ok(Self {
+             validator_id: Bytes32::decode(r)?,
+-            classical_sig: VariableBytes::decode(r)?,
++            classical_sig: decode_fixed_signature::<{ indra_crypto::CLASSICAL_SIG_BYTES }>(
++                r,
++                "QC classical signature",
++            )?,
+         })
+     }
+ }
+@@ -362,6 +365,20 @@
+     }
+ 
+     #[test]
++    fn qc_classical_signature_decode_requires_exact_length() {
++        for len in [
++            0,
++            indra_crypto::CLASSICAL_SIG_BYTES - 1,
++            indra_crypto::CLASSICAL_SIG_BYTES + 1,
++        ] {
++            let mut encoded = Bytes32::ZERO.encode_to_vec();
++            (len as u32).encode(&mut encoded);
++            encoded.extend(std::iter::repeat_n(0xDD, len));
++            assert!(ClassicalVoteSig::decode_exact(&encoded).is_err());
++        }
++    }
++
++    #[test]
+     fn unknown_qc_format_version_rejected() {
+         let mut buf = Vec::new();
+         0xFFu8.encode(&mut buf);
+diff --git a/indra-network/src/message.rs b/indra-network/src/message.rs
+--- a/indra-network/src/message.rs
++++ b/indra-network/src/message.rs
+@@ -12,9 +12,10 @@
+     codec::{ByteReader, Decode, Encode},
+     types::{
+         block::BlockProposalVNext,
++        crypto::HybridSignature,
+         governance::GovernanceOpV2,
+         primitives::{validate_consensus_round, Bytes32},
+-        staking::StakingOp,
++        staking::{StakingOp, StakingOpBody},
+         transaction::TransactionV1,
+         vote::VoteV1,
+     },
+@@ -194,8 +195,58 @@
+         /// Raw encoded QC bytes.
+         qc_bytes: Vec<u8>,
+     },
++}
++
++fn require_exact_hybrid_signature(signature: &HybridSignature) -> NetworkResult<()> {
++    let classical_len = signature.classical_sig.len();
++    if classical_len != indra_crypto::CLASSICAL_SIG_BYTES {
++        return Err(NetworkError::DecodeFailed {
++            reason: format!(
++                "hybrid classical signature must be exactly {} bytes, got {classical_len}",
++                indra_crypto::CLASSICAL_SIG_BYTES
++            ),
++        });
++    }
++    let pq_len = signature.pq_sig.len();
++    if pq_len != indra_crypto::PQ_SIG_BYTES {
++        return Err(NetworkError::DecodeFailed {
++            reason: format!(
++                "hybrid PQ signature must be exactly {} bytes, got {pq_len}",
++                indra_crypto::PQ_SIG_BYTES
++            ),
++        });
++    }
++    Ok(())
++}
++
++fn require_exact_staking_signatures(operation: &StakingOp) -> NetworkResult<()> {
++    require_exact_hybrid_signature(&operation.signature)?;
++    match &operation.body {
++        StakingOpBody::RegisterValidator { cold_signature, .. } => {
++            require_exact_hybrid_signature(cold_signature)
++        }
++        StakingOpBody::RotateValidatorColdKey {
++            new_cold_signature: Some(signature),
++            ..
++        } => require_exact_hybrid_signature(signature),
++        _ => Ok(()),
++    }
+ }
+ 
++fn require_exact_proposal_signatures(proposal: &BlockProposalVNext) -> NetworkResult<()> {
++    require_exact_hybrid_signature(&proposal.proposer_authorization)?;
++    for transaction in &proposal.block.transactions {
++        require_exact_hybrid_signature(&transaction.signature)?;
++    }
++    for operation in &proposal.block.staking_ops {
++        require_exact_staking_signatures(operation)?;
++    }
++    for operation in &proposal.block.governance_ops {
++        require_exact_hybrid_signature(&operation.signature)?;
++    }
++    Ok(())
++}
++
+ impl Message {
+     /// The message type discriminant.
+     pub fn message_type(&self) -> MessageType {
+@@ -392,6 +443,7 @@
+                         reason: e.to_string(),
+                     }
+                 })?;
++                require_exact_proposal_signatures(&block)?;
+                 Ok(Self::Block(block))
+             }
+             MessageType::Vote => {
+@@ -399,6 +451,7 @@
+                     VoteV1::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                         reason: e.to_string(),
+                     })?;
++                require_exact_hybrid_signature(&vote.signature)?;
+                 Ok(Self::Vote(vote))
+             }
+             MessageType::Tx => {
+@@ -407,6 +460,7 @@
+                         reason: e.to_string(),
+                     }
+                 })?;
++                require_exact_hybrid_signature(&tx.signature)?;
+                 Ok(Self::Tx(tx))
+             }
+             MessageType::StakingOp => {
+@@ -414,6 +468,7 @@
+                     StakingOp::decode_exact(payload).map_err(|e| NetworkError::DecodeFailed {
+                         reason: e.to_string(),
+                     })?;
++                require_exact_staking_signatures(&op)?;
+                 Ok(Self::StakingOp(op))
+             }
+             MessageType::GovernanceOp => {
+@@ -422,6 +477,7 @@
+                         reason: e.to_string(),
+                     }
+                 })?;
++                require_exact_hybrid_signature(&op.signature)?;
+                 Ok(Self::GovernanceOp(op))
+             }
+             MessageType::PeerList => {
+@@ -600,6 +656,7 @@
+                             reason: e.to_string(),
+                         }
+                     })?;
++                    require_exact_proposal_signatures(&block)?;
+                     blocks.push(block);
+                 }
+                 let flags = u8::decode(&mut reader).map_err(|e| NetworkError::DecodeFailed {
+@@ -800,6 +857,7 @@
+         },
+         staking::{StakingOp, StakingOpBody},
+         transaction::{InputV1, OutputV1, TransactionV1},
++        vote::{VoteStep, VoteV1},
+     };
+ 
+     fn test_block(height: u64) -> BlockVNext {
+@@ -905,7 +963,91 @@
+             }],
+             fee_amount: 10_000,
+             signature: dummy_sig(),
++        }
++    }
++
++    fn signature_bearing_messages(signature: HybridSignature) -> Vec<Message> {
++        let mut proposal = test_proposal(11);
++        proposal.proposer_authorization = signature.clone();
++
++        let mut tx = test_transaction();
++        tx.signature = signature.clone();
++        let mut staking = test_staking_op();
++        staking.signature = signature.clone();
++        let mut governance = test_governance_op();
++        governance.signature = signature.clone();
++
++        vec![
++            Message::Block(proposal.clone()),
++            Message::BlockResponse {
++                blocks: vec![proposal],
++                lowest_available: None,
++                highest_available: None,
++            },
++            Message::Vote(VoteV1 {
++                height: 11,
++                round: 0,
++                step: VoteStep::Precommit,
++                block_hash: Bytes32::from([0x61; 32]),
++                validator_id: Bytes32::from([0x62; 32]),
++                snapshot_root: Bytes32::from([0x63; 32]),
++                signature: signature.clone(),
++            }),
++            Message::Tx(tx),
++            Message::StakingOp(staking),
++            Message::GovernanceOp(governance),
++        ]
++    }
++
++    #[test]
++    fn all_hybrid_signature_message_decoders_require_exact_component_lengths() {
++        for message in signature_bearing_messages(dummy_sig()) {
++            assert!(Message::decode_framed_wire(&message.encode_wire().unwrap()).is_ok());
+         }
++
++        for malformed in [
++            HybridSignature {
++                classical_sig: VariableBytes::from_slice(&[0xAA; 63]).unwrap(),
++                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES]).unwrap(),
++            },
++            HybridSignature {
++                classical_sig: VariableBytes::from_slice(&[]).unwrap(),
++                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES]).unwrap(),
++            },
++            HybridSignature {
++                classical_sig: VariableBytes::from_slice(
++                    &[0xAA; indra_crypto::CLASSICAL_SIG_BYTES],
++                )
++                .unwrap(),
++                pq_sig: VariableBytes::from_slice(&[0xBB; indra_crypto::PQ_SIG_BYTES - 1]).unwrap(),
++            },
++            HybridSignature {
++                classical_sig: VariableBytes::from_slice(
++                    &[0xAA; indra_crypto::CLASSICAL_SIG_BYTES],
++                )
++                .unwrap(),
++                pq_sig: VariableBytes::from_slice(&[]).unwrap(),
++            },
++        ] {
++            for message in signature_bearing_messages(malformed.clone()) {
++                let wire = message.encode_wire().unwrap();
++                assert_eq!(
++                    u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize,
++                    wire.len() - 4
++                );
++                assert!(Message::decode_framed_wire(&wire).is_err());
++            }
++        }
++
++        let vote = signature_bearing_messages(dummy_sig())
++            .into_iter()
++            .find(|message| matches!(message, Message::Vote(_)))
++            .unwrap();
++        let mut truncated = vote.encode_wire().unwrap();
++        truncated.pop();
++        let declared_len = (truncated.len() - 4) as u32;
++        truncated[..4].copy_from_slice(&declared_len.to_le_bytes());
++        assert!(Message::decode_framed_wire(&truncated).is_err());
+     }
+ 
+     #[test]
+diff --git a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+--- a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
++++ b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+@@ -100,10 +100,10 @@
+     }
+ 
+     for (label, classical_len, pq_len, expected) in [
+-        ("signature_empty", 0, 0, true),
+-        ("signature_ed25519_63", 63, 4627, true),
++        ("signature_empty", 0, 0, false),
++        ("signature_ed25519_63", 63, 4627, false),
+         ("signature_ed25519_64", 64, 4627, true),
+-        ("signature_mldsa_4626", 64, 4626, true),
++        ("signature_mldsa_4626", 64, 4626, false),
+         ("signature_mldsa_4627", 64, 4627, true),
+     ] {
+         let bytes = vote(0, classical_len, pq_len).encode_wire().unwrap();

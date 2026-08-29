@@ -1,0 +1,18 @@
+PROPOSAL production hash=202ab7de…
+PREVOTE A accepted; SIGNERS=A; QUORUM=false
+ASSERT 1/4 phase=Prevote lock=None valid=None height=0
+PREVOTE B delivered; SIGNERS=A,B; STAKE=2/4; QUORUM=false; PHASE=Prevote
+ASSERT no precommit; no QC; height=0
+PREVOTE C delivered; SIGNERS=A,B,C; STAKE=3/4; QUORUM=true
+PHASE=Precommit; LOCK=proposal; VALID_ROUND=0
+LOCAL_PRECOMMIT A produced
+PoLC signers=A,B,C; D absent
+FINALIZED=false; HEIGHT=0
+REPLAY/duplicate and full campaign follow-up deferred to Step 19D
+Focused test PASS; fixture/proposal regressions PASS; workspace no-run PASS; git diff --check PASS
+STEP 19C.3 ASSERTION CLOSURE
+AFTER B: phase=Prevote height=0 last_qc=None
+AFTER C: phase=Precommit valid_round=0 valid_value=proposal locked_round=0 locked_value=proposal height=0 last_qc=None
+LOCAL_PRECOMMIT tuple=(validator=A,height=1,round=0,step=Precommit,block_hash=proposal)
+PoLC each vote=(height=1,round=0,step=Prevote,block_hash=proposal,snapshot_root=governing_height_1); signer_count=3; signers=A,B,C
+VALIDATION focused test PASS; workspace no-run PASS; git diff --check PASS

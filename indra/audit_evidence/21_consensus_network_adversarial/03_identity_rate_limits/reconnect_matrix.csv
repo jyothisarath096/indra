@@ -1,0 +1,9 @@
+case,identity key,expected,observed,status
+same validator graceful disconnect,validator ID,budget persists,limiter entry is not removed by drop_peer,confirmed by existing deterministic peer-manager test
+same validator abrupt close,validator ID,budget persists,all disconnect paths call drop_peer without removing limiter,source-traced before stop
+replacement connection,validator ID,budget persists,tie-break drops old peer but retains limiter,source-traced before stop
+simultaneous same-validator connection,validator ID,one aggregate budget,peer map permits one connection and deterministic tie-break keeps one,source-traced before stop
+failed auth then valid reconnect,"source IP/network group then validator ID",failure state must be bounded,"pre-auth state is now bounded by closed L3-NET-07 remediation",confirmed closed regression; not re-audited
+authenticated validator address churn,"outer validator ID -> inner source IP",historical reconnect state finite per validator,"16 live entries per validator; exact reset only removes the matching address; outer namespace remains after inner expiry",L3-NET-08 closed; L3-NET-09 open
+authority rotation after historical cooldowns,validator namespace, current validators must receive cooldown tracking,"200 expired inner trackers leave 200 outer namespaces; new validator insertion refused",L3-NET-09 open
+process restart,process memory,reset acceptable unless restart attacker-controlled,all in-memory limiter/cooldown state resets,documented; not fully tested after stop

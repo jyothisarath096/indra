@@ -1,0 +1,16 @@
+INIT shared four-validator fixture
+PROPOSAL production hash=202ab7de…
+PREVOTE_QUORUM A/B/C=true (production on_propose_timeout and inbound processing)
+PRECOMMIT A/B/C production signed
+PRECOMMIT B delivered: signer set A,B stake=2/4 quorum=false QC=None HEIGHT=0
+PRECOMMIT C delivered: signer set A,B,C stake=3/4 quorum=true
+QC_FORMED height=1 round=0 block=202ab7de… signers=A,B,C D_ABSENT=true
+COMMIT height=1 TIP=202ab7de…
+REPLAY C_PRECOMMIT=no-op; height unchanged
+VALIDATION focused PASS; workspace no-run PASS; diff-check PASS
+STEP 19D.1 DURABILITY/CLEANUP ASSERTIONS PASS
+2/4 checkpoint: original tip unchanged; QC bytes empty; qc_formations unchanged; signers A,B only; C,D absent; decision not QuorumReached
+3/4: decoded QC height=1 round=0 block=proposal; production snapshot verification PASS
+POST-COMMIT: phase=Propose round=0 locks/valid/pending proposal cleared; persisted last QC equals driver QC; pending QC cleared; VoteSafetyStore NoRecord
+STALE REPLAY C: height/tip/QC/round/phase/qc_formations unchanged; no commit action
+STEP 19D.2 QC SIGNER EVIDENCE: snapshot-resolved bitfield signers=A,B,C; D absent; summed production weight strictly >2/3; production snapshot QC verification PASS

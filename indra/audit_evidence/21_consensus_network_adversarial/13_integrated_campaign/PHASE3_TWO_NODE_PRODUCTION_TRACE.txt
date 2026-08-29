@@ -1,0 +1,7 @@
+TICK 0 node=A
+OUT node=A type=Vote h=1 r=0 step=Prevote
+ENQUEUE src=A dst=B type=Vote h=1 r=0
+DELIVER src=A dst=B type=Vote h=1 r=0
+ACCEPT node=B type=Vote h=1 r=0
+
+Produced by audit_harness_two_production_nodes_exchange_real_vote.

@@ -1,0 +1,62 @@
+--- a/indra-node/src/sync.rs
++++ b/indra-node/src/sync.rs
+@@
+     pub fn provisional(&self) -> Option<&ProvisionalSyncBlock> {
+         self.provisional.as_ref()
+     }
++
++    pub fn accept_provisional_qc_response(&self, validator_id: Bytes32, peer: SocketAddr, height: u64) -> Result<(), &'static str> {
++        let provisional = self.provisional.as_ref().ok_or("no provisional QC request")?;
++        if provisional.source_validator_id != validator_id || provisional.source != peer { return Err("response source does not match provisional QC requester"); }
++        if provisional.block.block.header.height != height { return Err("response height does not match provisional QC request"); }
++        Ok(())
++    }
+
+--- a/indra-node/src/bin/node.rs
++++ b/indra-node/src/bin/node.rs
+@@
+                             Message::QCResponse { height, qc_bytes } => {
+-                                let pending = driver.lock().unwrap().sync().provisional().cloned();
+-                                if let Some(pending) = pending {
+-                                    if pending.block.block.header.height != *height {
++                                let pending = {
++                                    let d = driver.lock().unwrap();
++                                    let Some(pending) = d.sync().provisional().cloned() else { continue; };
++                                    if d.sync().accept_provisional_qc_response(validator_id, addr, *height).is_err() {
+                                         gossip.score_peer(validator_id, indra_network::peer::ScoreEvent::InvalidMessage);
+                                         continue;
+                                     }
++                                    pending
++                                };
+                                     let verified = {
+                                         let d = driver.lock().unwrap();
+                                         indra_node::sync::verify_network_direct_provisional_qc(
+
+--- a/indra-node/src/sync.rs
++++ b/indra-node/src/sync.rs
+@@
+     fn provisional_qc_response_requires_selected_peer_and_height() {
+         let peer: SocketAddr = "127.0.0.1:30109".parse().unwrap();
+         let wrong_peer: SocketAddr = "127.0.0.1:30110".parse().unwrap();
+         let id = Bytes32::from([0xA9; 32]);
+         let wrong_id = Bytes32::from([0xAA; 32]);
+         let now = Instant::now();
+         let state = crate::genesis::canonical_test_genesis();
+         let block = make_block(&state);
+         let height = block.header.height;
+         let prepared = PreparedSyncBlock {
+             block_hash: block.header.block_hash(),
+             pre_height: state.height,
+             pre_tip_hash: state.tip_hash,
+             state,
+             epoch_record: None,
+             effects: CanonicalStateEffects::default(),
+         };
+         let mut sync = SyncState::follower(0);
+         sync.stage_provisional(block, prepared, id, peer, now);
+         assert!(sync.accept_provisional_qc_response(wrong_id, wrong_peer, height).is_err());
+         assert!(sync.accept_provisional_qc_response(id, peer, height + 1).is_err());
+         assert!(sync.accept_provisional_qc_response(id, peer, height).is_ok());
+         sync.clear_provisional();
+         assert!(sync.accept_provisional_qc_response(id, peer, height).is_err());
+     }

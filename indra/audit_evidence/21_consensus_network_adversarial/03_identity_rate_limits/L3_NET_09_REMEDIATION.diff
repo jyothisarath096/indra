@@ -1,0 +1,46 @@
+--- a/indra-network/src/policy.rs
++++ b/indra-network/src/policy.rs
+@@
+     pub fn len(&self) -> usize {
+         self.values.len()
+     }
++
++    /// Whether no retained cooldown metadata remains.
++    pub fn is_empty(&self) -> bool {
++        self.values.is_empty()
++    }
+
+--- a/indra-node/src/bin/node.rs
++++ b/indra-node/src/bin/node.rs
+@@
+     fn tracker_mut(
+         &mut self,
+         validator_id: indra_core::Bytes32,
++        now: Instant,
+     ) -> Option<&mut BoundedCooldownTracker<IpAddr>> {
+-        if !self.by_validator.contains_key(&validator_id)
+-            && self.by_validator.len() >= MAX_ACTIVE_VALIDATORS
+-        {
+-            return None;
++        if !self.by_validator.contains_key(&validator_id) {
++            if self.by_validator.len() >= MAX_ACTIVE_VALIDATORS {
++                let expired = self.by_validator.iter_mut().filter_map(|(id, tracker)| {
++                    tracker.prune_expired(now);
++                    tracker.is_empty().then_some(*id)
++                }).collect::<Vec<_>>();
++                for id in expired { self.by_validator.remove(&id); }
++            }
++            if self.by_validator.len() >= MAX_ACTIVE_VALIDATORS { return None; }
+         }
+@@
+-        self.tracker_mut(key.validator_id)
++        self.tracker_mut(key.validator_id, now)
+@@
++    // Added regressions: expired namespace admission, non-expired saturation,
++    // partial rotation, isolation/reset, churn, and global bounds.
+
+--- a/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/bin/post_auth_rotation.rs
++++ b/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/bin/post_auth_rotation.rs
+@@
++// Prune expired inner trackers at namespace admission, then admit the new
++// validator and verify full rotation remains <= 200 namespaces.

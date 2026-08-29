@@ -1,0 +1,5 @@
+family,auth required,request rate key,byte budget,max response bytes,max response objects,correlation,dedup,expensive work before limiter,unsolicited accepted
+RequestBlocks,authenticated validator,validator ID,request count plus response byte buckets,14680064,50 range-clamped blocks,no request token; serving range clamped,none,No storage read before actor limiter,yes bounded
+BlockResponse,authenticated validator,validator ID,per-validator plus global large-payload bytes,14680064,50 blocks,exact validator/socket/range/contiguity,per-connection duplicate plus sync binding,decode only before correlation; projection after,No
+RequestQC,authenticated validator,validator ID,request count bucket,14680064,one QC,no response token; point-to-point,none,No expensive lookup before limiter,yes bounded
+QCResponse,authenticated validator,validator ID,per-validator bytes and count; global frame cap,14680064,one QC <=200 signers,provisional height only in sync branch,2048-entry TTL wire hash,decode before provisional peer correlation,Yes matching-height provisional response (L3-NET-10)

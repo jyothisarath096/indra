@@ -1,0 +1,12 @@
+[package]
+name = "indra-transcript-reproposal-reproducer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+indra-core = { path = "../../../indra-core" }
+indra-crypto = { path = "../../../indra-crypto" }
+
+[workspace]
+

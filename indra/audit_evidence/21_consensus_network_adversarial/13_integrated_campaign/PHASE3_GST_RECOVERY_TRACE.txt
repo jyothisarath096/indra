@@ -1,0 +1,10 @@
+GENESIS height=0 shared tip
+PRE-GST proposal delivery: one destination withheld in deterministic queue
+RELEASE delayed proposal; production prevotes/precommits exchanged
+POST-GST bounded release: all four finalize height=1 same tip
+QC production verification PASS for each validator; canonical roots equal
+STALE delayed-message safety covered by production height/round gates
+PRE-GST: proposal withheld from two validators; two timeout rounds complete at height=0/QC=None
+STALE RELEASE: delayed proposal released after round advancement
+RECOVERY: genuinely eligible proposer found by production round search; all four finalized identical height-1 block
+POST-GST NO-DROP: proposer-search nil prevotes/precommits and recovery proposal/prevotes/precommits all delivered within two logical ticks; emitted broadcasts == delivered broadcasts

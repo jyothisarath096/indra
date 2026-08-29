@@ -1,0 +1,298 @@
+# L3-NET-11 CURRENT SOURCE BUNDLE
+
+
+FILE: indra-storage/src/vote_safety.rs
+SHA-256: 2d46a862db865f595b66629e09f6447144713ea60d4e2ca3c97db82e8d819f85
+SECTION: VoteSafetyStore::record
+
+    /// Persist the latest vote and current lock atomically before signing.
+    pub fn record(
+        &self,
+        height: u64,
+        round: u32,
+        step: u8,
+        consensus_lock: Option<&PersistedConsensusLock>,
+    ) -> StorageResult<()> {
+        validate_consensus_round(round)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+        if let VoteSafetyLoadResult::Record(existing) = self.load() {
+            let existing_slot = (existing.height, existing.round, existing.step);
+            let requested_slot = (height, round, step);
+            if requested_slot <= existing_slot {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "vote safety slot is not strictly later than persisted slot",
+                )
+                .into());
+            }
+        }
+        if let Some(lock) = consensus_lock {
+            validate_consensus_round(lock.round)
+                .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+            if lock.polc_votes.iter().any(|vote| vote.round != lock.round) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "persisted PoLC vote round differs from lock round",
+                )
+                .into());
+            }
+        }
+        if consensus_lock.is_some_and(|lock| lock.polc_votes.len() > MAX_PERSISTED_POLC_VOTES) {
+            return Err(
+                Error::new(ErrorKind::InvalidInput, "PoLC vote count exceeds maximum").into(),
+            );
+        }
+        let record = VoteSafetyRecord {
+            height,
+            round,
+            step,
+            consensus_lock: consensus_lock.cloned(),
+        };
+        let payload = encode_record(&record);
+        if payload.len() as u64 > MAX_SAFETY_FILE_BYTES.saturating_sub(4) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "safety record exceeds maximum size",
+            )
+            .into());
+        }
+        let mut bytes = payload;
+        bytes.extend_from_slice(&crc32(&bytes).to_le_bytes());
+        write_atomic_synced(&self.tmp_path, &self.path, &bytes)
+
+
+FILE: indra-node/src/driver.rs
+SHA-256: bbb6f84d14327314f3253a5444bc45555a1105521011d3bea99c00b0dea498ab
+SECTION: ConsensusDriver::sign_and_record_local_vote
+
+    fn sign_and_record_local_vote(
+        &mut self,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> Vec<DriverAction> {
+        let canonical_height = self.next_height();
+        if height != canonical_height || round != self.current_round {
+            eprintln!(
+                "[vote] refusing non-canonical signing coordinates: requested height={} round={}, canonical height={} round={}",
+                height, round, canonical_height, self.current_round
+            );
+            return vec![DriverAction::None];
+        }
+        let Some(local_validator_id) = self.engine.validator_id() else {
+            return vec![];
+        };
+        {
+            match self
+                .engine
+                .voter_authorized_for_height(height, local_validator_id)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "[vote] refusing local vote at height={height}: validator is not a member of the governing consensus authority"
+                    );
+                    return vec![];
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[vote] CRITICAL: refusing local vote at height={height}: failed to resolve consensus authority: {error}"
+                    );
+                    return vec![DriverAction::None];
+                }
+            }
+        }
+        if self.collector_has_vote_from(height, round, step, local_validator_id) {
+            return vec![];
+        }
+        if let Some(reason) = &self.vote_safety_unavailable {
+            eprintln!("[vote_safety] refusing to sign local vote: {reason}");
+            return vec![DriverAction::None];
+        }
+
+        let vote_block_hash = block_hash;
+
+        let step_byte = match step {
+            VoteStep::Prevote => 0u8,
+            VoteStep::Precommit => 1u8,
+        };
+        let persisted_lock = match self.persisted_consensus_lock() {
+            Ok(lock) => lock,
+            Err(reason) => {
+                eprintln!("[vote_safety] CRITICAL: refusing to vote: {reason}");
+                self.vote_safety_unavailable = Some(reason);
+                return vec![DriverAction::None];
+            }
+        };
+        if let Err(err) = self
+            .vote_safety
+            .record(height, round, step_byte, persisted_lock.as_ref())
+        {
+            eprintln!(
+                "[vote_safety] CRITICAL: failed to persist vote safety record before signing: {err}; refusing to vote"
+            );
+            return vec![DriverAction::None];
+        }
+
+        match self.engine.sign_vote(height, round, step, vote_block_hash) {
+            Ok(local_vote) => {
+                eprintln!(
+                    "[vote] produced {:?} for height={} round={} hash={}",
+                    step,
+                    height,
+                    round,
+                    hex::encode(&vote_block_hash.0[..4]),
+                );
+                self.record_vote_and_actions(
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    local_vote,
+                    false,
+                )
+            }
+            Err(err) => {
+                eprintln!(
+                    "[vote] failed to sign local {:?} for {} at height={} round={}: {}",
+                    step,
+                    hex::encode(&vote_block_hash.0[..4]),
+                    height,
+                    round,
+                    err,
+                );
+                vec![]
+
+
+FILE: indra-node/src/driver.rs
+SHA-256: bbb6f84d14327314f3253a5444bc45555a1105521011d3bea99c00b0dea498ab
+SECTION: ConsensusDriver::next_height
+
+                        }
+                    };
+                    eprintln!(
+                        "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                        safe_round, record.height, record.round, record.step
+                    );
+                    self.start_round(safe_round)
+                        .expect("safe persisted round was validated above");
+                }
+            }
+            VoteSafetyLoadResult::Corrupt(reason) => {
+                let msg = format!(
+                    "vote_safety.dat is corrupt or unreadable: {reason}; refusing to vote until operator recovery"
+                );
+
+
+FILE: indra-storage/src/vote_safety.rs
+SHA-256: 2d46a862db865f595b66629e09f6447144713ea60d4e2ca3c97db82e8d819f85
+SECTION: same_signing_slot_is_rejected_on_second_record
+
+    fn same_signing_slot_is_rejected_on_second_record() {
+        let path = tmp_path("same_slot");
+        let store = VoteSafetyStore::open(&path);
+        store.record(1, 0, 0, None).unwrap();
+        assert!(store.record(1, 0, 0, None).is_err());
+        assert!(store.record(1, 0, 1, None).is_ok());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_format_is_rejected_without_legacy_decoder() {
+        let path = tmp_path("old_format");
+
+
+FILE: indra-node/src/driver.rs
+SHA-256: bbb6f84d14327314f3253a5444bc45555a1105521011d3bea99c00b0dea498ab
+SECTION: focused driver regressions
+
+    fn audit_fixture_production_prevote_persists_vote_safety_record() {
+        let (mut driver, dir) = local_driver([0xA7u8; 32], "audit_fixture_prevote_persistence");
+        let safety_path = driver.engine.config.vote_safety_path();
+        assert!(safety_path.parent().is_some_and(|parent| parent.exists()));
+        let validator_id = driver.engine.validator_id().unwrap();
+        let actions = driver.sign_and_record_local_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            Bytes32::ZERO,
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        let store = VoteSafetyStore::open(&safety_path);
+        assert!(matches!(store.load(), VoteSafetyLoadResult::Record(record) if record.height == 1 && record.round == 0 && record.step == VoteStep::Prevote as u8));
+        assert_eq!(validator_id, driver.engine.validator_id().unwrap());
+        drop(store);
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_restart_conflicting_vote_reproducer_ordinary_height() {
+        let seed = [0xA9u8; 32];
+        let (mut driver, dir) = local_driver(seed, "audit_restart_conflict_ordinary");
+        let config = driver.engine.config.clone();
+        let first = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(first.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        drop(driver);
+        let engine = NodeEngine::init(config).unwrap();
+        let store = VoteSafetyStore::open(engine.config.vote_safety_path());
+        assert!(matches!(store.load(), VoteSafetyLoadResult::Record(record) if record.height == 1 && record.round == 0 && record.step == 0));
+        let mut reopened = ConsensusDriver::new(engine, store);
+        let second = reopened.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::from([1; 32]));
+        assert!(!second.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+## CORRECTED ConsensusDriver::next_height SOURCE
+FILE: indra-node/src/driver.rs
+SHA-256: bbb6f84d14327314f3253a5444bc45555a1105521011d3bea99c00b0dea498ab
+LINES: 959-961
+```rust
+    fn next_height(&self) -> u64 {
+        self.engine.state.height + 1
+    }
+```
+The function reads the durable/engine state height and returns the next local
+signing height. Arithmetic is ordinary Rust `u64` addition (not checked or
+saturating): genesis height 0 returns 1; height 1 returns 2; `u64::MAX` would
+overflow in checked/debug arithmetic and wrap in unchecked release arithmetic.
+Such a maximum height is outside normal reachable engine progression.
+
+## SECTION: signing_slot_ordering_matrix
+FILE: indra-storage/src/vote_safety.rs
+SHA-256: 2d46a862db865f595b66629e09f6447144713ea60d4e2ca3c97db82e8d819f85
+LINES: 319-331
+```rust
+    fn signing_slot_ordering_matrix() {
+        let path = tmp_path("matrix");
+        let store = VoteSafetyStore::open(&path);
+        assert!(store.record(10, 5, 0, None).is_ok());
+        assert!(store.record(10, 5, 0, None).is_err());
+        assert!(store.record(10, 5, 1, None).is_ok());
+        assert!(store.record(10, 5, 0, None).is_err());
+        assert!(store.record(10, 4, 1, None).is_err());
+        assert!(store.record(9, 9, 1, None).is_err());
+        assert!(store.record(10, 6, 0, None).is_ok());
+        assert!(store.record(11, 0, 0, None).is_ok());
+        let _ = fs::remove_file(path);
+    }
+```
+
+    #[test]
+    fn audit_signing_boundary_rejects_future_round_before_persistence() {
+        let (mut driver, dir) = local_driver([0xAAu8; 32], "audit_signing_boundary_round");
+        let safety_path = driver.engine.config.vote_safety_path();
+        let before = VoteSafetyStore::open(&safety_path).load();
+        let actions = driver.sign_and_record_local_vote(1, 1, VoteStep::Prevote, Bytes32::ZERO);
+        assert!(!actions.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
+        assert_eq!(VoteSafetyStore::open(&safety_path).load(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn proposer_authority_uses_snapshot_weights_not_live_registry() {
+        let (mut driver, dir) = local_driver([0xB1; 32], "snapshot_proposer_weight");
+        let local_id = driver.engine.validator_id().unwrap();
+        let snapshot = driver.engine.state.consensus_snapshots[0].clone();

@@ -1,0 +1,9 @@
+message,cheap gates,rate limit/dedup before crypto,expensive operations,bounded count,result
+Vote,frame identity height/round/step snapshot authority,validator limiter + exact replay fast path,Ed25519+ML-DSA hybrid,one vote,pass
+Proposal,frame/current parent/authority/duplicate,proposal limiter + accepted replay state,VRF + proposer hybrid + QC,one proposal,pass
+QCResponse,provisional exists validator/socket/height,source binding before decode/verify,QC signer verification,QC signer cap,pass
+BlockResponse,outstanding exact peer/range and <=50 blocks,request binding before projection,block QC/VRF/projection,50 blocks,pass
+Tx,decode/class/rate limit/mempool checks,validator limiter + relay dedup,transaction signatures,per-message bounded,pass
+StakingOp,decode/basic fields/rate limit,validator limiter,operation signature,per-message bounded,pass
+GovernanceOp,decode/basic fields/rate limit,validator limiter,operation signature,per-message bounded,pass
+PeerList,UTF-8/count/address filtering,relay TTL dedup,no consensus crypto,20 entries,pass

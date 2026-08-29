@@ -1,0 +1,8 @@
+state,expiry,trigger,verified
+height_claims,30s,observe_status retain,yes
+expensive_failure_sources,60s per-height inner entries,note_expensive_failure,yes; outer keys retained
+circuit_open_until,60s,circuit_open retain,yes; stale unqueried keys remain
+outbound_cooldowns,policy duration,lookup/reset only,no global sweep
+sync_cooldowns,60s cooldown,blocked lookup/reset,no global sweep
+discovered_peers,not time based,bounded eviction,yes
+op_relay_seen,category TTL,contains_at/insert_at,yes

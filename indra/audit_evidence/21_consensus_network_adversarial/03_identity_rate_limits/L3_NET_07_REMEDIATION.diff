@@ -1,0 +1,664 @@
+--- a/indra-network/src/policy.rs
++++ b/indra-network/src/policy.rs
+@@ -280,7 +280,222 @@
+     minimum: Duration,
+     maximum: Duration,
+ }
++
++#[derive(Debug, Clone)]
++struct BoundedCooldownValue {
++    cooldown: CooldownEntry,
++    generation: u64,
++    retention_deadline: Instant,
++}
++
++#[derive(Debug, Clone)]
++struct BoundedCooldownOrderEntry<K> {
++    key: K,
++    generation: u64,
++    retention_deadline: Instant,
++}
++
++/// Capacity- and idle-retention-bounded cooldown state for attacker-controlled
++/// identities.
++///
++/// Lookups do not refresh failure recency. Only a recorded failure advances the
++/// exponential cooldown and the retention deadline. Capacity eviction is
++/// deterministic: expired history is reclaimed first, then the
++/// least-recently-failed live identity is removed.
++pub struct BoundedCooldownTracker<K> {
++    values: HashMap<K, BoundedCooldownValue>,
++    order: VecDeque<BoundedCooldownOrderEntry<K>>,
++    capacity: usize,
++    minimum: Duration,
++    maximum: Duration,
++    retention_ttl: Duration,
++    next_generation: u64,
++    evictions: u64,
++}
++
++impl<K: Clone + Eq + Hash> BoundedCooldownTracker<K> {
++    /// Construct a bounded tracker with an explicit idle-retention policy.
++    pub fn new(
++        capacity: usize,
++        minimum: Duration,
++        maximum: Duration,
++        retention_ttl: Duration,
++    ) -> Self {
++        Self {
++            values: HashMap::with_capacity(capacity),
++            order: VecDeque::with_capacity(capacity),
++            capacity,
++            minimum,
++            maximum,
++            retention_ttl,
++            next_generation: 0,
++            evictions: 0,
++        }
++    }
+ 
++    /// Record a failure and return the cooldown applied to this attempt.
++    pub fn record_failure_at(&mut self, key: K, now: Instant) -> Duration {
++        self.prune_expired(now);
++        let current = self
++            .values
++            .get(&key)
++            .map(|value| value.cooldown.next_delay)
++            .unwrap_or(self.minimum);
++
++        if !self.values.contains_key(&key) {
++            while self.values.len() >= self.capacity {
++                if !self.evict_oldest_live() {
++                    break;
++                }
++                self.evictions = self.evictions.saturating_add(1);
++            }
++            if self.capacity == 0 {
++                return current;
++            }
++        }
++
++        let generation = self.allocate_generation();
++        let retention_deadline = now + self.retention_ttl;
++        self.values.insert(
++            key.clone(),
++            BoundedCooldownValue {
++                cooldown: CooldownEntry {
++                    retry_at: now + current,
++                    next_delay: (current * 2).min(self.maximum),
++                },
++                generation,
++                retention_deadline,
++            },
++        );
++        self.order.push_back(BoundedCooldownOrderEntry {
++            key,
++            generation,
++            retention_deadline,
++        });
++        self.compact_order_if_needed();
++        current
++    }
++
++    /// Return whether `key` is still inside its active retry cooldown.
++    ///
++    /// This operation may reclaim idle-expired metadata but never refreshes
++    /// recency, generation, or retention.
++    pub fn blocked_at(&mut self, key: &K, now: Instant) -> bool {
++        self.prune_expired(now);
++        self.values
++            .get(key)
++            .is_some_and(|value| now < value.cooldown.retry_at)
++    }
++
++    /// Reset exactly one identity after successful authentication.
++    pub fn reset(&mut self, key: &K) {
++        self.values.remove(key);
++        self.compact_order_if_needed();
++    }
++
++    /// Reclaim failure metadata whose idle-retention deadline has elapsed.
++    pub fn prune_expired(&mut self, now: Instant) {
++        while self
++            .order
++            .front()
++            .is_some_and(|entry| entry.retention_deadline <= now)
++        {
++            let entry = self.order.pop_front().expect("front exists");
++            if self.values.get(&entry.key).is_some_and(|value| {
++                value.generation == entry.generation && value.retention_deadline <= now
++            }) {
++                self.values.remove(&entry.key);
++            }
++        }
++        self.compact_order_if_needed();
++    }
++
++    fn allocate_generation(&mut self) -> u64 {
++        if self.next_generation == u64::MAX {
++            self.reindex_generations();
++        }
++        self.next_generation += 1;
++        self.next_generation
++    }
++
++    fn reindex_generations(&mut self) {
++        let mut live = Vec::with_capacity(self.values.len());
++        for entry in &self.order {
++            if self
++                .values
++                .get(&entry.key)
++                .is_some_and(|value| value.generation == entry.generation)
++            {
++                live.push((entry.key.clone(), entry.retention_deadline));
++            }
++        }
++        self.order.clear();
++        for (index, (key, retention_deadline)) in live.into_iter().enumerate() {
++            let generation = (index as u64) + 1;
++            if let Some(value) = self.values.get_mut(&key) {
++                value.generation = generation;
++            }
++            self.order.push_back(BoundedCooldownOrderEntry {
++                key,
++                generation,
++                retention_deadline,
++            });
++        }
++        self.next_generation = self.values.len() as u64;
++    }
++
++    fn evict_oldest_live(&mut self) -> bool {
++        while let Some(entry) = self.order.pop_front() {
++            if self
++                .values
++                .get(&entry.key)
++                .is_some_and(|value| value.generation == entry.generation)
++            {
++                self.values.remove(&entry.key);
++                return true;
++            }
++        }
++        false
++    }
++
++    fn compact_order_if_needed(&mut self) {
++        if self.order.len() <= self.capacity.saturating_mul(2) {
++            return;
++        }
++        let mut live = self
++            .values
++            .iter()
++            .map(|(key, value)| BoundedCooldownOrderEntry {
++                key: key.clone(),
++                generation: value.generation,
++                retention_deadline: value.retention_deadline,
++            })
++            .collect::<Vec<_>>();
++        live.sort_by_key(|entry| entry.generation);
++        self.order = live.into();
++    }
++
++    /// Number of live cooldown identities.
++    pub fn len(&self) -> usize {
++        self.values.len()
++    }
++
++    /// Configured live-identity hard cap.
++    pub fn capacity(&self) -> usize {
++        self.capacity
++    }
++
++    /// Number of deterministic capacity evictions.
++    pub fn evictions(&self) -> u64 {
++        self.evictions
++    }
++
++    /// Number of bounded ordering records retained.
++    pub fn bookkeeping_len(&self) -> usize {
++        self.order.len()
++    }
++}
++
+ impl<K: Eq + Hash> CooldownTracker<K> {
+     /// Create a tracker with inclusive minimum and maximum delays.
+     pub fn new(minimum: Duration, maximum: Duration) -> Self {
+@@ -561,9 +776,173 @@
+         );
+         tracker.reset(&"peer");
+         assert!(!tracker.blocked_at(&"peer", start));
++    }
++
++    fn bounded_cooldown(capacity: usize) -> BoundedCooldownTracker<u32> {
++        BoundedCooldownTracker::new(
++            capacity,
++            Duration::from_secs(2),
++            Duration::from_secs(60),
++            Duration::from_secs(60),
++        )
++    }
++
++    #[test]
++    fn bounded_cooldown_enforces_capacity_and_oldest_failure_eviction() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(4_096);
++        for key in 0..4_096 {
++            tracker.record_failure_at(key, start);
++        }
++        assert_eq!(tracker.len(), 4_096);
++        assert_eq!(tracker.capacity(), 4_096);
++
++        tracker.record_failure_at(4_096, start + Duration::from_millis(1));
++        assert_eq!(tracker.len(), 4_096);
++        assert_eq!(tracker.evictions(), 1);
++        assert!(!tracker.blocked_at(&0, start + Duration::from_millis(1)));
++        assert!(tracker.blocked_at(&4_096, start + Duration::from_millis(1)));
+     }
+ 
+     #[test]
++    fn bounded_cooldown_stays_bounded_under_original_attack_scale() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(4_096);
++        let mut maximum_live = 0;
++        let mut maximum_bookkeeping = 0;
++        for key in 0..200_000 {
++            tracker.record_failure_at(key, start);
++            maximum_live = maximum_live.max(tracker.len());
++            maximum_bookkeeping = maximum_bookkeeping.max(tracker.bookkeeping_len());
++        }
++        assert_eq!(maximum_live, 4_096);
++        assert!(maximum_bookkeeping <= 8_192);
++        assert_eq!(tracker.len(), 4_096);
++        assert!(tracker.bookkeeping_len() <= 8_192);
++    }
++
++    #[test]
++    fn bounded_cooldown_escalates_and_separates_retry_from_retention() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(8);
++        let expected = [2, 4, 8, 16, 32, 60, 60];
++        for (index, seconds) in expected.into_iter().enumerate() {
++            assert_eq!(
++                tracker.record_failure_at(1, start + Duration::from_millis(index as u64)),
++                Duration::from_secs(seconds)
++            );
++        }
++
++        let mut retry_tracker = bounded_cooldown(8);
++        assert_eq!(
++            retry_tracker.record_failure_at(2, start),
++            Duration::from_secs(2)
++        );
++        assert!(!retry_tracker.blocked_at(&2, start + Duration::from_secs(2)));
++        assert_eq!(retry_tracker.len(), 1, "failure history remains retained");
++        assert_eq!(
++            retry_tracker.record_failure_at(2, start + Duration::from_secs(59)),
++            Duration::from_secs(4),
++            "retained history continues exponential backoff"
++        );
++    }
++
++    #[test]
++    fn bounded_cooldown_reclaims_idle_metadata_at_retention_deadline() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(8);
++        tracker.record_failure_at(1, start);
++        assert_eq!(tracker.len(), 1);
++        tracker.prune_expired(start + Duration::from_secs(59));
++        assert_eq!(tracker.len(), 1);
++        tracker.prune_expired(start + Duration::from_secs(60));
++        assert_eq!(tracker.len(), 0);
++        assert_eq!(
++            tracker.record_failure_at(1, start + Duration::from_secs(60)),
++            Duration::from_secs(2)
++        );
++    }
++
++    #[test]
++    fn bounded_cooldown_reset_is_exact_and_stale_records_are_safe() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(3);
++        tracker.record_failure_at(1, start);
++        tracker.record_failure_at(2, start + Duration::from_secs(1));
++        tracker.record_failure_at(1, start + Duration::from_secs(10));
++        tracker.reset(&2);
++        assert_eq!(tracker.len(), 1);
++        assert!(tracker.blocked_at(&1, start + Duration::from_secs(10)));
++        assert!(!tracker.blocked_at(&2, start + Duration::from_secs(10)));
++
++        tracker.prune_expired(start + Duration::from_secs(60));
++        assert_eq!(tracker.len(), 1, "stale generation must not remove refresh");
++        tracker.prune_expired(start + Duration::from_secs(70));
++        assert_eq!(tracker.len(), 0);
++    }
++
++    #[test]
++    fn bounded_cooldown_refresh_changes_deterministic_eviction_order() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(2);
++        tracker.record_failure_at(1, start);
++        tracker.record_failure_at(2, start + Duration::from_millis(1));
++        tracker.record_failure_at(1, start + Duration::from_millis(2));
++        tracker.record_failure_at(3, start + Duration::from_millis(3));
++        assert!(tracker.blocked_at(&1, start + Duration::from_millis(3)));
++        assert!(!tracker.blocked_at(&2, start + Duration::from_millis(3)));
++        assert!(tracker.blocked_at(&3, start + Duration::from_millis(3)));
++        assert_eq!(tracker.evictions(), 1);
++    }
++
++    #[test]
++    fn bounded_cooldown_generation_wrap_reindexes_safely() {
++        let start = Instant::now();
++        let mut tracker = bounded_cooldown(3);
++        tracker.record_failure_at(1, start);
++        tracker.record_failure_at(2, start + Duration::from_millis(1));
++        tracker.next_generation = u64::MAX;
++        tracker.record_failure_at(1, start + Duration::from_millis(2));
++        tracker.record_failure_at(3, start + Duration::from_millis(3));
++        tracker.record_failure_at(4, start + Duration::from_millis(4));
++        assert!(tracker.blocked_at(&1, start + Duration::from_millis(4)));
++        assert!(!tracker.blocked_at(&2, start + Duration::from_millis(4)));
++        assert!(tracker.blocked_at(&3, start + Duration::from_millis(4)));
++        assert!(tracker.blocked_at(&4, start + Duration::from_millis(4)));
++        assert_eq!(tracker.len(), 3);
++        assert!(tracker.bookkeeping_len() <= 6);
++    }
++
++    #[test]
++    fn bounded_cooldown_concurrent_mutex_updates_never_exceed_bounds() {
++        use std::sync::{Arc, Mutex};
++
++        for round in 0..100u32 {
++            let tracker = Arc::new(Mutex::new(bounded_cooldown(4_096)));
++            let mut threads = Vec::new();
++            for worker in 0..8u32 {
++                let tracker = Arc::clone(&tracker);
++                threads.push(std::thread::spawn(move || {
++                    let now = Instant::now();
++                    for offset in 0..128u32 {
++                        let key = round * 10_000 + worker * 128 + offset;
++                        let mut guard = tracker.lock().unwrap();
++                        guard.record_failure_at(key, now);
++                        assert!(guard.len() <= 4_096);
++                        assert!(guard.bookkeeping_len() <= 8_192);
++                    }
++                }));
++            }
++            for thread in threads {
++                thread.join().unwrap();
++            }
++            let guard = tracker.lock().unwrap();
++            assert!(guard.len() <= 4_096);
++            assert!(guard.bookkeeping_len() <= 8_192);
++        }
++    }
++
++    #[test]
+     fn persistent_ban_survives_reload_and_new_socket_port() {
+         let path = std::env::temp_dir().join(format!(
+             "indra-ban-store-{}-{}",
+--- a/indra-network/src/lib.rs
++++ b/indra-network/src/lib.rs
+@@ -70,7 +70,7 @@
+ };
+ pub use peer::{PeerInfo, PeerStatus, PeerTable};
+ pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
+-pub use policy::{BanStore, BoundedTtlSet, CooldownTracker, NetworkGroup};
++pub use policy::{BanStore, BoundedCooldownTracker, BoundedTtlSet, CooldownTracker, NetworkGroup};
+ pub use rate_limit::{
+     GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket,
+ };
+--- a/indra-node/src/bin/node.rs
++++ b/indra-node/src/bin/node.rs
+@@ -29,7 +29,8 @@
+     message::{Message, PeerListEntry},
+     observer::NODE_TYPE_FULL,
+     perform_handshake_initiator, perform_handshake_responder, perform_observer_handshake_responder,
+-    read_frame_plain_limited, spawn_peer_manager, write_frame_plain, BoundedTtlSet, CooldownTracker, HandshakeConfig, NetworkCommand, NetworkEvent, NetworkGroup,
++    read_frame_plain_limited, spawn_peer_manager, write_frame_plain, BoundedCooldownTracker,
++    BoundedTtlSet, CooldownTracker, HandshakeConfig, NetworkCommand, NetworkEvent, NetworkGroup,
+     ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, RelayValidatorKey, TokenBucket,
+ };
+ use indra_node::{
+@@ -70,6 +71,9 @@
+ const OBSERVER_REQUEST_BLOCKS_RATE: u64 = 2;
+ const OBSERVER_REQUEST_BLOCKS_BURST: u64 = 4;
+ const MAX_INBOUND_PER_IP: u8 = 3;
++/// Reviewed hard resource bound for attacker-controlled pre-auth cooldown state.
++const PRE_AUTH_COOLDOWN_CAPACITY: usize = 4_096;
++const PRE_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
+ const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
+ 
+ fn unix_timestamp_secs() -> u64 {
+@@ -195,14 +199,19 @@
+ }
+ 
+ struct InboundCooldowns {
+-    pre_auth: CooldownTracker<PreAuthInboundKey>,
++    pre_auth: BoundedCooldownTracker<PreAuthInboundKey>,
+     post_auth: CooldownTracker<PostAuthInboundKey>,
+ }
+ 
+ impl InboundCooldowns {
+     fn new() -> Self {
+         Self {
+-            pre_auth: CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60)),
++            pre_auth: BoundedCooldownTracker::new(
++                PRE_AUTH_COOLDOWN_CAPACITY,
++                Duration::from_secs(2),
++                Duration::from_secs(60),
++                PRE_AUTH_COOLDOWN_RETENTION,
++            ),
+             post_auth: CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60)),
+         }
+     }
+@@ -6177,9 +6186,149 @@
+                 .record_failure_at(key, now + Duration::from_secs(2)),
+             Duration::from_secs(4)
+         );
++    }
++
++    fn pre_auth_key(ip: IpAddr) -> PreAuthInboundKey {
++        PreAuthInboundKey {
++            group: NetworkGroup::from_ip(ip),
++            ip,
++        }
+     }
+ 
+     #[test]
++    fn pre_auth_ipv4_churn_remains_strictly_bounded() {
++        let now = Instant::now();
++        let mut cooldowns = InboundCooldowns::new();
++        for raw in 1..=100_000u32 {
++            cooldowns
++                .pre_auth
++                .record_failure_at(pre_auth_key(IpAddr::V4(raw.into())), now);
++            assert!(cooldowns.pre_auth.len() <= PRE_AUTH_COOLDOWN_CAPACITY);
++            assert!(cooldowns.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
++        }
++        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
++    }
++
++    #[test]
++    fn pre_auth_ipv6_same_group_original_attack_scale_is_bounded() {
++        let now = Instant::now();
++        let mut cooldowns = InboundCooldowns::new();
++        let prefix =
++            u128::from_be_bytes([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        let mut maximum_live = 0;
++        let mut maximum_bookkeeping = 0;
++        for suffix in 1..=200_000u128 {
++            let ip = IpAddr::V6((prefix | suffix).into());
++            let key = pre_auth_key(ip);
++            assert_eq!(key.group, NetworkGroup::V6([0x20, 0x01, 0x0d, 0xb8]));
++            cooldowns.pre_auth.record_failure_at(key, now);
++            maximum_live = maximum_live.max(cooldowns.pre_auth.len());
++            maximum_bookkeeping = maximum_bookkeeping.max(cooldowns.pre_auth.bookkeeping_len());
++        }
++        assert_eq!(maximum_live, PRE_AUTH_COOLDOWN_CAPACITY);
++        assert!(maximum_bookkeeping <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
++        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
++    }
++
++    #[test]
++    fn pre_auth_saturation_allows_approved_self_eviction_without_growth() {
++        let now = Instant::now();
++        let attacker_a = pre_auth_key("2001:db8::1".parse().unwrap());
++        let mut cooldowns = InboundCooldowns::new();
++        cooldowns.pre_auth.record_failure_at(attacker_a, now);
++        assert!(cooldowns.pre_auth.blocked_at(&attacker_a, now));
++
++        let prefix =
++            u128::from_be_bytes([0x20, 0x01, 0x0d, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        for suffix in 1..=PRE_AUTH_COOLDOWN_CAPACITY as u128 {
++            let ip = IpAddr::V6((prefix | suffix).into());
++            cooldowns
++                .pre_auth
++                .record_failure_at(pre_auth_key(ip), now + Duration::from_millis(1));
++        }
++        assert_eq!(cooldowns.pre_auth.len(), PRE_AUTH_COOLDOWN_CAPACITY);
++        assert!(cooldowns.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
++        assert!(!cooldowns
++            .pre_auth
++            .blocked_at(&attacker_a, now + Duration::from_millis(1)));
++        assert_eq!(
++            cooldowns
++                .pre_auth
++                .record_failure_at(attacker_a, now + Duration::from_millis(1)),
++            Duration::from_secs(2)
++        );
++    }
++
++    #[test]
++    fn pre_auth_recent_legitimate_source_survives_older_churn() {
++        let now = Instant::now();
++        let legitimate = pre_auth_key("203.0.113.9".parse().unwrap());
++        let mut cooldowns = InboundCooldowns::new();
++        cooldowns.pre_auth.record_failure_at(legitimate, now);
++        for raw in 1..PRE_AUTH_COOLDOWN_CAPACITY as u32 {
++            cooldowns.pre_auth.record_failure_at(
++                pre_auth_key(IpAddr::V4(raw.into())),
++                now + Duration::from_millis(1),
++            );
++        }
++        cooldowns
++            .pre_auth
++            .record_failure_at(legitimate, now + Duration::from_millis(2));
++        cooldowns.pre_auth.record_failure_at(
++            pre_auth_key("198.51.100.250".parse().unwrap()),
++            now + Duration::from_millis(3),
++        );
++        assert!(cooldowns
++            .pre_auth
++            .blocked_at(&legitimate, now + Duration::from_millis(3)));
++    }
++
++    #[test]
++    fn pre_auth_failure_success_event_order_is_last_event_wins() {
++        let now = Instant::now();
++        let key = pre_auth_key("198.51.100.8".parse().unwrap());
++        let mut cooldowns = InboundCooldowns::new();
++
++        cooldowns.pre_auth.record_failure_at(key, now);
++        cooldowns.pre_auth.reset(&key);
++        assert!(!cooldowns.pre_auth.blocked_at(&key, now));
++
++        cooldowns.pre_auth.reset(&key);
++        cooldowns.pre_auth.record_failure_at(key, now);
++        assert!(cooldowns.pre_auth.blocked_at(&key, now));
++    }
++
++    #[test]
++    fn pre_auth_mutex_concurrency_is_bounded_for_one_hundred_runs() {
++        for run in 0..100u128 {
++            let cooldowns = Arc::new(Mutex::new(InboundCooldowns::new()));
++            let mut workers = Vec::new();
++            for worker in 0..4u128 {
++                let cooldowns = Arc::clone(&cooldowns);
++                workers.push(std::thread::spawn(move || {
++                    let now = Instant::now();
++                    for offset in 1..=64u128 {
++                        let suffix = run * 1_000 + worker * 64 + offset;
++                        let prefix = u128::from_be_bytes([
++                            0x20, 0x01, 0x0d, 0xba, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++                        ]);
++                        let mut guard = cooldowns.lock().unwrap();
++                        guard.pre_auth.record_failure_at(
++                            pre_auth_key(IpAddr::V6((prefix | suffix).into())),
++                            now,
++                        );
++                        assert!(guard.pre_auth.len() <= PRE_AUTH_COOLDOWN_CAPACITY);
++                        assert!(guard.pre_auth.bookkeeping_len() <= 2 * PRE_AUTH_COOLDOWN_CAPACITY);
++                    }
++                }));
++            }
++            for worker in workers {
++                worker.join().unwrap();
++            }
++        }
++    }
++
++    #[test]
+     fn stale_staged_proposal_does_not_block_valid_reproposal() {
+         let mode = choose_proposal_mode(true, true, None, 10, 3, true);
+ 
+--- a/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/main.rs
++++ b/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/main.rs
+@@ -1,6 +1,6 @@
+ use std::{net::IpAddr, time::Instant};
+ 
+-use indra_network::policy::CooldownTracker;
++use indra_network::policy::BoundedCooldownTracker;
+ 
+ fn distinct_ipv6(index: u128) -> IpAddr {
+     IpAddr::V6(index.into())
+@@ -11,30 +11,37 @@
+     const SECOND_WAVE: u128 = 100_000;
+ 
+     let now = Instant::now();
+-    let mut tracker = CooldownTracker::new(
++    let mut tracker = BoundedCooldownTracker::new(
++        4_096,
+         std::time::Duration::from_secs(2),
+         std::time::Duration::from_secs(60),
++        std::time::Duration::from_secs(60),
+     );
+ 
++    let mut maximum_live = 0;
++    let mut maximum_bookkeeping = 0;
+     for index in 1..=FIRST_WAVE {
+         tracker.record_failure_at(distinct_ipv6(index), now);
++        maximum_live = maximum_live.max(tracker.len());
++        maximum_bookkeeping = maximum_bookkeeping.max(tracker.bookkeeping_len());
+     }
+-    let retained_first = (1..=FIRST_WAVE)
+-        .filter(|index| tracker.blocked_at(&distinct_ipv6(*index), now))
+-        .count();
+-    assert_eq!(retained_first, FIRST_WAVE as usize);
++    assert_eq!(tracker.len(), 4_096);
+ 
+     for index in (FIRST_WAVE + 1)..=(FIRST_WAVE + SECOND_WAVE) {
+         tracker.record_failure_at(distinct_ipv6(index), now);
++        maximum_live = maximum_live.max(tracker.len());
++        maximum_bookkeeping = maximum_bookkeeping.max(tracker.bookkeeping_len());
+     }
+-    let retained_total = (1..=(FIRST_WAVE + SECOND_WAVE))
+-        .filter(|index| tracker.blocked_at(&distinct_ipv6(*index), now))
+-        .count();
+-    assert_eq!(retained_total, (FIRST_WAVE + SECOND_WAVE) as usize);
++    assert_eq!(tracker.len(), 4_096);
++    assert!(maximum_live <= 4_096);
++    assert!(maximum_bookkeeping <= 8_192);
+ 
+     println!(
+-        "REPRODUCED: unique_keys={} retained_and_blocked={} capacity_or_eviction=none",
++        "REMEDIATED: unique_keys={} live={} maximum_live={} bookkeeping={} maximum_bookkeeping={} hard_cap=4096 bookkeeping_cap=8192",
+         FIRST_WAVE + SECOND_WAVE,
+-        retained_total
++        tracker.len(),
++        maximum_live,
++        tracker.bookkeeping_len(),
++        maximum_bookkeeping,
+     );
+ }
+

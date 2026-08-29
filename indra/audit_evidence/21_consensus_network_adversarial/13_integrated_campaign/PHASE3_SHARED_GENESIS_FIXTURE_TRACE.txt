@@ -1,0 +1,4 @@
+NOT EXECUTED
+
+No shared two-validator sealed genesis fixture was constructed. Consequently no
+distinct-validator state agreement or vote tests were run.

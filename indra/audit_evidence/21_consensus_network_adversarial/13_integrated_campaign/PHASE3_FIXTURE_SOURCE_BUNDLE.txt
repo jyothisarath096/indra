@@ -1,0 +1,430 @@
+# PHASE 3 FIXTURE SOURCE BUNDLE — CURRENT COMPLETE SOURCE
+
+FILE: indra-node/src/driver.rs
+SYMBOL: local_driver
+VISIBILITY: current source visibility
+CURRENT SHA-256 OF FILE: 4ea08bcd6d6b5e57eeb71bead1081be8844d6b701c40b5dd18b62ea268fba6a5
+
+```rust
+    fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
+        let dir = temp_dir(suffix);
+        let mut config = NodeConfig::local_test(dir.clone());
+        let pq = PqKeypair::from_seed(&seed).unwrap();
+        let classical = ClassicalKeypair::from_seed(&seed);
+        let vrf = VrfKeypair::from_seed(&seed);
+        let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
+            [seed[0] ^ 0xA5; 32],
+            [seed[0] ^ 0x5A; 32],
+        )
+        .unwrap();
+        let cold_public = cold.public_key();
+        let cold_public = cold_public.as_complete_hybrid();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        )
+        .0;
+        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            "indra-testnet-1",
+            &indra_core::types::primitives::Bytes32(validator_id),
+            &indra_core::types::primitives::Bytes32(vrf.public_key()),
+            0,
+        )
+        .unwrap();
+        let (vrf_possession_output, vrf_possession_proof) =
+            indra_crypto::vrf_prove(&vrf, &challenge);
+        let genesis_path = dir.join("genesis.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = format!(
+            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+            hex::encode(validator_id),
+            hex::encode(classical.public_key().0),
+            hex::encode(pq.public_key().0),
+            hex::encode(vrf.public_key()),
+            hex::encode(vrf_possession_output.0),
+            hex::encode(vrf_possession_proof.0),
+            hex::encode(cold_public.classical.0),
+            hex::encode(cold_public.pq.0),
+        );
+        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+        std::fs::write(&genesis_path, &genesis).unwrap();
+        config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+        config.validator_seed = Some(seed);
+        config.vrf_seed = Some(seed);
+        config.pq_pk = Some(pq.public_key().0.to_vec());
+        config.pq_seed = Some(pq.secret_key_bytes());
+        let engine = NodeEngine::init(config.clone()).unwrap();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let mut driver = ConsensusDriver::new(engine, vote_safety);
+        for counter in 0u64..4_096 {
+            let mut header = [0u8; 80];
+            header[72..].copy_from_slice(&counter.to_le_bytes());
+            let settings = crate::genesis::GenesisSettings {
+                chain_id: "indra-testnet-1".into(),
+                active_slot_coefficient_numerator:
+                    indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+                bitcoin_pow_entropy_source: crate::genesis::BitcoinPowEntropySourceV1 {
+                    scheme: 1,
+                    network_genesis_hash: hex::encode([0u8; 32]),
+                    announced_height: 1,
+                    header_codec: 1,
+                    extraction_algorithm: 1,
+                    minimum_confirmations: 100,
+                    reorg_policy: 1,
+                },
+                bitcoin_pow_entropy_header: hex::encode(header),
+                genesis_precommit_hash: hex::encode([0x55; 32]),
+            };
+            driver.engine.state.election_seed =
+                crate::genesis::derive_genesis_election_seed(&settings).unwrap();
+            let election = driver.proposer_election_for_height(1, 0).unwrap();
+            let candidate = election
+                .candidates
+                .iter()
+                .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+                .unwrap();
+            if indra_consensus::proposer::compute_proposer_vrf(
+                candidate.validator_id,
+                &vrf,
+                &election,
+            )
+            .unwrap()
+            .eligible
+            {
+                let persisted = genesis.replace(
+                    &hex::encode([0u8; 80]),
+                    &settings.bitcoin_pow_entropy_header,
+                );
+                // The entropy header is consensus-critical genesis input. The
+                // exploratory engine above was built only to locate a
+                // deterministic eligible fixture seed; rebuild from an empty
+                // store so its height-zero anchor and fingerprint bind the
+                // finalized manifest rather than the placeholder header.
+                drop(driver);
+                std::fs::remove_dir_all(&dir).unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&genesis_path, persisted).unwrap();
+                let engine = NodeEngine::init(config).unwrap();
+                let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+                return (ConsensusDriver::new(engine, vote_safety), dir);
+            }
+        }
+        panic!("test genesis could not find an eligible deterministic election seed")
+    }
+
+    fn make_strict_block(
+        driver: &ConsensusDriver,
+        proposer_seed: [u8; 32],
+        round: u32,
+        prev_qc_bytes: Vec<u8>,
+
+```
+
+FILE: indra-node/src/genesis.rs
+SYMBOL: seal_test_genesis_fixture
+VISIBILITY: current source visibility
+CURRENT SHA-256 OF FILE: 4eefa6e51b815e7e4327756395dd5885e552467758026a542d14f4cba9240c6b
+
+```rust
+pub fn seal_test_genesis_fixture(content: &str) -> String {
+    if let Ok(manifest) = toml::from_str::<GenesisManifest>(content) {
+        let hash = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
+        return content.replacen(
+            &manifest.genesis.genesis_precommit_hash,
+            &hex::encode(hash.0),
+            1,
+        );
+    }
+    let placeholder = hex::encode([0u8; 32]);
+    let mut provisional = content.replacen(
+        "[genesis]\n",
+        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
+        1,
+    );
+    let validator_offsets = provisional
+        .match_indices("[[validators]]\n")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    for (validator_index, offset) in validator_offsets.into_iter().enumerate().rev() {
+        let insertion = offset + "[[validators]]\n".len();
+        provisional.insert_str(
+            insertion,
+            &format!(
+                "genesis_commitment_nonce = \"{}\"\n",
+                hex::encode([0x70u8.checked_add(validator_index as u8).unwrap(); 32])
+            ),
+
+```
+
+FILE: indra-node/src/config.rs
+SYMBOL: NodeConfig
+VISIBILITY: current source visibility
+CURRENT SHA-256 OF FILE: b076755948a0100c14d18c8668c22a12b2c25877be301385535fc16879641d80
+
+```rust
+pub struct NodeConfig {
+    /// Directory for persistent data (blocks, state snapshots, WAL).
+    pub data_dir: PathBuf,
+
+    /// Optional path to `genesis.toml` for seeding the initial validator set.
+    ///
+    /// This is applied exactly once when building the base genesis state
+    /// before any block replay. Snapshot-based restarts do not reload genesis
+    /// into an already-populated state.
+    pub genesis_path: Option<String>,
+
+    /// Minimum genesis validator count. Production configurations must use 4;
+    /// `local_test` uses 1 solely for focused single-validator unit fixtures.
+    pub(crate) genesis_validator_minimum: usize,
+
+    /// The node's validator identity (32-byte Ed25519 seed).
+    /// If None, this node is a full node (validates but does not propose).
+    pub validator_seed: Option<[u8; 32]>,
+
+    /// The node's VRF seed (32 bytes).
+    /// Required if validator_seed is set.
+    pub vrf_seed: Option<[u8; 32]>,
+
+    /// The node's ML-DSA-87 seed bytes (from keys.json).
+    /// Required if validator_seed is set.
+    pub pq_seed: Option<Vec<u8>>,
+
+    /// The node's ML-DSA-87 public key bytes (from keys.json).
+    pub pq_pk: Option<Vec<u8>>,
+
+    /// Listen address for P2P (Phase 6).
+    pub p2p_addr: String,
+
+    /// Bootstrap peer addresses (Phase 6).
+    pub bootstrap_peers: Vec<String>,
+
+    /// DNS seed hostname for peer discovery.
+    pub dns_seed_host: String,
+
+    /// Whether DNS-based peer discovery is enabled.
+    pub dns_discovery_enabled: bool,
+
+    /// DNSSEC validation policy for DNS seed hostname responses.
+    pub dns_seed_validation: DnsSeedValidationMode,
+
+    /// Signed DNS node-list validation policy.
+    pub dns_seed_signed_validation: SignedDnsSeedValidationMode,
+
+    /// ML-DSA-87 public key for signed DNS node-list verification.
+    ///
+    /// This key is the trust anchor for signed discovery and must be known
+    /// independently of DNS. DNS is only transport for the signed list.
+    pub dns_seed_signed_public_key: Option<Vec<u8>>,
+
+    /// Path to peer table persistence file.
+    pub peers_file: String,
+
+    /// How many blocks between state snapshots.
+    pub snapshot_interval: u64,
+
+    /// Maximum mempool size (number of transactions).
+    pub mempool_capacity: usize,
+
+    /// Maximum staking operations held in the local staking-op mempool.
+    pub staking_mempool_capacity: usize,
+
+    /// Maximum governance operations held in the local governance-op mempool.
+    pub governance_mempool_capacity: usize,
+
+    /// Number of recent blocks to keep in pruned mode.
+    ///
+    /// `None` means archive mode.
+    pub prune_keep_blocks: Option<u64>,
+
+    /// Listen address for the observer/full-node port.
+    ///
+    /// `None` disables the observer port entirely.
+    pub observer_addr: Option<String>,
+
+    /// Listen address for the Prometheus metrics endpoint.
+    ///
+    /// `None` disables metrics entirely.
+    pub metrics_addr: Option<String>,
+}
+
+/// Default staking-op mempool capacity.
+pub const DEFAULT_STAKING_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Hard upper bound for the operator-configurable transaction mempool.
+pub const MAX_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Hard upper bound for the operator-configurable staking-operation pool.
+pub const MAX_STAKING_MEMPOOL_CAPACITY: usize = 5_000;
+
+/// Default governance-op mempool capacity.
+///
+/// The expected governance burst is bounded by active validators and active
+/// proposals: commits, reveals, and redelegations for each active validator,
+/// plus headroom for propose/execute/cancel operations.
+pub fn default_governance_mempool_capacity() -> usize {
+    max_governance_mempool_capacity()
+}
+
+/// Hard upper bound for the operator-configurable governance-operation pool.
+///
+/// This follows the same active-validator × active-proposal × four-operation
+/// headroom formula as the default, rather than duplicating a numeric value.
+pub fn max_governance_mempool_capacity() -> usize {
+    MAX_ACTIVE_VALIDATORS
+        .saturating_mul(MAX_ACTIVE_GOVERNANCE_PROPOSALS)
+        .saturating_mul(4)
+        .max(256)
+}
+
+/// Validate every operator-configurable pending-pool capacity.
+pub fn validate_pool_capacities(
+    mempool_capacity: usize,
+    staking_mempool_capacity: usize,
+    governance_mempool_capacity: usize,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if !(1..=MAX_MEMPOOL_CAPACITY).contains(&mempool_capacity) {
+        errors.push(format!(
+            "storage.mempool_capacity must be between 1 and {MAX_MEMPOOL_CAPACITY}"
+        ));
+    }
+    if !(1..=MAX_STAKING_MEMPOOL_CAPACITY).contains(&staking_mempool_capacity) {
+        errors.push(format!(
+            "storage.staking_mempool_capacity must be between 1 and {MAX_STAKING_MEMPOOL_CAPACITY}"
+        ));
+    }
+    let governance_max = max_governance_mempool_capacity();
+    if !(1..=governance_max).contains(&governance_mempool_capacity) {
+        errors.push(format!(
+            "storage.governance_mempool_capacity must be between 1 and {governance_max}"
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+```
+
+FILE: indra-node/src/config.rs
+SYMBOL: NodeConfig::local_test
+VISIBILITY: current source visibility
+CURRENT SHA-256 OF FILE: b076755948a0100c14d18c8668c22a12b2c25877be301385535fc16879641d80
+
+```rust
+impl NodeConfig {
+    /// Create a default configuration for local testing.
+    pub fn local_test(data_dir: PathBuf) -> Self {
+        let genesis_path = data_dir.join("genesis.toml");
+        std::fs::create_dir_all(&data_dir).expect("create local-test data directory");
+        if !genesis_path.exists() {
+            let hot = indra_crypto::HybridKeypair::new(
+                indra_crypto::ClassicalKeypair::from_seed(&[0x42; 32]),
+                indra_crypto::PqKeypair::from_seed(&[0x43; 32]).unwrap(),
+            );
+            let cold =
+                indra_crypto::ColdHybridKeypair::from_independent_seeds([0x44; 32], [0x45; 32])
+                    .unwrap();
+            let hot_public = hot.public_key();
+            let cold_public = cold.public_key();
+            let cold_public = cold_public.as_complete_hybrid();
+            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]);
+            let vrf_public = vrf.public_key();
+            let validator_id = indra_core::types::crypto::HybridPubKey {
+                classical_pk: indra_core::Bytes32::from(hot_public.classical.0),
+                pq_pk: indra_core::VariableBytes::from_slice(&hot_public.pq.0)
+                    .expect("fixed-size ML-DSA-87 public key fits protocol maximum"),
+            }
+            .identity_id()
+            .0;
+            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+                "indra-testnet-1",
+                &indra_core::Bytes32::from(validator_id),
+                &indra_core::Bytes32::from(vrf_public),
+                0,
+            )
+            .expect("local test VRF challenge");
+            let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+            let contents = format!(
+                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+                hex::encode(validator_id), hex::encode(hot_public.classical.0),
+                hex::encode(hot_public.pq.0), hex::encode(vrf_public),
+                hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
+                hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
+            );
+            let contents = {
+                let placeholder = hex::encode([0u8; 32]);
+                let provisional = contents
+                    .replacen(
+                        "[genesis]\n",
+                        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
+                        1,
+                    )
+                    .replacen(
+                        "[[validators]]\n",
+                        &format!(
+                            "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
+                            hex::encode([0x70u8; 32])
+                        ),
+                        1,
+                    );
+                let manifest: crate::genesis::GenesisManifest = toml::from_str(&provisional)
+                    .expect("generated local-test genesis has the current schema");
+                let hash =
+                    crate::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
+                        .expect("generated local-test genesis precommit is canonical");
+                provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
+            };
+            std::fs::write(&genesis_path, contents).expect("write local-test genesis");
+        }
+        let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
+        Self {
+            data_dir,
+            genesis_path: Some(genesis_path.to_string_lossy().to_string()),
+            genesis_validator_minimum: 1,
+            validator_seed: Some([0x42u8; 32]),
+
+```
+
+FILE: indra-storage/src/vote_safety.rs
+SYMBOL: VoteSafetyStore
+VISIBILITY: current source visibility
+CURRENT SHA-256 OF FILE: ddac0327843038555c6b485cdb4ce42e54c56cf7edbd38e6742dd1d792adb987
+
+```rust
+pub struct VoteSafetyStore {
+    path: PathBuf,
+    tmp_path: PathBuf,
+}
+
+impl VoteSafetyStore {
+    /// Open a safety store at the given path.
+    pub fn open(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
+        let tmp_path = path.with_extension("tmp");
+        Self { path, tmp_path }
+    }
+
+    /// Persist the latest vote and current lock atomically before signing.
+    pub fn record(
+        &self,
+        height: u64,
+        round: u32,
+        step: u8,
+        consensus_lock: Option<&PersistedConsensusLock>,
+    ) -> StorageResult<()> {
+        validate_consensus_round(round)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+        if let VoteSafetyLoadResult::Record(existing) = self.load() {
+            let existing_slot = (existing.height, existing.round, existing.step);
+
+```
+
+## FINAL HASH TABLE
+indra-node/src/driver.rs  4ea08bcd6d6b5e57eeb71bead1081be8844d6b701c40b5dd18b62ea268fba6a5
+indra-node/src/genesis.rs  4eefa6e51b815e7e4327756395dd5885e552467758026a542d14f4cba9240c6b
+indra-node/src/config.rs  b076755948a0100c14d18c8668c22a12b2c25877be301385535fc16879641d80
+indra-storage/src/vote_safety.rs  ddac0327843038555c6b485cdb4ce42e54c56cf7edbd38e6742dd1d792adb987
+

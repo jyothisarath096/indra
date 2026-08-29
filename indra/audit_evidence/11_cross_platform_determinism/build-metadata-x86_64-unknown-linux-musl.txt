@@ -1,0 +1,17 @@
+execution_class=NOT_EXECUTED
+reason=no native x86_64 Linux execution environment available; no emulation was used
+build_class=CROSS_COMPILED_ONLY
+build_host=Apple M4 aarch64 macOS
+target=x86_64-unknown-linux-musl
+rustc=1.93.1 (01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf)
+cargo=1.93.1 (083ac5135f967fd9dc906ab057a2315861c7a80d)
+llvm=21.1.8
+profile=release
+rustflags=<empty>
+features=default only
+linker=rust-lld 21.1.8 via rust-lld-driver.py
+source_revision=b6404ccacc508d92a022f50ad1af3da4d4e31a02 (dirty worktree)
+root_Cargo.lock_sha256=5479dc079feaa81055de2a26ef585c9778b5257ace77d5e805229bc2679ab7b7
+audit_Cargo.lock_sha256=2fa5f97878d92192b5ec33344f07de90cc7906acb2dbc382f55afa09c9cb17bb
+binary_sha256=7fd2b26044eb23d0f68a404d00cb18b25f08c2a67aa41e4b3df45521981e01d8
+result_sha256=UNAVAILABLE

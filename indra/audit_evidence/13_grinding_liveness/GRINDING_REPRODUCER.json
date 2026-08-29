@@ -1,0 +1,26 @@
+{
+  "finding": "L2-GR-01",
+  "description": "adaptive whole-proposal withholding biases next-height coalition eligibility",
+  "inputs": {
+    "f": "0.5",
+    "coalition_stake_fraction": "0.33",
+    "honest_online_stake_fraction": "0.67",
+    "strategy": "publish an adversary-only eligible proposal iff its resulting next seed elects the coalition at next height round 0; otherwise withhold"
+  },
+  "analytic_results": {
+    "baseline_next_height_coalition_eligibility": "0.2044635162450813291201932204438704654009",
+    "biased_next_height_coalition_eligibility": "0.2570133745218283521861316893273405563761",
+    "absolute_bias": "0.05254985827674702306593846888347009097522",
+    "relative_advantage": "0.2570133745218283521861316893273405563761",
+    "balanced_predicate_tv_lower_bound": "0.07372786766258725601124086713603857718473",
+    "expected_rounds_to_terminal": "2.514026749043656704372263378654681112752"
+  },
+  "derivation": {
+    "p_b": "1-(1-f)^beta",
+    "p_h": "1-(1-f)^(1-beta)",
+    "p_only_b": "p_b*(1-p_h)",
+    "target": "p_b",
+    "race_win": "p_only_b*target/(p_h+p_only_b*target)",
+    "biased_target": "target+(1-target)*race_win"
+  }
+}

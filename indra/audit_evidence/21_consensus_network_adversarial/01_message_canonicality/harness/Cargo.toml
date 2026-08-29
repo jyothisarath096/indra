@@ -1,0 +1,11 @@
+[package]
+name = "message-canonicality-audit-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indra-core = { path = "../../../../indra-core" }
+indra-network = { path = "../../../../indra-network" }
+
+[workspace]
+

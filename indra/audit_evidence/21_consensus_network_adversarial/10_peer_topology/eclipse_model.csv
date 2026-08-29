@@ -1,0 +1,6 @@
+byzantine_validators,addresses_per_validator,candidate_share,logical_active_share,observation
+1,1,1/200,at most 1 peer,validator deduplication
+1,10,up to 10/256,at most 1 peer,address multiplicity before auth
+10,10,up to 100/256,at most 10 peers,below one-third authority
+40,10,up to 256/256,at most 40 peers,discovery can be attacker-heavy
+66,1,up to 66/256,at most 66 peers,still below one-third

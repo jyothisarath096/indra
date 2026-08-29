@@ -1,0 +1,3555 @@
+diff --git a/indra/indra-consensus/src/qc.rs b/indra/indra-consensus/src/qc.rs
+index b74d07a1..8a298ddf 100644
+--- a/indra/indra-consensus/src/qc.rs
++++ b/indra/indra-consensus/src/qc.rs
+@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
+ use indra_core::types::{
+     crypto::PQVoteSig,
+     primitives::{
+-        has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, Bytes32, VariableBytes,
+-        MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
++        has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, validate_consensus_round,
++        Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
+     },
+     qc::{ClassicalVoteSig, QuorumCertificateV1},
+     vote::{VoteStep, VoteV1},
+@@ -42,6 +42,7 @@ pub struct QcBuilder {
+     round: u32,
+     block_hash: Bytes32,
+     chain_id: String,
++    snapshot_root: Bytes32,
+     validators: Vec<QcValidator>,
+     total_stake: u64,
+     votes: BTreeMap<Bytes32, VoteV1>,
+@@ -54,6 +55,7 @@ impl QcBuilder {
+         round: u32,
+         block_hash: Bytes32,
+         chain_id: String,
++        snapshot_root: Bytes32,
+         validators: Vec<QcValidator>,
+     ) -> Self {
+         let total_stake = validators
+@@ -65,6 +67,7 @@ impl QcBuilder {
+             round,
+             block_hash,
+             chain_id,
++            snapshot_root,
+             validators,
+             total_stake,
+             votes: BTreeMap::new(),
+@@ -76,6 +79,7 @@ impl QcBuilder {
+         if vote.height == self.height
+             && vote.round == self.round
+             && vote.block_hash == self.block_hash
++            && vote.snapshot_root == self.snapshot_root
+         {
+             self.votes.insert(vote.validator_id, vote);
+         }
+@@ -97,6 +101,7 @@ impl QcBuilder {
+ 
+     /// Build the QC if quorum has been reached.
+     pub fn build(&self) -> ConsensusResult<QuorumCertificateV1> {
++        validate_round(self.round)?;
+         let stake_bps = self.current_stake_bps();
+         let voted_stake = self
+             .votes
+@@ -115,6 +120,7 @@ impl QcBuilder {
+             self.round,
+             self.block_hash,
+             &self.chain_id,
++            self.snapshot_root,
+             &self.validators,
+             self.votes.values().collect(),
+         )
+@@ -127,10 +133,19 @@ pub fn build_qc(
+     round: u32,
+     block_hash: Bytes32,
+     chain_id: &str,
++    snapshot_root: Bytes32,
+     validators: &[QcValidator],
+     votes: Vec<&VoteV1>,
+ ) -> ConsensusResult<QuorumCertificateV1> {
+-    build_qc_from_votes(height, round, block_hash, chain_id, validators, votes)
++    build_qc_from_votes(
++        height,
++        round,
++        block_hash,
++        chain_id,
++        snapshot_root,
++        validators,
++        votes,
++    )
+ }
+ 
+ fn build_qc_from_votes(
+@@ -138,9 +153,11 @@ fn build_qc_from_votes(
+     round: u32,
+     block_hash: Bytes32,
+     _chain_id: &str,
++    snapshot_root: Bytes32,
+     validators: &[QcValidator],
+     votes: Vec<&VoteV1>,
+ ) -> ConsensusResult<QuorumCertificateV1> {
++    validate_round(round)?;
+     let by_id: HashMap<Bytes32, &QcValidator> =
+         validators.iter().map(|v| (v.validator_id, v)).collect();
+ 
+@@ -148,6 +165,11 @@ fn build_qc_from_votes(
+     let mut pq_sigs = Vec::new();
+     let mut classical_sigs = Vec::new();
+     for vote in &votes {
++        if vote.snapshot_root != snapshot_root {
++            return Err(ConsensusError::CryptoError {
++                detail: "mixed or incorrect snapshot roots in QC votes".to_string(),
++            });
++        }
+         let Some(validator) = by_id.get(&vote.validator_id) else {
+             continue;
+         };
+@@ -186,6 +208,7 @@ fn build_qc_from_votes(
+         height,
+         round,
+         block_hash,
++        snapshot_root,
+         signer_bitfield,
+         pq_signatures: pq_sigs,
+         classical_signatures: classical_sigs,
+@@ -261,6 +284,7 @@ pub fn verify_qc(
+     total_stake: u64,
+     chain_id: &str,
+ ) -> ConsensusResult<()> {
++    validate_round(qc.round)?;
+     let signers = signer_validators(qc, validators)?;
+     let signed_stake = signers
+         .iter()
+@@ -316,6 +340,7 @@ pub fn verify_qc(
+             VoteStep::Precommit,
+             &qc.block_hash,
+             &validator.validator_id,
++            &qc.snapshot_root,
+             chain_id,
+         );
+         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
+@@ -371,6 +396,14 @@ pub fn verify_qc(
+     Ok(())
+ }
+ 
++fn validate_round(round: u32) -> ConsensusResult<()> {
++    validate_consensus_round(round)
++        .map(|_| ())
++        .map_err(|error| ConsensusError::InvalidRound {
++            detail: error.to_string(),
++        })
++}
++
+ /// Verify a QC with full hybrid signature enforcement.
+ ///
+ /// Both ML-DSA-87 (PQ) and
+@@ -390,7 +423,16 @@ mod tests {
+     use super::*;
+     use crate::vote::produce_vote;
+     use indra_core::types::primitives::DEFAULT_CHAIN_ID;
++    use indra_core::types::{
++        block::VrfSuiteV1,
++        consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
++        primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        qc::verify_qc_against_snapshot,
++    };
+     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
++    use indra_crypto::VrfKeypair;
++
++    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
+ 
+     fn make_validator(seed: u8, position: usize, stake: u64) -> (QcValidator, HybridKeypair) {
+         let classical = ClassicalKeypair::from_seed(&[seed; 32]);
+@@ -408,6 +450,107 @@ mod tests {
+         (v, hybrid_kp)
+     }
+ 
++    #[test]
++    fn qc_is_cryptographically_bound_to_one_snapshot_root() {
++        let (validator, signer) = make_validator(0x61, 0, 1);
++        let public = signer.public_key();
++        let vrf_pk = VrfKeypair::from_seed(&[0x62; 32]).public_key();
++        let entry = |weight| {
++            ConsensusSnapshotEntry::new(
++                validator.validator_id,
++                weight,
++                public.classical.0,
++                public.pq.0,
++                vrf_pk,
++                VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
++                0,
++            )
++            .unwrap()
++        };
++        let snapshot_a = ConsensusSnapshot::new(
++            1,
++            0,
++            vec![entry(1)],
++            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        )
++        .unwrap();
++        let snapshot_b = ConsensusSnapshot::new(
++            1,
++            0,
++            vec![entry(2)],
++            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++        )
++        .unwrap();
++        assert_ne!(snapshot_a.snapshot_root, snapshot_b.snapshot_root);
++
++        let block_hash = Bytes32::from([0x63; 32]);
++        let vote = produce_vote(
++            1,
++            0,
++            VoteStep::Precommit,
++            block_hash,
++            validator.validator_id,
++            snapshot_a.snapshot_root,
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        let qc = build_qc(
++            1,
++            0,
++            block_hash,
++            DEFAULT_CHAIN_ID,
++            snapshot_a.snapshot_root,
++            &[validator],
++            vec![&vote],
++        )
++        .unwrap();
++
++        assert!(verify_qc_against_snapshot(&qc, &snapshot_a, DEFAULT_CHAIN_ID).is_ok());
++        assert!(verify_qc_against_snapshot(&qc, &snapshot_b, DEFAULT_CHAIN_ID).is_err());
++    }
++
++    #[test]
++    fn qc_builder_rejects_mixed_snapshot_votes_before_quorum() {
++        let (a, a_key) = make_validator(0x64, 0, 5);
++        let (b, b_key) = make_validator(0x65, 1, 5);
++        let block_hash = Bytes32::from([0x66; 32]);
++        let root_a = Bytes32::from([0xA1; 32]);
++        let root_b = Bytes32::from([0xB2; 32]);
++        let vote_a = produce_vote(
++            1,
++            0,
++            VoteStep::Precommit,
++            block_hash,
++            a.validator_id,
++            root_a,
++            DEFAULT_CHAIN_ID,
++            &a_key,
++        )
++        .unwrap();
++        let vote_b = produce_vote(
++            1,
++            0,
++            VoteStep::Precommit,
++            block_hash,
++            b.validator_id,
++            root_b,
++            DEFAULT_CHAIN_ID,
++            &b_key,
++        )
++        .unwrap();
++        assert!(build_qc(
++            1,
++            0,
++            block_hash,
++            DEFAULT_CHAIN_ID,
++            root_a,
++            &[a, b],
++            vec![&vote_a, &vote_b],
++        )
++        .is_err());
++    }
++
+     #[test]
+     fn build_qc_single_validator() {
+         let (v, kp) = make_validator(0x01, 0, 10_000);
+@@ -418,6 +561,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -427,6 +571,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v.clone()],
+             vec![&vote],
+         )
+@@ -436,6 +581,38 @@ mod tests {
+         assert_eq!(qc.signer_count(), 1);
+     }
+ 
++    #[test]
++    fn qc_construction_rejects_round_limit_and_above() {
++        let (validator, keypair) = make_validator(0x72, 0, 10_000);
++        let vote = produce_vote(
++            1,
++            0,
++            VoteStep::Precommit,
++            TEST_SNAPSHOT_ROOT,
++            validator.validator_id,
++            TEST_SNAPSHOT_ROOT,
++            DEFAULT_CHAIN_ID,
++            &keypair,
++        )
++        .unwrap();
++        for round in [
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
++            u32::MAX,
++        ] {
++            assert!(build_qc(
++                1,
++                round,
++                TEST_SNAPSHOT_ROOT,
++                DEFAULT_CHAIN_ID,
++                TEST_SNAPSHOT_ROOT,
++                std::slice::from_ref(&validator),
++                vec![&vote],
++            )
++            .is_err());
++        }
++    }
++
+     #[test]
+     fn qc_bitfield_set_correctly() {
+         let (v, kp) = make_validator(0x02, 5, 10_000);
+@@ -446,6 +623,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -455,6 +633,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v.clone()],
+             vec![&vote],
+         )
+@@ -473,6 +652,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -483,6 +663,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash,
++            snapshot_root: TEST_SNAPSHOT_ROOT,
+             signer_bitfield,
+             pq_signatures: vec![PQVoteSig {
+                 validator_id: v.validator_id,
+@@ -508,6 +689,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -517,6 +699,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v.clone()],
+             vec![&vote],
+         )
+@@ -542,6 +725,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -551,6 +735,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v.clone()],
+             vec![&vote],
+         )
+@@ -569,6 +754,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -578,6 +764,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v.clone()],
+             vec![&vote],
+         )
+@@ -602,6 +789,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v1.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp1,
+         )
+@@ -611,6 +799,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &[v1.clone(), v2.clone()],
+             vec![&vote],
+         )
+@@ -631,6 +820,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash,
++            snapshot_root: TEST_SNAPSHOT_ROOT,
+             signer_bitfield,
+             pq_signatures: vec![PQVoteSig {
+                 validator_id: v.validator_id,
+@@ -656,6 +846,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash: Bytes32::from([0x11u8; 32]),
++            snapshot_root: TEST_SNAPSHOT_ROOT,
+             signer_bitfield,
+             pq_signatures: vec![],
+             classical_signatures: vec![],
+@@ -679,6 +870,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -690,6 +882,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash,
++            snapshot_root: TEST_SNAPSHOT_ROOT,
+             signer_bitfield,
+             pq_signatures: vec![
+                 PQVoteSig {
+@@ -748,6 +941,7 @@ mod tests {
+             VoteStep::Precommit,
+             hash_a,
+             byzantine.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &byzantine_key,
+         )
+@@ -758,6 +952,7 @@ mod tests {
+             VoteStep::Precommit,
+             hash_a,
+             honest_a.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &honest_a_key,
+         )
+@@ -768,6 +963,7 @@ mod tests {
+             VoteStep::Precommit,
+             hash_b,
+             byzantine.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &byzantine_key,
+         )
+@@ -778,6 +974,7 @@ mod tests {
+             VoteStep::Precommit,
+             hash_b,
+             honest_b.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &honest_b_key,
+         )
+@@ -788,6 +985,7 @@ mod tests {
+             round,
+             hash_a,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &validators,
+             vec![&byzantine_a, &honest_a_vote],
+         )
+@@ -797,6 +995,7 @@ mod tests {
+             round,
+             hash_b,
+             DEFAULT_CHAIN_ID,
++            TEST_SNAPSHOT_ROOT,
+             &validators,
+             vec![&byzantine_b, &honest_b_vote],
+         )
+diff --git a/indra/indra-consensus/src/vote.rs b/indra/indra-consensus/src/vote.rs
+index b01ab8d0..67df9952 100644
+--- a/indra/indra-consensus/src/vote.rs
++++ b/indra/indra-consensus/src/vote.rs
+@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
+ 
+ use indra_core::types::{
+     crypto::HybridSignature as CoreHybridSignature,
+-    primitives::{has_strict_two_thirds_quorum, muldiv, Bytes32},
++    primitives::{has_strict_two_thirds_quorum, muldiv, validate_consensus_round, Bytes32},
+     vote::{VoteStep, VoteV1},
+ };
+ use indra_crypto::hybrid::{
+@@ -64,6 +64,7 @@ pub struct VoteCollector {
+     step: VoteStep,
+     chain_id: String,
+     voters: Vec<RegisteredVoter>,
++    snapshot_root: Bytes32,
+     total_stake: u64,
+     // validator_id → (vote, stake)
+     received: BTreeMap<Bytes32, (VoteV1, u64)>,
+@@ -76,6 +77,7 @@ impl VoteCollector {
+         round: u32,
+         step: VoteStep,
+         chain_id: String,
++        snapshot_root: Bytes32,
+         voters: Vec<RegisteredVoter>,
+     ) -> Self {
+         let total_stake = voters
+@@ -87,6 +89,7 @@ impl VoteCollector {
+             round,
+             step,
+             chain_id,
++            snapshot_root,
+             voters,
+             total_stake,
+             received: BTreeMap::new(),
+@@ -103,8 +106,9 @@ impl VoteCollector {
+     ///
+     /// Returns the current decision after this vote.
+     pub fn add_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
++        validate_round(vote.round)?;
+         self.validate_dimensions_membership_and_duplicate(&vote)?;
+-        verify_vote_authority(&vote, &self.chain_id, &self.voters)?;
++        verify_vote_authority(&vote, &self.chain_id, &self.snapshot_root, &self.voters)?;
+         self.add_verified_vote(vote)
+     }
+ 
+@@ -116,6 +120,7 @@ impl VoteCollector {
+     /// twice. Structural dimensions and duplicate admission remain enforced
+     /// here.
+     pub fn add_verified_vote(&mut self, vote: VoteV1) -> ConsensusResult<VoteDecision> {
++        validate_round(vote.round)?;
+         self.validate_dimensions_membership_and_duplicate(&vote)?;
+         let voter = self
+             .voters
+@@ -141,6 +146,11 @@ impl VoteCollector {
+                 detail: "vote step mismatch".to_string(),
+             });
+         }
++        if vote.snapshot_root != self.snapshot_root {
++            return Err(ConsensusError::CryptoError {
++                detail: "vote snapshot root mismatch".to_string(),
++            });
++        }
+ 
+         // Resolve stake from the same voter snapshot used by the authority
+         // verification performed by the caller.
+@@ -208,8 +218,15 @@ impl VoteCollector {
+ pub fn verify_vote_authority(
+     vote: &VoteV1,
+     chain_id: &str,
++    expected_snapshot_root: &Bytes32,
+     voters: &[RegisteredVoter],
+ ) -> ConsensusResult<()> {
++    validate_round(vote.round)?;
++    if vote.snapshot_root != *expected_snapshot_root {
++        return Err(ConsensusError::CryptoError {
++            detail: "vote snapshot root mismatch".to_string(),
++        });
++    }
+     let voter = voters
+         .iter()
+         .find(|v| v.validator_id == vote.validator_id)
+@@ -220,6 +237,7 @@ pub fn verify_vote_authority(
+         vote.step,
+         &vote.block_hash,
+         &vote.validator_id,
++        &vote.snapshot_root,
+         chain_id,
+     );
+     let sig_classical: [u8; 64] =
+@@ -266,12 +284,21 @@ pub fn produce_vote(
+     step: VoteStep,
+     block_hash: Bytes32,
+     validator_id: Bytes32,
++    snapshot_root: Bytes32,
+     chain_id: &str,
+     keypair: &HybridKeypair,
+ ) -> ConsensusResult<VoteV1> {
++    validate_round(round)?;
+     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
+-    let signing_bytes =
+-        vote_signing_bytes(height, round, step, &block_hash, &validator_id, chain_id);
++    let signing_bytes = vote_signing_bytes(
++        height,
++        round,
++        step,
++        &block_hash,
++        &validator_id,
++        &snapshot_root,
++        chain_id,
++    );
+     let sig = keypair.sign(&signing_bytes)?;
+     Ok(VoteV1 {
+         height,
+@@ -279,6 +306,7 @@ pub fn produce_vote(
+         step,
+         block_hash,
+         validator_id,
++        snapshot_root,
+         signature: CoreHybridSignature {
+             classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&sig.classical.0)
+                 .map_err(|_| ConsensusError::CryptoError {
+@@ -293,6 +321,14 @@ pub fn produce_vote(
+     })
+ }
+ 
++fn validate_round(round: u32) -> ConsensusResult<()> {
++    validate_consensus_round(round)
++        .map(|_| ())
++        .map_err(|error| ConsensusError::InvalidRound {
++            detail: error.to_string(),
++        })
++}
++
+ /// Produce the canonical bytes a vote signature covers.
+ pub fn vote_signing_bytes(
+     height: u64,
+@@ -300,6 +336,7 @@ pub fn vote_signing_bytes(
+     step: VoteStep,
+     block_hash: &Bytes32,
+     validator_id: &Bytes32,
++    snapshot_root: &Bytes32,
+     chain_id: &str,
+ ) -> Vec<u8> {
+     indra_core::types::vote_signing::vote_signing_bytes(
+@@ -308,6 +345,7 @@ pub fn vote_signing_bytes(
+         step,
+         block_hash,
+         validator_id,
++        snapshot_root,
+         chain_id,
+     )
+ }
+@@ -318,6 +356,8 @@ mod tests {
+     use indra_core::types::{primitives::DEFAULT_CHAIN_ID, vote::VoteStep};
+     use indra_crypto::hybrid::HybridKeypair;
+ 
++    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
++
+     fn voter(seed: u8, stake: u64) -> (RegisteredVoter, HybridKeypair) {
+         let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&[seed; 32]);
+         let pq = indra_crypto::hybrid::PqKeypair::generate();
+@@ -342,6 +382,7 @@ mod tests {
+             0,
+             VoteStep::Precommit,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v.clone()],
+         );
+ 
+@@ -351,6 +392,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -360,6 +402,28 @@ mod tests {
+         assert!(matches!(decision, VoteDecision::QuorumReached { .. }));
+     }
+ 
++    #[test]
++    fn vote_production_rejects_round_limit_and_above() {
++        let (voter, keypair) = voter(0x71, 10_000);
++        for round in [
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
++            u32::MAX,
++        ] {
++            assert!(produce_vote(
++                1,
++                round,
++                VoteStep::Prevote,
++                TEST_SNAPSHOT_ROOT,
++                voter.validator_id,
++                TEST_SNAPSHOT_ROOT,
++                DEFAULT_CHAIN_ID,
++                &keypair,
++            )
++            .is_err());
++        }
++    }
++
+     #[test]
+     fn wrong_height_rejected() {
+         let (v, kp) = voter(0x01, 10_000);
+@@ -369,6 +433,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v.clone()],
+         );
+ 
+@@ -379,6 +444,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -398,6 +464,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v.clone()],
+         );
+ 
+@@ -407,6 +474,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -426,6 +494,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v],
+         );
+ 
+@@ -435,6 +504,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             stranger.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &stranger_kp,
+         )
+@@ -451,6 +521,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v.clone()],
+         );
+ 
+@@ -460,6 +531,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp,
+         )
+@@ -482,6 +554,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             "indra-testnet-1",
+             &kp,
+         )
+@@ -491,6 +564,7 @@ mod tests {
+             0,
+             VoteStep::Precommit,
+             "indra-mainnet-1".to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v],
+         );
+ 
+@@ -513,6 +587,7 @@ mod tests {
+             0,
+             VoteStep::Precommit,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v1.clone(), v2.clone(), v3.clone()],
+         );
+ 
+@@ -523,6 +598,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v1.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp1,
+         )
+@@ -533,6 +609,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v2.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp2,
+         )
+@@ -557,6 +634,7 @@ mod tests {
+             0,
+             VoteStep::Precommit,
+             DEFAULT_CHAIN_ID.to_string(),
++            TEST_SNAPSHOT_ROOT,
+             vec![v1.clone(), v2.clone(), v3.clone()],
+         );
+ 
+@@ -566,6 +644,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v1.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp1,
+         )
+@@ -576,6 +655,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v2.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp2,
+         )
+@@ -586,6 +666,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             v3.validator_id,
++            TEST_SNAPSHOT_ROOT,
+             DEFAULT_CHAIN_ID,
+             &kp3,
+         )
+diff --git a/indra/indra-consensus/tests/consensus.rs b/indra/indra-consensus/tests/consensus.rs
+index d4bd442d..f17e66bd 100644
+--- a/indra/indra-consensus/tests/consensus.rs
++++ b/indra/indra-consensus/tests/consensus.rs
+@@ -121,7 +121,8 @@ impl TestValidator {
+ #[test]
+ fn mempool_to_block_pipeline() {
+     let mut state = ChainState::new_genesis();
+-    state.active_slot_coefficient_numerator = 1u64 << 63;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
+     let mut mempool = Mempool::default_config();
+     let (owner_pubkey, owner_keypair) = make_user_keypair(0x55);
+@@ -211,7 +212,11 @@ fn mempool_to_block_pipeline() {
+             chain_id: state.chain_id.as_bytes().to_vec(),
+             election_seed: state.election_seed,
+             snapshot_root: state.consensus_snapshots[0].snapshot_root,
+-            active_slot_coefficient_numerator: 1u64 << 63,
++            active_slot_coefficient_numerator:
++                indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
++            sortition_log: state.consensus_snapshots[0]
++                .sortition_log_interval()
++                .unwrap(),
+             height: 1,
+             round,
+             candidates: vec![ProposerCandidate {
+@@ -269,6 +274,7 @@ fn full_consensus_round() {
+         round,
+         VoteStep::Precommit,
+         DEFAULT_CHAIN_ID.to_string(),
++        Bytes32::ZERO,
+         voters,
+     );
+ 
+@@ -279,6 +285,7 @@ fn full_consensus_round() {
+             VoteStep::Precommit,
+             block_hash,
+             v.id,
++            Bytes32::ZERO,
+             DEFAULT_CHAIN_ID,
+             &v.hybrid_kp,
+         )
+@@ -303,6 +310,7 @@ fn full_consensus_round() {
+         round,
+         block_hash,
+         DEFAULT_CHAIN_ID.to_string(),
++        Bytes32::ZERO,
+         qc_validators.clone(),
+     );
+     for vote in collector.accepted_votes() {
+@@ -373,6 +381,7 @@ fn qc_builder_quorum_detection() {
+         0,
+         block_hash,
+         DEFAULT_CHAIN_ID.to_string(),
++        Bytes32::ZERO,
+         qc_validators.clone(),
+     );
+ 
+@@ -386,6 +395,7 @@ fn qc_builder_quorum_detection() {
+         VoteStep::Precommit,
+         block_hash,
+         v1.id,
++        Bytes32::ZERO,
+         DEFAULT_CHAIN_ID,
+         &v1.hybrid_kp,
+     )
+@@ -412,6 +422,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
+         .map(|(i, v)| v.as_qc_validator(i))
+         .collect();
+     let block_hash = Bytes32::from([0xEFu8; 32]);
++    let snapshot_root = Bytes32::from([0x5Au8; 32]);
+     let height = 7u64;
+     let round = 0u32;
+ 
+@@ -429,6 +440,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
+                 VoteStep::Precommit,
+                 block_hash,
+                 validator.id,
++                snapshot_root,
+                 DEFAULT_CHAIN_ID,
+                 &validator.hybrid_kp,
+             )
+@@ -452,6 +464,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
+         height,
+         round,
+         block_hash,
++        snapshot_root,
+         signer_bitfield,
+         pq_signatures,
+         classical_signatures,
+diff --git a/indra/indra-core/src/types/qc.rs b/indra/indra-core/src/types/qc.rs
+index 72993428..96965f25 100644
+--- a/indra/indra-core/src/types/qc.rs
++++ b/indra/indra-core/src/types/qc.rs
+@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
+ pub const SIGNER_BITFIELD_BYTES: usize = MAX_VALIDATORS.div_ceil(8);
+ /// QC format version for pre-hybrid PQ-only signatures.
+ /// QC format version for hybrid PQ + Ed25519 signatures.
+-pub const QC_FORMAT_HYBRID: u8 = 2;
++pub const QC_FORMAT_HYBRID: u8 = 3;
+ 
+ /// Ed25519 vote signature carried inside a hybrid quorum certificate.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -63,6 +63,8 @@ pub struct QuorumCertificateV1 {
+     pub round: u32,
+     /// Certified full block hash.
+     pub block_hash: Bytes32,
++    /// Root of the immutable consensus snapshot governing `height`.
++    pub snapshot_root: Bytes32,
+     /// Bitfield: bit i = 1 → validator at slot i signed.
+     pub signer_bitfield: [u8; SIGNER_BITFIELD_BYTES],
+     /// Individual ML-DSA-87 signatures for included validators.
+@@ -105,6 +107,12 @@ impl VerifiedQc {
+ /// Failure from authoritative QC verification against a frozen snapshot.
+ #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+ pub enum QcVerificationError {
++    /// QC round lies outside the finite consensus domain.
++    #[error("QC contains an invalid consensus round")]
++    InvalidRound,
++    /// QC names a snapshot other than the supplied governing snapshot.
++    #[error("QC snapshot root does not match the governing snapshot")]
++    SnapshotRootMismatch,
+     /// A set bit has no corresponding snapshot member.
+     #[error("QC signer bitfield references an absent validator")]
+     UnknownSignerPosition,
+@@ -135,6 +143,11 @@ pub fn verify_qc_against_snapshot(
+     snapshot: &ConsensusSnapshot,
+     chain_id: &str,
+ ) -> Result<VerifiedQc, QcVerificationError> {
++    crate::types::primitives::validate_consensus_round(qc.round)
++        .map_err(|_| QcVerificationError::InvalidRound)?;
++    if qc.snapshot_root != snapshot.snapshot_root {
++        return Err(QcVerificationError::SnapshotRootMismatch);
++    }
+     let mut signers = Vec::new();
+     for (byte_index, byte) in qc.signer_bitfield.iter().copied().enumerate() {
+         for bit_index in 0..8 {
+@@ -188,6 +201,7 @@ pub fn verify_qc_against_snapshot(
+             VoteStep::Precommit,
+             &qc.block_hash,
+             &signer.validator_id,
++            &qc.snapshot_root,
+             chain_id,
+         );
+         let pq_signature = pq
+@@ -255,6 +269,7 @@ impl Encode for QuorumCertificateV1 {
+         self.height.encode(buf);
+         self.round.encode(buf);
+         self.block_hash.encode(buf);
++        self.snapshot_root.encode(buf);
+         buf.extend_from_slice(&self.signer_bitfield);
+         encode_list(&self.pq_signatures, buf);
+         encode_list(&self.classical_signatures, buf);
+@@ -263,6 +278,7 @@ impl Encode for QuorumCertificateV1 {
+         1 + 8
+             + 4
+             + 32
++            + 32
+             + SIGNER_BITFIELD_BYTES
+             + list_encoded_len(&self.pq_signatures)
+             + list_encoded_len(&self.classical_signatures)
+@@ -276,8 +292,9 @@ impl Decode for QuorumCertificateV1 {
+             return Err(IndraError::InvalidQcFormat { format });
+         }
+         let height = u64::decode(r)?;
+-        let round = u32::decode(r)?;
++        let round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
+         let block_hash = Bytes32::decode(r)?;
++        let snapshot_root = Bytes32::decode(r)?;
+         let bf_bytes = r.read_bytes(SIGNER_BITFIELD_BYTES)?;
+         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
+         signer_bitfield.copy_from_slice(bf_bytes);
+@@ -287,6 +304,7 @@ impl Decode for QuorumCertificateV1 {
+             height,
+             round,
+             block_hash,
++            snapshot_root,
+             signer_bitfield,
+             pq_signatures,
+             classical_signatures,
+@@ -304,6 +322,7 @@ mod tests {
+             height: 1_000,
+             round: 0,
+             block_hash: Bytes32::from([0x77u8; 32]),
++            snapshot_root: Bytes32::from([0x88u8; 32]),
+             signer_bitfield: [0b11111111u8; SIGNER_BITFIELD_BYTES],
+             pq_signatures: vec![],
+             classical_signatures: vec![],
+@@ -325,6 +344,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash: Bytes32::from([0x01; 32]),
++            snapshot_root: Bytes32::from([0x02; 32]),
+             signer_bitfield: [0u8; SIGNER_BITFIELD_BYTES],
+             pq_signatures: vec![],
+             classical_signatures: vec![ClassicalVoteSig {
+@@ -405,6 +425,24 @@ mod tests {
+         assert_eq!(SIGNER_BITFIELD_BYTES, 188);
+     }
+ 
++    #[test]
++    fn decoder_enforces_finite_round_domain() {
++        for round in [0, crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
++            let mut qc = dummy_qc();
++            qc.round = round;
++            assert!(QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).is_ok());
++        }
++        for round in [
++            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT,
++            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
++            u32::MAX,
++        ] {
++            let mut qc = dummy_qc();
++            qc.round = round;
++            assert!(QuorumCertificateV1::decode_exact(&qc.encode_to_vec()).is_err());
++        }
++    }
++
+     #[test]
+     fn is_signer_checks_bit() {
+         let mut qc = dummy_qc();
+diff --git a/indra/indra-core/src/types/vote.rs b/indra/indra-core/src/types/vote.rs
+index 4de9837a..8a6b0fc1 100644
+--- a/indra/indra-core/src/types/vote.rs
++++ b/indra/indra-core/src/types/vote.rs
+@@ -51,6 +51,8 @@ pub struct VoteV1 {
+     pub block_hash: Bytes32,
+     /// Validator's identity.
+     pub validator_id: Bytes32,
++    /// Root of the immutable consensus snapshot governing `height`.
++    pub snapshot_root: Bytes32,
+     /// Hybrid signature over the canonical vote signing bytes.
+     pub signature: HybridSignature,
+ }
+@@ -62,26 +64,29 @@ impl Encode for VoteV1 {
+         self.step.encode(buf);
+         self.block_hash.encode(buf);
+         self.validator_id.encode(buf);
++        self.snapshot_root.encode(buf);
+         self.signature.encode(buf);
+     }
+     fn encoded_len(&self) -> usize {
+-        8 + 4 + 1 + 32 + 32 + self.signature.encoded_len()
++        8 + 4 + 1 + 32 + 32 + 32 + self.signature.encoded_len()
+     }
+ }
+ 
+ impl Decode for VoteV1 {
+     fn decode(r: &mut ByteReader<'_>) -> IndraResult<Self> {
+         let height = u64::decode(r)?;
+-        let round = u32::decode(r)?;
++        let round = crate::types::primitives::validate_consensus_round(u32::decode(r)?)?;
+         let step = VoteStep::decode(r)?;
+         let block_hash = Bytes32::decode(r)?;
+         let validator_id = Bytes32::decode(r)?;
++        let snapshot_root = Bytes32::decode(r)?;
+         Ok(Self {
+             height,
+             round,
+             step,
+             block_hash,
+             validator_id,
++            snapshot_root,
+             signature: HybridSignature::decode(r)?,
+         })
+     }
+@@ -107,6 +112,7 @@ mod tests {
+             step: VoteStep::Precommit,
+             block_hash: Bytes32::from([0xAAu8; 32]),
+             validator_id: Bytes32::from([0xBBu8; 32]),
++            snapshot_root: Bytes32::from([0xCCu8; 32]),
+             signature: HybridSignature {
+                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                 pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+@@ -120,6 +126,24 @@ mod tests {
+         assert_eq!(v, VoteV1::decode_exact(&v.encode_to_vec()).unwrap());
+     }
+ 
++    #[test]
++    fn decoder_enforces_finite_round_domain() {
++        for round in [0, crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
++            let mut vote = dummy_vote();
++            vote.round = round;
++            assert!(VoteV1::decode_exact(&vote.encode_to_vec()).is_ok());
++        }
++        for round in [
++            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT,
++            crate::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
++            u32::MAX,
++        ] {
++            let mut vote = dummy_vote();
++            vote.round = round;
++            assert!(VoteV1::decode_exact(&vote.encode_to_vec()).is_err());
++        }
++    }
++
+     #[test]
+     fn vote_step_encoding() {
+         assert_eq!(VoteStep::Prevote.encode_to_vec(), vec![0x00]);
+diff --git a/indra/indra-core/src/types/vote_signing.rs b/indra/indra-core/src/types/vote_signing.rs
+index cf624d8a..85404b7d 100644
+--- a/indra/indra-core/src/types/vote_signing.rs
++++ b/indra/indra-core/src/types/vote_signing.rs
+@@ -14,6 +14,7 @@ pub fn vote_signing_bytes(
+     step: VoteStep,
+     block_hash: &Bytes32,
+     validator_id: &Bytes32,
++    snapshot_root: &Bytes32,
+     chain_id: &str,
+ ) -> Vec<u8> {
+     let chain_bytes = chain_id.as_bytes();
+@@ -26,6 +27,7 @@ pub fn vote_signing_bytes(
+     step.encode(&mut buf);
+     block_hash.encode(&mut buf);
+     validator_id.encode(&mut buf);
++    snapshot_root.encode(&mut buf);
+     buf
+ }
+ 
+@@ -39,16 +41,18 @@ mod tests {
+             1,
+             0,
+             VoteStep::Precommit,
+-            &Bytes32::ZERO,
+-            &Bytes32::ZERO,
++            &Bytes32::from([0x5A; 32]),
++            &Bytes32::from([0x5A; 32]),
++            &Bytes32::from([0x5A; 32]),
+             "indra-testnet-1",
+         );
+         let bytes_mainnet = vote_signing_bytes(
+             1,
+             0,
+             VoteStep::Precommit,
++            &Bytes32::from([0x5A; 32]),
+             &Bytes32::ZERO,
+-            &Bytes32::ZERO,
++            &Bytes32::from([0x5A; 32]),
+             "indra-mainnet-1",
+         );
+         assert_ne!(
+@@ -65,6 +69,7 @@ mod tests {
+             VoteStep::Precommit,
+             &Bytes32::ZERO,
+             &Bytes32::ZERO,
++            &Bytes32::from([0x5A; 32]),
+             "indra-testnet-1",
+         );
+         let second = vote_signing_bytes(
+@@ -73,6 +78,30 @@ mod tests {
+             VoteStep::Precommit,
+             &Bytes32([1; 32]),
+             &Bytes32::ZERO,
++            &Bytes32::from([0x5A; 32]),
++            "indra-testnet-1",
++        );
++        assert_ne!(first, second);
++    }
++
++    #[test]
++    fn vote_signing_bytes_bind_snapshot_root() {
++        let first = vote_signing_bytes(
++            1,
++            0,
++            VoteStep::Precommit,
++            &Bytes32::ZERO,
++            &Bytes32::ZERO,
++            &Bytes32::from([1; 32]),
++            "indra-testnet-1",
++        );
++        let second = vote_signing_bytes(
++            1,
++            0,
++            VoteStep::Precommit,
++            &Bytes32::ZERO,
++            &Bytes32::ZERO,
++            &Bytes32::from([2; 32]),
+             "indra-testnet-1",
+         );
+         assert_ne!(first, second);
+diff --git a/indra/indra-node/src/driver.rs b/indra/indra-node/src/driver.rs
+index 98aee15d..c018a710 100644
+--- a/indra/indra-node/src/driver.rs
++++ b/indra/indra-node/src/driver.rs
+@@ -17,8 +17,10 @@ use indra_consensus::{
+ };
+ use indra_core::codec::{Decode, Encode};
+ use indra_core::types::{
+-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+-    primitives::{has_strict_two_thirds_quorum, Bytes32},
++    block::{BlockProposalVNext, BlockVNext},
++    primitives::{
++        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ROUNDS_PER_HEIGHT,
++    },
+     proposal::verify_proposal,
+     qc::QuorumCertificateV1,
+     vote::{VoteStep, VoteV1},
+@@ -682,7 +684,7 @@ impl ConsensusDriver {
+     pub fn reset_round(&mut self) {
+         self.prune_future_proposals();
+         self.valid_proposal = None;
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -698,7 +700,7 @@ impl ConsensusDriver {
+         self.vote_collectors.clear();
+         self.round_advance_evidence.clear();
+         self.seen_round_votes.clear();
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -727,9 +729,14 @@ impl ConsensusDriver {
+         (height, round, step)
+     }
+ 
+-    fn start_round(&mut self, round: u32) {
++    fn start_round(&mut self, round: u32) -> NodeResult<()> {
++        validate_consensus_round(round).map_err(|error| NodeError::BlockInvalid {
++            height: self.next_height(),
++            reason: error.to_string(),
++        })?;
+         self.current_round = round;
+         self.current_phase = RoundPhase::Propose;
++        Ok(())
+     }
+ 
+     fn enter_precommit_phase(&mut self) {
+@@ -749,7 +756,7 @@ impl ConsensusDriver {
+             round,
+             self.engine.state.election_seed,
+             snapshot,
+-        )
++        )?
+         .election)
+     }
+ 
+@@ -807,6 +814,7 @@ impl ConsensusDriver {
+         &mut self,
+         lock: PersistedConsensusLock,
+     ) -> Result<(), String> {
++        validate_consensus_round(lock.round).map_err(|error| error.to_string())?;
+         if lock.height != self.next_height()
+             || lock.proposal.block.header.height != lock.height
+             || lock.proposal.block.header.block_hash() != lock.block_hash
+@@ -831,6 +839,7 @@ impl ConsensusDriver {
+             lock.round,
+             VoteStep::Prevote,
+             self.engine.state.chain_id.clone(),
++            snapshot.snapshot_root,
+             self.registered_voters.clone(),
+         );
+         for vote in &lock.polc_votes {
+@@ -885,12 +894,28 @@ impl ConsensusDriver {
+                 }
+                 self.vote_safety_unavailable = None;
+                 if record.height == next_height && record.round >= self.current_round {
+-                    let safe_round = record.round.saturating_add(1);
++                    let safe_round = match record
++                        .round
++                        .checked_add(1)
++                        .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++                    {
++                        Some(round) => round,
++                        None => {
++                            let message = format!(
++                                "persisted vote at final legal round {} leaves no safe round at height {}",
++                                record.round, record.height
++                            );
++                            eprintln!("[vote_safety] CRITICAL: {message}");
++                            self.vote_safety_unavailable = Some(message);
++                            return;
++                        }
++                    };
+                     eprintln!(
+                         "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                         safe_round, record.height, record.round, record.step
+                     );
+-                    self.start_round(safe_round);
++                    self.start_round(safe_round)
++                        .expect("safe persisted round was validated above");
+                 }
+             }
+             VoteSafetyLoadResult::Corrupt(reason) => {
+@@ -921,7 +946,11 @@ impl ConsensusDriver {
+     fn prune_round_advance_evidence(&mut self) {
+         let height = self.next_height();
+         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
+-        let max_round = self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP);
++        let max_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
+         self.round_advance_evidence
+             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
+         if self.round_advance_evidence.len() > MAX_STALLED_HEIGHT_ENTRIES {
+@@ -1222,7 +1251,7 @@ impl ConsensusDriver {
+         };
+         let hash = block.header.block_hash();
+         let value_hash = block.header.value_hash;
+-        let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
++        let vote_hash = if block.header.polc_round.is_none() {
+             // Rule 2
+             if self.locked_round.is_none() || self.locked_value == Some(hash) {
+                 hash
+@@ -1231,7 +1260,7 @@ impl ConsensusDriver {
+             }
+         } else {
+             // Rule 3
+-            let valid_round = block.header.polc_round;
++            let valid_round = block.header.polc_round.expect("checked Some above");
+             if valid_round < self.current_round
+                 && self.has_quorum_for_value_hash(
+                     height,
+@@ -1351,6 +1380,16 @@ impl ConsensusDriver {
+         from: Option<SocketAddr>,
+         proposal: BlockProposalVNext,
+     ) -> Vec<DriverAction> {
++        if validate_consensus_round(proposal.block.header.proposer_round).is_err()
++            || validate_consensus_round(proposal.block.header.value_entropy.origin_round).is_err()
++            || proposal
++                .block
++                .header
++                .polc_round
++                .is_some_and(|round| validate_consensus_round(round).is_err())
++        {
++            return vec![DriverAction::None];
++        }
+         if !self.sync.is_caught_up() {
+             return vec![DriverAction::None];
+         }
+@@ -1428,8 +1467,20 @@ impl ConsensusDriver {
+             }
+         }
+ 
+-        let mut projected_state = self.engine.state.clone();
+-        if indra_state::apply_block(&mut projected_state, &verified, 0).is_err() {
++        // Admission must validate the commitments before staging the proposal:
++        // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
++        // without recomputing it would let a PoLC authorize different immutable
++        // value entropy under the same claimed identity.
++        let projected =
++            match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
++            {
++                Ok(projected) => projected,
++                Err(_) => return vec![DriverAction::None],
++            };
++        if projected.state_root != block.header.state_root
++            || projected.validator_set_root != block.header.validator_set_root
++            || projected.value_hash != block.header.value_hash
++        {
+             return vec![DriverAction::None];
+         }
+ 
+@@ -1507,9 +1558,16 @@ impl ConsensusDriver {
+     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+         let mut actions = Vec::new();
+ 
+-        if vote.height != self.next_height()
+-            || vote.round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+-        {
++        if validate_consensus_round(vote.round).is_err() {
++            return actions;
++        }
++
++        let maximum_jump_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
++        if vote.height != self.next_height() || vote.round > maximum_jump_round {
+             return actions;
+         }
+ 
+@@ -1522,9 +1580,25 @@ impl ConsensusDriver {
+             return actions;
+         }
+ 
+-        if let Err(err) =
+-            verify_vote_authority(&vote, &self.engine.state.chain_id, &self.registered_voters)
+-                .map_err(|error| error.to_string())
++        let governing_snapshot_root =
++            match self.engine.state.snapshot_for_consensus_height(vote.height) {
++                Ok(snapshot) => snapshot.snapshot_root,
++                Err(error) => {
++                    actions.push(DriverAction::DisconnectInvalidConsensusPeer {
++                        from,
++                        validator_id: vote.validator_id,
++                        reason: format!("Vote snapshot unavailable: {error}"),
++                    });
++                    return actions;
++                }
++            };
++        if let Err(err) = verify_vote_authority(
++            &vote,
++            &self.engine.state.chain_id,
++            &governing_snapshot_root,
++            &self.registered_voters,
++        )
++        .map_err(|error| error.to_string())
+         {
+             actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                 from,
+@@ -1611,7 +1685,13 @@ impl ConsensusDriver {
+         if !self.sync.is_caught_up()
+             || height != self.next_height()
+             || target_round <= self.current_round
+-            || target_round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
++            || validate_consensus_round(target_round).is_err()
++            || target_round
++                > self
++                    .current_round
++                    .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++                    .unwrap_or(u32::MAX)
++                    .min(MAX_ROUNDS_PER_HEIGHT - 1)
+         {
+             return Vec::new();
+         }
+@@ -1643,7 +1723,8 @@ impl ConsensusDriver {
+             "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
+             self.current_round, target_round, height, signed_stake, total_stake
+         );
+-        self.start_round(target_round);
++        self.start_round(target_round)
++            .expect("certified target round was validated before mutation");
+         self.apply_vote_safety();
+         self.prune_stalled_collections();
+         self.maybe_prevote_current_round_proposal()
+@@ -1677,6 +1758,7 @@ impl ConsensusDriver {
+                     vote.round,
+                     vote.step,
+                     self.engine.state.chain_id.clone(),
++                    vote.snapshot_root,
+                     self.registered_voters.clone(),
+                 )
+             });
+@@ -1727,6 +1809,7 @@ impl ConsensusDriver {
+                     vote.round,
+                     vote.step,
+                     self.engine.state.chain_id.clone(),
++                    vote.snapshot_root,
+                     self.registered_voters.clone(),
+                 )
+             });
+@@ -1928,6 +2011,11 @@ impl ConsensusDriver {
+             round,
+             block_hash,
+             &self.engine.state.chain_id,
++            self.engine
++                .state
++                .snapshot_for_consensus_height(height)
++                .expect("governing snapshot already resolved")
++                .snapshot_root,
+             &qc_validators,
+             quorum_votes,
+         ) {
+@@ -2021,7 +2109,7 @@ impl ConsensusDriver {
+                         "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
+                     );
+                 }
+-                self.start_round(0);
++                self.start_round(0).expect("round zero is always legal");
+                 actions.extend(self.activate_buffered_proposals_for_new_tip());
+ 
+                 self.vote_collectors
+@@ -2257,11 +2345,19 @@ impl ConsensusDriver {
+     }
+ 
+     /// Rule 10 — on precommit timeout, advance to the next round.
+-    pub fn on_precommit_timeout(&mut self) {
++    pub fn on_precommit_timeout(&mut self) -> NodeResult<()> {
+         if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Precommit {
+-            return;
++            return Ok(());
+         }
+-        self.start_round(self.current_round.saturating_add(1));
++        let next_round = self
++            .current_round
++            .checked_add(1)
++            .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++            .ok_or(NodeError::RoundLimitExceeded {
++                height: self.next_height(),
++                round: self.current_round,
++            })?;
++        self.start_round(next_round)
+     }
+ 
+     /// Current committed chain height.
+@@ -2314,7 +2410,7 @@ mod tests {
+                 value_hash: Bytes32::ZERO,
+                 base_fee: state.base_fee,
+                 proposer_round: 0,
+-                polc_round: NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::ZERO,
+                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: state.election_seed,
+@@ -2357,13 +2453,29 @@ mod tests {
+         Bytes32::from(bytes)
+     }
+ 
+-    fn dummy_vote(height: u64, round: u32, step: VoteStep, block_hash: Bytes32) -> VoteV1 {
++    fn governing_snapshot_root(driver: &ConsensusDriver, height: u64) -> Bytes32 {
++        driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .expect("test fixture must have the governing snapshot")
++            .snapshot_root
++    }
++
++    fn dummy_vote(
++        height: u64,
++        round: u32,
++        step: VoteStep,
++        block_hash: Bytes32,
++        snapshot_root: Bytes32,
++    ) -> VoteV1 {
+         VoteV1 {
+             height,
+             round,
+             step,
+             block_hash,
+             validator_id: test_hash(round as usize),
++            snapshot_root,
+             signature: indra_core::types::crypto::HybridSignature {
+                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+@@ -2377,6 +2489,12 @@ mod tests {
+         height: u64,
+         block_hash: Bytes32,
+     ) -> Vec<u8> {
++        let snapshot_root = driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .unwrap()
++            .snapshot_root;
+         let validator_id = indra_core::types::crypto::hybrid_identity_id(
+             &signer.public_key().classical.0,
+             &signer.public_key().pq.0,
+@@ -2387,6 +2505,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             validator_id,
++            snapshot_root,
+             DEFAULT_CHAIN_ID,
+             signer,
+         )
+@@ -2396,6 +2515,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &driver.engine.qc_validators(),
+             vec![&vote],
+         )
+@@ -2410,6 +2530,12 @@ mod tests {
+         round: u32,
+         block_hash: Bytes32,
+     ) -> Vec<u8> {
++        let snapshot_root = driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .unwrap()
++            .snapshot_root;
+         let votes: Vec<_> = signers
+             .iter()
+             .map(|signer| {
+@@ -2423,6 +2549,7 @@ mod tests {
+                     VoteStep::Precommit,
+                     block_hash,
+                     validator_id,
++                    snapshot_root,
+                     DEFAULT_CHAIN_ID,
+                     signer,
+                 )
+@@ -2435,6 +2562,7 @@ mod tests {
+             round,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &driver.engine.qc_validators(),
+             vote_refs,
+         )
+@@ -2536,7 +2664,7 @@ mod tests {
+         let genesis_path = dir.join("genesis.toml");
+         std::fs::create_dir_all(&dir).unwrap();
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -2546,6 +2674,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, &genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some(seed);
+@@ -2560,7 +2689,8 @@ mod tests {
+             header[72..].copy_from_slice(&counter.to_le_bytes());
+             let settings = crate::genesis::GenesisSettings {
+                 chain_id: "indra-testnet-1".into(),
+-                active_slot_coefficient_numerator: 1u64 << 63,
++                active_slot_coefficient_numerator:
++                    indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+                 bitcoin_pow_entropy_source: crate::genesis::BitcoinPowEntropySourceV1 {
+                     scheme: 1,
+                     network_genesis_hash: hex::encode([0u8; 32]),
+@@ -2571,6 +2701,7 @@ mod tests {
+                     reorg_policy: 1,
+                 },
+                 bitcoin_pow_entropy_header: hex::encode(header),
++                genesis_precommit_hash: hex::encode([0x55; 32]),
+             };
+             driver.engine.state.election_seed =
+                 crate::genesis::derive_genesis_election_seed(&settings).unwrap();
+@@ -2616,7 +2747,7 @@ mod tests {
+         prev_qc_bytes: Vec<u8>,
+     ) -> indra_core::types::block::BlockProposalVNext {
+         let vrf = VrfKeypair::from_seed(&proposer_seed);
+-        let election = (round..round.saturating_add(4_096))
++        let election = (round..MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|candidate_round| {
+                 let election = driver
+                     .proposer_election_for_height(driver.height() + 1, candidate_round)
+@@ -2695,7 +2826,9 @@ mod tests {
+         // completed round-change that precedes delivery of that proposal; the
+         // round-evidence protocol itself has dedicated adversarial tests.
+         if proposal.header.proposer_round > driver.current_round() {
+-            driver.start_round(proposal.header.proposer_round);
++            driver
++                .start_round(proposal.header.proposer_round)
++                .expect("test proposal round must be legal");
+         }
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -2948,10 +3081,15 @@ mod tests {
+             2,
+             indra_core::types::primitives::Bytes64([0x55; 64]),
+             &snapshot,
+-        );
++        )
++        .unwrap();
+         let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
+         let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
+ 
++        assert_eq!(
++            vrf.election.sortition_log,
++            snapshot.sortition_log_interval().unwrap()
++        );
+         assert_eq!(vrf.election.candidates.len(), voters.len());
+         assert_eq!(voters.len(), qc.len());
+         for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+@@ -3069,7 +3207,8 @@ mod tests {
+                         0,
+                         Bytes64([(*height % 251) as u8; 64]),
+                         snapshot,
+-                    );
++                    )
++                    .unwrap();
+                     assert_eq!(voters.len(), validators.len());
+                     assert_eq!(validators.len(), authority.election.candidates.len());
+                     for ((voter, validator), candidate) in voters
+@@ -3093,6 +3232,7 @@ mod tests {
+                                 VoteStep::Precommit,
+                                 block_hash,
+                                 *id,
++                                snapshot.snapshot_root,
+                                 DEFAULT_CHAIN_ID,
+                                 signer,
+                             )
+@@ -3104,6 +3244,7 @@ mod tests {
+                         0,
+                         block_hash,
+                         DEFAULT_CHAIN_ID,
++                        snapshot.snapshot_root,
+                         &validators,
+                         votes.iter().collect(),
+                     )
+@@ -3173,10 +3314,10 @@ mod tests {
+ 
+         let mut block_a = make_block(&driver.engine.state);
+         block_a.header.proposer_round = 0;
+-        block_a.header.polc_round = NO_POLC_ROUND;
++        block_a.header.polc_round = None;
+         let mut block_b = block_a.clone();
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = 0;
++        block_b.header.polc_round = Some(0);
+ 
+         assert_eq!(block_a.header.value_hash, block_b.header.value_hash);
+         let hash_a = block_a.header.block_hash();
+@@ -3189,6 +3330,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            governing_snapshot_root(&driver, 1),
+             voters,
+         );
+         let signer_ids = [
+@@ -3218,6 +3360,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash_a,
+                 signer_ids[idx],
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signers[idx],
+             )
+@@ -3234,6 +3377,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash_b,
+                 signer_ids[idx],
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signers[idx],
+             )
+@@ -3250,6 +3394,7 @@ mod tests {
+             VoteStep::Prevote,
+             hash_a,
+             signer_ids[2],
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             signers[2],
+         )
+@@ -3289,6 +3434,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -3299,6 +3445,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -3309,6 +3456,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -3319,6 +3467,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -3468,7 +3617,14 @@ mod tests {
+         let signer = install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
+         driver.refresh_registered_voters();
+ 
+-        let block = make_strict_block(&driver, [0x4Fu8; 32], 5, vec![]);
++        let target_round = (1..=8)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, 1, *round))
++            })
++            .expect("single-validator fixture must be eligible within the round-jump cap");
++        let block = make_strict_block(&driver, [0x4Fu8; 32], target_round, vec![]);
+         let block_hash = block.header.block_hash();
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -3480,15 +3636,16 @@ mod tests {
+         assert!(!actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+ 
+         let vote = indra_consensus::vote::produce_vote(
+             1,
+-            5,
++            target_round,
+             VoteStep::Prevote,
+-            Bytes32::ZERO,
++            block_hash,
+             validator_id_for(&signer),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &signer,
+         )
+@@ -3503,7 +3660,7 @@ mod tests {
+         assert!(actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+@@ -3570,12 +3727,88 @@ mod tests {
+         driver.current_phase = RoundPhase::Precommit;
+         driver.current_round = 3;
+ 
+-        driver.on_precommit_timeout();
++        driver.on_precommit_timeout().unwrap();
+         assert_eq!(driver.current_round(), 4);
+         assert_eq!(driver.current_phase(), RoundPhase::Propose);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn final_round_timeout_fails_closed_without_state_mutation() {
++        let (mut driver, dir) = local_driver([0x48u8; 32], "round_limit");
++        driver.current_round = MAX_ROUNDS_PER_HEIGHT - 2;
++        driver.current_phase = RoundPhase::Precommit;
++        driver.on_precommit_timeout().unwrap();
++        assert_eq!(driver.current_round(), MAX_ROUNDS_PER_HEIGHT - 1);
++        assert_eq!(driver.current_phase(), RoundPhase::Propose);
++
++        driver.current_phase = RoundPhase::Precommit;
++        let before = (
++            driver.current_round,
++            driver.current_phase,
++            driver.pending_blocks.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let error = driver.on_precommit_timeout().unwrap_err();
++        assert!(matches!(error, NodeError::RoundLimitExceeded { .. }));
++        assert_eq!(
++            before,
++            (
++                driver.current_round,
++                driver.current_phase,
++                driver.pending_blocks.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn invalid_high_round_vote_is_rejected_before_any_consensus_mutation() {
++        let (mut driver, dir) = local_driver([0x49u8; 32], "high_round_vote");
++        let signer = install_active_validator(&mut driver, [0x49u8; 32], "local");
++        driver.refresh_registered_voters();
++        let mut vote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&signer),
++            governing_snapshot_root(&driver, 1),
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        vote.round = MAX_ROUNDS_PER_HEIGHT;
++        let before = (
++            driver.seen_round_votes.len(),
++            driver.round_advance_evidence.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let actions = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9499".parse().unwrap(),
++            vote,
++        });
++        assert!(actions.is_empty());
++        assert_eq!(
++            before,
++            (
++                driver.seen_round_votes.len(),
++                driver.round_advance_evidence.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn process_status_cannot_advance_round_without_quorum_evidence() {
+         let (mut driver, dir) = local_driver([0x4Au8; 32], "status_round_advance");
+@@ -3632,6 +3865,7 @@ mod tests {
+                 },
+                 Bytes32::ZERO,
+                 validator_id_for(signer),
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -3750,6 +3984,7 @@ mod tests {
+         let (mut driver, dir) = local_driver([0x90u8; 32], "bounded_buffered_votes");
+         driver.current_round = 128;
+         let peer: SocketAddr = "127.0.0.1:9501".parse().unwrap();
++        let snapshot_root = governing_snapshot_root(&driver, 1);
+ 
+         for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+             let hash = test_hash(i);
+@@ -3757,7 +3992,10 @@ mod tests {
+                 .buffered_votes
+                 .entry((1, i as u32, hash))
+                 .or_default()
+-                .push((peer, dummy_vote(1, i as u32, VoteStep::Prevote, hash)));
++                .push((
++                    peer,
++                    dummy_vote(1, i as u32, VoteStep::Prevote, hash, snapshot_root),
++                ));
+         }
+         driver.prune_buffered_votes();
+ 
+@@ -3778,6 +4016,7 @@ mod tests {
+                     i as u32,
+                     VoteStep::Prevote,
+                     DEFAULT_CHAIN_ID.to_string(),
++                    governing_snapshot_root(&driver, 1),
+                     driver.registered_voters.clone(),
+                 ),
+             );
+@@ -3921,6 +4160,23 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn restart_after_vote_in_final_round_fails_closed() {
++        let (mut driver, dir) = local_driver([0x4Cu8; 32], "final_round_restart");
++        driver
++            .vote_safety
++            .record(1, MAX_ROUNDS_PER_HEIGHT - 1, 1, None)
++            .unwrap();
++        let before = driver.current_round();
++        driver.apply_vote_safety();
++        assert_eq!(driver.current_round(), before);
++        assert!(driver
++            .vote_safety_unavailable
++            .as_deref()
++            .is_some_and(|reason| reason.contains("no safe round")));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn apply_vote_safety_ignores_old_height() {
+         let (mut driver, dir) = local_driver([0x4Eu8; 32], "vote_safety_old_height");
+@@ -4014,6 +4270,7 @@ mod tests {
+             VoteStep::Prevote,
+             hash_a,
+             validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4048,7 +4305,7 @@ mod tests {
+         // legitimately prevoted this conflicting full block hash.
+         let mut block_b = make_block(&restarted.engine.state);
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = NO_POLC_ROUND;
++        block_b.header.polc_round = None;
+         block_b.header.timestamp = block_b.header.timestamp.saturating_add(1);
+         block_b.header.value_hash = block_b.compute_value_hash(restarted.engine.state.total_supply);
+         let hash_b = block_b.header.block_hash();
+@@ -4085,6 +4342,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4120,6 +4378,43 @@ mod tests {
+         let _ = std::fs::remove_dir_all(dir);
+     }
+ 
++    #[test]
++    fn persisted_lock_above_round_cap_is_rejected_before_restore_mutation() {
++        let seed = [0x7Fu8; 32];
++        let (mut driver, dir) = local_driver(seed, "restart_rejects_high_lock_round");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        let proposal = make_strict_block(&driver, seed, 0, vec![]);
++        let block_hash = proposal.header.block_hash();
++        let prevote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            block_hash,
++            validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
++            DEFAULT_CHAIN_ID,
++            &local,
++        )
++        .unwrap();
++        let lock = PersistedConsensusLock {
++            height: 1,
++            round: MAX_ROUNDS_PER_HEIGHT,
++            block_hash,
++            value_hash: proposal.header.value_hash,
++            proposal,
++            polc_votes: vec![prevote],
++        };
++        assert!(driver.vote_safety.record(1, 0, 1, Some(&lock)).is_err());
++        let before = (driver.locked_round, driver.valid_round, driver.locked_value);
++        assert!(driver.verify_and_restore_consensus_lock(lock).is_err());
++        assert_eq!(
++            before,
++            (driver.locked_round, driver.valid_round, driver.locked_value)
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn lock_polc_is_durable_before_precommit_broadcast_is_returned() {
+         let (mut driver, dir) = local_driver([0x7Au8; 32], "lock_before_precommit");
+@@ -4142,6 +4437,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash,
+                 validator_id_for(signer),
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -4188,6 +4484,7 @@ mod tests {
+             VoteStep::Precommit,
+             Bytes32::from([0xAAu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4198,6 +4495,7 @@ mod tests {
+             VoteStep::Precommit,
+             Bytes32::from([0xBBu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4237,6 +4535,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             real_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &attacker,
+         )
+@@ -4256,6 +4555,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             real_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &real,
+         )
+@@ -4288,6 +4588,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             remote_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4317,6 +4618,7 @@ mod tests {
+                 VoteStep::Precommit,
+                 hash,
+                 real_id,
++                governing_snapshot_root(&driver, driver.next_height()),
+                 DEFAULT_CHAIN_ID,
+                 &attacker,
+             )
+@@ -4464,6 +4766,7 @@ mod tests {
+             VoteStep::Precommit,
+             block2.header.block_hash(),
+             source_validator_id,
++            governing_snapshot_root(&driver, 2),
+             DEFAULT_CHAIN_ID,
+             &source_local,
+         )
+@@ -4473,6 +4776,7 @@ mod tests {
+             block2.header.proposer_round,
+             block2.header.block_hash(),
+             DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 2),
+             &driver.engine.qc_validators(),
+             vec![&qc_vote],
+         )
+@@ -4551,6 +4855,7 @@ mod tests {
+             VoteStep::Precommit,
+             block2.header.block_hash(),
+             validator_id,
++            governing_snapshot_root(&driver, 2),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4560,6 +4865,7 @@ mod tests {
+             block2.header.proposer_round,
+             block2.header.block_hash(),
+             DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 2),
+             &driver.engine.qc_validators(),
+             vec![&qc_vote],
+         )
+@@ -4970,14 +5276,22 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let qc =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap();
++        let qc = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap();
+         let qc_bytes = qc.encode_to_vec();
+ 
+         let _ = driver.process(DriverEvent::QcResponse {
+@@ -5015,14 +5329,22 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let qc =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap();
++        let qc = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap();
+         let mut qc_bytes = qc.encode_to_vec();
+         let last = qc_bytes.len() - 1;
+         qc_bytes[last] ^= 0x01;
+@@ -5062,15 +5384,23 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let mut qc_bytes =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap()
+-                .encode_to_vec();
++        let mut qc_bytes = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap()
++        .encode_to_vec();
+         qc_bytes.push(0xA5);
+ 
+         let actions = driver.process(DriverEvent::QcResponse {
+@@ -5202,6 +5532,7 @@ mod tests {
+             VoteStep::Prevote,
+             original_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, height),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -5212,6 +5543,7 @@ mod tests {
+             VoteStep::Prevote,
+             original_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, height),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -5235,7 +5567,7 @@ mod tests {
+         assert_eq!(valid_block.header.value_hash, value_hash);
+ 
+         let local_vrf = VrfKeypair::from_seed(&[0x73; 32]);
+-        let election = (original_round.saturating_add(1)..original_round.saturating_add(4_096))
++        let election = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver, height, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(
+@@ -5262,7 +5594,7 @@ mod tests {
+ 
+         assert_eq!(reproposed.header.value_hash, value_hash);
+         assert_eq!(reproposed.header.proposer_round, reproposal_round);
+-        assert_eq!(reproposed.header.polc_round, original_round);
++        assert_eq!(reproposed.header.polc_round, Some(original_round));
+ 
+         driver.current_round = reproposal_round;
+         driver.current_phase = RoundPhase::Propose;
+@@ -5345,6 +5677,96 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn vrf007_substituted_entropy_is_rejected_before_vote_or_lock_mutation() {
++        let seed = [0x7Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "vrf007_admission_order");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++
++        let height = driver.next_height();
++        let round_zero = election_for_round(&driver, height, 0);
++        let original = driver
++            .engine
++            .propose(&round_zero, 1_700_000_001, driver.last_qc_bytes(), None)
++            .unwrap();
++        let local_id = validator_id_for(&local);
++        let local_vrf = VrfKeypair::from_seed(&seed);
++        let later = (1..4_096)
++            .map(|round| election_for_round(&driver, height, round))
++            .find(|election| {
++                indra_consensus::proposer::compute_proposer_vrf(local_id, &local_vrf, election)
++                    .is_ok_and(|claim| claim.eligible)
++            })
++            .expect("test validator becomes eligible in a later round");
++        let mut substituted = driver
++            .engine
++            .repropose(
++                &original,
++                later.round,
++                Some(0),
++                &later,
++                original.header.timestamp,
++                driver.last_qc_bytes(),
++            )
++            .unwrap();
++
++        // Reproduce VRF-007 exactly: install another genuine eligible entropy
++        // proof but retain the old stable value identity and post-state roots.
++        substituted.block.header.value_entropy = indra_core::types::block::ProposalEntropyV1 {
++            origin_proposer_id: substituted.header.proposer_id,
++            origin_round: substituted.header.proposer_round,
++            vrf_output: substituted.header.proposer_vrf_output.clone(),
++            vrf_proof: substituted.header.proposer_vrf_proof.clone(),
++        };
++        reauthorize_test_proposal(
++            &mut substituted,
++            seed,
++            driver.engine.state.chain_id.as_bytes(),
++        );
++        assert_ne!(
++            original.header.value_entropy,
++            substituted.header.value_entropy
++        );
++        assert_eq!(original.header.value_hash, substituted.header.value_hash);
++        assert!(verify_live_proposal(&driver, &substituted).is_ok());
++        assert_ne!(
++            substituted.header.value_hash,
++            substituted.compute_value_hash(driver.engine.state.total_supply),
++            "the substituted entropy has a different canonical stable identity"
++        );
++
++        driver.current_round = later.round;
++        driver.current_phase = RoundPhase::Propose;
++        let pending_before = driver.pending_blocks.len();
++        let collectors_before = driver.vote_collectors.len();
++        let lock_before = (
++            driver.locked_round,
++            driver.locked_value,
++            driver.locked_value_hash,
++        );
++        let actions = driver.process(DriverEvent::InboundBlock {
++            from: None,
++            proposal: substituted,
++        });
++
++        assert!(actions
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert_eq!(driver.vote_collectors.len(), collectors_before);
++        assert_eq!(
++            (
++                driver.locked_round,
++                driver.locked_value,
++                driver.locked_value_hash
++            ),
++            lock_before
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn repropose_matches_clone_based_reference() {
+         let (mut driver, dir) = local_driver([0x78u8; 32], "repropose_clone_reference");
+@@ -5363,13 +5785,20 @@ mod tests {
+             )
+             .expect("initial proposal should succeed");
+ 
+-        let election_round_one = election_for_round(&driver, height, 1);
++        let reproposal_round = (1..4_096)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, height, *round))
++            })
++            .expect("test proposer must become eligible within bounded round search");
++        let election_round_one = election_for_round(&driver, height, reproposal_round);
+         let pre_state = driver.engine.state.clone();
+         let reproposed = driver
+             .engine
+             .repropose(
+                 &proposal,
+-                1,
++                reproposal_round,
+                 Some(0),
+                 &election_round_one,
+                 proposal.header.timestamp,
+@@ -5394,8 +5823,8 @@ mod tests {
+             reproposed.compute_value_hash(clone_reference.total_supply)
+         );
+         assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
+-        assert_eq!(reproposed.header.proposer_round, 1);
+-        assert_eq!(reproposed.header.polc_round, 0);
++        assert_eq!(reproposed.header.proposer_round, reproposal_round);
++        assert_eq!(reproposed.header.polc_round, Some(0));
+         assert_eq!(
+             driver.engine.state, pre_state,
+             "reproposal projection must roll back and leave real engine state untouched"
+@@ -5489,6 +5918,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 block_x_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5511,9 +5941,9 @@ mod tests {
+             value_hash
+         );
+ 
+-        driver_b.on_precommit_timeout();
++        driver_b.on_precommit_timeout().unwrap();
+         let b_vrf = VrfKeypair::from_seed(&[0x82; 32]);
+-        let election_round_one = (original_round.saturating_add(1)..4_096)
++        let election_round_one = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver_b, 1, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, election)
+@@ -5563,6 +5993,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 block_y_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5584,6 +6015,7 @@ mod tests {
+                 VoteStep::Precommit,
+                 block_y_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5665,6 +6097,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::from([0xABu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+diff --git a/indra/indra-node/src/engine.rs b/indra/indra-node/src/engine.rs
+index e3aadce4..ad69e59c 100644
+--- a/indra/indra-node/src/engine.rs
++++ b/indra/indra-node/src/engine.rs
+@@ -25,7 +25,7 @@ use indra_consensus::{
+ };
+ use indra_core::codec::Decode;
+ use indra_core::types::{
+-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
++    block::{BlockProposalVNext, BlockVNext},
+     crypto::HybridPubKey,
+     governance::GovernanceOpV2,
+     primitives::{
+@@ -1254,6 +1254,14 @@ impl NodeEngine {
+         prev_qc_bytes: Vec<u8>,
+         polc_round: Option<u32>,
+     ) -> NodeResult<BlockProposalVNext> {
++        if let Some(round) = polc_round {
++            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
++                NodeError::BlockInvalid {
++                    height: self.state.height + 1,
++                    reason: error.to_string(),
++                }
++            })?;
++        }
+         ensure_disk_writable(&self.config.data_dir)?;
+         let proposal_height = self.state.height + 1;
+         if proposal_height > 1 && prev_qc_bytes.is_empty() {
+@@ -1295,6 +1303,20 @@ impl NodeEngine {
+         timestamp: u64,
+         last_qc: Vec<u8>,
+     ) -> NodeResult<BlockProposalVNext> {
++        indra_core::types::primitives::validate_consensus_round(new_round).map_err(|error| {
++            NodeError::BlockInvalid {
++                height: self.state.height + 1,
++                reason: error.to_string(),
++            }
++        })?;
++        if let Some(round) = valid_round {
++            indra_core::types::primitives::validate_consensus_round(round).map_err(|error| {
++                NodeError::BlockInvalid {
++                    height: self.state.height + 1,
++                    reason: error.to_string(),
++                }
++            })?;
++        }
+         ensure_disk_writable(&self.config.data_dir)?;
+         let proposal_height = self.state.height + 1;
+         if proposal_height > 1 && last_qc.is_empty() {
+@@ -1325,7 +1347,7 @@ impl NodeEngine {
+         let mut block = original_block.clone();
+         block.header.timestamp = timestamp;
+         block.header.proposer_round = new_round;
+-        block.header.polc_round = valid_round.unwrap_or(NO_POLC_ROUND);
++        block.header.polc_round = valid_round;
+         block.header.proposer_id = slot.proposer_id;
+         block.header.vrf_suite = indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2;
+         block.header.election_seed = election.election_seed;
+@@ -1545,12 +1567,17 @@ impl NodeEngine {
+             .hybrid_keypair
+             .as_ref()
+             .ok_or(NodeError::NotValidator)?;
++        let snapshot_root = self
++            .state
++            .snapshot_for_consensus_height(height)?
++            .snapshot_root;
+         produce_vote(
+             height,
+             round,
+             step,
+             block_hash,
+             validator_id,
++            snapshot_root,
+             &self.state.chain_id,
+             hybrid_keypair,
+         )
+@@ -1856,7 +1883,8 @@ mod tests {
+         GovernanceActionType, GovernanceOpV2, GovernancePayload,
+     };
+     use indra_core::types::primitives::{
+-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, TRANSACTION_PROTOCOL_VERSION,
++        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
++        TRANSACTION_PROTOCOL_VERSION,
+     };
+     use indra_core::types::slashing::SlashEvidenceV1;
+     use indra_core::types::stake_position::{
+@@ -1993,7 +2021,7 @@ mod tests {
+         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+         let genesis_path = dir.join("genesis.toml");
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -2003,6 +2031,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, genesis).unwrap();
+         genesis_path.to_string_lossy().to_string()
+     }
+@@ -2331,6 +2360,7 @@ mod tests {
+                 step_1,
+                 hash_1,
+                 validator_id,
++                Bytes32::ZERO,
+                 &engine.state.chain_id,
+                 keypair,
+             )
+@@ -2341,6 +2371,7 @@ mod tests {
+                 step_2,
+                 hash_2,
+                 validator_id,
++                Bytes32::ZERO,
+                 &engine.state.chain_id,
+                 keypair,
+             )
+@@ -2388,6 +2419,7 @@ mod tests {
+                     election_seed: state.election_seed,
+                     snapshot_root: snapshot.snapshot_root,
+                     active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++                    sortition_log: snapshot.sortition_log_interval().unwrap(),
+                     height,
+                     round,
+                     candidates: candidates.clone(),
+@@ -2441,6 +2473,7 @@ mod tests {
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot
+@@ -2460,7 +2493,7 @@ mod tests {
+         height: u64,
+         vrf: &VrfKeypair,
+     ) -> ProposerElection {
+-        (0..4_096)
++        (0..MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|round| {
+                 let election = test_election(state, height, round);
+                 let candidate = election
+@@ -2499,6 +2532,7 @@ mod tests {
+         value_hash: Bytes32,
+         classical_seed: [u8; 32],
+         pq_seed: [u8; 32],
++        snapshot_root: Bytes32,
+     ) -> Vec<u8> {
+         let classical = ClassicalKeypair::from_seed(&classical_seed);
+         let pq = PqKeypair::from_seed(&pq_seed).unwrap();
+@@ -2512,6 +2546,7 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            snapshot_root,
+             &DEFAULT_CHAIN_ID,
+             &hybrid,
+         )
+@@ -2521,6 +2556,7 @@ mod tests {
+             round,
+             value_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &[QcValidator {
+                 validator_id,
+                 position: 0,
+@@ -2647,6 +2683,7 @@ mod tests {
+                         VoteStep::Prevote,
+                         Bytes32::from([height as u8; 32]),
+                         validator_id,
++                        snapshot.snapshot_root,
+                         DEFAULT_CHAIN_ID,
+                         &signer,
+                     )
+@@ -2656,6 +2693,7 @@ mod tests {
+                         0,
+                         VoteStep::Prevote,
+                         DEFAULT_CHAIN_ID.to_string(),
++                        snapshot.snapshot_root,
+                         voters,
+                     );
+                     collector.add_vote(vote).unwrap()
+@@ -2692,6 +2730,7 @@ mod tests {
+                     VoteStep::Precommit,
+                     block_hash,
+                     validator_id,
++                    snapshot.snapshot_root,
+                     DEFAULT_CHAIN_ID,
+                     signer,
+                 )
+@@ -2703,6 +2742,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot.snapshot_root,
+             &validators,
+             votes.iter().collect(),
+         )
+@@ -3747,6 +3787,11 @@ mod tests {
+                 block.header.block_hash(),
+                 [0x42u8; 32],
+                 [0x42u8; 32],
++                engine
++                    .state
++                    .snapshot_for_consensus_height(height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+             assert_eq!(engine.state.height, height);
+         }
+@@ -3779,6 +3824,11 @@ mod tests {
+                     block.header.block_hash(),
+                     [0x42; 32],
+                     [0x42; 32],
++                    engine
++                        .state
++                        .snapshot_for_consensus_height(height)
++                        .unwrap()
++                        .snapshot_root,
+                 );
+             }
+             engine.state.clone()
+@@ -3826,6 +3876,11 @@ mod tests {
+                 engine.state.tip_hash,
+                 [0x42u8; 32],
+                 [0x42u8; 32],
++                engine
++                    .state
++                    .snapshot_for_consensus_height(engine.state.height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+             let second = make_strict_block(&engine.state, [0x42u8; 32], parent_qc);
+             let mut projected = engine.state.clone();
+@@ -4002,6 +4057,11 @@ mod tests {
+                     block.header.block_hash(),
+                     [0x42u8; 32],
+                     [0x42u8; 32],
++                    engine
++                        .state
++                        .snapshot_for_consensus_height(height)
++                        .unwrap()
++                        .snapshot_root,
+                 );
+                 assert_eq!(engine.state.height, height);
+             }
+@@ -4036,6 +4096,11 @@ mod tests {
+                     block.header.block_hash(),
+                     [0x42u8; 32],
+                     [0x42u8; 32],
++                    engine
++                        .state
++                        .snapshot_for_consensus_height(height)
++                        .unwrap()
++                        .snapshot_root,
+                 );
+                 assert_eq!(engine.state.height, height);
+             }
+@@ -4108,6 +4173,7 @@ mod tests {
+             )
+             .replace(&hex::encode(old_output.0), &hex::encode(new_output.0))
+             .replace(&hex::encode(old_proof.0), &hex::encode(new_proof.0));
++        genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(genesis_path, genesis).unwrap();
+ 
+         {
+@@ -4132,14 +4198,13 @@ mod tests {
+             engine.write_chain_manifest().unwrap();
+         }
+         let genesis_path = manifest_config.genesis_path.as_ref().unwrap();
+-        let genesis = std::fs::read_to_string(genesis_path).unwrap().replace(
+-            "active_slot_coefficient_numerator = \"9223372036854775808\"",
+-            "active_slot_coefficient_numerator = \"1\"",
+-        );
++        let genesis = std::fs::read_to_string(genesis_path)
++            .unwrap()
++            .replace("stake = 1000000000000", "stake = 1000000000001");
+         std::fs::write(genesis_path, genesis).unwrap();
+         assert!(matches!(
+             NodeEngine::init(manifest_config),
+-            Err(NodeError::GenesisMismatch)
++            Err(NodeError::ValidatorConfigIncomplete { .. })
+         ));
+         let _ = std::fs::remove_dir_all(&manifest_dir);
+ 
+@@ -4193,6 +4258,11 @@ mod tests {
+                     block.header.block_hash(),
+                     [0x42u8; 32],
+                     [0x42u8; 32],
++                    engine
++                        .state
++                        .snapshot_for_consensus_height(height)
++                        .unwrap()
++                        .snapshot_root,
+                 );
+             }
+             make_strict_block(&engine.state, [0x42u8; 32], last_qc)
+@@ -4294,7 +4364,7 @@ mod tests {
+         let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+         let genesis_path = dir.join("genesis.toml");
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -4304,6 +4374,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some([0x11; 32]);
+@@ -4378,7 +4449,35 @@ mod tests {
+             Some(VrfKeypair::from_seed(&[0x99u8; 32]).public_key());
+ 
+         crate::genesis::finalize_test_genesis(&mut engine.state);
+-        let election = test_election(&engine.state, 1, 0);
++        // This fixed fixture is eligible at round 13 under the registered key.
++        // Keeping the round explicit separates the key-binding invariant from
++        // probabilistic eligibility-search helper behavior.
++        let election = test_election(&engine.state, 1, 13);
++        let registered_vrf = VrfKeypair::from_seed(&[0x99; 32]);
++        let foreign_local_vrf = VrfKeypair::from_seed(&[0x42; 32]);
++        let alpha = election.vrf_input(&local_id).unwrap();
++        let (foreign_output, foreign_proof) = indra_crypto::vrf_prove(&foreign_local_vrf, &alpha);
++        assert!(indra_crypto::vrf_verify(
++            &foreign_local_vrf.public_key(),
++            &alpha,
++            &foreign_output,
++            &foreign_proof,
++        )
++        .is_ok());
++        assert!(indra_crypto::vrf_verify(
++            &registered_vrf.public_key(),
++            &alpha,
++            &foreign_output,
++            &foreign_proof,
++        )
++        .is_err());
++        assert!(
++            compute_proposer_vrf(local_id, &registered_vrf, &election)
++                .unwrap()
++                .eligible,
++            "the snapshot-registered VRF key fixture must be eligible at round 13"
++        );
++        assert!(compute_proposer_vrf(local_id, &foreign_local_vrf, &election).is_err());
+ 
+         assert!(
+             !engine.is_proposer(&election),
+@@ -4908,7 +5007,8 @@ mod tests {
+         assert_eq!(engine.governance_mempool, vec![governance]);
+         assert_eq!(engine.pending_slashes.len(), 1);
+ 
+-        let election = test_election(&engine.state, 1, 0);
++        let election =
++            first_eligible_test_election(&engine.state, 1, &VrfKeypair::from_seed(&[0x42; 32]));
+         let template = BlockTemplate {
+             proposer_vrf_keypair: VrfKeypair::from_seed(&[0x42; 32]),
+             prev_qc_bytes: vec![],
+diff --git a/indra/indra-node/src/sync.rs b/indra/indra-node/src/sync.rs
+index 7dabd35b..a60e53a1 100644
+--- a/indra/indra-node/src/sync.rs
++++ b/indra/indra-node/src/sync.rs
+@@ -1126,12 +1126,8 @@ pub(crate) fn project_and_verify_block_state_root(
+         });
+     }
+ 
+-    // Skip value_hash verification for legacy blocks produced before the
+-    // value_hash feature was introduced. These blocks store Bytes32::ZERO.
+     let actual_value_hash = block.compute_value_hash(projected.total_supply);
+-    if block.header.value_hash != indra_core::Bytes32::ZERO
+-        && actual_value_hash != block.header.value_hash
+-    {
++    if actual_value_hash != block.header.value_hash {
+         return Err(NodeError::BlockInvalid {
+             height: block.header.height,
+             reason: format!(
+@@ -1307,6 +1303,7 @@ mod tests {
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot
+@@ -1335,7 +1332,7 @@ mod tests {
+         prev_qc_bytes: Vec<u8>,
+     ) -> indra_core::types::block::BlockProposalVNext {
+         let proposer = VrfKeypair::from_seed(&[proposer_seed; 32]);
+-        let election = (round..round.saturating_add(4_096))
++        let election = (round..indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|candidate_round| {
+                 let election = build_election(state, state.height + 1, candidate_round);
+                 let candidate = election
+@@ -1388,6 +1385,7 @@ mod tests {
+         hybrid: &HybridKeypair,
+         pq_pk: Vec<u8>,
+         stake: u64,
++        snapshot_root: Bytes32,
+     ) -> Vec<u8> {
+         let vote = produce_vote(
+             height,
+@@ -1395,6 +1393,7 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            snapshot_root,
+             DEFAULT_CHAIN_ID,
+             hybrid,
+         )
+@@ -1404,6 +1403,7 @@ mod tests {
+             round,
+             value_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &[QcValidator {
+                 validator_id,
+                 position: 0,
+@@ -1437,6 +1437,7 @@ mod tests {
+                     VoteStep::Precommit,
+                     block_hash,
+                     validator_id,
++                    snapshot.snapshot_root,
+                     DEFAULT_CHAIN_ID,
+                     signer,
+                 )
+@@ -1448,6 +1449,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot.snapshot_root,
+             &validators,
+             votes.iter().collect(),
+         )
+@@ -1684,6 +1686,10 @@ mod tests {
+                 &hybrid,
+                 hybrid.public_key().pq.0.to_vec(),
+                 10_000,
++                actual_state
++                    .snapshot_for_consensus_height(block.header.height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+         }
+     }
+@@ -1727,6 +1733,10 @@ mod tests {
+                 &hybrid,
+                 hybrid.public_key().pq.0.to_vec(),
+                 10_000,
++                state
++                    .snapshot_for_consensus_height(block.header.height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+         }
+     }
+@@ -1746,6 +1756,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(state.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut mempool = Mempool::default_config();
+         let timestamp_secs = 1_999_999_999;
+@@ -1993,6 +2007,10 @@ mod tests {
+                 &hybrid,
+                 pq_pk.clone(),
+                 10_000,
++                state
++                    .snapshot_for_consensus_height(block.header.height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+             assert_eq!(state.height, i);
+         }
+@@ -2307,6 +2325,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(real.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut after_real = state.clone();
+         apply_verified_test(&mut after_real, &real, 0).unwrap();
+@@ -2337,6 +2359,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         *qc.last_mut().unwrap() ^= 0x01;
+         let mut after_block = state.clone();
+@@ -2349,6 +2375,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut carrier = make_strict_block(&after_block, 0xB2, 0, valid_qc);
+         replace_qc_and_reauthorize(&mut carrier, qc, 0xB2, after_block.chain_id.as_bytes());
+@@ -2391,6 +2421,11 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             stake,
++            source
++                .state
++                .snapshot_for_consensus_height(1)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut block2 = make_strict_block(&source.state, 0x42, 0, qc1);
+         authorize_test_proposal(
+@@ -2408,6 +2443,11 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             stake,
++            source
++                .state
++                .snapshot_for_consensus_height(2)
++                .unwrap()
++                .snapshot_root,
+         );
+         indra_storage::save_last_qc(&source.config.state_dir(), &qc2).unwrap();
+         let genesis_path = source_dir.join("genesis.toml");
+@@ -2455,6 +2495,10 @@ mod tests {
+                 &hybrid,
+                 hybrid.public_key().pq.0.to_vec(),
+                 10_000,
++                builder
++                    .snapshot_for_consensus_height(block.header.height)
++                    .unwrap()
++                    .snapshot_root,
+             );
+             apply_verified_test(&mut builder, &block, 0).unwrap();
+             blocks.push(block);
+@@ -2667,6 +2711,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut block2 = make_strict_block(&state, 0x12, 0, valid_qc);
+         replace_qc_and_reauthorize(&mut block2, vec![], 0x12, state.chain_id.as_bytes());
+@@ -2695,6 +2743,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let valid_qc = build_qc_bytes(
+             block1.header.height,
+@@ -2704,6 +2756,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut block2 = make_strict_block(&state, 0x14, 0, valid_qc);
+         replace_qc_and_reauthorize(&mut block2, wrong_qc_bytes, 0x14, state.chain_id.as_bytes());
+@@ -2738,6 +2794,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let valid_qc = build_qc_bytes(
+             block1.header.height,
+@@ -2747,6 +2807,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut block2 = make_strict_block(&state, 0x15, 0, valid_qc);
+         replace_qc_and_reauthorize(
+@@ -2784,6 +2848,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let block2 = make_strict_block(&state, 0x16, 0, qc_bytes);
+ 
+@@ -2803,6 +2871,10 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let mut qc_bytes = valid_qc.clone();
+         qc_bytes.push(0xA5);
+@@ -2843,6 +2915,7 @@ mod tests {
+             &hybrid,
+             hybrid.public_key().pq.0.to_vec(),
+             10_000,
++            snapshot.snapshot_root,
+         ))
+         .unwrap();
+         qc.classical_signatures[0].classical_sig = VariableBytes::from_slice(&[0xEE; 64]).unwrap();
+@@ -2931,6 +3004,7 @@ mod tests {
+             0,
+             VoteStep::Precommit,
+             DEFAULT_CHAIN_ID.to_string(),
++            snapshot.snapshot_root,
+             voters,
+         );
+         let a_vote = produce_vote(
+@@ -2939,6 +3013,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_h_hash,
+             a_id,
++            snapshot.snapshot_root,
+             DEFAULT_CHAIN_ID,
+             &a,
+         )
+@@ -2953,6 +3028,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_h_hash,
+             b_id,
++            snapshot.snapshot_root,
+             DEFAULT_CHAIN_ID,
+             &b,
+         )
+@@ -2970,6 +3046,7 @@ mod tests {
+             0,
+             block_h_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot.snapshot_root,
+             &crate::engine::NodeEngine::qc_validators_for_height(u64::MAX, &snapshot),
+             vec![&a_vote, &b_vote],
+         )
+@@ -3085,6 +3162,10 @@ mod tests {
+             &hybrid,
+             pq_pk,
+             10_000,
++            state
++                .snapshot_for_consensus_height(block1.header.height)
++                .unwrap()
++                .snapshot_root,
+         );
+         let block2 = make_strict_block(&state, 0x31, 0, qc_bytes);
+ 
+diff --git a/indra/indra-node/tests/node.rs b/indra/indra-node/tests/node.rs
+index 58f518bb..6782a541 100644
+--- a/indra/indra-node/tests/node.rs
++++ b/indra/indra-node/tests/node.rs
+@@ -65,7 +65,8 @@ fn temp_dir(suffix: &str) -> PathBuf {
+ 
+ fn anchored_genesis_state() -> ChainState {
+     let mut state = build_genesis_state();
+-    state.active_slot_coefficient_numerator = 1u64 << 63;
++    state.active_slot_coefficient_numerator =
++        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
+     state.consensus_snapshots.clear();
+     state.reward_economic_snapshot = None;
+     state.slash_membership_roots.clear();
+@@ -88,6 +89,7 @@ fn make_strict_block(
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot
+@@ -158,6 +160,7 @@ fn dummy_vote() -> VoteV1 {
+         step: VoteStep::Precommit,
+         block_hash: Bytes32::from([0xAB; 32]),
+         validator_id: Bytes32::from([0xCD; 32]),
++        snapshot_root: Bytes32::from([0xEF; 32]),
+         signature: HybridSignature {
+             classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
+@@ -297,7 +300,7 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
+     let (vrf_possession_output, vrf_possession_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+     let genesis_path = dir.join("genesis.toml");
+     let genesis = format!(
+-        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+         name,
+         hex::encode(validator_id.0),
+         hex::encode(classical.public_key().0),
+@@ -308,16 +311,40 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &
+         hex::encode(cold_public.classical.0),
+         hex::encode(cold_public.pq.0),
+     );
++    let placeholder = hex::encode([0u8; 32]);
++    let provisional = genesis
++        .replacen(
++            "[genesis]\n",
++            &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
++            1,
++        )
++        .replacen(
++            "[[validators]]\n",
++            &format!(
++                "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
++                hex::encode([0x70u8; 32])
++            ),
++            1,
++        );
++    let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
++    let hash = indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
++        .unwrap();
++    let genesis = provisional.replacen(&placeholder, &hex::encode(hash.0), 1);
+     std::fs::write(&genesis_path, genesis).unwrap();
+     genesis_path.to_string_lossy().to_string()
+ }
+ 
+ fn build_single_validator_qc_bytes(
++    state: &ChainState,
+     height: u64,
+     round: u32,
+     block_hash: Bytes32,
+     seed: [u8; 32],
+ ) -> Vec<u8> {
++    let snapshot_root = state
++        .snapshot_for_consensus_height(height)
++        .expect("QC fixture must use the governing snapshot")
++        .snapshot_root;
+     let classical = ClassicalKeypair::from_seed(&seed);
+     let pq = PqKeypair::from_seed(&seed).unwrap();
+     let hybrid = HybridKeypair::new(classical, pq);
+@@ -330,6 +357,7 @@ fn build_single_validator_qc_bytes(
+         VoteStep::Precommit,
+         block_hash,
+         validator_id,
++        snapshot_root,
+         DEFAULT_CHAIN_ID,
+         &hybrid,
+     )
+@@ -339,6 +367,7 @@ fn build_single_validator_qc_bytes(
+         round,
+         block_hash,
+         DEFAULT_CHAIN_ID,
++        snapshot_root,
+         &[QcValidator {
+             validator_id,
+             position: 0,
+@@ -412,6 +441,7 @@ fn node_engine_init_and_commit() {
+         let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
+         engine.commit_proposal(&block).unwrap();
+         last_qc = build_single_validator_qc_bytes(
++            &engine.state,
+             i,
+             block.header.proposer_round,
+             block.header.block_hash(),
+@@ -451,6 +481,7 @@ fn state_root_changes_after_each_block() {
+     let root1 = compute_state_root(&state);
+ 
+     let qc1 = build_single_validator_qc_bytes(
++        &state,
+         1,
+         b1.header.proposer_round,
+         b1.header.block_hash(),
+@@ -499,6 +530,7 @@ fn block_store_survives_reopen() {
+             )
+             .unwrap();
+             last_qc = build_single_validator_qc_bytes(
++                &state,
+                 i,
+                 b.header.proposer_round,
+                 b.header.block_hash(),
+@@ -537,6 +569,7 @@ fn restarted_block_store_preserves_hash_chain() {
+             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
+             engine.commit_proposal(&block).unwrap();
+             last_qc = build_single_validator_qc_bytes(
++                &engine.state,
+                 height,
+                 block.header.proposer_round,
+                 block.header.block_hash(),
+@@ -583,6 +616,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
+         )
+         .unwrap();
+         source_last_qc = build_single_validator_qc_bytes(
++            &source_state,
+             height,
+             block.header.proposer_round,
+             block.header.block_hash(),
+@@ -646,6 +680,7 @@ fn current_binary_hashes_workspace_block_log_consistently() {
+             let block = make_strict_block(&engine.state, [0x42u8; 32], last_qc.clone());
+             engine.commit_proposal(&block).unwrap();
+             last_qc = build_single_validator_qc_bytes(
++                &engine.state,
+                 height,
+                 block.header.proposer_round,
+                 block.header.block_hash(),
+@@ -721,6 +756,7 @@ fn full_node_pipeline() {
+             )
+             .unwrap();
+             last_qc = build_single_validator_qc_bytes(
++                &state,
+                 i,
+                 b.header.proposer_round,
+                 b.header.block_hash(),
+@@ -915,6 +951,12 @@ fn node_syncs_before_joining_consensus() {
+         VoteStep::Prevote,
+         Bytes32::from([0xCCu8; 32]),
+         remote_id,
++        driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(1)
++            .unwrap()
++            .snapshot_root,
+         DEFAULT_CHAIN_ID,
+         &remote,
+     )
+@@ -963,6 +1005,7 @@ fn full_restart_recovery_end_to_end() {
+         )
+         .unwrap();
+         source_last_qc = build_single_validator_qc_bytes(
++            &source_state,
+             height,
+             block.header.proposer_round,
+             block.header.block_hash(),
+diff --git a/indra/indra-state/src/apply.rs b/indra/indra-state/src/apply.rs
+index 5363e934..95bd29db 100644
+--- a/indra/indra-state/src/apply.rs
++++ b/indra/indra-state/src/apply.rs
+@@ -908,6 +908,16 @@ mod tests {
+         cold_seed[0] = cold_seed[0].wrapping_add(1);
+         let (cold_pubkey, cold_keypair) = make_test_keypair(cold_seed);
+         let validator_id = staking_delegator_id_for_test(&validator_pubkey);
++        let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
++        let vrf_pk = vrf_keypair.public_key();
++        let challenge = StakingOp::vrf_possession_challenge(
++            &state.chain_id,
++            &validator_id,
++            &Bytes32::from(vrf_pk),
++            0,
++        )
++        .unwrap();
++        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf_keypair, &challenge);
+         let deposit_utxo_id = state
+             .utxos
+             .insert(
+@@ -926,7 +936,9 @@ mod tests {
+                 commission_bps: 1_000,
+                 deposit_utxo_id,
+                 validator_pubkey,
+-                vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
++                vrf_pk,
++                vrf_possession_output: indra_core::types::primitives::Bytes64(vrf_output.0),
++                vrf_possession_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
+                 cold_pubkey: indra_core::types::crypto::ColdHybridPubKey {
+                     classical_pk: cold_pubkey.classical_pk,
+                     pq_pk: cold_pubkey.pq_pk,
+@@ -1597,6 +1609,8 @@ mod tests {
+             .saturating_add(state.fee_reward_pool)
+     }
+ 
++    const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
++
+     fn signed_vote(
+         keypair: &HybridKeypair,
+         validator_id: Bytes32,
+@@ -1604,6 +1618,26 @@ mod tests {
+         round: u32,
+         step: VoteStep,
+         block_hash: Bytes32,
++    ) -> VoteV1 {
++        signed_vote_with_snapshot_root(
++            keypair,
++            validator_id,
++            height,
++            round,
++            step,
++            block_hash,
++            TEST_SNAPSHOT_ROOT,
++        )
++    }
++
++    fn signed_vote_with_snapshot_root(
++        keypair: &HybridKeypair,
++        validator_id: Bytes32,
++        height: u64,
++        round: u32,
++        step: VoteStep,
++        block_hash: Bytes32,
++        snapshot_root: Bytes32,
+     ) -> VoteV1 {
+         let signing_bytes = indra_core::types::vote_signing::vote_signing_bytes(
+             height,
+@@ -1611,6 +1645,7 @@ mod tests {
+             step,
+             &block_hash,
+             &validator_id,
++            &snapshot_root,
+             DEFAULT_CHAIN_ID,
+         );
+         let sig = keypair.sign(&signing_bytes).unwrap();
+@@ -1620,6 +1655,7 @@ mod tests {
+             step,
+             block_hash,
+             validator_id,
++            snapshot_root,
+             signature: HybridSignature {
+                 classical_sig: VariableBytes::from_slice(&sig.classical.0).unwrap(),
+                 pq_sig: VariableBytes::from_slice(&sig.pq.0).unwrap(),
+@@ -1752,13 +1788,14 @@ mod tests {
+                         .find(|(key, _)| key.identity_id() == entry.validator_id)
+                         .map(|(_, keypair)| keypair)
+                         .expect("test snapshot validator seed must be known");
+-                    signed_vote(
++                    signed_vote_with_snapshot_root(
+                         &keypair,
+                         entry.validator_id,
+                         height - 1,
+                         0,
+                         VoteStep::Precommit,
+                         state.tip_hash,
++                        snapshot.snapshot_root,
+                     )
+                 })
+                 .collect();
+@@ -1766,6 +1803,7 @@ mod tests {
+                 height: height - 1,
+                 round: 0,
+                 block_hash: state.tip_hash,
++                snapshot_root: snapshot.snapshot_root,
+                 signer_bitfield: {
+                     let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
+                     for position in 0..votes.len() {
+@@ -1802,7 +1840,7 @@ mod tests {
+                 value_hash: Bytes32::ZERO,
+                 base_fee: state.base_fee,
+                 proposer_round: 0,
+-                polc_round: indra_core::types::block::NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::from([0x91; 32]),
+                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: state.election_seed,
+@@ -2464,6 +2502,7 @@ mod tests {
+             height: 1,
+             round: 0,
+             block_hash: state.tip_hash,
++            snapshot_root: snapshot.snapshot_root,
+             signer_bitfield: {
+                 let mut bits = [0u8; indra_core::types::qc::SIGNER_BITFIELD_BYTES];
+                 bits[0] = 1;
+@@ -4227,6 +4266,7 @@ fn verify_vote_sig_with_keys(
+         vote.step,
+         &vote.block_hash,
+         &vote.validator_id,
++        &vote.snapshot_root,
+         chain_id,
+     );
+     let pk = HybridPublicKey {
+diff --git a/indra/indra-storage/src/vote_safety.rs b/indra/indra-storage/src/vote_safety.rs
+index 1f23360f..dabf0381 100644
+--- a/indra/indra-storage/src/vote_safety.rs
++++ b/indra/indra-storage/src/vote_safety.rs
+@@ -11,13 +11,17 @@ use std::path::{Path, PathBuf};
+ 
+ use indra_core::{
+     codec::{ByteReader, Decode, Encode},
+-    types::{block::BlockProposalVNext, primitives::Bytes32, vote::VoteV1},
++    types::{
++        block::BlockProposalVNext,
++        primitives::{validate_consensus_round, Bytes32},
++        vote::VoteV1,
++    },
+ };
+ 
+ use crate::atomic::{crc32, write_atomic_synced};
+ use crate::error::StorageResult;
+ 
+-const SAFETY_FORMAT_VERSION: u8 = 1;
++const SAFETY_FORMAT_VERSION: u8 = 3;
+ const MAX_PERSISTED_POLC_VOTES: usize = 200;
+ const MAX_SAFETY_FILE_BYTES: u64 = 25_165_824;
+ 
+@@ -85,6 +89,19 @@ impl VoteSafetyStore {
+         step: u8,
+         consensus_lock: Option<&PersistedConsensusLock>,
+     ) -> StorageResult<()> {
++        validate_consensus_round(round)
++            .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
++        if let Some(lock) = consensus_lock {
++            validate_consensus_round(lock.round)
++                .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?;
++            if lock.polc_votes.iter().any(|vote| vote.round != lock.round) {
++                return Err(Error::new(
++                    ErrorKind::InvalidInput,
++                    "persisted PoLC vote round differs from lock round",
++                )
++                .into());
++            }
++        }
+         if consensus_lock.is_some_and(|lock| lock.polc_votes.len() > MAX_PERSISTED_POLC_VOTES) {
+             return Err(
+                 Error::new(ErrorKind::InvalidInput, "PoLC vote count exceeds maximum").into(),
+@@ -187,7 +204,9 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
+         return Err(format!("unsupported safety format version {version}"));
+     }
+     let height = u64::decode(&mut reader).map_err(|error| error.to_string())?;
+-    let round = u32::decode(&mut reader).map_err(|error| error.to_string())?;
++    let round =
++        validate_consensus_round(u32::decode(&mut reader).map_err(|error| error.to_string())?)
++            .map_err(|error| error.to_string())?;
+     let step = u8::decode(&mut reader).map_err(|error| error.to_string())?;
+     if step > 1 {
+         return Err(format!("invalid vote step {step}"));
+@@ -196,7 +215,10 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
+         0 => None,
+         1 => {
+             let lock_height = u64::decode(&mut reader).map_err(|error| error.to_string())?;
+-            let lock_round = u32::decode(&mut reader).map_err(|error| error.to_string())?;
++            let lock_round = validate_consensus_round(
++                u32::decode(&mut reader).map_err(|error| error.to_string())?,
++            )
++            .map_err(|error| error.to_string())?;
+             let block_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
+             let value_hash = Bytes32::decode(&mut reader).map_err(|error| error.to_string())?;
+             let block_len = u32::decode(&mut reader).map_err(|error| error.to_string())? as usize;
+@@ -217,6 +239,9 @@ fn decode_record(bytes: &[u8]) -> Result<VoteSafetyRecord, String> {
+                 polc_votes
+                     .push(VoteV1::decode_exact(vote_bytes).map_err(|error| error.to_string())?);
+             }
++            if polc_votes.iter().any(|vote| vote.round != lock_round) {
++                return Err("persisted PoLC vote round differs from lock round".into());
++            }
+             Some(PersistedConsensusLock {
+                 height: lock_height,
+                 round: lock_round,
+@@ -322,4 +347,38 @@ mod tests {
+         assert_eq!((loaded.height, loaded.round, loaded.step), (100, 15, 1));
+         let _ = fs::remove_file(path);
+     }
++
++    #[test]
++    fn vote_safety_enforces_finite_round_domain_on_write_and_load() {
++        let path = tmp_path("round_domain");
++        let store = VoteSafetyStore::open(&path);
++        for round in [0, indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1] {
++            store.record(1, round, 0, None).unwrap();
++            assert!(matches!(
++                store.load(),
++                VoteSafetyLoadResult::Record(record) if record.round == round
++            ));
++        }
++        for round in [
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
++            indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
++            u32::MAX,
++        ] {
++            assert!(store.record(1, round, 0, None).is_err());
++
++            // Recompute the CRC so this exercises semantic persisted-state
++            // validation rather than corrupted-byte handling.
++            let record = VoteSafetyRecord {
++                height: 1,
++                round,
++                step: 0,
++                consensus_lock: None,
++            };
++            let mut bytes = encode_record(&record);
++            bytes.extend_from_slice(&crc32(&bytes).to_le_bytes());
++            fs::write(&path, bytes).unwrap();
++            assert!(matches!(store.load(), VoteSafetyLoadResult::Corrupt(_)));
++        }
++        let _ = fs::remove_file(path);
++    }
+ }

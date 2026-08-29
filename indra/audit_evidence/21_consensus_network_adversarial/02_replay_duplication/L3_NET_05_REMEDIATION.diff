@@ -1,0 +1,275 @@
+--- a/indra-node/src/driver.rs
++++ b/indra-node/src/driver.rs
+@@ -186,6 +186,15 @@
+     None,
+ }
+ 
++#[cfg(test)]
++/// Test-only counters proving proposal replay admission cost.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++struct ProposalAdmissionMetrics {
++    proposal_verifications: usize,
++    qc_verifications: usize,
++    detached_projections: usize,
++}
++
+ /// The consensus driver.
+ pub struct ConsensusDriver {
+     /// The underlying node engine.
+@@ -234,6 +243,8 @@
+     pub vote_safety: VoteSafetyStore,
+     /// If set, local voting is disabled until operator recovery.
+     vote_safety_unavailable: Option<String>,
++    #[cfg(test)]
++    proposal_admission_metrics: ProposalAdmissionMetrics,
+ }
+ 
+ impl ConsensusDriver {
+@@ -263,6 +274,8 @@
+             sync: SyncState::follower(0),
+             vote_safety,
+             vote_safety_unavailable: None,
++            #[cfg(test)]
++            proposal_admission_metrics: ProposalAdmissionMetrics::default(),
+         };
+         driver.sync = if driver.engine.state.height == 0 {
+             // At genesis every validator already has genesis state — no sync needed.
+@@ -1344,6 +1357,18 @@
+             return vec![DriverAction::None];
+         }
+ 
++        // `pending_blocks` is authoritative: entries are inserted only after
++        // proposer/VRF, embedded-QC, detached projection, and root validation
++        // all succeed. An exact block hash already present here therefore
++        // identifies an accepted proposal replay without letting unverified
++        // input create trusted replay state. Different-round reproposals and
++        // conflicting proposals have different consensus block hashes and
++        // continue through full admission.
++        let block_hash = block.header.block_hash();
++        if self.pending_blocks.contains_key(&block_hash) {
++            return vec![DriverAction::None];
++        }
++
+         self.process_proposal_internal(from, proposal)
+     }
+ 
+@@ -1361,6 +1386,10 @@
+                 return vec![DriverAction::None];
+             }
+         };
++        #[cfg(test)]
++        {
++            self.proposal_admission_metrics.proposal_verifications += 1;
++        }
+         let verified = match verify_proposal(
+             &proposal,
+             self.engine.state.chain_id.as_bytes(),
+@@ -1381,6 +1410,10 @@
+         };
+ 
+         if block.header.height > 1 {
++            #[cfg(test)]
++            {
++                self.proposal_admission_metrics.qc_verifications += 1;
++            }
+             if let Err(err) = crate::sync::verify_network_block_qc(
+                 block,
+                 &self.engine.state,
+@@ -1398,6 +1431,10 @@
+         // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
+         // without recomputing it would let a PoLC authorize different immutable
+         // value entropy under the same claimed identity.
++        #[cfg(test)]
++        {
++            self.proposal_admission_metrics.detached_projections += 1;
++        }
+         let projected =
+             match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
+             {
+@@ -3441,6 +3478,133 @@
+     }
+ 
+     #[test]
++    fn accepted_proposal_replay_skips_authoritative_admission_across_peer_paths() {
++        let seed = [0x49u8; 32];
++        let (mut driver, dir) = local_driver(seed, "accepted_proposal_replay_fast_path");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++
++        let proposal = make_strict_block(&driver, seed, 0, vec![]);
++        let hash = proposal.header.block_hash();
++        let phase_before = driver.current_phase();
++        let first = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9202".parse().unwrap()),
++            proposal: proposal.clone(),
++        });
++        assert!(first
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert_eq!(
++            driver.proposal_admission_metrics,
++            ProposalAdmissionMetrics {
++                proposal_verifications: 1,
++                qc_verifications: 0,
++                detached_projections: 1,
++            }
++        );
++        let pending_before = driver.pending_blocks.len();
++        let metrics_before = driver.proposal_admission_metrics;
++
++        // A different authenticated transport address models another relay or
++        // a reconnected peer. Driver-authoritative state is connection-agnostic.
++        let replay = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9203".parse().unwrap()),
++            proposal,
++        });
++
++        assert!(replay
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.proposal_admission_metrics, metrics_before);
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert!(driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.current_phase(), phase_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn invalid_proposal_cannot_poison_accepted_replay_state() {
++        let seed = [0x4Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "invalid_proposal_no_replay_poison");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++
++        let valid = make_strict_block(&driver, seed, 0, vec![]);
++        let hash = valid.header.block_hash();
++        let mut invalid = valid.clone();
++        invalid.proposer_authorization.classical_sig =
++            VariableBytes::from_slice(&[0xA5; indra_crypto::CLASSICAL_SIG_BYTES]).unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9204".parse().unwrap()),
++            proposal: invalid,
++        });
++        assert!(rejected
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert!(!driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.proposal_admission_metrics.proposal_verifications, 1);
++        assert_eq!(driver.proposal_admission_metrics.detached_projections, 0);
++
++        let accepted = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9205".parse().unwrap()),
++            proposal: valid,
++        });
++        assert!(accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert!(driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.proposal_admission_metrics.proposal_verifications, 2);
++        assert_eq!(driver.proposal_admission_metrics.detached_projections, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn accepted_height_two_proposal_replay_skips_embedded_qc_verification() {
++        let seed = [0x4Cu8; 32];
++        let (mut driver, dir) = local_driver(seed, "height_two_proposal_replay_fast_path");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++
++        let first_height = make_strict_block(&driver, seed, 0, vec![]);
++        let _ = process_single_validator_proposal(&mut driver, first_height);
++        assert_eq!(driver.height(), 1);
++
++        let proposal = make_strict_block(&driver, seed, 0, driver.last_qc_bytes().to_vec());
++        let before = driver.proposal_admission_metrics;
++        let accepted = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9206".parse().unwrap()),
++            proposal: proposal.clone(),
++        });
++        assert!(accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert_eq!(
++            driver.proposal_admission_metrics.proposal_verifications,
++            before.proposal_verifications + 1
++        );
++        assert_eq!(
++            driver.proposal_admission_metrics.qc_verifications,
++            before.qc_verifications + 1
++        );
++        assert_eq!(
++            driver.proposal_admission_metrics.detached_projections,
++            before.detached_projections + 1
++        );
++        let after_first = driver.proposal_admission_metrics;
++
++        let replay = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9207".parse().unwrap()),
++            proposal,
++        });
++        assert!(replay
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.proposal_admission_metrics, after_first);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
+     fn empty_round_timeouts_do_not_advance_election_seed() {
+         let (mut driver, dir) = local_driver([0x48; 32], "empty_round_seed_stable");
+         let _local = install_active_validator(&mut driver, [0x48; 32], "local");
+
+--- a/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
++++ b/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
+@@ -2,15 +2,24 @@
+ 
+ driver = Path("indra-node/src/driver.rs").read_text()
+ 
+-proposal = driver[driver.index("fn process_proposal_internal("):driver.index("fn process_vote(")]
++proposal_boundary = driver[driver.index("fn process_proposal("):driver.index("fn process_proposal_internal(")]
++required = [
++    "block.header.height != next_height",
++    "block.header.block_hash()",
++    "pending_blocks.contains_key",
++    "process_proposal_internal",
++]
++positions = [proposal_boundary.index(token) for token in required]
++assert positions == sorted(positions), (required, positions)
++
++proposal_admission = driver[driver.index("fn process_proposal_internal("):driver.index("fn process_vote(")]
+ required = [
+     "snapshot_for_consensus_height",
+     "verify_proposal(",
+     "verify_network_block_qc(",
+     "project_block_for_roots(",
+-    "pending_blocks.contains_key",
+ ]
+-positions = [proposal.index(token) for token in required]
++positions = [proposal_admission.index(token) for token in required]
+ assert positions == sorted(positions), (required, positions)
+ 
+ vote = driver[driver.index("fn process_vote("):driver.index("fn maybe_advance_to_certified_round(")]
+@@ -23,4 +32,4 @@
+ positions = [vote.index(token) for token in required]
+ assert positions == sorted(positions), (required, positions)
+ 
+-print("PASS: production source order matches L3-NET-05/06 reproducer claims")
++print("PASS: L3-NET-05 replay guard precedes admission; L3-NET-06 order unchanged")
+
+--- a/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/run_replay_audit.sh
++++ b/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/run_replay_audit.sh
+@@ -13,6 +13,9 @@
+ cargo test -p indra-node peer_status_repeated_messages_cannot_force_round_advance
+ cargo test -p indra-node future_and_wrong_parent_proposals_are_dropped_before_consensus_mutation
+ cargo test -p indra-node response_binding_rejects_unsolicited_wrong_peer_and_out_of_range
++cargo test -p indra-node accepted_proposal_replay_skips_authoritative_admission_across_peer_paths
++cargo test -p indra-node invalid_proposal_cannot_poison_accepted_replay_state
++cargo test -p indra-node accepted_height_two_proposal_replay_skips_embedded_qc_verification
+ 
+-# Guard the two repeated-work findings against source-order misreporting.
++# Guard the remediated L3-NET-05 order and preserve the L3-NET-06 observation.
+ python3 audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
+
+

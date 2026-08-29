@@ -1,0 +1,19 @@
+=== UNTRACKED FILE DETAILS ===
+
+--- 14340 ---
+-rw-r--r--  1 bonkai  staff  0 30 Jul 20:55 14340
+14340: empty
+
+--- 6148 ---
+-rw-r--r--  1 bonkai  staff  0 30 Jul 20:55 6148
+6148: empty
+
+--- 8196 ---
+-rw-r--r--  1 bonkai  staff  0 30 Jul 20:55 8196
+8196: empty
+
+=== PORCELAIN V2 STATUS ===
+? 14340
+? 6148
+? 8196
+? audit_evidence/

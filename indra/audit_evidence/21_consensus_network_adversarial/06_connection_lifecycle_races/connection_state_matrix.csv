@@ -1,0 +1,9 @@
+container,key,value,owner,stale_protection,invariant
+peers_by_validator,validator,ManagedPeer/addr,peer-manager actor,exact addr check in drop_peer,one logical peer per validator
+validator_by_addr,socket,validator,peer-manager actor,drop only after current match,reverse map for live sockets
+peer_addrs,validator,socket,network bridge mutex,address removed on disconnect, outbound routing identity
+addr_validators,socket,validator,network bridge mutex,address event,authenticated address attribution
+connected_validator_ids,validator,set,network bridge mutex,actor event order,connected identity summary
+authenticated_peer_addrs,string socket,set,network bridge mutex,disconnect event,discovery exclusion
+limiters_by_validator,validator,PeerRateLimiter,peer-manager actor,validator scoped,continuity across replacement
+sync outstanding,validator+socket+range,request,driver actor,exact socket binding,stale response rejected

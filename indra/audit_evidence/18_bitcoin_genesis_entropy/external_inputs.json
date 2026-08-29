@@ -1,0 +1,15 @@
+{
+  "status": "required before an economic-sufficiency conclusion; not established by this repository",
+  "inputs": [
+    {"name": "current_bitcoin_network_hash_rate", "unit": "hashes/second", "purpose": "convert q and block-work formulas into required equipment/work"},
+    {"name": "current_btc_price", "unit": "fiat/BTC", "purpose": "value foregone rewards and bribes"},
+    {"name": "current_block_subsidy_plus_fees", "unit": "BTC/block", "purpose": "cost discarded blocks and private forks"},
+    {"name": "mining_pool_concentration", "unit": "fraction by identified pool", "purpose": "assess feasible coordination and q"},
+    {"name": "rental_hash_availability", "unit": "hashes/second and duration", "purpose": "bound short-lived acquired q"},
+    {"name": "electricity_and_asic_economics", "unit": "cost/hash and capital", "purpose": "estimate owned-hash attack cost"},
+    {"name": "realistic_miner_or_pool_bribery_cost", "unit": "fiat or BTC", "purpose": "price coordinated withholding/reorg behavior"},
+    {"name": "economic_value_of_corrupting_indra_genesis", "unit": "fiat-equivalent", "purpose": "compare attack cost with attainable benefit"},
+    {"name": "ceremony_time_bitcoin_tip_and_chainwork", "unit": "height and 256-bit chainwork", "purpose": "reproduce most-work membership and depth"},
+    {"name": "public_precommitment_artifact_and_timestamp", "unit": "signed publication record", "purpose": "prove descriptor preceded the target block"}
+  ]
+}

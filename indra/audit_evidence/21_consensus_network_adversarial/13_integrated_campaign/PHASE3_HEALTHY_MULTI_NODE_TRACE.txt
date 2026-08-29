@@ -1,0 +1,4 @@
+NOT EXECUTED
+
+The current harness has no production-backed multi-validator fixture capable of
+driving proposal/vote/QC processing across virtual nodes.

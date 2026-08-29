@@ -1,0 +1,9 @@
+FINALIZE height=1 tip=202ab7de… QC=A,B,C
+REPLAY finalized proposal: unchanged
+REPLAY stale valid prevote: unchanged
+REPLAY stale valid precommit: unchanged
+CONFLICT D height=1 different block hash: production stale gate; unchanged
+ASSERT height=1 tip/QC/round/phase/qc_formations unchanged; no pending finalized proposal
+VALIDATION Step19E PASS; Step19D PASS; workspace no-run PASS; diff-check PASS
+STEP 19E.1 alternate production-valid proposal hash!=committed delivered post-commit: baseline unchanged; alternate pending=false
+SAME-HEIGHT QC regression set_last_qc_bytes_if_newer_height_ordering PASS: conflicting QC Err; cached QC unchanged

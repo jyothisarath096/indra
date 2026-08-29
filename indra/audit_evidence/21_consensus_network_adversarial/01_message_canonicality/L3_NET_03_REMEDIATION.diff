@@ -1,0 +1,74 @@
+diff --git a/indra-network/src/message.rs b/indra-network/src/message.rs
+--- a/indra-network/src/message.rs
++++ b/indra-network/src/message.rs
+@@ -465,1 +465,5 @@
+-                    let s = String::from_utf8_lossy(peer_bytes).to_string();
++                    let s = std::str::from_utf8(peer_bytes)
++                        .map_err(|_| NetworkError::DecodeFailed {
++                            reason: "peer list address is not valid UTF-8".to_string(),
++                        })?
++                        .to_owned();
+@@ -1159,6 +1163,45 @@ mod tests {
+         assert!(matches!(decoded, Message::PeerList(got) if got == peers));
+     }
+ 
++    fn framed_peer_list_with_raw_address(address: &[u8]) -> Vec<u8> {
++        let mut payload = vec![MessageType::PeerList as u8];
++        1u32.encode(&mut payload);
++        (address.len() as u16).encode(&mut payload);
++        payload.extend_from_slice(address);
++        0u8.encode(&mut payload);
++
++        let mut framed = Vec::with_capacity(4 + payload.len());
++        (payload.len() as u32).encode(&mut framed);
++        framed.extend_from_slice(&payload);
++        framed
++    }
++
++    #[test]
++    fn peer_list_address_utf8_is_strict_and_canonical() {
++        for address in [
++            b"validator.example:27656".as_slice(),
++            "例え.テスト:27656".as_bytes(),
++        ] {
++            let framed = framed_peer_list_with_raw_address(address);
++            let decoded = Message::decode_framed_wire(&framed).unwrap();
++            assert_eq!(decoded.encode_wire().unwrap(), framed);
++        }
++
++        for malformed in [
++            &[0xFF][..],
++            &[0xFE][..],
++            &[0xE2, 0x82][..],
++            &[0xC0, 0xAF][..],
++            &[0xF5, 0x80, 0x80, 0x80][..],
++        ] {
++            let framed = framed_peer_list_with_raw_address(malformed);
++            assert!(matches!(
++                Message::decode_framed_wire(&framed),
++                Err(NetworkError::DecodeFailed { .. })
++            ));
++        }
++    }
++
+     #[test]
+     fn address_only_peer_list_without_identity_markers_is_rejected() {
+         let peers = ["203.0.113.10:30303", "203.0.113.11:30303"];
+diff --git a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+--- a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
++++ b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+@@ -87,12 +87,8 @@ fn main() {
+ 
+     let peer_a = frame_with_prefix(8, &[0x04, 1, 0, 0, 0, 1, 0, 0xff, 0]);
+     let peer_b = frame_with_prefix(8, &[0x04, 1, 0, 0, 0, 1, 0, 0xfe, 0]);
+-    assert!(accepted("peer_list_invalid_utf8_ff", &peer_a));
+-    assert!(accepted("peer_list_invalid_utf8_fe", &peer_b));
+-    let peer_a_decoded = production_decode(&peer_a).unwrap();
+-    let peer_b_decoded = production_decode(&peer_b).unwrap();
+-    assert_eq!(peer_a_decoded, peer_b_decoded);
+-    assert_ne!(peer_a_decoded.encode_wire().unwrap(), peer_a);
++    assert!(!accepted("peer_list_invalid_utf8_ff", &peer_a));
++    assert!(!accepted("peer_list_invalid_utf8_fe", &peer_b));
+ 
+     for round in [0, 1023, 1024, u32::MAX] {
+         let encoded = vote(round, 64, 4627).encode_wire();

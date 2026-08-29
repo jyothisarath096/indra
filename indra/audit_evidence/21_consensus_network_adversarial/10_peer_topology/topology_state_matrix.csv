@@ -1,0 +1,9 @@
+state,key,capacity,admission,eviction,ordering,authority_aware,attacker_influence
+bootstrap peers,address,operator configured,config,none,configured,yes,low
+genesis peers,address,operator configured,genesis,none,configured,yes,low
+discovered_peers,address,256,authenticated PeerList/DNS/persisted,lexical non-protected first,HashSet then sorted eviction,no,high before auth
+peer_sources,address,accepted address set,PeerList/DNS,none,HashMap iteration,no,medium
+peers_by_validator,validator,one logical peer,authenticated handshake,tie-break deterministic,actor serialized,yes,low
+outbound targets,validator/socket,8 target,eligible candidates,connection success/failure,randomized diverse,partly,medium
+inbound peers,socket,64 total/3 per IP,handshake reservation,capacity reject,arrival,validator after auth,medium
+connected maps,socket/validator,authority bounded,authenticated event,exact replacement,actor/mutex,yes,low

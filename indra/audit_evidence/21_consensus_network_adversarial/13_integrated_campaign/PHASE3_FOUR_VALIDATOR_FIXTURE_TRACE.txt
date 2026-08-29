@@ -1,0 +1,14 @@
+GENESIS create validators=4 stake_each=1000000
+GENESIS seal once
+INIT node=0..3 production NodeEngine::init PASS
+ASSERT pairwise_distinct_validator_ids PASS
+ASSERT shared_genesis_bytes PASS
+ASSERT authority_membership_all_four PASS
+ASSERT snapshot_root_equal_all_four PASS
+ASSERT distinct_data_dirs PASS
+ASSERT distinct_vote_safety_paths PASS
+TEST audit_fixture_shared_genesis_four_distinct_validators PASS
+TEST audit_fixture_shared_genesis_two_distinct_validators PASS
+TEST audit_harness_two_distinct_validators_exchange_votes PASS
+WORKSPACE no-run PASS
+git diff --check PASS

@@ -1,0 +1,35 @@
+Focused L3-NET-08 diff (unified excerpts; unrelated pre-existing worktree changes omitted)
+
+--- a/indra-node/src/bin/node.rs
++++ b/indra-node/src/bin/node.rs
+@@
++const POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY: usize = 16;
++const POST_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
+@@
+-    post_auth: CooldownTracker<PostAuthInboundKey>,
++    post_auth: PostAuthCooldowns,
+@@
++struct PostAuthCooldowns {
++    by_validator: HashMap<indra_core::Bytes32, BoundedCooldownTracker<IpAddr>>,
++}
++// Per-validator tracker_mut, record_failure_at, blocked_at, reset, and bounded
++// test observability; outer namespace capped at MAX_ACTIVE_VALIDATORS.
+@@
+-            post_auth: CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60)),
++            post_auth: PostAuthCooldowns::new(),
+@@
++#[test]
++fn post_auth_address_churn_is_bounded_per_validator() { /* 200,000 IPv6 addresses -> 16 */ }
++#[test]
++fn post_auth_validator_buckets_are_isolated_and_exact_reset_only() { /* isolation */ }
++#[test]
++fn post_auth_validator_namespace_is_hard_bounded() { /* <= 200 namespaces */ }
+
+--- a/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/bin/post_auth_growth.rs
++++ b/audit_evidence/21_consensus_network_adversarial/03_identity_rate_limits/harness/src/bin/post_auth_growth.rs
+@@
+-// single unbounded HashMap<(validator, ip)>
++// HashMap<validator, BoundedCooldownTracker<ip>>, capacity 16 per validator
+@@
+-assert_eq!(retained, 200_000);
++assert_eq!(retained, 16);

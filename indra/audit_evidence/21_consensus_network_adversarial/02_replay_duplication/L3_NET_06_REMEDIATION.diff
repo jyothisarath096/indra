@@ -1,0 +1,599 @@
+--- a/indra-node/src/driver.rs
++++ b/indra-node/src/driver.rs
+@@ -195,6 +195,24 @@
+     detached_projections: usize,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct AcceptedVoteIdentity {
++    block_hash: Bytes32,
++    snapshot_root: Bytes32,
++}
++
++#[cfg(test)]
++/// Test-only counters proving vote replay admission cost and state effects.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++struct VoteAdmissionMetrics {
++    snapshot_lookups: usize,
++    hybrid_authority_calls: usize,
++    successful_ed25519_verifications: usize,
++    successful_mldsa_verifications: usize,
++    collector_insertions: usize,
++    qc_formations: usize,
++}
++
+ /// The consensus driver.
+ pub struct ConsensusDriver {
+     /// The underlying node engine.
+@@ -212,7 +230,7 @@
+     /// Missing proposals already requested from peers.
+     requested_proposals: HashSet<(u64, u32, Bytes32)>,
+-    /// First accepted vote hash per (validator, height, round, step).
++    /// First accepted vote identity per (validator, height, round, step).
+-    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), Bytes32>,
++    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), AcceptedVoteIdentity>,
+     /// Blocks whose precommit quorum arrived before the proposal was staged.
+     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
+     /// Tendermint lock state for the current height.
+@@ -245,6 +263,8 @@
+     vote_safety_unavailable: Option<String>,
+     #[cfg(test)]
+     proposal_admission_metrics: ProposalAdmissionMetrics,
++    #[cfg(test)]
++    vote_admission_metrics: VoteAdmissionMetrics,
+ }
+ 
+ impl ConsensusDriver {
+@@ -276,6 +296,8 @@
+             vote_safety_unavailable: None,
+             #[cfg(test)]
+             proposal_admission_metrics: ProposalAdmissionMetrics::default(),
++            #[cfg(test)]
++            vote_admission_metrics: VoteAdmissionMetrics::default(),
+         };
+         driver.sync = if driver.engine.state.height == 0 {
+             // At genesis every validator already has genesis state — no sync needed.
+@@ -1528,6 +1550,28 @@
+             return actions;
+         }
+ 
++        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
++        let replay_identity = AcceptedVoteIdentity {
++            block_hash: vote.block_hash,
++            snapshot_root: vote.snapshot_root,
++        };
++        // This map is populated only after authoritative snapshot and hybrid
++        // verification. Matching the complete signed semantic identity is
++        // therefore safe before repeated snapshot/crypto work. A conflicting
++        // block hash or snapshot root deliberately continues to verification
++        // and slash/evidence handling.
++        if self
++            .seen_round_votes
++            .get(&slot_key)
++            .is_some_and(|accepted| *accepted == replay_identity)
++        {
++            return actions;
++        }
++
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.snapshot_lookups += 1;
++        }
+         let governing_snapshot_root =
+             match self.engine.state.snapshot_for_consensus_height(vote.height) {
+                 Ok(snapshot) => snapshot.snapshot_root,
+@@ -1540,6 +1584,10 @@
+                     return actions;
+                 }
+             };
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.hybrid_authority_calls += 1;
++        }
+         if let Err(err) = verify_vote_authority(
+             &vote,
+             &self.engine.state.chain_id,
+@@ -1555,13 +1603,20 @@
+             });
+             return actions;
+         }
++        #[cfg(test)]
++        {
++            // Successful `verify_vote_authority` means both sequential hybrid
++            // components completed successfully.
++            self.vote_admission_metrics.successful_ed25519_verifications += 1;
++            self.vote_admission_metrics.successful_mldsa_verifications += 1;
++        }
++
+         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
+             actions.push(DriverAction::SlashDetected(evidence));
+         }
+ 
+-        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
+-        if let Some(existing_hash) = self.seen_round_votes.get(&slot_key).copied() {
+-            if existing_hash == vote.block_hash {
++        if let Some(existing) = self.seen_round_votes.get(&slot_key).copied() {
++            if existing == replay_identity {
+             } else {
+                 eprintln!(
+                     "[vote] rejected equivocating vote from {} for {} at height={} round={} (already saw {})",
+@@ -1569,12 +1624,12 @@
+                     hex::encode(&vote.block_hash.0[..4]),
+                     vote.height,
+                     vote.round,
+-                    hex::encode(&existing_hash.0[..4]),
++                    hex::encode(&existing.block_hash.0[..4]),
+                 );
+             }
+             return actions;
+         }
+-        self.seen_round_votes.insert(slot_key, vote.block_hash);
++        self.seen_round_votes.insert(slot_key, replay_identity);
+         self.prune_seen_round_votes();
+ 
+         // VoteV1 signatures bind chain ID, height, round, full validator ID,
+@@ -1718,10 +1773,16 @@
+         self.prune_vote_collectors();
+ 
+         match decision {
+-            Ok(_decision) => actions.push(DriverAction::ScorePeer {
+-                from,
+-                event: indra_network::peer::ScoreEvent::ValidVote,
+-            }),
++            Ok(_decision) => {
++                #[cfg(test)]
++                {
++                    self.vote_admission_metrics.collector_insertions += 1;
++                }
++                actions.push(DriverAction::ScorePeer {
++                    from,
++                    event: indra_network::peer::ScoreEvent::ValidVote,
++                });
++            }
+             Err(err) => {
+                 eprintln!(
+                     "[vote] rejected vote from {} for {} at height={} round={}: {}",
+@@ -1770,6 +1831,10 @@
+ 
+         match decision {
+             Ok(decision) => {
++                #[cfg(test)]
++                {
++                    self.vote_admission_metrics.collector_insertions += 1;
++                }
+                 actions.push(DriverAction::ScorePeer {
+                     from,
+                     event: indra_network::peer::ScoreEvent::ValidVote,
+@@ -1953,6 +2018,10 @@
+ 
+         let quorum_vote_values = self.precommit_votes_for_block(collector, block_hash);
+         let quorum_votes: Vec<&VoteV1> = quorum_vote_values.iter().collect();
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.qc_formations += 1;
++        }
+         let qc = match build_qc(
+             height,
+             round,
+@@ -4121,7 +4190,10 @@
+         for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+             driver.seen_round_votes.insert(
+                 (test_hash(i), 1, i as u32, VoteStep::Prevote),
+-                test_hash(i + 1_000),
++                AcceptedVoteIdentity {
++                    block_hash: test_hash(i + 1_000),
++                    snapshot_root: Bytes32::ZERO,
++                },
+             );
+         }
+         driver.prune_seen_round_votes();
+@@ -4621,6 +4693,295 @@
+     }
+ 
+     #[test]
++    fn accepted_vote_replay_skips_snapshot_and_hybrid_work_across_peer_paths() {
++        let (mut driver, dir) = local_driver([0x40u8; 32], "accepted_vote_replay_fast_path");
++        let remote = install_active_validator(&mut driver, [0x41u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let vote = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&remote),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let phase_before = driver.current_phase();
++
++        let first = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9291".parse().unwrap(),
++            vote: vote.clone(),
++        });
++        assert!(!first
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert_eq!(
++            driver.vote_admission_metrics,
++            VoteAdmissionMetrics {
++                snapshot_lookups: 1,
++                hybrid_authority_calls: 1,
++                successful_ed25519_verifications: 1,
++                successful_mldsa_verifications: 1,
++                collector_insertions: 1,
++                qc_formations: 0,
++            }
++        );
++        let metrics_after_first = driver.vote_admission_metrics;
++        let seen_after_first = driver.seen_round_votes.len();
++
++        // A new authenticated address models another relay or a replacement
++        // connection. The driver state is consensus-scoped, not connection-scoped.
++        let replay = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9292".parse().unwrap(),
++            vote,
++        });
++        assert!(replay.is_empty());
++        assert_eq!(driver.vote_admission_metrics, metrics_after_first);
++        assert_eq!(driver.seen_round_votes.len(), seen_after_first);
++        assert_eq!(driver.current_phase(), phase_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn cryptographically_invalid_vote_cannot_poison_replay_state() {
++        let (mut driver, dir) = local_driver([0x42u8; 32], "invalid_vote_no_replay_poison");
++        let remote = install_active_validator(&mut driver, [0x43u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let valid = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&remote),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let slot = (valid.validator_id, valid.height, valid.round, valid.step);
++        let mut invalid = valid.clone();
++        let mut bad_pq = invalid.signature.pq_sig.as_slice().to_vec();
++        bad_pq[0] ^= 0x80;
++        invalid.signature.pq_sig = VariableBytes::from_slice(&bad_pq).unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9293".parse().unwrap(),
++            vote: invalid,
++        });
++        assert!(rejected
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert!(!driver.seen_round_votes.contains_key(&slot));
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 0);
++        assert_eq!(
++            driver.vote_admission_metrics.successful_mldsa_verifications,
++            0
++        );
++
++        let accepted = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9294".parse().unwrap(),
++            vote: valid,
++        });
++        assert!(!accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert!(driver.seen_round_votes.contains_key(&slot));
++        assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 2);
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 1);
++        assert_eq!(
++            driver
++                .vote_admission_metrics
++                .successful_ed25519_verifications,
++            1
++        );
++        assert_eq!(
++            driver.vote_admission_metrics.successful_mldsa_verifications,
++            1
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn wrong_snapshot_vote_is_not_collapsed_into_exact_replay() {
++        let (mut driver, dir) = local_driver([0x44u8; 32], "wrong_snapshot_not_replay");
++        let remote = install_active_validator(&mut driver, [0x45u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let remote_id = validator_id_for(&remote);
++        let accepted = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            remote_id,
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let _ = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9295".parse().unwrap(),
++            vote: accepted,
++        });
++        let before = driver.vote_admission_metrics;
++        let wrong_root = Bytes32::from([0xA6; 32]);
++        let wrong = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            remote_id,
++            wrong_root,
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9296".parse().unwrap(),
++            vote: wrong,
++        });
++        assert!(rejected
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert_eq!(
++            driver.vote_admission_metrics.snapshot_lookups,
++            before.snapshot_lookups + 1
++        );
++        assert_eq!(
++            driver.vote_admission_metrics.hybrid_authority_calls,
++            before.hybrid_authority_calls + 1
++        );
++        assert_eq!(
++            driver
++                .vote_admission_metrics
++                .successful_ed25519_verifications,
++            before.successful_ed25519_verifications
++        );
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn vote_replay_identity_is_round_step_and_height_scoped() {
++        let (mut driver, dir) = local_driver([0x46u8; 32], "vote_replay_dimensions");
++        let remote = install_active_validator(&mut driver, [0x47u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let height = driver.next_height();
++        let root = governing_snapshot_root(&driver, height);
++        let remote_id = validator_id_for(&remote);
++        let votes = [
++            indra_consensus::vote::produce_vote(
++                height,
++                0,
++                VoteStep::Prevote,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++            indra_consensus::vote::produce_vote(
++                height,
++                0,
++                VoteStep::Precommit,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++            indra_consensus::vote::produce_vote(
++                height,
++                1,
++                VoteStep::Prevote,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++        ];
++        for (index, vote) in votes.iter().cloned().enumerate() {
++            let actions = driver.process(DriverEvent::InboundVote {
++                from: SocketAddr::from(([127, 0, 0, 1], 9300 + index as u16)),
++                vote,
++            });
++            assert!(!actions.iter().any(|action| matches!(
++                action,
++                DriverAction::DisconnectInvalidConsensusPeer { .. }
++            )));
++        }
++        assert_eq!(driver.vote_admission_metrics.snapshot_lookups, 3);
++        assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 3);
++        assert_eq!(driver.seen_round_votes.len(), 3);
++
++        let before = driver.vote_admission_metrics;
++        let seen_before = driver.seen_round_votes.len();
++        driver.engine.state.height = height;
++        let stale = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9303".parse().unwrap(),
++            vote: votes[0].clone(),
++        });
++        assert!(stale.is_empty());
++        assert_eq!(driver.vote_admission_metrics, before);
++        assert_eq!(driver.seen_round_votes.len(), seen_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn vote_replay_state_is_not_persisted_across_restart() {
++        let seed = [0x48u8; 32];
++        let (mut driver, dir) = local_driver(seed, "vote_replay_restart_scope");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let signer = HybridKeypair::new(
++            ClassicalKeypair::from_seed(&seed),
++            PqKeypair::from_seed(&seed).unwrap(),
++        );
++        let vote = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&signer),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        let _ = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9304".parse().unwrap(),
++            vote: vote.clone(),
++        });
++        assert_eq!(driver.seen_round_votes.len(), 1);
++
++        let config = driver.engine.config.clone();
++        drop(driver);
++        let engine = NodeEngine::init(config).unwrap();
++        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
++        let mut restarted = ConsensusDriver::new(engine, vote_safety);
++        restarted.sync.mark_caught_up(restarted.height());
++        assert!(restarted.seen_round_votes.is_empty());
++        let _ = restarted.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9305".parse().unwrap(),
++            vote,
++        });
++        assert_eq!(restarted.vote_admission_metrics.snapshot_lookups, 1);
++        assert_eq!(restarted.vote_admission_metrics.hybrid_authority_calls, 1);
++        assert_eq!(restarted.vote_admission_metrics.collector_insertions, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
+     fn driver_detects_double_precommit() {
+         let (mut driver, dir) = local_driver([0x48u8; 32], "double_precommit");
+         let remote = install_active_validator(&mut driver, [0x49u8; 32], "remote");
+@@ -4670,6 +5031,62 @@
+     }
+ 
+     #[test]
++    fn conflicting_vote_orderings_bypass_exact_replay_fast_path() {
++        for (index, reverse) in [false, true].into_iter().enumerate() {
++            let seed = [0x50u8 + index as u8; 32];
++            let suffix = format!("equivocation_order_{index}");
++            let (mut driver, dir) = local_driver(seed, &suffix);
++            let remote =
++                install_active_validator(&mut driver, [0x52u8 + index as u8; 32], "remote");
++            driver.refresh_registered_voters();
++            driver.sync.mark_caught_up(driver.height());
++            let remote_id = validator_id_for(&remote);
++            let make_vote = |hash| {
++                indra_consensus::vote::produce_vote(
++                    driver.next_height(),
++                    0,
++                    VoteStep::Precommit,
++                    hash,
++                    remote_id,
++                    governing_snapshot_root(&driver, driver.next_height()),
++                    DEFAULT_CHAIN_ID,
++                    &remote,
++                )
++                .unwrap()
++            };
++            let a = make_vote(Bytes32::from([0xAA; 32]));
++            let b = make_vote(Bytes32::from([0xBB; 32]));
++            let (first, second) = if reverse { (b, a) } else { (a, b) };
++            let _ = driver.process(DriverEvent::InboundVote {
++                from: "127.0.0.1:9297".parse().unwrap(),
++                vote: first,
++            });
++            let evidence = driver.process(DriverEvent::InboundVote {
++                from: "127.0.0.1:9298".parse().unwrap(),
++                vote: second,
++            });
++
++            assert!(evidence
++                .iter()
++                .any(|action| matches!(action, DriverAction::SlashDetected(_))));
++            assert_eq!(driver.vote_admission_metrics.snapshot_lookups, 2);
++            assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 2);
++            assert_eq!(
++                driver
++                    .vote_admission_metrics
++                    .successful_ed25519_verifications,
++                2
++            );
++            assert_eq!(
++                driver.vote_admission_metrics.successful_mldsa_verifications,
++                2
++            );
++            assert_eq!(driver.vote_admission_metrics.collector_insertions, 0);
++            let _ = std::fs::remove_dir_all(&dir);
++        }
++    }
++
++    #[test]
+     fn forged_vote_cannot_poison_real_validators_round_slot() {
+         let (mut driver, dir) = local_driver([0x4Bu8; 32], "forged_vote_slot");
+         let real = install_active_validator(&mut driver, [0x4Cu8; 32], "real");
+@@ -4719,7 +5136,13 @@
+         assert!(!legitimate_actions
+             .iter()
+             .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
+-        assert_eq!(driver.seen_round_votes.get(&slot), Some(&Bytes32::ZERO));
++        assert_eq!(
++            driver.seen_round_votes.get(&slot),
++            Some(&AcceptedVoteIdentity {
++                block_hash: Bytes32::ZERO,
++                snapshot_root: governing_snapshot_root(&driver, driver.next_height()),
++            })
++        );
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
+
+--- a/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
++++ b/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
+@@ -24,12 +24,14 @@
+ 
+ vote = driver[driver.index("fn process_vote("):driver.index("fn maybe_advance_to_certified_round(")]
+ required = [
++    "let slot_key =",
++    "let replay_identity = AcceptedVoteIdentity",
++    "seen_round_votes",
+     "snapshot_for_consensus_height",
+     "verify_vote_authority(",
+     "slash_detector.observe_vote",
+-    "seen_round_votes.get",
+ ]
+ positions = [vote.index(token) for token in required]
+ assert positions == sorted(positions), (required, positions)
+ 
+-print("PASS: L3-NET-05 replay guard precedes admission; L3-NET-06 order unchanged")
++print("PASS: L3-NET-05 and L3-NET-06 trusted replay guards precede expensive admission")
+
+--- a/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/run_replay_audit.sh
++++ b/audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/run_replay_audit.sh
+@@ -16,6 +16,10 @@
+ cargo test -p indra-node accepted_proposal_replay_skips_authoritative_admission_across_peer_paths
+ cargo test -p indra-node invalid_proposal_cannot_poison_accepted_replay_state
+ cargo test -p indra-node accepted_height_two_proposal_replay_skips_embedded_qc_verification
++cargo test -p indra-node accepted_vote_replay_skips_snapshot_and_hybrid_work_across_peer_paths
++cargo test -p indra-node cryptographically_invalid_vote_cannot_poison_replay_state
++cargo test -p indra-node wrong_snapshot_vote_is_not_collapsed_into_exact_replay
++cargo test -p indra-node conflicting_vote_orderings_bypass_exact_replay_fast_path
+ 
+-# Guard the remediated L3-NET-05 order and preserve the L3-NET-06 observation.
++# Guard both remediated trusted replay boundaries.
+ python3 audit_evidence/21_consensus_network_adversarial/02_replay_duplication/harness/source_order.py
+

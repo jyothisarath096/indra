@@ -1,0 +1,28 @@
+{
+  "model_version": 1,
+  "protocol": {
+    "f": "3/8",
+    "F": "6917529027641081856",
+    "maximum_active_validators": 200,
+    "qc_predicate": "signed_stake * 3 > total_stake * 2",
+    "consensus_weight": "validator self stake only; delegated stake excluded"
+  },
+  "probability": {
+    "eligibility": "1-(1-f)^(w/W)",
+    "distinct_rounds": "modeled as independent under RFC 9381 pseudorandomness and round-bound injective transcripts",
+    "aggregate_no_proposer": "(1-f)^online_stake_fraction",
+    "q768_note": "ideal probabilities are used; the separately audited downward threshold approximation is negligible for topology-scale results"
+  },
+  "failure_model": {
+    "correlated_outage": "the named stake fraction is deterministically unavailable for voting and proposing",
+    "byzantine": "the coalition coordinates eligibility disclosure, proposal withholding, and vote withholding",
+    "partition": "messages do not cross partition; each side retains its own stake fraction",
+    "honest_signing": "honest validators do not sign conflicting finalized values"
+  },
+  "not_claimed": [
+    "validator identities correspond one-to-one with operators",
+    "network addresses identify cloud provider, region, country, or ASN",
+    "the historical testnet topology predicts mainnet topology",
+    "independent validator failures approximate provider or operator outages"
+  ]
+}

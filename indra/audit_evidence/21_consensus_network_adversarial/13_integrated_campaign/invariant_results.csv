@@ -1,0 +1,9 @@
+invariant,source,result,scope
+finalized hash unique,driver safety records/tests,pass,unit/restart coverage
+committed height monotonic,engine/driver restart tests,pass,unit coverage
+honest H/R/S vote uniqueness,persisted vote safety tests,pass,unit/restart coverage
+legal lock transitions,PoLC/lock tests,pass,unit coverage
+QC strict >2/3 authority,qc and sync verification tests,pass,unit coverage
+snapshot authority consistency,snapshot binding tests,pass,unit coverage
+post-GST finalization,multi-node campaign,not executed,coverage gap
+restarted catch-up,multi-node campaign,not executed,coverage gap

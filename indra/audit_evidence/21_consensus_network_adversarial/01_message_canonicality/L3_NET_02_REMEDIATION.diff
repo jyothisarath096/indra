@@ -1,0 +1,139 @@
+diff --git a/indra-network/src/message.rs b/indra-network/src/message.rs
+--- a/indra-network/src/message.rs
++++ b/indra-network/src/message.rs
+@@ -504,2 +504,7 @@ impl Message {
+             MessageType::Ping => {
++                if payload.len() != 8 {
++                    return Err(NetworkError::DecodeFailed {
++                        reason: "ping payload must be exactly 8 bytes".to_string(),
++                    });
++                }
+                 let nonce_bytes: [u8; 8] = payload
+@@ -517,2 +522,7 @@ impl Message {
+             MessageType::Pong => {
++                if payload.len() != 8 {
++                    return Err(NetworkError::DecodeFailed {
++                        reason: "pong payload must be exactly 8 bytes".to_string(),
++                    });
++                }
+                 let nonce_bytes: [u8; 8] = payload
+@@ -530,2 +540,7 @@ impl Message {
+             MessageType::RequestBlocks => {
++                if payload.len() != 16 {
++                    return Err(NetworkError::DecodeFailed {
++                        reason: "request_blocks payload must be exactly 16 bytes".to_string(),
++                    });
++                }
+                 let from_height_bytes: [u8; 8] = payload
+@@ -706,2 +721,7 @@ impl Message {
+             MessageType::RequestQC => {
++                if payload.len() != 8 {
++                    return Err(NetworkError::DecodeFailed {
++                        reason: "request_qc payload must be exactly 8 bytes".to_string(),
++                    });
++                }
+                 let height_bytes: [u8; 8] = payload
+@@ -739,3 +759,14 @@ impl Message {
+                 let len = u32::from_le_bytes(len_bytes) as usize;
++                let expected_len = 12usize.checked_add(len).ok_or(NetworkError::DecodeFailed {
++                    reason: "qc_response length overflow".to_string(),
++                })?;
++                if payload.len() != expected_len {
++                    return Err(NetworkError::DecodeFailed {
++                        reason: format!(
++                            "qc_response payload length mismatch: declared {len} QC bytes, payload contains {}",
++                            payload.len().saturating_sub(12)
++                        ),
++                    });
++                }
+                 let qc_bytes = payload
+-                    .get(12..12 + len)
++                    .get(12..expected_len)
+@@ -1263,1 +1294,1 @@ mod tests {
+-    fn framed_decoder_accepts_outer_transport_maximum_when_declared_exactly() {
++    fn framed_decoder_rejects_noncanonical_fixed_payload_at_transport_maximum() {
+@@ -1269,6 +1300,68 @@ mod tests {
+         assert!(matches!(
+             Message::decode_framed_wire(&wire),
+-            Ok(Message::Ping(0))
++            Err(NetworkError::DecodeFailed { .. })
+         ));
+     }
++
++    fn assert_canonical_and_rejects_trailing(msg: Message) {
++        let canonical = msg.encode_wire().unwrap();
++        let decoded = Message::decode_framed_wire(&canonical).unwrap();
++        assert_eq!(decoded.encode_wire().unwrap(), canonical);
++
++        for suffix in [
++            vec![0xAA],
++            vec![0xAA, 0x55, 0x00],
++            Message::Pong(9).encode_wire().unwrap(),
++        ] {
++            let mut malformed = canonical.clone();
++            malformed.extend_from_slice(&suffix);
++            let declared_len = (malformed.len() - 4) as u32;
++            malformed[..4].copy_from_slice(&declared_len.to_le_bytes());
++            assert!(Message::decode_framed_wire(&malformed).is_err());
++        }
++    }
++
++    #[test]
++    fn ping_payload_is_exact_and_canonical() {
++        assert_canonical_and_rejects_trailing(Message::Ping(u64::MAX));
++    }
++
++    #[test]
++    fn pong_payload_is_exact_and_canonical() {
++        assert_canonical_and_rejects_trailing(Message::Pong(0));
++    }
++
++    #[test]
++    fn request_blocks_payload_is_exact_and_canonical() {
++        assert_canonical_and_rejects_trailing(Message::RequestBlocks {
++            from_height: 0,
++            to_height: u64::MAX,
++        });
++    }
++
++    #[test]
++    fn request_qc_payload_is_exact_and_canonical() {
++        assert_canonical_and_rejects_trailing(Message::RequestQC { height: u64::MAX });
++    }
++
++    #[test]
++    fn qc_response_payload_is_exact_and_canonical() {
++        assert_canonical_and_rejects_trailing(Message::QCResponse {
++            height: 0,
++            qc_bytes: vec![],
++        });
++        assert_canonical_and_rejects_trailing(Message::QCResponse {
++            height: u64::MAX,
++            qc_bytes: vec![0x11, 0x22, 0x33],
++        });
++
++        let maximum = Message::QCResponse {
++            height: 1,
++            qc_bytes: vec![0; MAX_MSG_BYTES - 17],
++        }
++        .encode_wire()
++        .unwrap();
++        assert_eq!(maximum.len(), MAX_MSG_BYTES);
++        assert!(Message::decode_framed_wire(&maximum).is_ok());
++    }
+ }
+diff --git a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+--- a/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
++++ b/audit_evidence/21_consensus_network_adversarial/01_message_canonicality/harness/src/main.rs
+@@ -54,1 +54,1 @@ fn main() {
+-    assert!(accepted("ping_trailing", &ping_trailing));
++    assert!(!accepted("ping_trailing", &ping_trailing));
+@@ -63,1 +63,1 @@ fn main() {
+-    assert!(accepted("request_blocks_trailing", &request_blocks));
++    assert!(!accepted("request_blocks_trailing", &request_blocks));
+@@ -67,1 +67,1 @@ fn main() {
+-    assert!(accepted("request_qc_trailing", &request_qc));
++    assert!(!accepted("request_qc_trailing", &request_qc));
+@@ -76,1 +76,1 @@ fn main() {
+-    assert!(accepted("qc_response_trailing", &qc_response));
++    assert!(!accepted("qc_response_trailing", &qc_response));

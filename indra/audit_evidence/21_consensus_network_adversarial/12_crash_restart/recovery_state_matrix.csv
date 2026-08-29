@@ -1,0 +1,10 @@
+state,persistent,storage,load/restore,validation,reset,safety,liveness
+committed height/tip,yes,chain DB,startup engine load,chain consistency,none,high,high
+state root,yes,chain DB,engine init,root validation,none,high,high
+lock/last vote,yes,consensus safety record,driver startup,anti-double-sign checks,none,critical,medium
+authority snapshot,yes,snapshot/chain,engine restore,snapshot root/authority checks,none,critical,high
+BanStore,yes,peer-bans file,peer manager load,strict format/expiry,expiry cleanup,medium,medium
+connections,no,sockets,network startup,handshake reauth,reconnect,low,high
+outstanding/provisional sync,no,memory,none,discarded,reset,medium,high
+timers,no,memory,phase reconstruction,phase validity,restart timers,low,medium
+relay/replay caches,no,memory,none,none,clear,low,low

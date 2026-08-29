@@ -1,0 +1,14 @@
+state,purpose,key,scope,created_before_auth,expiry_or_cleanup,hard_bound,observed_result
+outbound_cooldowns,dial backoff,"Address(String)|Validator(Bytes32)",candidate/validator,no,reset on success; no periodic prune,"discovered <=256 plus configured peers",bounded for network-discovered candidates; configured bootstrap set is operationally bounded
+failure_counts,dial eviction counters,Socket address string,candidate,no,removed at 20 failures or success,discovered candidate set,does not retain evicted candidates
+sync_cooldowns,sync timeout/validation backoff,validator Bytes32,validator,no,reset on success; no epoch prune,authority cap per epoch only,historical validator IDs survive authority rotation (hardening concern)
+discovered_peers,peer discovery,peer address string,peer,no,deterministic bounded eviction,256,hard bounded
+peer_sources,discovery provenance,peer address string,peer,no,updated with accepted peers; no independent cap,<=accepted discovered addresses in normal path,bounded if eviction cleanup remains coupled
+height_claims,peer height corroboration,validator Bytes32,validator,yes,30s retain,active validator claims,expiry-pruned
+outstanding,single sync request,unit,session,no,consume/timeout,1,bounded
+provisional,staged sync candidate,unit,session,no,take/clear,1,bounded
+expensive_failure_sources,breaker source attribution,height u64,consensus height,no,inner 60s prune; outer key retained,potentially historical heights,not attacker-arbitrary through admission path; lifecycle assumption
+circuit_open_until,expensive validation breaker,height u64,consensus height,no,retain expired on circuit_open,process map can retain stale keys until queried,operationally bounded by reachable sync heights
+op_relay_seen,relay duplicate suppression,hash,object,no,TTL + fixed capacities,512/2048/16384 depending category,hard bounded
+pending_dependencies,dependency wait state,consensus object key,session,no,expiry/reset,source bounded,hard bounded by implementation
+peer_manager limiters,authenticated message budgets,validator Bytes32,validator,after auth,authority lifecycle,<=200 validators,hard bounded by authority cap

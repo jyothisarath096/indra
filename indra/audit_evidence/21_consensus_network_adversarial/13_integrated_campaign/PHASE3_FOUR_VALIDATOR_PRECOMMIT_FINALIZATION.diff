@@ -1,0 +1,2796 @@
+diff --git a/indra/indra-node/src/driver.rs b/indra/indra-node/src/driver.rs
+index 98aee15d..80a1558f 100644
+--- a/indra/indra-node/src/driver.rs
++++ b/indra/indra-node/src/driver.rs
+@@ -17,8 +17,10 @@ use indra_consensus::{
+ };
+ use indra_core::codec::{Decode, Encode};
+ use indra_core::types::{
+-    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+-    primitives::{has_strict_two_thirds_quorum, Bytes32},
++    block::{BlockProposalVNext, BlockVNext},
++    primitives::{
++        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ROUNDS_PER_HEIGHT,
++    },
+     proposal::verify_proposal,
+     qc::QuorumCertificateV1,
+     vote::{VoteStep, VoteV1},
+@@ -161,8 +163,6 @@ pub enum DriverAction {
+         /// Raw encoded QC bytes.
+         qc_bytes: Vec<u8>,
+     },
+-    /// Re-process a buffered future proposal after the local tip advances.
+-    ActivateBufferedProposal(BlockProposalVNext),
+     /// Slash evidence was detected.
+     SlashDetected(SlashEvidence),
+     /// A connected peer sent a consensus message that passed cheap routing
+@@ -186,6 +186,33 @@ pub enum DriverAction {
+     None,
+ }
+ 
++#[cfg(test)]
++/// Test-only counters proving proposal replay admission cost.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++struct ProposalAdmissionMetrics {
++    proposal_verifications: usize,
++    qc_verifications: usize,
++    detached_projections: usize,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct AcceptedVoteIdentity {
++    block_hash: Bytes32,
++    snapshot_root: Bytes32,
++}
++
++#[cfg(test)]
++/// Test-only counters proving vote replay admission cost and state effects.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++struct VoteAdmissionMetrics {
++    snapshot_lookups: usize,
++    hybrid_authority_calls: usize,
++    successful_ed25519_verifications: usize,
++    successful_mldsa_verifications: usize,
++    collector_insertions: usize,
++    qc_formations: usize,
++}
++
+ /// The consensus driver.
+ pub struct ConsensusDriver {
+     /// The underlying node engine.
+@@ -198,14 +225,12 @@ pub struct ConsensusDriver {
+     round_advance_evidence: HashMap<(u64, u32), BTreeMap<Bytes32, VoteV1>>,
+     /// Pending blocks by block hash.
+     pending_blocks: HashMap<Bytes32, BlockProposalVNext>,
+-    /// Proposals buffered because they arrived before their parent tip was committed locally.
+-    future_proposals: HashMap<(u64, Bytes32), Vec<BlockProposalVNext>>,
+     /// Votes received before the matching proposal was staged locally.
+     buffered_votes: HashMap<(u64, u32, Bytes32), Vec<(SocketAddr, VoteV1)>>,
+     /// Missing proposals already requested from peers.
+     requested_proposals: HashSet<(u64, u32, Bytes32)>,
+-    /// First accepted vote hash per (validator, height, round, step).
+-    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), Bytes32>,
++    /// First accepted vote identity per (validator, height, round, step).
++    seen_round_votes: HashMap<(Bytes32, u64, u32, VoteStep), AcceptedVoteIdentity>,
+     /// Blocks whose precommit quorum arrived before the proposal was staged.
+     pending_precommit_quorum: HashSet<(u64, u32, Bytes32)>,
+     /// Tendermint lock state for the current height.
+@@ -236,6 +261,10 @@ pub struct ConsensusDriver {
+     pub vote_safety: VoteSafetyStore,
+     /// If set, local voting is disabled until operator recovery.
+     vote_safety_unavailable: Option<String>,
++    #[cfg(test)]
++    proposal_admission_metrics: ProposalAdmissionMetrics,
++    #[cfg(test)]
++    vote_admission_metrics: VoteAdmissionMetrics,
+ }
+ 
+ impl ConsensusDriver {
+@@ -247,7 +276,6 @@ impl ConsensusDriver {
+             vote_collectors: HashMap::new(),
+             round_advance_evidence: HashMap::new(),
+             pending_blocks: HashMap::new(),
+-            future_proposals: HashMap::new(),
+             buffered_votes: HashMap::new(),
+             requested_proposals: HashSet::new(),
+             seen_round_votes: HashMap::new(),
+@@ -266,6 +294,10 @@ impl ConsensusDriver {
+             sync: SyncState::follower(0),
+             vote_safety,
+             vote_safety_unavailable: None,
++            #[cfg(test)]
++            proposal_admission_metrics: ProposalAdmissionMetrics::default(),
++            #[cfg(test)]
++            vote_admission_metrics: VoteAdmissionMetrics::default(),
+         };
+         driver.sync = if driver.engine.state.height == 0 {
+             // At genesis every validator already has genesis state — no sync needed.
+@@ -680,9 +712,8 @@ impl ConsensusDriver {
+ 
+     /// External compatibility hook used after height advancement.
+     pub fn reset_round(&mut self) {
+-        self.prune_future_proposals();
+         self.valid_proposal = None;
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -691,14 +722,13 @@ impl ConsensusDriver {
+         self.sync.mark_caught_up(self.engine.state.height);
+         self.refresh_registered_voters();
+         self.pending_blocks.clear();
+-        self.future_proposals.clear();
+         self.buffered_votes.clear();
+         self.requested_proposals.clear();
+         self.pending_precommit_quorum.clear();
+         self.vote_collectors.clear();
+         self.round_advance_evidence.clear();
+         self.seen_round_votes.clear();
+-        self.start_round(0);
++        self.start_round(0).expect("round zero is always legal");
+         self.apply_vote_safety();
+     }
+ 
+@@ -727,9 +757,14 @@ impl ConsensusDriver {
+         (height, round, step)
+     }
+ 
+-    fn start_round(&mut self, round: u32) {
++    fn start_round(&mut self, round: u32) -> NodeResult<()> {
++        validate_consensus_round(round).map_err(|error| NodeError::BlockInvalid {
++            height: self.next_height(),
++            reason: error.to_string(),
++        })?;
+         self.current_round = round;
+         self.current_phase = RoundPhase::Propose;
++        Ok(())
+     }
+ 
+     fn enter_precommit_phase(&mut self) {
+@@ -749,7 +784,7 @@ impl ConsensusDriver {
+             round,
+             self.engine.state.election_seed,
+             snapshot,
+-        )
++        )?
+         .election)
+     }
+ 
+@@ -807,6 +842,7 @@ impl ConsensusDriver {
+         &mut self,
+         lock: PersistedConsensusLock,
+     ) -> Result<(), String> {
++        validate_consensus_round(lock.round).map_err(|error| error.to_string())?;
+         if lock.height != self.next_height()
+             || lock.proposal.block.header.height != lock.height
+             || lock.proposal.block.header.block_hash() != lock.block_hash
+@@ -831,6 +867,7 @@ impl ConsensusDriver {
+             lock.round,
+             VoteStep::Prevote,
+             self.engine.state.chain_id.clone(),
++            snapshot.snapshot_root,
+             self.registered_voters.clone(),
+         );
+         for vote in &lock.polc_votes {
+@@ -885,12 +922,28 @@ impl ConsensusDriver {
+                 }
+                 self.vote_safety_unavailable = None;
+                 if record.height == next_height && record.round >= self.current_round {
+-                    let safe_round = record.round.saturating_add(1);
++                    let safe_round = match record
++                        .round
++                        .checked_add(1)
++                        .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++                    {
++                        Some(round) => round,
++                        None => {
++                            let message = format!(
++                                "persisted vote at final legal round {} leaves no safe round at height {}",
++                                record.round, record.height
++                            );
++                            eprintln!("[vote_safety] CRITICAL: {message}");
++                            self.vote_safety_unavailable = Some(message);
++                            return;
++                        }
++                    };
+                     eprintln!(
+                         "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
+                         safe_round, record.height, record.round, record.step
+                     );
+-                    self.start_round(safe_round);
++                    self.start_round(safe_round)
++                        .expect("safe persisted round was validated above");
+                 }
+             }
+             VoteSafetyLoadResult::Corrupt(reason) => {
+@@ -911,7 +964,6 @@ impl ConsensusDriver {
+         self.prune_vote_collectors();
+         self.prune_round_advance_evidence();
+         self.prune_pending_blocks();
+-        self.prune_future_proposals_bounded();
+         self.prune_buffered_votes();
+         self.prune_requested_proposals();
+         self.prune_seen_round_votes();
+@@ -921,7 +973,11 @@ impl ConsensusDriver {
+     fn prune_round_advance_evidence(&mut self) {
+         let height = self.next_height();
+         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
+-        let max_round = self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP);
++        let max_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
+         self.round_advance_evidence
+             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
+         if self.round_advance_evidence.len() > MAX_STALLED_HEIGHT_ENTRIES {
+@@ -982,56 +1038,6 @@ impl ConsensusDriver {
+         self.pending_blocks.retain(|hash, _| keep.contains(hash));
+     }
+ 
+-    fn prune_future_proposals_bounded(&mut self) {
+-        for proposals in self.future_proposals.values_mut() {
+-            if proposals.len() > MAX_STALLED_HEIGHT_ENTRIES {
+-                let next_height = self.engine.state.height.saturating_add(1);
+-                let current_round = self.current_round;
+-                proposals.sort_by_key(|proposal| {
+-                    (
+-                        proposal.block.header.height.abs_diff(next_height),
+-                        proposal.block.header.proposer_round.abs_diff(current_round),
+-                        proposal.block.header.block_hash().0,
+-                    )
+-                });
+-                proposals.truncate(MAX_STALLED_HEIGHT_ENTRIES);
+-            }
+-        }
+-        self.future_proposals
+-            .retain(|_, proposals| !proposals.is_empty());
+-
+-        let total: usize = self.future_proposals.values().map(Vec::len).sum();
+-        if total <= MAX_STALLED_HEIGHT_ENTRIES {
+-            return;
+-        }
+-
+-        let next_height = self.next_height();
+-        let current_round = self.current_round;
+-        let mut ranked = Vec::new();
+-        for proposals in self.future_proposals.values() {
+-            for proposal in proposals {
+-                let hash = proposal.block.header.block_hash();
+-                ranked.push((
+-                    hash,
+-                    proposal.block.header.height.abs_diff(next_height),
+-                    proposal.block.header.proposer_round.abs_diff(current_round),
+-                ));
+-            }
+-        }
+-        ranked.sort_by_key(|(hash, height_distance, round_distance)| {
+-            (*height_distance, *round_distance, hash.0)
+-        });
+-        let keep: HashSet<_> = ranked
+-            .into_iter()
+-            .take(MAX_STALLED_HEIGHT_ENTRIES)
+-            .map(|(hash, _, _)| hash)
+-            .collect();
+-        self.future_proposals.retain(|_, proposals| {
+-            proposals.retain(|proposal| keep.contains(&proposal.block.header.block_hash()));
+-            !proposals.is_empty()
+-        });
+-    }
+-
+     fn prune_buffered_votes(&mut self) {
+         if self.buffered_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES {
+             return;
+@@ -1109,14 +1115,6 @@ impl ConsensusDriver {
+             .retain(|key| keep.contains(key));
+     }
+ 
+-    fn prune_future_proposals(&mut self) {
+-        let next_height = self.next_height();
+-        self.future_proposals.retain(|(height, _), _| {
+-            *height >= next_height && *height <= next_height.saturating_add(2)
+-        });
+-        self.prune_future_proposals_bounded();
+-    }
+-
+     fn pending_block_for_slot(&self, height: u64, round: u32) -> Option<BlockVNext> {
+         self.pending_blocks
+             .values()
+@@ -1222,7 +1220,7 @@ impl ConsensusDriver {
+         };
+         let hash = block.header.block_hash();
+         let value_hash = block.header.value_hash;
+-        let vote_hash = if block.header.polc_round == NO_POLC_ROUND {
++        let vote_hash = if block.header.polc_round.is_none() {
+             // Rule 2
+             if self.locked_round.is_none() || self.locked_value == Some(hash) {
+                 hash
+@@ -1231,7 +1229,7 @@ impl ConsensusDriver {
+             }
+         } else {
+             // Rule 3
+-            let valid_round = block.header.polc_round;
++            let valid_round = block.header.polc_round.expect("checked Some above");
+             if valid_round < self.current_round
+                 && self.has_quorum_for_value_hash(
+                     height,
+@@ -1262,6 +1260,14 @@ impl ConsensusDriver {
+         step: VoteStep,
+         block_hash: Bytes32,
+     ) -> Vec<DriverAction> {
++        let canonical_height = self.next_height();
++        if height != canonical_height || round != self.current_round {
++            eprintln!(
++                "[vote] refusing non-canonical signing coordinates: requested height={} round={}, canonical height={} round={}",
++                height, round, canonical_height, self.current_round
++            );
++            return vec![DriverAction::None];
++        }
+         let Some(local_validator_id) = self.engine.validator_id() else {
+             return vec![];
+         };
+@@ -1346,11 +1352,32 @@ impl ConsensusDriver {
+         }
+     }
+ 
++    #[cfg(feature = "audit-harness")]
++    pub(crate) fn audit_create_local_vote(
++        &mut self,
++        height: u64,
++        round: u32,
++        step: VoteStep,
++        block_hash: Bytes32,
++    ) -> Vec<DriverAction> {
++        self.sign_and_record_local_vote(height, round, step, block_hash)
++    }
++
+     fn process_proposal(
+         &mut self,
+         from: Option<SocketAddr>,
+         proposal: BlockProposalVNext,
+     ) -> Vec<DriverAction> {
++        if validate_consensus_round(proposal.block.header.proposer_round).is_err()
++            || validate_consensus_round(proposal.block.header.value_entropy.origin_round).is_err()
++            || proposal
++                .block
++                .header
++                .polc_round
++                .is_some_and(|round| validate_consensus_round(round).is_err())
++        {
++            return vec![DriverAction::None];
++        }
+         if !self.sync.is_caught_up() {
+             return vec![DriverAction::None];
+         }
+@@ -1360,21 +1387,26 @@ impl ConsensusDriver {
+         if block.header.height < next_height {
+             return vec![DriverAction::None];
+         }
+-        if block.header.height > next_height.saturating_add(2) {
++        // A proposal is consensus state only when its parent is the current
++        // canonical tip and its full transition can be projected now. Future
++        // or wrong-parent proposals are dropped; proposal request/response
++        // recovery can fetch them after the parent commits. Keeping decoded
++        // objects here would give unverified data trusted-container status.
++        if block.header.height != next_height
++            || block.header.prev_hash != self.engine.state.tip_hash
++        {
+             return vec![DriverAction::None];
+         }
+-        if block.header.height > next_height || block.header.prev_hash != self.engine.state.tip_hash
+-        {
+-            let key = (block.header.height, block.header.prev_hash);
+-            let entry = self.future_proposals.entry(key).or_default();
+-            let block_hash = block.header.block_hash();
+-            if !entry
+-                .iter()
+-                .any(|existing| existing.block.header.block_hash() == block_hash)
+-            {
+-                entry.push(proposal);
+-            }
+-            self.prune_future_proposals();
++
++        // `pending_blocks` is authoritative: entries are inserted only after
++        // proposer/VRF, embedded-QC, detached projection, and root validation
++        // all succeed. An exact block hash already present here therefore
++        // identifies an accepted proposal replay without letting unverified
++        // input create trusted replay state. Different-round reproposals and
++        // conflicting proposals have different consensus block hashes and
++        // continue through full admission.
++        let block_hash = block.header.block_hash();
++        if self.pending_blocks.contains_key(&block_hash) {
+             return vec![DriverAction::None];
+         }
+ 
+@@ -1395,6 +1427,10 @@ impl ConsensusDriver {
+                 return vec![DriverAction::None];
+             }
+         };
++        #[cfg(test)]
++        {
++            self.proposal_admission_metrics.proposal_verifications += 1;
++        }
+         let verified = match verify_proposal(
+             &proposal,
+             self.engine.state.chain_id.as_bytes(),
+@@ -1415,6 +1451,10 @@ impl ConsensusDriver {
+         };
+ 
+         if block.header.height > 1 {
++            #[cfg(test)]
++            {
++                self.proposal_admission_metrics.qc_verifications += 1;
++            }
+             if let Err(err) = crate::sync::verify_network_block_qc(
+                 block,
+                 &self.engine.state,
+@@ -1428,8 +1468,24 @@ impl ConsensusDriver {
+             }
+         }
+ 
+-        let mut projected_state = self.engine.state.clone();
+-        if indra_state::apply_block(&mut projected_state, &verified, 0).is_err() {
++        // Admission must validate the commitments before staging the proposal:
++        // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
++        // without recomputing it would let a PoLC authorize different immutable
++        // value entropy under the same claimed identity.
++        #[cfg(test)]
++        {
++            self.proposal_admission_metrics.detached_projections += 1;
++        }
++        let projected =
++            match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
++            {
++                Ok(projected) => projected,
++                Err(_) => return vec![DriverAction::None],
++            };
++        if projected.state_root != block.header.state_root
++            || projected.validator_set_root != block.header.validator_set_root
++            || projected.value_hash != block.header.value_hash
++        {
+             return vec![DriverAction::None];
+         }
+ 
+@@ -1488,28 +1544,19 @@ impl ConsensusDriver {
+         actions
+     }
+ 
+-    fn activate_buffered_proposals_for_new_tip(&mut self) -> Vec<DriverAction> {
+-        let key = (self.next_height(), self.engine.state.tip_hash);
+-        let Some(buffered) = self.future_proposals.remove(&key) else {
+-            self.prune_future_proposals();
+-            return vec![];
+-        };
+-
+-        let mut candidates = buffered;
+-        candidates.sort_by_key(|proposal| proposal.block.header.proposer_round);
+-        self.prune_future_proposals();
+-        candidates
+-            .into_iter()
+-            .map(DriverAction::ActivateBufferedProposal)
+-            .collect()
+-    }
+-
+     fn process_vote(&mut self, from: SocketAddr, vote: VoteV1) -> Vec<DriverAction> {
+         let mut actions = Vec::new();
+ 
+-        if vote.height != self.next_height()
+-            || vote.round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+-        {
++        if validate_consensus_round(vote.round).is_err() {
++            return actions;
++        }
++
++        let maximum_jump_round = self
++            .current_round
++            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++            .unwrap_or(u32::MAX)
++            .min(MAX_ROUNDS_PER_HEIGHT - 1);
++        if vote.height != self.next_height() || vote.round > maximum_jump_round {
+             return actions;
+         }
+ 
+@@ -1522,9 +1569,51 @@ impl ConsensusDriver {
+             return actions;
+         }
+ 
+-        if let Err(err) =
+-            verify_vote_authority(&vote, &self.engine.state.chain_id, &self.registered_voters)
+-                .map_err(|error| error.to_string())
++        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
++        let replay_identity = AcceptedVoteIdentity {
++            block_hash: vote.block_hash,
++            snapshot_root: vote.snapshot_root,
++        };
++        // This map is populated only after authoritative snapshot and hybrid
++        // verification. Matching the complete signed semantic identity is
++        // therefore safe before repeated snapshot/crypto work. A conflicting
++        // block hash or snapshot root deliberately continues to verification
++        // and slash/evidence handling.
++        if self
++            .seen_round_votes
++            .get(&slot_key)
++            .is_some_and(|accepted| *accepted == replay_identity)
++        {
++            return actions;
++        }
++
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.snapshot_lookups += 1;
++        }
++        let governing_snapshot_root =
++            match self.engine.state.snapshot_for_consensus_height(vote.height) {
++                Ok(snapshot) => snapshot.snapshot_root,
++                Err(error) => {
++                    actions.push(DriverAction::DisconnectInvalidConsensusPeer {
++                        from,
++                        validator_id: vote.validator_id,
++                        reason: format!("Vote snapshot unavailable: {error}"),
++                    });
++                    return actions;
++                }
++            };
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.hybrid_authority_calls += 1;
++        }
++        if let Err(err) = verify_vote_authority(
++            &vote,
++            &self.engine.state.chain_id,
++            &governing_snapshot_root,
++            &self.registered_voters,
++        )
++        .map_err(|error| error.to_string())
+         {
+             actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                 from,
+@@ -1533,14 +1622,20 @@ impl ConsensusDriver {
+             });
+             return actions;
+         }
++        #[cfg(test)]
++        {
++            // Successful `verify_vote_authority` means both sequential hybrid
++            // components completed successfully.
++            self.vote_admission_metrics.successful_ed25519_verifications += 1;
++            self.vote_admission_metrics.successful_mldsa_verifications += 1;
++        }
+ 
+         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
+             actions.push(DriverAction::SlashDetected(evidence));
+         }
+ 
+-        let slot_key = (vote.validator_id, vote.height, vote.round, vote.step);
+-        if let Some(existing_hash) = self.seen_round_votes.get(&slot_key).copied() {
+-            if existing_hash == vote.block_hash {
++        if let Some(existing) = self.seen_round_votes.get(&slot_key).copied() {
++            if existing == replay_identity {
+             } else {
+                 eprintln!(
+                     "[vote] rejected equivocating vote from {} for {} at height={} round={} (already saw {})",
+@@ -1548,12 +1643,12 @@ impl ConsensusDriver {
+                     hex::encode(&vote.block_hash.0[..4]),
+                     vote.height,
+                     vote.round,
+-                    hex::encode(&existing_hash.0[..4]),
++                    hex::encode(&existing.block_hash.0[..4]),
+                 );
+             }
+             return actions;
+         }
+-        self.seen_round_votes.insert(slot_key, vote.block_hash);
++        self.seen_round_votes.insert(slot_key, replay_identity);
+         self.prune_seen_round_votes();
+ 
+         // VoteV1 signatures bind chain ID, height, round, full validator ID,
+@@ -1611,7 +1706,13 @@ impl ConsensusDriver {
+         if !self.sync.is_caught_up()
+             || height != self.next_height()
+             || target_round <= self.current_round
+-            || target_round > self.current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
++            || validate_consensus_round(target_round).is_err()
++            || target_round
++                > self
++                    .current_round
++                    .checked_add(MAX_ACCEPTED_ROUND_JUMP)
++                    .unwrap_or(u32::MAX)
++                    .min(MAX_ROUNDS_PER_HEIGHT - 1)
+         {
+             return Vec::new();
+         }
+@@ -1643,7 +1744,8 @@ impl ConsensusDriver {
+             "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
+             self.current_round, target_round, height, signed_stake, total_stake
+         );
+-        self.start_round(target_round);
++        self.start_round(target_round)
++            .expect("certified target round was validated before mutation");
+         self.apply_vote_safety();
+         self.prune_stalled_collections();
+         self.maybe_prevote_current_round_proposal()
+@@ -1677,6 +1779,7 @@ impl ConsensusDriver {
+                     vote.round,
+                     vote.step,
+                     self.engine.state.chain_id.clone(),
++                    vote.snapshot_root,
+                     self.registered_voters.clone(),
+                 )
+             });
+@@ -1689,10 +1792,16 @@ impl ConsensusDriver {
+         self.prune_vote_collectors();
+ 
+         match decision {
+-            Ok(_decision) => actions.push(DriverAction::ScorePeer {
+-                from,
+-                event: indra_network::peer::ScoreEvent::ValidVote,
+-            }),
++            Ok(_decision) => {
++                #[cfg(test)]
++                {
++                    self.vote_admission_metrics.collector_insertions += 1;
++                }
++                actions.push(DriverAction::ScorePeer {
++                    from,
++                    event: indra_network::peer::ScoreEvent::ValidVote,
++                });
++            }
+             Err(err) => {
+                 eprintln!(
+                     "[vote] rejected vote from {} for {} at height={} round={}: {}",
+@@ -1727,6 +1836,7 @@ impl ConsensusDriver {
+                     vote.round,
+                     vote.step,
+                     self.engine.state.chain_id.clone(),
++                    vote.snapshot_root,
+                     self.registered_voters.clone(),
+                 )
+             });
+@@ -1740,6 +1850,10 @@ impl ConsensusDriver {
+ 
+         match decision {
+             Ok(decision) => {
++                #[cfg(test)]
++                {
++                    self.vote_admission_metrics.collector_insertions += 1;
++                }
+                 actions.push(DriverAction::ScorePeer {
+                     from,
+                     event: indra_network::peer::ScoreEvent::ValidVote,
+@@ -1923,11 +2037,20 @@ impl ConsensusDriver {
+ 
+         let quorum_vote_values = self.precommit_votes_for_block(collector, block_hash);
+         let quorum_votes: Vec<&VoteV1> = quorum_vote_values.iter().collect();
++        #[cfg(test)]
++        {
++            self.vote_admission_metrics.qc_formations += 1;
++        }
+         let qc = match build_qc(
+             height,
+             round,
+             block_hash,
+             &self.engine.state.chain_id,
++            self.engine
++                .state
++                .snapshot_for_consensus_height(height)
++                .expect("governing snapshot already resolved")
++                .snapshot_root,
+             &qc_validators,
+             quorum_votes,
+         ) {
+@@ -2021,8 +2144,7 @@ impl ConsensusDriver {
+                         "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
+                     );
+                 }
+-                self.start_round(0);
+-                actions.extend(self.activate_buffered_proposals_for_new_tip());
++                self.start_round(0).expect("round zero is always legal");
+ 
+                 self.vote_collectors
+                     .retain(|(vote_height, _, _), _| *vote_height > height);
+@@ -2030,9 +2152,6 @@ impl ConsensusDriver {
+                     .retain(|(vote_height, _), _| *vote_height > height);
+                 self.pending_blocks
+                     .retain(|_, pending| pending.block.header.height > height);
+-                let next_height = self.next_height();
+-                self.future_proposals
+-                    .retain(|(proposal_height, _), _| *proposal_height >= next_height);
+                 self.buffered_votes
+                     .retain(|(vote_height, _, _), _| *vote_height > height);
+                 self.seen_round_votes
+@@ -2257,11 +2376,19 @@ impl ConsensusDriver {
+     }
+ 
+     /// Rule 10 — on precommit timeout, advance to the next round.
+-    pub fn on_precommit_timeout(&mut self) {
++    pub fn on_precommit_timeout(&mut self) -> NodeResult<()> {
+         if !self.sync.is_caught_up() || self.current_phase != RoundPhase::Precommit {
+-            return;
++            return Ok(());
+         }
+-        self.start_round(self.current_round.saturating_add(1));
++        let next_round = self
++            .current_round
++            .checked_add(1)
++            .filter(|round| *round < MAX_ROUNDS_PER_HEIGHT)
++            .ok_or(NodeError::RoundLimitExceeded {
++                height: self.next_height(),
++                round: self.current_round,
++            })?;
++        self.start_round(next_round)
+     }
+ 
+     /// Current committed chain height.
+@@ -2314,7 +2441,7 @@ mod tests {
+                 value_hash: Bytes32::ZERO,
+                 base_fee: state.base_fee,
+                 proposer_round: 0,
+-                polc_round: NO_POLC_ROUND,
++                polc_round: None,
+                 proposer_id: Bytes32::ZERO,
+                 vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                 election_seed: state.election_seed,
+@@ -2357,13 +2484,29 @@ mod tests {
+         Bytes32::from(bytes)
+     }
+ 
+-    fn dummy_vote(height: u64, round: u32, step: VoteStep, block_hash: Bytes32) -> VoteV1 {
++    fn governing_snapshot_root(driver: &ConsensusDriver, height: u64) -> Bytes32 {
++        driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .expect("test fixture must have the governing snapshot")
++            .snapshot_root
++    }
++
++    fn dummy_vote(
++        height: u64,
++        round: u32,
++        step: VoteStep,
++        block_hash: Bytes32,
++        snapshot_root: Bytes32,
++    ) -> VoteV1 {
+         VoteV1 {
+             height,
+             round,
+             step,
+             block_hash,
+             validator_id: test_hash(round as usize),
++            snapshot_root,
+             signature: indra_core::types::crypto::HybridSignature {
+                 classical_sig: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+                 pq_sig: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+@@ -2377,6 +2520,12 @@ mod tests {
+         height: u64,
+         block_hash: Bytes32,
+     ) -> Vec<u8> {
++        let snapshot_root = driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .unwrap()
++            .snapshot_root;
+         let validator_id = indra_core::types::crypto::hybrid_identity_id(
+             &signer.public_key().classical.0,
+             &signer.public_key().pq.0,
+@@ -2387,6 +2536,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             validator_id,
++            snapshot_root,
+             DEFAULT_CHAIN_ID,
+             signer,
+         )
+@@ -2396,6 +2546,7 @@ mod tests {
+             0,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &driver.engine.qc_validators(),
+             vec![&vote],
+         )
+@@ -2410,6 +2561,12 @@ mod tests {
+         round: u32,
+         block_hash: Bytes32,
+     ) -> Vec<u8> {
++        let snapshot_root = driver
++            .engine
++            .state
++            .snapshot_for_consensus_height(height)
++            .unwrap()
++            .snapshot_root;
+         let votes: Vec<_> = signers
+             .iter()
+             .map(|signer| {
+@@ -2423,6 +2580,7 @@ mod tests {
+                     VoteStep::Precommit,
+                     block_hash,
+                     validator_id,
++                    snapshot_root,
+                     DEFAULT_CHAIN_ID,
+                     signer,
+                 )
+@@ -2435,6 +2593,7 @@ mod tests {
+             round,
+             block_hash,
+             DEFAULT_CHAIN_ID,
++            snapshot_root,
+             &driver.engine.qc_validators(),
+             vote_refs,
+         )
+@@ -2536,7 +2695,7 @@ mod tests {
+         let genesis_path = dir.join("genesis.toml");
+         std::fs::create_dir_all(&dir).unwrap();
+         let genesis = format!(
+-            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
++            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+             hex::encode(validator_id),
+             hex::encode(classical.public_key().0),
+             hex::encode(pq.public_key().0),
+@@ -2546,6 +2705,7 @@ mod tests {
+             hex::encode(cold_public.classical.0),
+             hex::encode(cold_public.pq.0),
+         );
++        let genesis = crate::genesis::seal_test_genesis_fixture(&genesis);
+         std::fs::write(&genesis_path, &genesis).unwrap();
+         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
+         config.validator_seed = Some(seed);
+@@ -2560,7 +2720,8 @@ mod tests {
+             header[72..].copy_from_slice(&counter.to_le_bytes());
+             let settings = crate::genesis::GenesisSettings {
+                 chain_id: "indra-testnet-1".into(),
+-                active_slot_coefficient_numerator: 1u64 << 63,
++                active_slot_coefficient_numerator:
++                    indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+                 bitcoin_pow_entropy_source: crate::genesis::BitcoinPowEntropySourceV1 {
+                     scheme: 1,
+                     network_genesis_hash: hex::encode([0u8; 32]),
+@@ -2571,6 +2732,7 @@ mod tests {
+                     reorg_policy: 1,
+                 },
+                 bitcoin_pow_entropy_header: hex::encode(header),
++                genesis_precommit_hash: hex::encode([0x55; 32]),
+             };
+             driver.engine.state.election_seed =
+                 crate::genesis::derive_genesis_election_seed(&settings).unwrap();
+@@ -2609,6 +2771,42 @@ mod tests {
+         panic!("test genesis could not find an eligible deterministic election seed")
+     }
+ 
++    struct TestValidatorMaterial {
++        seed: [u8; 32],
++        classical: ClassicalKeypair,
++        pq: PqKeypair,
++        vrf: VrfKeypair,
++        cold: indra_crypto::ColdHybridKeypair,
++        validator_id: [u8; 32],
++        vrf_output: Vec<u8>,
++        vrf_proof: Vec<u8>,
++    }
++
++    fn test_validator_material(seed: [u8; 32]) -> TestValidatorMaterial {
++        let classical = ClassicalKeypair::from_seed(&seed);
++        let pq = PqKeypair::from_seed(&seed).unwrap();
++        let vrf = VrfKeypair::from_seed(&seed);
++        let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
++            [seed[0] ^ 0xA5; 32], [seed[0] ^ 0x5A; 32],
++        ).unwrap();
++        let validator_id = indra_core::types::crypto::hybrid_identity_id(
++            &classical.public_key().0, &pq.public_key().0,
++        ).0;
++        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
++            "indra-testnet-1", &Bytes32::from(validator_id),
++            &Bytes32::from(vrf.public_key()), 0,
++        ).unwrap();
++        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
++        TestValidatorMaterial { seed, classical, pq, vrf, cold, validator_id,
++            vrf_output: vrf_output.0.to_vec(), vrf_proof: vrf_proof.0 }
++    }
++
++    fn render_test_validator_record(name: &str, m: &TestValidatorMaterial, stake: u64) -> String {
++        let cold_public = m.cold.public_key();
++        let cold = cold_public.as_complete_hybrid();
++        format!("\n[[validators]]\nname = \"{name}\"\nvalidator_id = \"{}\"\nstake = {stake}\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n", hex::encode(m.validator_id), hex::encode(m.classical.public_key().0), hex::encode(m.pq.public_key().0), hex::encode(m.vrf.public_key()), hex::encode(&m.vrf_output), hex::encode(&m.vrf_proof), hex::encode(cold.classical.0), hex::encode(cold.pq.0))
++    }
++
+     fn make_strict_block(
+         driver: &ConsensusDriver,
+         proposer_seed: [u8; 32],
+@@ -2616,7 +2814,7 @@ mod tests {
+         prev_qc_bytes: Vec<u8>,
+     ) -> indra_core::types::block::BlockProposalVNext {
+         let vrf = VrfKeypair::from_seed(&proposer_seed);
+-        let election = (round..round.saturating_add(4_096))
++        let election = (round..MAX_ROUNDS_PER_HEIGHT)
+             .find_map(|candidate_round| {
+                 let election = driver
+                     .proposer_election_for_height(driver.height() + 1, candidate_round)
+@@ -2695,7 +2893,9 @@ mod tests {
+         // completed round-change that precedes delivery of that proposal; the
+         // round-evidence protocol itself has dedicated adversarial tests.
+         if proposal.header.proposer_round > driver.current_round() {
+-            driver.start_round(proposal.header.proposer_round);
++            driver
++                .start_round(proposal.header.proposer_round)
++                .expect("test proposal round must be legal");
+         }
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -2893,14 +3093,412 @@ mod tests {
+             .engine
+             .voter_authorized_for_height(u64::MAX, local_id)
+             .unwrap());
+-        let actions =
+-            driver.sign_and_record_local_vote(u64::MAX, 0, VoteStep::Prevote, Bytes32::ZERO);
++        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
++        assert!(actions
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastVote(_))));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn audit_fixture_production_prevote_persists_vote_safety_record() {
++        let (mut driver, dir) = local_driver([0xA7u8; 32], "audit_fixture_prevote_persistence");
++        let safety_path = driver.engine.config.vote_safety_path();
++        assert!(safety_path.parent().is_some_and(|parent| parent.exists()));
++        let validator_id = driver.engine.validator_id().unwrap();
++        let actions = driver.sign_and_record_local_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++        );
+         assert!(actions
+             .iter()
+             .any(|action| matches!(action, DriverAction::BroadcastVote(_))));
++        let store = VoteSafetyStore::open(&safety_path);
++        assert!(matches!(store.load(), VoteSafetyLoadResult::Record(record) if record.height == 1 && record.round == 0 && record.step == VoteStep::Prevote as u8));
++        assert_eq!(validator_id, driver.engine.validator_id().unwrap());
++        drop(store);
++        drop(driver);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn audit_restart_conflicting_vote_reproducer_ordinary_height() {
++        let seed = [0xA9u8; 32];
++        let (mut driver, dir) = local_driver(seed, "audit_restart_conflict_ordinary");
++        let config = driver.engine.config.clone();
++        let first = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
++        assert!(first.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
++        drop(driver);
++        let engine = NodeEngine::init(config).unwrap();
++        let store = VoteSafetyStore::open(engine.config.vote_safety_path());
++        assert!(matches!(store.load(), VoteSafetyLoadResult::Record(record) if record.height == 1 && record.round == 0 && record.step == 0));
++        let mut reopened = ConsensusDriver::new(engine, store);
++        let second = reopened.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::from([1; 32]));
++        assert!(!second.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
++        drop(reopened);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn audit_signing_boundary_rejects_future_round_before_persistence() {
++        let (mut driver, dir) = local_driver([0xAAu8; 32], "audit_signing_boundary_round");
++        let safety_path = driver.engine.config.vote_safety_path();
++        let before = VoteSafetyStore::open(&safety_path).load();
++        let actions = driver.sign_and_record_local_vote(1, 1, VoteStep::Prevote, Bytes32::ZERO);
++        assert!(!actions.iter().any(|action| matches!(action, DriverAction::BroadcastVote(_))));
++        assert_eq!(VoteSafetyStore::open(&safety_path).load(), before);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn audit_harness_two_production_nodes_exchange_real_vote() {
++        // Two independently opened production drivers exchange the exact
++        // signed vote through a deterministic in-test scheduler queue.
++        let (mut a, dir_a) = local_driver([0xC1; 32], "bridge_a");
++        let (mut b, dir_b) = local_driver([0xC1; 32], "bridge_b");
++        let source: SocketAddr = "127.0.0.1:10001".parse().unwrap();
++        let actions = a.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
++        let vote = actions
++            .into_iter()
++            .find_map(|action| match action {
++                DriverAction::BroadcastVote(vote) => Some(vote),
++                _ => None,
++            })
++            .expect("production signer must emit a vote");
++        let mut queue = std::collections::VecDeque::new();
++        queue.push_back(vote);
++        let delivered = queue.pop_front().expect("scheduler must deliver vote");
++        let _ = b.process(DriverEvent::InboundVote {
++            from: source,
++            vote: delivered,
++        });
++        let _ = std::fs::remove_dir_all(dir_a);
++        let _ = std::fs::remove_dir_all(dir_b);
++    }
++
++    struct TwoValidatorFixture {
++        driver_a: ConsensusDriver,
++        driver_b: ConsensusDriver,
++        material_a: TestValidatorMaterial,
++        material_b: TestValidatorMaterial,
++        sealed_genesis: Vec<u8>,
++        dir_a: PathBuf,
++        dir_b: PathBuf,
++        vote_safety_path_a: PathBuf,
++        vote_safety_path_b: PathBuf,
++    }
++
++    fn shared_two_validator_fixture() -> TwoValidatorFixture {
++        let a = test_validator_material([0xA1; 32]);
++        let b = test_validator_material([0xB2; 32]);
++        let (driver_a, dir_a) = local_driver(a.seed, "shared_a_seed");
++        let original = std::fs::read_to_string(dir_a.join("genesis.toml")).unwrap();
++        let original = original
++            .lines()
++            .filter(|line| !line.starts_with("genesis_precommit_hash = ")
++                && !line.starts_with("genesis_commitment_nonce = "))
++            .collect::<Vec<_>>()
++            .join("\n");
++        drop(driver_a);
++        let sealed = crate::genesis::seal_test_genesis_fixture(&(original + &render_test_validator_record("b", &b, 1_000_000)));
++        let sealed_genesis = sealed.as_bytes().to_vec();
++        std::fs::write(dir_a.join("genesis.toml"), &sealed).unwrap();
++        let dir_b = temp_dir("shared_b_seed");
++        std::fs::create_dir_all(&dir_b).unwrap();
++        std::fs::write(dir_b.join("genesis.toml"), &sealed).unwrap();
++        let mut ca = NodeConfig::local_test(dir_a.clone());
++        ca.genesis_path = Some(dir_a.join("genesis.toml").to_string_lossy().into());
++        ca.validator_seed = Some(a.seed); ca.vrf_seed = Some(a.seed);
++        ca.pq_seed = Some(a.pq.secret_key_bytes()); ca.pq_pk = Some(a.pq.public_key().0.to_vec());
++        let mut cb = NodeConfig::local_test(dir_b.clone());
++        cb.genesis_path = Some(dir_b.join("genesis.toml").to_string_lossy().into());
++        cb.validator_seed = Some(b.seed); cb.vrf_seed = Some(b.seed);
++        cb.pq_seed = Some(b.pq.secret_key_bytes()); cb.pq_pk = Some(b.pq.public_key().0.to_vec());
++        let ea = NodeEngine::init(ca).unwrap(); let eb = NodeEngine::init(cb).unwrap();
++        let vote_safety_path_a = ea.config.vote_safety_path();
++        let vote_safety_path_b = eb.config.vote_safety_path();
++        TwoValidatorFixture { driver_a: ConsensusDriver::new(ea, VoteSafetyStore::open(&vote_safety_path_a)), driver_b: ConsensusDriver::new(eb, VoteSafetyStore::open(&vote_safety_path_b)), material_a: a, material_b: b, sealed_genesis, dir_a, dir_b, vote_safety_path_a, vote_safety_path_b }
++    }
++
++    #[test]
++    fn audit_fixture_shared_genesis_two_distinct_validators() {
++        let fixture = shared_two_validator_fixture();
++        let a = &fixture.material_a; let b = &fixture.material_b;
++        assert_ne!(a.validator_id, b.validator_id);
++        assert!(fixture.driver_a.engine.state.validators.get(&Bytes32::from(b.validator_id)).is_some());
++        assert!(fixture.driver_b.engine.state.validators.get(&Bytes32::from(a.validator_id)).is_some());
++        assert_eq!(fixture.driver_a.engine.state.genesis_fingerprint, fixture.driver_b.engine.state.genesis_fingerprint);
++        assert_ne!(fixture.dir_a, fixture.dir_b);
++        assert_ne!(fixture.vote_safety_path_a, fixture.vote_safety_path_b);
++        assert_eq!(std::fs::read(fixture.dir_a.join("genesis.toml")).unwrap(), fixture.sealed_genesis);
++        assert_eq!(std::fs::read(fixture.dir_b.join("genesis.toml")).unwrap(), fixture.sealed_genesis);
++        let _ = std::fs::remove_dir_all(fixture.dir_a); let _ = std::fs::remove_dir_all(fixture.dir_b);
++    }
++
++    struct FourValidatorFixture { drivers: Vec<ConsensusDriver>, materials: Vec<TestValidatorMaterial>, sealed_genesis: Vec<u8>, dirs: Vec<PathBuf>, vote_safety_paths: Vec<PathBuf> }
++
++    fn shared_four_validator_fixture() -> FourValidatorFixture {
++        let seeds = [[0xA1; 32], [0xB2; 32], [0xC3; 32], [0xD4; 32]];
++        let materials: Vec<_> = seeds.into_iter().map(test_validator_material).collect();
++        for i in 0..4 { for j in (i + 1)..4 { assert_ne!(materials[i].validator_id, materials[j].validator_id); } }
++        let (driver, dir0) = local_driver(materials[0].seed, "shared_four_template");
++        let mut base = std::fs::read_to_string(dir0.join("genesis.toml")).unwrap();
++        drop(driver); let _ = std::fs::remove_dir_all(&dir0);
++        base = base.lines().filter(|l| !l.starts_with("genesis_precommit_hash = ") && !l.starts_with("genesis_commitment_nonce = ")).collect::<Vec<_>>().join("\n");
++        for (i, m) in materials.iter().enumerate().skip(1) { base.push_str(&render_test_validator_record(&format!("v{i}"), m, 1_000_000)); }
++        let sealed = crate::genesis::seal_test_genesis_fixture(&base).into_bytes();
++        let mut drivers = Vec::new(); let mut dirs = Vec::new(); let mut safety = Vec::new();
++        for (i, m) in materials.iter().enumerate() {
++            let dir = temp_dir(&format!("shared_four_{i}")); std::fs::create_dir_all(&dir).unwrap();
++            std::fs::write(dir.join("genesis.toml"), &sealed).unwrap();
++            let mut cfg = NodeConfig::local_test(dir.clone()); cfg.genesis_path = Some(dir.join("genesis.toml").to_string_lossy().into()); cfg.validator_seed = Some(m.seed); cfg.vrf_seed = Some(m.seed); cfg.pq_seed = Some(m.pq.secret_key_bytes()); cfg.pq_pk = Some(m.pq.public_key().0.to_vec());
++            let engine = NodeEngine::init(cfg).unwrap(); let path = engine.config.vote_safety_path(); safety.push(path.clone()); drivers.push(ConsensusDriver::new(engine, VoteSafetyStore::open(&path))); dirs.push(dir);
++        }
++        for i in 0..4 { assert_eq!(drivers[i].engine.validator_id(), Some(Bytes32::from(materials[i].validator_id))); assert_eq!(drivers[i].engine.state.genesis_fingerprint, drivers[0].engine.state.genesis_fingerprint); for m in &materials { assert!(drivers[i].engine.state.validators.get(&Bytes32::from(m.validator_id)).is_some()); } }
++        for i in 0..4 { assert_eq!(std::fs::read(dirs[i].join("genesis.toml")).unwrap(), sealed); for j in (i + 1)..4 { assert_ne!(dirs[i], dirs[j]); assert_ne!(safety[i], safety[j]); } }
++        let roots: Vec<_> = drivers.iter().map(|d| d.engine.state.snapshot_for_consensus_height(1).unwrap().snapshot_root).collect(); assert!(roots.iter().all(|r| *r == roots[0]));
++        FourValidatorFixture { drivers, materials, sealed_genesis: sealed, dirs, vote_safety_paths: safety }
++    }
++
++    #[test]
++    fn audit_fixture_shared_genesis_four_distinct_validators() {
++        let fixture = shared_four_validator_fixture();
++        for i in 0..4 { assert_eq!(fixture.drivers[i].engine.validator_id(), Some(Bytes32::from(fixture.materials[i].validator_id))); assert_eq!(fixture.drivers[i].engine.state.height, fixture.drivers[0].engine.state.height); assert_eq!(fixture.drivers[i].engine.state.tip_hash, fixture.drivers[0].engine.state.tip_hash); }
++        let snapshot = fixture.drivers[0].engine.state.snapshot_for_consensus_height(1).unwrap();
++        assert_eq!(snapshot.entries().len(), 4);
++        let weights: Vec<_> = fixture.materials.iter().map(|m| snapshot.entry_with_position(&Bytes32::from(m.validator_id)).unwrap().1.consensus_weight_spark).collect();
++        assert!(weights.iter().all(|w| *w == weights[0]));
++        for i in 0..4 { for j in (i + 1)..4 { assert_ne!(fixture.dirs[i], fixture.dirs[j]); assert_ne!(fixture.vote_safety_paths[i], fixture.vote_safety_paths[j]); } assert_eq!(std::fs::read(fixture.dirs[i].join("genesis.toml")).unwrap(), fixture.sealed_genesis); }
++        let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
++    }
++
++    #[test]
++    fn audit_harness_four_validators_accept_one_production_proposal() {
++        let mut fixture = shared_four_validator_fixture();
++        for d in &mut fixture.drivers { d.sync.mark_caught_up(d.height()); }
++        let election = fixture.drivers[0].proposer_election_for_height(1, 0).unwrap();
++        let eligible: Vec<_> = (0..4).filter(|i| fixture.drivers[*i].engine.is_proposer(&election)).collect();
++        assert!(!eligible.is_empty());
++        let proposer = *eligible.iter().min().unwrap();
++        let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
++        let hash = proposal.block.header.block_hash();
++        let value_hash = proposal.block.header.value_hash;
++        let proposer_id = proposal.block.header.proposer_id;
++        let mut queue = std::collections::VecDeque::new();
++        queue.push_back(proposal.clone());
++        let local = queue.pop_front().unwrap();
++        fixture.drivers[proposer].process(DriverEvent::InboundBlock { from: None, proposal: local });
++        assert!(fixture.drivers[proposer].pending_proposal(&hash).is_some());
++        for i in 0..4 { if i != proposer { queue.push_back(proposal.clone()); let p = queue.pop_front().unwrap(); fixture.drivers[i].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: p }); assert!(fixture.drivers[i].pending_proposal(&hash).is_some()); } assert_eq!(fixture.drivers[i].engine.state.height, 0); }
++        assert_eq!(proposal.block.header.value_hash, value_hash); assert_eq!(proposal.block.header.proposer_id, proposer_id);
++        let before = fixture.drivers[(proposer + 1) % 4].proposal_admission_metrics;
++        fixture.drivers[(proposer + 1) % 4].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: proposal.clone() });
++        assert_eq!(fixture.drivers[(proposer + 1) % 4].proposal_admission_metrics, before);
++        let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
++    }
++
++    #[test]
++    fn audit_harness_four_validator_strict_prevote_quorum_boundary() {
++        let mut fixture = shared_four_validator_fixture();
++        for d in &mut fixture.drivers { d.sync.mark_caught_up(d.height()); }
++        let election = fixture.drivers[0].proposer_election_for_height(1, 0).unwrap();
++        let proposer = (0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap();
++        let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
++        let hash = proposal.block.header.block_hash();
++        for i in 0..4 { fixture.drivers[i].process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
++        let mut votes = Vec::new();
++        let ids: Vec<_> = fixture.drivers.iter().map(|d| d.engine.validator_id().unwrap()).collect();
++        assert_eq!(ids.len(), 4); assert!(ids.iter().enumerate().all(|(i,id)| ids.iter().skip(i+1).all(|other| id != other)));
++        for i in 0..3 { let actions = fixture.drivers[i].on_propose_timeout(); let vote = actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap(); assert_eq!(vote.validator_id, ids[i]); assert_eq!((vote.height,vote.round,vote.step,vote.block_hash),(1,0,VoteStep::Prevote,hash)); votes.push(vote); }
++        assert!(fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Prevote,ids[0]));
++        assert_eq!(fixture.drivers[0].current_phase(), RoundPhase::Prevote);
++        assert!(fixture.drivers[0].valid_round.is_none() && fixture.drivers[0].valid_value.is_none());
++        assert!(fixture.drivers[0].locked_round.is_none() && fixture.drivers[0].locked_value.is_none());
++        assert_eq!(fixture.drivers[0].last_qc_height(), None);
++        assert!(fixture.drivers[0].locked_round.is_none());
++        let b_actions = fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:13001".parse().unwrap(), vote: votes[1].clone() });
++        assert!(!matches!(fixture.drivers[0].vote_decision(1,0,VoteStep::Prevote), Some(VoteDecision::QuorumReached { .. })));
++        assert!(b_actions.iter().all(|a| !matches!(a, DriverAction::BroadcastVote(v) if v.step == VoteStep::Precommit)));
++        assert!(fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Prevote,ids[1]));
++        assert!(!fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Prevote,ids[2]));
++        assert!(!fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Prevote,ids[3]));
++        assert!(fixture.drivers[0].valid_round.is_none() && fixture.drivers[0].valid_value.is_none());
++        assert!(fixture.drivers[0].locked_round.is_none() && fixture.drivers[0].locked_value.is_none());
++        assert_eq!(fixture.drivers[0].current_phase(), RoundPhase::Prevote);
++        assert_eq!(fixture.drivers[0].engine.state.height, 0);
++        let actions = fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:13002".parse().unwrap(), vote: votes[2].clone() });
++        match fixture.drivers[0].vote_decision(1,0,VoteStep::Prevote) { Some(VoteDecision::QuorumReached { block_hash, .. }) => assert_eq!(block_hash, hash), other => panic!("expected quorum, got {other:?}") }
++        let precommits: Vec<_> = actions.iter().filter_map(|a| if let DriverAction::BroadcastVote(v)=a { if v.step == VoteStep::Precommit {Some(v)} else {None} } else {None}).collect();
++        assert_eq!(precommits.len(), 1);
++        assert_eq!((precommits[0].validator_id, precommits[0].height, precommits[0].round, precommits[0].step, precommits[0].block_hash), (ids[0],1,0,VoteStep::Precommit,hash));
++        assert_eq!(fixture.drivers[0].current_phase(), RoundPhase::Precommit);
++        assert_eq!(fixture.drivers[0].valid_round, Some(0));
++        assert_eq!(fixture.drivers[0].valid_value, Some(hash));
++        assert_eq!(fixture.drivers[0].locked_round, Some(0));
++        assert_eq!(fixture.drivers[0].locked_value, Some(hash));
++        assert_eq!(fixture.drivers[0].engine.state.height, 0);
++        assert_eq!(fixture.drivers[0].last_qc_height(), None);
++        let governing_root = governing_snapshot_root(&fixture.drivers[0], 1);
++        let polc_ids: std::collections::HashSet<_> = fixture.drivers[0].locked_polc_votes.iter().map(|v| v.validator_id).collect();
++        assert!(polc_ids.contains(&ids[0]) && polc_ids.contains(&ids[1]) && polc_ids.contains(&ids[2]) && !polc_ids.contains(&ids[3]));
++        assert_eq!(polc_ids.len(), 3);
++        for vote in &fixture.drivers[0].locked_polc_votes {
++            assert_eq!(vote.height, 1);
++            assert_eq!(vote.round, 0);
++            assert_eq!(vote.step, VoteStep::Prevote);
++            assert_eq!(vote.block_hash, hash);
++            assert_eq!(vote.snapshot_root, governing_root);
++        }
++        let phase_before = fixture.drivers[0].current_phase(); let valid_before = fixture.drivers[0].valid_round; let value_before = fixture.drivers[0].valid_value; let lock_before = fixture.drivers[0].locked_round; let locked_value_before = fixture.drivers[0].locked_value; let polc_before = fixture.drivers[0].locked_polc_votes.clone(); let height_before = fixture.drivers[0].engine.state.height; let qc_before = fixture.drivers[0].last_qc_height(); let metrics_before = fixture.drivers[0].vote_admission_metrics;
++        let replay = fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:13002".parse().unwrap(), vote: votes[2].clone() });
++        assert_eq!(fixture.drivers[0].current_phase(), phase_before);
++        assert_eq!(fixture.drivers[0].valid_round, valid_before); assert_eq!(fixture.drivers[0].valid_value, value_before); assert_eq!(fixture.drivers[0].locked_round, lock_before); assert_eq!(fixture.drivers[0].locked_value, locked_value_before); assert_eq!(fixture.drivers[0].locked_polc_votes, polc_before); assert_eq!(fixture.drivers[0].engine.state.height, height_before); assert_eq!(fixture.drivers[0].last_qc_height(), qc_before); assert_eq!(fixture.drivers[0].vote_admission_metrics, metrics_before);
++        assert!(replay.iter().all(|a| !matches!(a, DriverAction::BroadcastVote(v) if v.step == VoteStep::Precommit)));
++        assert_eq!(fixture.drivers[0].engine.state.height, 0);
++        let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
++    }
++
++    #[test]
++    fn audit_harness_four_validator_strict_precommit_quorum_finalizes() {
++        let mut fixture = shared_four_validator_fixture();
++        for d in &mut fixture.drivers { d.sync.mark_caught_up(d.height()); }
++        let election = fixture.drivers[0].proposer_election_for_height(1, 0).unwrap();
++        let proposer = (0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap();
++        let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
++        let hash = proposal.block.header.block_hash();
++        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
++        let ids: Vec<_> = fixture.drivers.iter().map(|d| d.engine.validator_id().unwrap()).collect();
++        let mut prevotes = Vec::new();
++        for i in 0..3 {
++            let actions = fixture.drivers[i].on_propose_timeout();
++            prevotes.push(actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap());
++        }
++        let mut precommits = Vec::new();
++        for i in 0..3 {
++            for j in 0..3 {
++                if i != j {
++                    let actions = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}", 14000+j).parse().unwrap(), vote: prevotes[j].clone() });
++                    if let Some(v) = actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a { (v.step == VoteStep::Precommit).then_some(v) } else {None}) { precommits.push((i, v)); }
++                }
++            }
++        }
++        precommits.sort_by_key(|(i, _)| *i);
++        assert_eq!(precommits.len(), 3);
++        for (i, v) in &precommits { assert_eq!(fixture.drivers[*i].current_phase(), RoundPhase::Precommit); assert_eq!((v.validator_id,v.height,v.round,v.step,v.block_hash),(ids[*i],1,0,VoteStep::Precommit,hash)); }
++        let original_tip_hash = fixture.drivers[0].engine.state.tip_hash;
++        let before = fixture.drivers[0].vote_admission_metrics.qc_formations;
++        assert_eq!(fixture.drivers[0].engine.state.height, 0);
++        fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:14001".parse().unwrap(), vote: precommits[1].1.clone() });
++        assert_eq!(fixture.drivers[0].engine.state.height, 0);
++        assert_eq!(fixture.drivers[0].engine.state.tip_hash, original_tip_hash);
++        assert_eq!(fixture.drivers[0].last_qc_height(), None);
++        assert!(fixture.drivers[0].last_qc_bytes().is_empty());
++        assert_eq!(fixture.drivers[0].vote_admission_metrics.qc_formations, before);
++        assert!(fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Precommit,ids[0]));
++        assert!(fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Precommit,ids[1]));
++        assert!(!fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Precommit,ids[2]));
++        assert!(!fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Precommit,ids[3]));
++        assert!(!matches!(fixture.drivers[0].vote_decision(1,0,VoteStep::Precommit), Some(VoteDecision::QuorumReached { .. })));
++        fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:14002".parse().unwrap(), vote: precommits[2].1.clone() });
++        assert_eq!(fixture.drivers[0].engine.state.height, 1);
++        assert_eq!(fixture.drivers[0].engine.state.tip_hash, hash);
++        assert_eq!(fixture.drivers[0].last_qc_height(), Some(1));
++        assert!(!fixture.drivers[0].last_qc_bytes().is_empty());
++        assert_eq!(fixture.drivers[0].vote_admission_metrics.qc_formations, before + 1);
++        let qc = QuorumCertificateV1::decode_exact(&fixture.drivers[0].last_qc_bytes()).unwrap();
++        assert_eq!((qc.height,qc.round,qc.block_hash),(1,0,hash));
++        let snapshot = fixture.drivers[0].engine.state.snapshot_for_consensus_height(1).unwrap().clone();
++        indra_core::types::qc::verify_qc_against_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).unwrap();
++        let qc_signers: Vec<_> = snapshot.entries().iter().enumerate()
++            .filter(|(i, _)| (qc.signer_bitfield[*i / 8] & (1u8 << (*i % 8))) != 0)
++            .map(|(_, entry)| entry.validator_id)
++            .collect();
++        assert!(qc_signers.contains(&ids[0]));
++        assert!(qc_signers.contains(&ids[1]));
++        assert!(qc_signers.contains(&ids[2]));
++        assert!(!qc_signers.contains(&ids[3]));
++        let signer_weight: u64 = snapshot.entries().iter().enumerate()
++            .filter(|(i, _)| (qc.signer_bitfield[*i / 8] & (1u8 << (*i % 8))) != 0)
++            .map(|(_, entry)| entry.consensus_weight_spark).sum();
++        let total_weight: u64 = snapshot.entries().iter().map(|entry| entry.consensus_weight_spark).sum();
++        assert!(has_strict_two_thirds_quorum(signer_weight, total_weight));
++        assert_eq!(fixture.drivers[0].current_round(), 0);
++        assert_eq!(fixture.drivers[0].current_phase(), RoundPhase::Propose);
++        assert!(fixture.drivers[0].locked_round.is_none() && fixture.drivers[0].locked_value.is_none() && fixture.drivers[0].locked_value_hash.is_none());
++        assert!(fixture.drivers[0].locked_polc_votes.is_empty());
++        assert!(fixture.drivers[0].valid_round.is_none() && fixture.drivers[0].valid_value.is_none() && fixture.drivers[0].valid_proposal.is_none());
++        assert!(fixture.drivers[0].pending_proposal(&hash).is_none());
++        let state_dir = fixture.drivers[0].engine.config.state_dir();
++        assert_eq!(indra_storage::load_last_qc(&state_dir).unwrap(), Some(fixture.drivers[0].last_qc_bytes()));
++        assert_eq!(indra_storage::load_pending_last_qc(&state_dir).unwrap(), None);
++        assert!(matches!(fixture.drivers[0].vote_safety.load(), VoteSafetyLoadResult::NoRecord));
++        let replay_height = fixture.drivers[0].engine.state.height;
++        let replay_tip = fixture.drivers[0].engine.state.tip_hash;
++        let replay_qc = fixture.drivers[0].last_qc_bytes();
++        let replay_qch = fixture.drivers[0].last_qc_height();
++        let replay_round = fixture.drivers[0].current_round();
++        let replay_phase = fixture.drivers[0].current_phase();
++        let replay_formations = fixture.drivers[0].vote_admission_metrics.qc_formations;
++        fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:14002".parse().unwrap(), vote: precommits[2].1.clone() });
++        assert_eq!(fixture.drivers[0].engine.state.height, replay_height);
++        assert_eq!(fixture.drivers[0].engine.state.tip_hash, replay_tip);
++        assert_eq!(fixture.drivers[0].last_qc_bytes(), replay_qc);
++        assert_eq!(fixture.drivers[0].last_qc_height(), replay_qch);
++        assert_eq!(fixture.drivers[0].current_round(), replay_round);
++        assert_eq!(fixture.drivers[0].current_phase(), replay_phase);
++        assert_eq!(fixture.drivers[0].vote_admission_metrics.qc_formations, replay_formations);
++        let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
++    }
++
++    #[test]
++    fn audit_fixture_shared_genesis_rejects_non_authority_local_validator() {
++        let (_driver, dir) = local_driver([0xA1; 32], "shared_non_authority");
++        let c = test_validator_material([0xC3; 32]);
++        let mut config = NodeConfig::local_test(dir.clone());
++        config.genesis_path = Some(dir.join("genesis.toml").to_string_lossy().into());
++        config.validator_seed = Some(c.seed); config.vrf_seed = Some(c.seed);
++        config.pq_seed = Some(c.pq.secret_key_bytes()); config.pq_pk = Some(c.pq.public_key().0.to_vec());
++        assert!(NodeEngine::init(config).is_err());
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
++    #[test]
++    fn audit_harness_two_distinct_validators_exchange_votes() {
++        let mut fixture = shared_two_validator_fixture();
++        let a_id = Bytes32::from(fixture.material_a.validator_id);
++        let b_id = Bytes32::from(fixture.material_b.validator_id);
++        assert_ne!(a_id, b_id);
++        let h = fixture.driver_a.next_height();
++        let r = fixture.driver_a.current_round();
++        let va = fixture.driver_a.sign_and_record_local_vote(h, r, VoteStep::Prevote, Bytes32::ZERO)
++            .into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap();
++        assert_eq!(va.validator_id, a_id);
++        let mut queue = std::collections::VecDeque::new();
++        queue.push_back(va);
++        let va = queue.pop_front().unwrap();
++        fixture.driver_b.process(DriverEvent::InboundVote { from: "127.0.0.1:11001".parse().unwrap(), vote: va });
++        assert!(fixture.driver_b.collector_has_vote_from(h, r, VoteStep::Prevote, a_id));
++        let vb = fixture.driver_b.sign_and_record_local_vote(h, r, VoteStep::Prevote, Bytes32::ZERO)
++            .into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap();
++        assert_eq!(vb.validator_id, b_id);
++        queue.push_back(vb);
++        let vb = queue.pop_front().unwrap();
++        fixture.driver_a.process(DriverEvent::InboundVote { from: "127.0.0.1:11002".parse().unwrap(), vote: vb });
++        assert!(fixture.driver_a.collector_has_vote_from(h, r, VoteStep::Prevote, b_id));
++        let c = test_validator_material([0xC3; 32]);
++        let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&c.seed), c.pq);
++        let vc = indra_consensus::vote::produce_vote(h, r, VoteStep::Prevote, Bytes32::ZERO, Bytes32::from(c.validator_id), governing_snapshot_root(&fixture.driver_a, h), DEFAULT_CHAIN_ID, &signer).unwrap();
++        queue.push_back(vc);
++        let vc = queue.pop_front().unwrap();
++        let c_actions = fixture.driver_a.process(DriverEvent::InboundVote { from: "127.0.0.1:11003".parse().unwrap(), vote: vc });
++        assert!(!fixture.driver_a.collector_has_vote_from(h, r, VoteStep::Prevote, Bytes32::from(c.validator_id)));
++        assert!(c_actions.iter().any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { validator_id, reason, .. } if *validator_id == Bytes32::from(c.validator_id) && reason.contains("Vote validation failed"))));
++        let _ = std::fs::remove_dir_all(fixture.dir_a); let _ = std::fs::remove_dir_all(fixture.dir_b);
++    }
++
++
+     #[test]
+     fn proposer_authority_uses_snapshot_weights_not_live_registry() {
+         let (mut driver, dir) = local_driver([0xB1; 32], "snapshot_proposer_weight");
+@@ -2948,10 +3546,15 @@ mod tests {
+             2,
+             indra_core::types::primitives::Bytes64([0x55; 64]),
+             &snapshot,
+-        );
++        )
++        .unwrap();
+         let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
+         let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
+ 
++        assert_eq!(
++            vrf.election.sortition_log,
++            snapshot.sortition_log_interval().unwrap()
++        );
+         assert_eq!(vrf.election.candidates.len(), voters.len());
+         assert_eq!(voters.len(), qc.len());
+         for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+@@ -3069,7 +3672,8 @@ mod tests {
+                         0,
+                         Bytes64([(*height % 251) as u8; 64]),
+                         snapshot,
+-                    );
++                    )
++                    .unwrap();
+                     assert_eq!(voters.len(), validators.len());
+                     assert_eq!(validators.len(), authority.election.candidates.len());
+                     for ((voter, validator), candidate) in voters
+@@ -3093,6 +3697,7 @@ mod tests {
+                                 VoteStep::Precommit,
+                                 block_hash,
+                                 *id,
++                                snapshot.snapshot_root,
+                                 DEFAULT_CHAIN_ID,
+                                 signer,
+                             )
+@@ -3104,6 +3709,7 @@ mod tests {
+                         0,
+                         block_hash,
+                         DEFAULT_CHAIN_ID,
++                        snapshot.snapshot_root,
+                         &validators,
+                         votes.iter().collect(),
+                     )
+@@ -3173,10 +3779,10 @@ mod tests {
+ 
+         let mut block_a = make_block(&driver.engine.state);
+         block_a.header.proposer_round = 0;
+-        block_a.header.polc_round = NO_POLC_ROUND;
++        block_a.header.polc_round = None;
+         let mut block_b = block_a.clone();
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = 0;
++        block_b.header.polc_round = Some(0);
+ 
+         assert_eq!(block_a.header.value_hash, block_b.header.value_hash);
+         let hash_a = block_a.header.block_hash();
+@@ -3189,6 +3795,7 @@ mod tests {
+             0,
+             VoteStep::Prevote,
+             DEFAULT_CHAIN_ID.to_string(),
++            governing_snapshot_root(&driver, 1),
+             voters,
+         );
+         let signer_ids = [
+@@ -3218,6 +3825,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash_a,
+                 signer_ids[idx],
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signers[idx],
+             )
+@@ -3234,6 +3842,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash_b,
+                 signer_ids[idx],
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signers[idx],
+             )
+@@ -3250,6 +3859,7 @@ mod tests {
+             VoteStep::Prevote,
+             hash_a,
+             signer_ids[2],
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             signers[2],
+         )
+@@ -3289,6 +3899,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -3299,6 +3910,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -3309,6 +3921,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -3319,6 +3932,7 @@ mod tests {
+             VoteStep::Precommit,
+             block_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -3385,27 +3999,154 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn empty_round_timeouts_do_not_advance_election_seed() {
+-        let (mut driver, dir) = local_driver([0x48; 32], "empty_round_seed_stable");
+-        let _local = install_active_validator(&mut driver, [0x48; 32], "local");
++    fn accepted_proposal_replay_skips_authoritative_admission_across_peer_paths() {
++        let seed = [0x49u8; 32];
++        let (mut driver, dir) = local_driver(seed, "accepted_proposal_replay_fast_path");
++        let _local = install_active_validator(&mut driver, seed, "local");
+         driver.refresh_registered_voters();
+-        let seed = driver.engine.state.election_seed;
+-        let height = driver.height();
+-        let _ = driver.on_propose_timeout();
+-        let _ = driver.on_precommit_timeout();
+-        assert_eq!(driver.height(), height);
+-        assert_eq!(driver.engine.state.election_seed, seed);
+-        let _ = std::fs::remove_dir_all(&dir);
+-    }
+ 
+-    #[test]
+-    fn proposal_selection_switches_to_better_priority_only_before_prevote() {
+-        let (mut driver, dir) = local_driver([0x46; 32], "priority_selection_timeout");
+-        let a = install_active_validator(&mut driver, [0x46; 32], "a");
+-        let b = install_active_validator(&mut driver, [0x47; 32], "b");
+-        driver.refresh_registered_voters();
+-        let a_id = validator_id_for(&a);
+-        let b_id = validator_id_for(&b);
++        let proposal = make_strict_block(&driver, seed, 0, vec![]);
++        let hash = proposal.header.block_hash();
++        let phase_before = driver.current_phase();
++        let first = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9202".parse().unwrap()),
++            proposal: proposal.clone(),
++        });
++        assert!(first
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert_eq!(
++            driver.proposal_admission_metrics,
++            ProposalAdmissionMetrics {
++                proposal_verifications: 1,
++                qc_verifications: 0,
++                detached_projections: 1,
++            }
++        );
++        let pending_before = driver.pending_blocks.len();
++        let metrics_before = driver.proposal_admission_metrics;
++
++        // A different authenticated transport address models another relay or
++        // a reconnected peer. Driver-authoritative state is connection-agnostic.
++        let replay = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9203".parse().unwrap()),
++            proposal,
++        });
++
++        assert!(replay
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.proposal_admission_metrics, metrics_before);
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert!(driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.current_phase(), phase_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn invalid_proposal_cannot_poison_accepted_replay_state() {
++        let seed = [0x4Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "invalid_proposal_no_replay_poison");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++
++        let valid = make_strict_block(&driver, seed, 0, vec![]);
++        let hash = valid.header.block_hash();
++        let mut invalid = valid.clone();
++        invalid.proposer_authorization.classical_sig =
++            VariableBytes::from_slice(&[0xA5; indra_crypto::CLASSICAL_SIG_BYTES]).unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9204".parse().unwrap()),
++            proposal: invalid,
++        });
++        assert!(rejected
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert!(!driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.proposal_admission_metrics.proposal_verifications, 1);
++        assert_eq!(driver.proposal_admission_metrics.detached_projections, 0);
++
++        let accepted = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9205".parse().unwrap()),
++            proposal: valid,
++        });
++        assert!(accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert!(driver.pending_blocks.contains_key(&hash));
++        assert_eq!(driver.proposal_admission_metrics.proposal_verifications, 2);
++        assert_eq!(driver.proposal_admission_metrics.detached_projections, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn accepted_height_two_proposal_replay_skips_embedded_qc_verification() {
++        let seed = [0x4Cu8; 32];
++        let (mut driver, dir) = local_driver(seed, "height_two_proposal_replay_fast_path");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++
++        let first_height = make_strict_block(&driver, seed, 0, vec![]);
++        let _ = process_single_validator_proposal(&mut driver, first_height);
++        assert_eq!(driver.height(), 1);
++
++        let proposal = make_strict_block(&driver, seed, 0, driver.last_qc_bytes().to_vec());
++        let before = driver.proposal_admission_metrics;
++        let accepted = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9206".parse().unwrap()),
++            proposal: proposal.clone(),
++        });
++        assert!(accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
++        assert_eq!(
++            driver.proposal_admission_metrics.proposal_verifications,
++            before.proposal_verifications + 1
++        );
++        assert_eq!(
++            driver.proposal_admission_metrics.qc_verifications,
++            before.qc_verifications + 1
++        );
++        assert_eq!(
++            driver.proposal_admission_metrics.detached_projections,
++            before.detached_projections + 1
++        );
++        let after_first = driver.proposal_admission_metrics;
++
++        let replay = driver.process(DriverEvent::InboundBlock {
++            from: Some("127.0.0.1:9207".parse().unwrap()),
++            proposal,
++        });
++        assert!(replay
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.proposal_admission_metrics, after_first);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn empty_round_timeouts_do_not_advance_election_seed() {
++        let (mut driver, dir) = local_driver([0x48; 32], "empty_round_seed_stable");
++        let _local = install_active_validator(&mut driver, [0x48; 32], "local");
++        driver.refresh_registered_voters();
++        let seed = driver.engine.state.election_seed;
++        let height = driver.height();
++        let _ = driver.on_propose_timeout();
++        let _ = driver.on_precommit_timeout();
++        assert_eq!(driver.height(), height);
++        assert_eq!(driver.engine.state.election_seed, seed);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn proposal_selection_switches_to_better_priority_only_before_prevote() {
++        let (mut driver, dir) = local_driver([0x46; 32], "priority_selection_timeout");
++        let a = install_active_validator(&mut driver, [0x46; 32], "a");
++        let b = install_active_validator(&mut driver, [0x47; 32], "b");
++        driver.refresh_registered_voters();
++        let a_id = validator_id_for(&a);
++        let b_id = validator_id_for(&b);
+         let a_vrf = VrfKeypair::from_seed(&[0x46; 32]);
+         let b_vrf = VrfKeypair::from_seed(&[0x47; 32]);
+         let round = (0..4_096)
+@@ -3468,7 +4209,14 @@ mod tests {
+         let signer = install_active_validator(&mut driver, [0x4Fu8; 32], "validator");
+         driver.refresh_registered_voters();
+ 
+-        let block = make_strict_block(&driver, [0x4Fu8; 32], 5, vec![]);
++        let target_round = (1..=8)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, 1, *round))
++            })
++            .expect("single-validator fixture must be eligible within the round-jump cap");
++        let block = make_strict_block(&driver, [0x4Fu8; 32], target_round, vec![]);
+         let block_hash = block.header.block_hash();
+         let mut actions = driver.process(DriverEvent::InboundBlock {
+             from: None,
+@@ -3480,15 +4228,16 @@ mod tests {
+         assert!(!actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+ 
+         let vote = indra_consensus::vote::produce_vote(
+             1,
+-            5,
++            target_round,
+             VoteStep::Prevote,
+-            Bytes32::ZERO,
++            block_hash,
+             validator_id_for(&signer),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &signer,
+         )
+@@ -3503,7 +4252,7 @@ mod tests {
+         assert!(actions.iter().any(|action| matches!(
+             action,
+             DriverAction::BroadcastVote(vote)
+-                if vote.round == 5 && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
++                if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
+         )));
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+@@ -3570,12 +4319,88 @@ mod tests {
+         driver.current_phase = RoundPhase::Precommit;
+         driver.current_round = 3;
+ 
+-        driver.on_precommit_timeout();
++        driver.on_precommit_timeout().unwrap();
+         assert_eq!(driver.current_round(), 4);
+         assert_eq!(driver.current_phase(), RoundPhase::Propose);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn final_round_timeout_fails_closed_without_state_mutation() {
++        let (mut driver, dir) = local_driver([0x48u8; 32], "round_limit");
++        driver.current_round = MAX_ROUNDS_PER_HEIGHT - 2;
++        driver.current_phase = RoundPhase::Precommit;
++        driver.on_precommit_timeout().unwrap();
++        assert_eq!(driver.current_round(), MAX_ROUNDS_PER_HEIGHT - 1);
++        assert_eq!(driver.current_phase(), RoundPhase::Propose);
++
++        driver.current_phase = RoundPhase::Precommit;
++        let before = (
++            driver.current_round,
++            driver.current_phase,
++            driver.pending_blocks.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let error = driver.on_precommit_timeout().unwrap_err();
++        assert!(matches!(error, NodeError::RoundLimitExceeded { .. }));
++        assert_eq!(
++            before,
++            (
++                driver.current_round,
++                driver.current_phase,
++                driver.pending_blocks.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn invalid_high_round_vote_is_rejected_before_any_consensus_mutation() {
++        let (mut driver, dir) = local_driver([0x49u8; 32], "high_round_vote");
++        let signer = install_active_validator(&mut driver, [0x49u8; 32], "local");
++        driver.refresh_registered_voters();
++        let mut vote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&signer),
++            governing_snapshot_root(&driver, 1),
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        vote.round = MAX_ROUNDS_PER_HEIGHT;
++        let before = (
++            driver.seen_round_votes.len(),
++            driver.round_advance_evidence.len(),
++            driver.vote_collectors.len(),
++            driver.locked_round,
++            driver.valid_round,
++        );
++        let actions = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9499".parse().unwrap(),
++            vote,
++        });
++        assert!(actions.is_empty());
++        assert_eq!(
++            before,
++            (
++                driver.seen_round_votes.len(),
++                driver.round_advance_evidence.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.valid_round,
++            )
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn process_status_cannot_advance_round_without_quorum_evidence() {
+         let (mut driver, dir) = local_driver([0x4Au8; 32], "status_round_advance");
+@@ -3632,6 +4457,7 @@ mod tests {
+                 },
+                 Bytes32::ZERO,
+                 validator_id_for(signer),
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -3750,6 +4576,7 @@ mod tests {
+         let (mut driver, dir) = local_driver([0x90u8; 32], "bounded_buffered_votes");
+         driver.current_round = 128;
+         let peer: SocketAddr = "127.0.0.1:9501".parse().unwrap();
++        let snapshot_root = governing_snapshot_root(&driver, 1);
+ 
+         for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+             let hash = test_hash(i);
+@@ -3757,7 +4584,10 @@ mod tests {
+                 .buffered_votes
+                 .entry((1, i as u32, hash))
+                 .or_default()
+-                .push((peer, dummy_vote(1, i as u32, VoteStep::Prevote, hash)));
++                .push((
++                    peer,
++                    dummy_vote(1, i as u32, VoteStep::Prevote, hash, snapshot_root),
++                ));
+         }
+         driver.prune_buffered_votes();
+ 
+@@ -3778,6 +4608,7 @@ mod tests {
+                     i as u32,
+                     VoteStep::Prevote,
+                     DEFAULT_CHAIN_ID.to_string(),
++                    governing_snapshot_root(&driver, 1),
+                     driver.registered_voters.clone(),
+                 ),
+             );
+@@ -3812,7 +4643,10 @@ mod tests {
+         for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+             driver.seen_round_votes.insert(
+                 (test_hash(i), 1, i as u32, VoteStep::Prevote),
+-                test_hash(i + 1_000),
++                AcceptedVoteIdentity {
++                    block_hash: test_hash(i + 1_000),
++                    snapshot_root: Bytes32::ZERO,
++                },
+             );
+         }
+         driver.prune_seen_round_votes();
+@@ -3841,21 +4675,111 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn future_proposals_does_not_grow_unbounded() {
+-        let (mut driver, dir) = local_driver([0x95u8; 32], "bounded_future_proposals");
+-        driver.current_round = 128;
+-        let key = (driver.next_height(), driver.engine.state.tip_hash);
++    fn future_and_wrong_parent_proposals_are_dropped_before_consensus_mutation() {
++        let seed = [0x95u8; 32];
++        let (mut driver, dir) = local_driver(seed, "strict_future_admission");
++        let _local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
+ 
+-        for i in 0..(MAX_STALLED_HEIGHT_ENTRIES + 100) {
+-            let mut block = make_block(&driver.engine.state);
+-            block.header.proposer_round = i as u32;
+-            block.header.timestamp = block.header.timestamp.saturating_add(i as u64);
+-            driver.future_proposals.entry(key).or_default().push(block);
+-        }
+-        driver.prune_future_proposals_bounded();
++        let current = make_strict_block(&driver, seed, 0, vec![]);
++        let mut future = current.clone();
++        future.block.header.height = driver.next_height() + 1;
++        reauthorize_test_proposal(&mut future, seed, driver.engine.state.chain_id.as_bytes());
++
++        let mut wrong_parent = current;
++        wrong_parent.block.header.prev_hash = Bytes32::from([0xDD; 32]);
++        reauthorize_test_proposal(
++            &mut wrong_parent,
++            seed,
++            driver.engine.state.chain_id.as_bytes(),
++        );
+ 
+-        let total: usize = driver.future_proposals.values().map(Vec::len).sum();
+-        assert!(total <= MAX_STALLED_HEIGHT_ENTRIES);
++        // These mutations represent every expensive validation family in the
++        // ordinary path. Because the parent state is unavailable/wrong, none
++        // may obtain verified-container status before those checks are possible.
++        let mut cases = vec![
++            ("future-valid-envelope", future.clone()),
++            ("wrong-parent", wrong_parent),
++        ];
++        let mut invalid_signature = future.clone();
++        invalid_signature.proposer_authorization.classical_sig =
++            VariableBytes::from_slice(&[0xA5; 64]).unwrap();
++        cases.push(("invalid-signature", invalid_signature));
++        let mut invalid_vrf = future.clone();
++        invalid_vrf.block.header.proposer_vrf_proof =
++            VariableBytes::from_slice(&[0x5A; 80]).unwrap();
++        cases.push(("invalid-vrf-or-ineligible", invalid_vrf));
++        let mut invalid_qc = future.clone();
++        invalid_qc.block.header.quorum_certificate = VariableBytes::from_slice(&[0xFF]).unwrap();
++        cases.push(("invalid-qc", invalid_qc));
++        let mut wrong_snapshot_context = future.clone();
++        wrong_snapshot_context.block.header.election_seed = Bytes64::from([0x44; 64]);
++        cases.push(("wrong-snapshot-context", wrong_snapshot_context));
++        let mut wrong_value = future.clone();
++        wrong_value.block.header.value_hash = Bytes32::from([0x11; 32]);
++        cases.push(("wrong-value-hash", wrong_value));
++        let mut invalid_transaction = future.clone();
++        invalid_transaction.block.transactions.push(
++            indra_core::types::transaction::TransactionV1 {
++                version: ProtocolVersion::CURRENT,
++                signature_module_id: 0,
++                inputs: vec![],
++                outputs: vec![],
++                fee_amount: 0,
++                signature: indra_core::types::crypto::HybridSignature {
++                    classical_sig: VariableBytes::from_slice(&[]).unwrap(),
++                    pq_sig: VariableBytes::from_slice(&[]).unwrap(),
++                },
++            },
++        );
++        cases.push(("invalid-transaction-transition", invalid_transaction));
++        let mut invalid_monetary = future.clone();
++        invalid_monetary.block.header.base_fee = u64::MAX;
++        cases.push(("invalid-monetary-transition", invalid_monetary));
++        let mut wrong_state = future.clone();
++        wrong_state.block.header.state_root = Bytes32::from([0x22; 32]);
++        cases.push(("wrong-state-or-transition", wrong_state));
++        let mut wrong_validators = future;
++        wrong_validators.block.header.validator_set_root = Bytes32::from([0x33; 32]);
++        cases.push(("wrong-validator-root", wrong_validators));
++
++        for (name, proposal) in cases {
++            let before = (
++                driver.pending_blocks.len(),
++                driver.vote_collectors.len(),
++                driver.locked_round,
++                driver.locked_value,
++                driver.valid_round,
++                driver.valid_value,
++                driver.current_round,
++                driver.vote_safety.load(),
++            );
++            let actions = driver.process(DriverEvent::InboundBlock {
++                from: None,
++                proposal,
++            });
++            assert!(
++                actions
++                    .iter()
++                    .all(|action| matches!(action, DriverAction::None)),
++                "{name}"
++            );
++            assert_eq!(
++                before,
++                (
++                    driver.pending_blocks.len(),
++                    driver.vote_collectors.len(),
++                    driver.locked_round,
++                    driver.locked_value,
++                    driver.valid_round,
++                    driver.valid_value,
++                    driver.current_round,
++                    driver.vote_safety.load(),
++                ),
++                "{name} mutated consensus state"
++            );
++        }
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
+@@ -3894,14 +4818,6 @@ mod tests {
+             .any(|action| matches!(action, DriverAction::BroadcastBlock(_))));
+         assert!(driver.vote_collectors.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+         assert!(driver.pending_blocks.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+-        assert!(
+-            driver
+-                .future_proposals
+-                .values()
+-                .map(Vec::len)
+-                .sum::<usize>()
+-                <= MAX_STALLED_HEIGHT_ENTRIES
+-        );
+         assert!(driver.buffered_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+         assert!(driver.requested_proposals.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+         assert!(driver.seen_round_votes.len() <= MAX_STALLED_HEIGHT_ENTRIES);
+@@ -3921,6 +4837,23 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn restart_after_vote_in_final_round_fails_closed() {
++        let (mut driver, dir) = local_driver([0x4Cu8; 32], "final_round_restart");
++        driver
++            .vote_safety
++            .record(1, MAX_ROUNDS_PER_HEIGHT - 1, 1, None)
++            .unwrap();
++        let before = driver.current_round();
++        driver.apply_vote_safety();
++        assert_eq!(driver.current_round(), before);
++        assert!(driver
++            .vote_safety_unavailable
++            .as_deref()
++            .is_some_and(|reason| reason.contains("no safe round")));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn apply_vote_safety_ignores_old_height() {
+         let (mut driver, dir) = local_driver([0x4Eu8; 32], "vote_safety_old_height");
+@@ -4014,6 +4947,7 @@ mod tests {
+             VoteStep::Prevote,
+             hash_a,
+             validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4048,7 +4982,7 @@ mod tests {
+         // legitimately prevoted this conflicting full block hash.
+         let mut block_b = make_block(&restarted.engine.state);
+         block_b.header.proposer_round = 1;
+-        block_b.header.polc_round = NO_POLC_ROUND;
++        block_b.header.polc_round = None;
+         block_b.header.timestamp = block_b.header.timestamp.saturating_add(1);
+         block_b.header.value_hash = block_b.compute_value_hash(restarted.engine.state.total_supply);
+         let hash_b = block_b.header.block_hash();
+@@ -4085,6 +5019,7 @@ mod tests {
+             VoteStep::Prevote,
+             block_hash,
+             validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4120,6 +5055,43 @@ mod tests {
+         let _ = std::fs::remove_dir_all(dir);
+     }
+ 
++    #[test]
++    fn persisted_lock_above_round_cap_is_rejected_before_restore_mutation() {
++        let seed = [0x7Fu8; 32];
++        let (mut driver, dir) = local_driver(seed, "restart_rejects_high_lock_round");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        let proposal = make_strict_block(&driver, seed, 0, vec![]);
++        let block_hash = proposal.header.block_hash();
++        let prevote = indra_consensus::vote::produce_vote(
++            1,
++            0,
++            VoteStep::Prevote,
++            block_hash,
++            validator_id_for(&local),
++            governing_snapshot_root(&driver, 1),
++            DEFAULT_CHAIN_ID,
++            &local,
++        )
++        .unwrap();
++        let lock = PersistedConsensusLock {
++            height: 1,
++            round: MAX_ROUNDS_PER_HEIGHT,
++            block_hash,
++            value_hash: proposal.header.value_hash,
++            proposal,
++            polc_votes: vec![prevote],
++        };
++        assert!(driver.vote_safety.record(1, 0, 1, Some(&lock)).is_err());
++        let before = (driver.locked_round, driver.valid_round, driver.locked_value);
++        assert!(driver.verify_and_restore_consensus_lock(lock).is_err());
++        assert_eq!(
++            before,
++            (driver.locked_round, driver.valid_round, driver.locked_value)
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn lock_polc_is_durable_before_precommit_broadcast_is_returned() {
+         let (mut driver, dir) = local_driver([0x7Au8; 32], "lock_before_precommit");
+@@ -4142,6 +5114,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 hash,
+                 validator_id_for(signer),
++                governing_snapshot_root(&driver, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -4172,6 +5145,295 @@ mod tests {
+         panic!("prevote quorum did not produce the expected precommit");
+     }
+ 
++    #[test]
++    fn accepted_vote_replay_skips_snapshot_and_hybrid_work_across_peer_paths() {
++        let (mut driver, dir) = local_driver([0x40u8; 32], "accepted_vote_replay_fast_path");
++        let remote = install_active_validator(&mut driver, [0x41u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let vote = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&remote),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let phase_before = driver.current_phase();
++
++        let first = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9291".parse().unwrap(),
++            vote: vote.clone(),
++        });
++        assert!(!first
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert_eq!(
++            driver.vote_admission_metrics,
++            VoteAdmissionMetrics {
++                snapshot_lookups: 1,
++                hybrid_authority_calls: 1,
++                successful_ed25519_verifications: 1,
++                successful_mldsa_verifications: 1,
++                collector_insertions: 1,
++                qc_formations: 0,
++            }
++        );
++        let metrics_after_first = driver.vote_admission_metrics;
++        let seen_after_first = driver.seen_round_votes.len();
++
++        // A new authenticated address models another relay or a replacement
++        // connection. The driver state is consensus-scoped, not connection-scoped.
++        let replay = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9292".parse().unwrap(),
++            vote,
++        });
++        assert!(replay.is_empty());
++        assert_eq!(driver.vote_admission_metrics, metrics_after_first);
++        assert_eq!(driver.seen_round_votes.len(), seen_after_first);
++        assert_eq!(driver.current_phase(), phase_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn cryptographically_invalid_vote_cannot_poison_replay_state() {
++        let (mut driver, dir) = local_driver([0x42u8; 32], "invalid_vote_no_replay_poison");
++        let remote = install_active_validator(&mut driver, [0x43u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let valid = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&remote),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let slot = (valid.validator_id, valid.height, valid.round, valid.step);
++        let mut invalid = valid.clone();
++        let mut bad_pq = invalid.signature.pq_sig.as_slice().to_vec();
++        bad_pq[0] ^= 0x80;
++        invalid.signature.pq_sig = VariableBytes::from_slice(&bad_pq).unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9293".parse().unwrap(),
++            vote: invalid,
++        });
++        assert!(rejected
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert!(!driver.seen_round_votes.contains_key(&slot));
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 0);
++        assert_eq!(
++            driver.vote_admission_metrics.successful_mldsa_verifications,
++            0
++        );
++
++        let accepted = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9294".parse().unwrap(),
++            vote: valid,
++        });
++        assert!(!accepted
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert!(driver.seen_round_votes.contains_key(&slot));
++        assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 2);
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 1);
++        assert_eq!(
++            driver
++                .vote_admission_metrics
++                .successful_ed25519_verifications,
++            1
++        );
++        assert_eq!(
++            driver.vote_admission_metrics.successful_mldsa_verifications,
++            1
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn wrong_snapshot_vote_is_not_collapsed_into_exact_replay() {
++        let (mut driver, dir) = local_driver([0x44u8; 32], "wrong_snapshot_not_replay");
++        let remote = install_active_validator(&mut driver, [0x45u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let remote_id = validator_id_for(&remote);
++        let accepted = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            remote_id,
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++        let _ = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9295".parse().unwrap(),
++            vote: accepted,
++        });
++        let before = driver.vote_admission_metrics;
++        let wrong_root = Bytes32::from([0xA6; 32]);
++        let wrong = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            remote_id,
++            wrong_root,
++            DEFAULT_CHAIN_ID,
++            &remote,
++        )
++        .unwrap();
++
++        let rejected = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9296".parse().unwrap(),
++            vote: wrong,
++        });
++        assert!(rejected
++            .iter()
++            .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
++        assert_eq!(
++            driver.vote_admission_metrics.snapshot_lookups,
++            before.snapshot_lookups + 1
++        );
++        assert_eq!(
++            driver.vote_admission_metrics.hybrid_authority_calls,
++            before.hybrid_authority_calls + 1
++        );
++        assert_eq!(
++            driver
++                .vote_admission_metrics
++                .successful_ed25519_verifications,
++            before.successful_ed25519_verifications
++        );
++        assert_eq!(driver.vote_admission_metrics.collector_insertions, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn vote_replay_identity_is_round_step_and_height_scoped() {
++        let (mut driver, dir) = local_driver([0x46u8; 32], "vote_replay_dimensions");
++        let remote = install_active_validator(&mut driver, [0x47u8; 32], "remote");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let height = driver.next_height();
++        let root = governing_snapshot_root(&driver, height);
++        let remote_id = validator_id_for(&remote);
++        let votes = [
++            indra_consensus::vote::produce_vote(
++                height,
++                0,
++                VoteStep::Prevote,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++            indra_consensus::vote::produce_vote(
++                height,
++                0,
++                VoteStep::Precommit,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++            indra_consensus::vote::produce_vote(
++                height,
++                1,
++                VoteStep::Prevote,
++                Bytes32::ZERO,
++                remote_id,
++                root,
++                DEFAULT_CHAIN_ID,
++                &remote,
++            )
++            .unwrap(),
++        ];
++        for (index, vote) in votes.iter().cloned().enumerate() {
++            let actions = driver.process(DriverEvent::InboundVote {
++                from: SocketAddr::from(([127, 0, 0, 1], 9300 + index as u16)),
++                vote,
++            });
++            assert!(!actions.iter().any(|action| matches!(
++                action,
++                DriverAction::DisconnectInvalidConsensusPeer { .. }
++            )));
++        }
++        assert_eq!(driver.vote_admission_metrics.snapshot_lookups, 3);
++        assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 3);
++        assert_eq!(driver.seen_round_votes.len(), 3);
++
++        let before = driver.vote_admission_metrics;
++        let seen_before = driver.seen_round_votes.len();
++        driver.engine.state.height = height;
++        let stale = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9303".parse().unwrap(),
++            vote: votes[0].clone(),
++        });
++        assert!(stale.is_empty());
++        assert_eq!(driver.vote_admission_metrics, before);
++        assert_eq!(driver.seen_round_votes.len(), seen_before);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn vote_replay_state_is_not_persisted_across_restart() {
++        let seed = [0x48u8; 32];
++        let (mut driver, dir) = local_driver(seed, "vote_replay_restart_scope");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++        let signer = HybridKeypair::new(
++            ClassicalKeypair::from_seed(&seed),
++            PqKeypair::from_seed(&seed).unwrap(),
++        );
++        let vote = indra_consensus::vote::produce_vote(
++            driver.next_height(),
++            0,
++            VoteStep::Prevote,
++            Bytes32::ZERO,
++            validator_id_for(&signer),
++            governing_snapshot_root(&driver, driver.next_height()),
++            DEFAULT_CHAIN_ID,
++            &signer,
++        )
++        .unwrap();
++        let _ = driver.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9304".parse().unwrap(),
++            vote: vote.clone(),
++        });
++        assert_eq!(driver.seen_round_votes.len(), 1);
++
++        let config = driver.engine.config.clone();
++        drop(driver);
++        let engine = NodeEngine::init(config).unwrap();
++        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
++        let mut restarted = ConsensusDriver::new(engine, vote_safety);
++        restarted.sync.mark_caught_up(restarted.height());
++        assert!(restarted.seen_round_votes.is_empty());
++        let _ = restarted.process(DriverEvent::InboundVote {
++            from: "127.0.0.1:9305".parse().unwrap(),
++            vote,
++        });
++        assert_eq!(restarted.vote_admission_metrics.snapshot_lookups, 1);
++        assert_eq!(restarted.vote_admission_metrics.hybrid_authority_calls, 1);
++        assert_eq!(restarted.vote_admission_metrics.collector_insertions, 1);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn driver_detects_double_precommit() {
+         let (mut driver, dir) = local_driver([0x48u8; 32], "double_precommit");
+@@ -4188,6 +5450,7 @@ mod tests {
+             VoteStep::Precommit,
+             Bytes32::from([0xAAu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4198,6 +5461,7 @@ mod tests {
+             VoteStep::Precommit,
+             Bytes32::from([0xBBu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4219,6 +5483,62 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn conflicting_vote_orderings_bypass_exact_replay_fast_path() {
++        for (index, reverse) in [false, true].into_iter().enumerate() {
++            let seed = [0x50u8 + index as u8; 32];
++            let suffix = format!("equivocation_order_{index}");
++            let (mut driver, dir) = local_driver(seed, &suffix);
++            let remote =
++                install_active_validator(&mut driver, [0x52u8 + index as u8; 32], "remote");
++            driver.refresh_registered_voters();
++            driver.sync.mark_caught_up(driver.height());
++            let remote_id = validator_id_for(&remote);
++            let make_vote = |hash| {
++                indra_consensus::vote::produce_vote(
++                    driver.next_height(),
++                    0,
++                    VoteStep::Precommit,
++                    hash,
++                    remote_id,
++                    governing_snapshot_root(&driver, driver.next_height()),
++                    DEFAULT_CHAIN_ID,
++                    &remote,
++                )
++                .unwrap()
++            };
++            let a = make_vote(Bytes32::from([0xAA; 32]));
++            let b = make_vote(Bytes32::from([0xBB; 32]));
++            let (first, second) = if reverse { (b, a) } else { (a, b) };
++            let _ = driver.process(DriverEvent::InboundVote {
++                from: "127.0.0.1:9297".parse().unwrap(),
++                vote: first,
++            });
++            let evidence = driver.process(DriverEvent::InboundVote {
++                from: "127.0.0.1:9298".parse().unwrap(),
++                vote: second,
++            });
++
++            assert!(evidence
++                .iter()
++                .any(|action| matches!(action, DriverAction::SlashDetected(_))));
++            assert_eq!(driver.vote_admission_metrics.snapshot_lookups, 2);
++            assert_eq!(driver.vote_admission_metrics.hybrid_authority_calls, 2);
++            assert_eq!(
++                driver
++                    .vote_admission_metrics
++                    .successful_ed25519_verifications,
++                2
++            );
++            assert_eq!(
++                driver.vote_admission_metrics.successful_mldsa_verifications,
++                2
++            );
++            assert_eq!(driver.vote_admission_metrics.collector_insertions, 0);
++            let _ = std::fs::remove_dir_all(&dir);
++        }
++    }
++
+     #[test]
+     fn forged_vote_cannot_poison_real_validators_round_slot() {
+         let (mut driver, dir) = local_driver([0x4Bu8; 32], "forged_vote_slot");
+@@ -4237,6 +5557,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             real_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &attacker,
+         )
+@@ -4256,6 +5577,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             real_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &real,
+         )
+@@ -4267,7 +5589,13 @@ mod tests {
+         assert!(!legitimate_actions
+             .iter()
+             .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
+-        assert_eq!(driver.seen_round_votes.get(&slot), Some(&Bytes32::ZERO));
++        assert_eq!(
++            driver.seen_round_votes.get(&slot),
++            Some(&AcceptedVoteIdentity {
++                block_hash: Bytes32::ZERO,
++                snapshot_root: governing_snapshot_root(&driver, driver.next_height()),
++            })
++        );
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
+@@ -4288,6 +5616,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::ZERO,
+             remote_id,
++            governing_snapshot_root(&driver, driver.next_height()),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )
+@@ -4317,6 +5646,7 @@ mod tests {
+                 VoteStep::Precommit,
+                 hash,
+                 real_id,
++                governing_snapshot_root(&driver, driver.next_height()),
+                 DEFAULT_CHAIN_ID,
+                 &attacker,
+             )
+@@ -4464,6 +5794,7 @@ mod tests {
+             VoteStep::Precommit,
+             block2.header.block_hash(),
+             source_validator_id,
++            governing_snapshot_root(&driver, 2),
+             DEFAULT_CHAIN_ID,
+             &source_local,
+         )
+@@ -4473,6 +5804,7 @@ mod tests {
+             block2.header.proposer_round,
+             block2.header.block_hash(),
+             DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 2),
+             &driver.engine.qc_validators(),
+             vec![&qc_vote],
+         )
+@@ -4551,6 +5883,7 @@ mod tests {
+             VoteStep::Precommit,
+             block2.header.block_hash(),
+             validator_id,
++            governing_snapshot_root(&driver, 2),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+@@ -4560,6 +5893,7 @@ mod tests {
+             block2.header.proposer_round,
+             block2.header.block_hash(),
+             DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 2),
+             &driver.engine.qc_validators(),
+             vec![&qc_vote],
+         )
+@@ -4970,14 +6304,22 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let qc =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap();
++        let qc = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap();
+         let qc_bytes = qc.encode_to_vec();
+ 
+         let _ = driver.process(DriverEvent::QcResponse {
+@@ -5015,14 +6357,22 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let qc =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap();
++        let qc = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap();
+         let mut qc_bytes = qc.encode_to_vec();
+         let last = qc_bytes.len() - 1;
+         qc_bytes[last] ^= 0x01;
+@@ -5062,15 +6412,23 @@ mod tests {
+             VoteStep::Precommit,
+             value_hash,
+             validator_id,
++            governing_snapshot_root(&driver, 7),
+             DEFAULT_CHAIN_ID,
+             &local,
+         )
+         .unwrap();
+         let validators = driver.engine.qc_validators();
+-        let mut qc_bytes =
+-            indra_consensus::build_qc(7, 0, value_hash, DEFAULT_CHAIN_ID, &validators, vec![&vote])
+-                .unwrap()
+-                .encode_to_vec();
++        let mut qc_bytes = indra_consensus::build_qc(
++            7,
++            0,
++            value_hash,
++            DEFAULT_CHAIN_ID,
++            governing_snapshot_root(&driver, 7),
++            &validators,
++            vec![&vote],
++        )
++        .unwrap()
++        .encode_to_vec();
+         qc_bytes.push(0xA5);
+ 
+         let actions = driver.process(DriverEvent::QcResponse {
+@@ -5202,6 +6560,7 @@ mod tests {
+             VoteStep::Prevote,
+             original_hash,
+             remote_a_id,
++            governing_snapshot_root(&driver, height),
+             DEFAULT_CHAIN_ID,
+             &remote_a,
+         )
+@@ -5212,6 +6571,7 @@ mod tests {
+             VoteStep::Prevote,
+             original_hash,
+             remote_b_id,
++            governing_snapshot_root(&driver, height),
+             DEFAULT_CHAIN_ID,
+             &remote_b,
+         )
+@@ -5235,7 +6595,7 @@ mod tests {
+         assert_eq!(valid_block.header.value_hash, value_hash);
+ 
+         let local_vrf = VrfKeypair::from_seed(&[0x73; 32]);
+-        let election = (original_round.saturating_add(1)..original_round.saturating_add(4_096))
++        let election = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver, height, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(
+@@ -5262,7 +6622,7 @@ mod tests {
+ 
+         assert_eq!(reproposed.header.value_hash, value_hash);
+         assert_eq!(reproposed.header.proposer_round, reproposal_round);
+-        assert_eq!(reproposed.header.polc_round, original_round);
++        assert_eq!(reproposed.header.polc_round, Some(original_round));
+ 
+         driver.current_round = reproposal_round;
+         driver.current_phase = RoundPhase::Propose;
+@@ -5345,6 +6705,96 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn vrf007_substituted_entropy_is_rejected_before_vote_or_lock_mutation() {
++        let seed = [0x7Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "vrf007_admission_order");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++
++        let height = driver.next_height();
++        let round_zero = election_for_round(&driver, height, 0);
++        let original = driver
++            .engine
++            .propose(&round_zero, 1_700_000_001, driver.last_qc_bytes(), None)
++            .unwrap();
++        let local_id = validator_id_for(&local);
++        let local_vrf = VrfKeypair::from_seed(&seed);
++        let later = (1..4_096)
++            .map(|round| election_for_round(&driver, height, round))
++            .find(|election| {
++                indra_consensus::proposer::compute_proposer_vrf(local_id, &local_vrf, election)
++                    .is_ok_and(|claim| claim.eligible)
++            })
++            .expect("test validator becomes eligible in a later round");
++        let mut substituted = driver
++            .engine
++            .repropose(
++                &original,
++                later.round,
++                Some(0),
++                &later,
++                original.header.timestamp,
++                driver.last_qc_bytes(),
++            )
++            .unwrap();
++
++        // Reproduce VRF-007 exactly: install another genuine eligible entropy
++        // proof but retain the old stable value identity and post-state roots.
++        substituted.block.header.value_entropy = indra_core::types::block::ProposalEntropyV1 {
++            origin_proposer_id: substituted.header.proposer_id,
++            origin_round: substituted.header.proposer_round,
++            vrf_output: substituted.header.proposer_vrf_output.clone(),
++            vrf_proof: substituted.header.proposer_vrf_proof.clone(),
++        };
++        reauthorize_test_proposal(
++            &mut substituted,
++            seed,
++            driver.engine.state.chain_id.as_bytes(),
++        );
++        assert_ne!(
++            original.header.value_entropy,
++            substituted.header.value_entropy
++        );
++        assert_eq!(original.header.value_hash, substituted.header.value_hash);
++        assert!(verify_live_proposal(&driver, &substituted).is_ok());
++        assert_ne!(
++            substituted.header.value_hash,
++            substituted.compute_value_hash(driver.engine.state.total_supply),
++            "the substituted entropy has a different canonical stable identity"
++        );
++
++        driver.current_round = later.round;
++        driver.current_phase = RoundPhase::Propose;
++        let pending_before = driver.pending_blocks.len();
++        let collectors_before = driver.vote_collectors.len();
++        let lock_before = (
++            driver.locked_round,
++            driver.locked_value,
++            driver.locked_value_hash,
++        );
++        let actions = driver.process(DriverEvent::InboundBlock {
++            from: None,
++            proposal: substituted,
++        });
++
++        assert!(actions
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert_eq!(driver.vote_collectors.len(), collectors_before);
++        assert_eq!(
++            (
++                driver.locked_round,
++                driver.locked_value,
++                driver.locked_value_hash
++            ),
++            lock_before
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn repropose_matches_clone_based_reference() {
+         let (mut driver, dir) = local_driver([0x78u8; 32], "repropose_clone_reference");
+@@ -5363,13 +6813,20 @@ mod tests {
+             )
+             .expect("initial proposal should succeed");
+ 
+-        let election_round_one = election_for_round(&driver, height, 1);
++        let reproposal_round = (1..4_096)
++            .find(|round| {
++                driver
++                    .engine
++                    .is_proposer(&election_for_round(&driver, height, *round))
++            })
++            .expect("test proposer must become eligible within bounded round search");
++        let election_round_one = election_for_round(&driver, height, reproposal_round);
+         let pre_state = driver.engine.state.clone();
+         let reproposed = driver
+             .engine
+             .repropose(
+                 &proposal,
+-                1,
++                reproposal_round,
+                 Some(0),
+                 &election_round_one,
+                 proposal.header.timestamp,
+@@ -5394,8 +6851,8 @@ mod tests {
+             reproposed.compute_value_hash(clone_reference.total_supply)
+         );
+         assert_eq!(proposal.header.value_hash, reproposed.header.value_hash);
+-        assert_eq!(reproposed.header.proposer_round, 1);
+-        assert_eq!(reproposed.header.polc_round, 0);
++        assert_eq!(reproposed.header.proposer_round, reproposal_round);
++        assert_eq!(reproposed.header.polc_round, Some(0));
+         assert_eq!(
+             driver.engine.state, pre_state,
+             "reproposal projection must roll back and leave real engine state untouched"
+@@ -5489,6 +6946,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 block_x_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5511,9 +6969,9 @@ mod tests {
+             value_hash
+         );
+ 
+-        driver_b.on_precommit_timeout();
++        driver_b.on_precommit_timeout().unwrap();
+         let b_vrf = VrfKeypair::from_seed(&[0x82; 32]);
+-        let election_round_one = (original_round.saturating_add(1)..4_096)
++        let election_round_one = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
+             .map(|round| election_for_round(&driver_b, 1, round))
+             .find(|election| {
+                 indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, election)
+@@ -5563,6 +7021,7 @@ mod tests {
+                 VoteStep::Prevote,
+                 block_y_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5584,6 +7043,7 @@ mod tests {
+                 VoteStep::Precommit,
+                 block_y_hash,
+                 validator_id,
++                governing_snapshot_root(&driver_b, 1),
+                 DEFAULT_CHAIN_ID,
+                 signer,
+             )
+@@ -5665,6 +7125,7 @@ mod tests {
+             VoteStep::Prevote,
+             Bytes32::from([0xABu8; 32]),
+             remote_id,
++            governing_snapshot_root(&driver, 1),
+             DEFAULT_CHAIN_ID,
+             &remote,
+         )

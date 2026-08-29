@@ -1,0 +1,15 @@
+execution_class=NATIVE_PHYSICAL
+host=Apple M4 MacBook Air
+uname=Darwin Kolaparthis-MacBook-Air.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:26 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T8132 arm64
+target=aarch64-apple-darwin
+rustc=1.93.1 (01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf)
+cargo=1.93.1 (083ac5135f967fd9dc906ab057a2315861c7a80d)
+llvm=21.1.8
+profile=release
+rustflags=<empty>
+features=default only
+source_revision=b6404ccacc508d92a022f50ad1af3da4d4e31a02 (dirty worktree)
+root_Cargo.lock_sha256=5479dc079feaa81055de2a26ef585c9778b5257ace77d5e805229bc2679ab7b7
+audit_Cargo.lock_sha256=2fa5f97878d92192b5ec33344f07de90cc7906acb2dbc382f55afa09c9cb17bb
+binary_sha256=423272ce8a66e19020542203ab93d4f2db22e984adf59c8d132e2d2f0a880dbf
+result_sha256=1c34146a3434d151bcfb5832ea3946da184259954adf228b05c69b9645cc2d37

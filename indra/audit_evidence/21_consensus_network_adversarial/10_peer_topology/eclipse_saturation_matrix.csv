@@ -1,0 +1,6 @@
+scenario,byzantine_validators,attacker_addresses,attacker_discovered,honest_discovered,outbound_attempts,attacker_attempts,honest_attempts,active_byzantine,active_honest,steps_to_first_honest,permanent_starvation,full_eclipse
+40 validators saturated,40,256+,256,0,8-target loop,up to 8,0,<=40,0 until insertion,1 after honest insertion,no with reserved honest root,no
+66 validators saturated,66,256+,256,0,8-target loop,up to 8,0,<=66,0 until insertion,1 after honest insertion,no with reserved honest root,no
+honest insertion into full set,40,256,255,1,1,0,1,<=40,1,1,no,no
+continuous attacker churn,66,10000+,bounded 256,non-reserved may churn,8-target loop,randomized,at least reserved honest,<=66,>=1 reserved,finite under reservation,no,no
+reserved bootstrap protected,40,256+,attacker entries only,bootstrap retained,8,attacker mix,honest reserved,<=40,>=1,1,no,no

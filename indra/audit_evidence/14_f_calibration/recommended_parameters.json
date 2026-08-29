@@ -1,0 +1,41 @@
+{
+  "classification": "RECOMMENDED RANGE",
+  "quantization": {
+    "general_rule": "nearest integer to f*2^64, ties rounded upward",
+    "hard_min_rule": "ceil(0.36*2^64)",
+    "hard_max_rule": "floor(0.40*2^64)"
+  },
+  "hard_min": {
+    "requested_f": "0.36",
+    "F": "6640827866535438582",
+    "effective_f_fraction": "3320413933267719291/9223372036854775808",
+    "effective_f_decimal": "0.3600000000000000000130104260698260532081"
+  },
+  "preferred": {
+    "requested_f": "0.375",
+    "F": "6917529027641081856",
+    "effective_f_fraction": "3/8",
+    "effective_f_decimal": "0.375"
+  },
+  "hard_max": {
+    "requested_f": "0.40",
+    "F": "7378697629483820646",
+    "effective_f_fraction": "3689348814741910323/9223372036854775808",
+    "effective_f_decimal": "0.3999999999999999999783159565502899113199"
+  },
+  "acceptance_limits": {
+    "expected_honest_proposer_rounds_at_beta_limit": "<=4",
+    "p_no_honest_10_rounds_at_beta_limit": "<=0.06",
+    "p_no_honest_20_rounds_at_beta_limit": "<=0.005",
+    "p_multiple_proposers_200_equal": "<=0.10 with engineering margin",
+    "p_only_byzantine_at_beta_limit": "<=0.12",
+    "adaptive_next_eligibility_absolute_bias": "<=0.05",
+    "balanced_predicate_tv_lower_bound": "<=0.10",
+    "split_200_p_multiple_given_any": "<=0.09"
+  },
+  "disposition": {
+    "GR-01": "ACCEPTED RESIDUAL",
+    "GR-02": "CLOSABLE BY PARAMETER CONSTRAINT"
+  },
+  "mainnet_rule": "Genesis and persisted consensus configuration must reject F outside the inclusive integer envelope; no compatibility exception for unsafe testnet values."
+}

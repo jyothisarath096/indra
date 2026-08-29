@@ -1,0 +1,6 @@
+structure,key,lifetime,persistence,mutation,attacker_influence,threshold,expiry/reset,bound,disconnect_effect
+PeerInfo,SocketAddr,peer-table,lived memory,score_event,transport events,score<=0,ban duration,MAX_PEERS=80,disconnect/ban
+scores_by_validator,Bytes32,process,none,adjust_validator_score,authenticated offenses,score<=0,clamp [0,200],authority-bounded,identity ban
+BanStore,Bytes32,restart persistent,atomic file,ban_until,authenticated validator only,expiry unix time,cleanup_expired_at,protocol traffic bounded by expiry,reject reconnect
+rate-limit strikes,validator,process,none,rate violation,authenticated traffic,policy threshold,decay,validator bounded,may ban
+discovered peers,address,process,disk persistence,peer list,network addresses,256,eviction,256,none

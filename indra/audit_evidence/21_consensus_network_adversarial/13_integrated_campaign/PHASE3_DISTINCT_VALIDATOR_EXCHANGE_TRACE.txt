@@ -1,0 +1,15 @@
+INIT A=7de456cd… B=270e915a… shared genesis fingerprint
+ASSERT A != B
+SIGN A h=1 r=0 Prevote
+ENQUEUE A -> B
+DELIVER A -> B
+ACCEPT B signer=A
+SIGN B h=1 r=0 Prevote
+ENQUEUE B -> A
+DELIVER B -> A
+ACCEPT A signer=B
+SIGN C h=1 r=0 Prevote (C absent from authority)
+ENQUEUE C -> A
+DELIVER C -> A
+REJECT C authoritative-validation (DisconnectInvalidConsensusPeer: Vote validation failed)
+COLLECTOR C absent

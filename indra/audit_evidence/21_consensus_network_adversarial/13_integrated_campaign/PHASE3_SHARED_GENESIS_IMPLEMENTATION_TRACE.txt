@@ -1,0 +1,17 @@
+TEST audit_fixture_shared_genesis_two_distinct_validators: PASS
+  material A seed=0xA1, material B seed=0xB2
+  validator IDs distinct
+  one sealed manifest, two identical genesis files
+  NodeEngine A and B initialized
+  both authority sets contain A and B
+  genesis fingerprints equal
+  durable directories distinct
+
+TEST audit_fixture_shared_genesis_rejects_non_authority_local_validator: PASS
+  validator C seed=0xC3 absent from genesis
+  NodeEngine::init rejected configured C identity
+
+TEST audit_harness_two_production_nodes_exchange_real_vote: PASS
+Harness self-tests: PASS (4 passed)
+Workspace no-run compile: PASS
+git diff --check: PASS

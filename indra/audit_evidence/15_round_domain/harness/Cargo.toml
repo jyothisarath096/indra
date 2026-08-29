@@ -1,0 +1,13 @@
+[package]
+name = "indra-round-domain-audit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+indra-core = { path = "../../../indra-core" }
+indra-consensus = { path = "../../../indra-consensus" }
+indra-crypto = { path = "../../../indra-crypto" }
+indra-storage = { path = "../../../indra-storage" }

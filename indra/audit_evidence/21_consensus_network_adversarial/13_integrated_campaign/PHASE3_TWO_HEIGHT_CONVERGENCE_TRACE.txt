@@ -1,0 +1,11 @@
+HEIGHT1: four production validators finalized identical proposal and QC
+HEIGHT2 ROUND0: no eligible proposer; production nil prevote/nil precommit/timeout advancement
+HEIGHT2: first eligible proposer round=5; proposal carries height-1 QC
+HEIGHT2: all four finalized identical proposal/QC; canonical convergence PASS
+RESULT: two-height convergence CLOSED
+HARDENING: empty rounds preserve height/tip and advance all nodes synchronously; H2 proposer round=5
+H2 QCs: all four decode height=2 round=5 and verify against governing snapshot
+POST-COMMIT: locks/valid/pending cleared; VoteSafetyStore NoRecord on all nodes
+STALE H1 REPLAY ON A: complete height/tip/QC/round/phase/formation snapshot unchanged
+FINAL ASSERTIONS: H1 hash captured before H2; embedded H1 QC decoded and production-verified; all H2 QCs decoded/verified; cleanup and stale replay invariants PASS
+FINAL ROOT ASSERTIONS: production-computed state_root and validator_set_root identical across A/B/C/D and unchanged during stale H1 replay; complete lock/PoLC/valid cleanup PASS

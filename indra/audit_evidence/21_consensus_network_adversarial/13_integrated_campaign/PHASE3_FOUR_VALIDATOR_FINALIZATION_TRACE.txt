@@ -1,0 +1,4 @@
+NOT EXECUTED
+
+Blocker: four-validator shared-genesis fixture and all-node production
+commit/convergence bridge are not present.

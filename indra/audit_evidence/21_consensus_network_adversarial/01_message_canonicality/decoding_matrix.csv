@@ -1,0 +1,33 @@
+case,message,result,production_decoder,canonical_after_accept,notes
+exact canonical,all inventoried application messages,ACCEPT,Message::decode_wire,yes except encoder-side oversized PeerList address caveat,existing round-trip tests plus audit harness
+remove one byte,Block/Vote/Tx/Staking/Governance/Status/RequestProposal/BlockResponse/PeerList,REJECT,exact/custom decoder,N/A,bounds checked
+remove one byte,Ping/Pong/RequestBlocks/RequestQC/QCResponse,REJECT when required field truncated,custom decoder,N/A,harness/source tests
+trailing arbitrary bytes,Block/Vote/Tx/Staking/Governance/Status/RequestProposal/BlockResponse/PeerList,REJECT,decode_exact/custom exact,yes,production behavior
+trailing arbitrary bytes,Ping/Pong/RequestBlocks/RequestQC/QCResponse,ACCEPT,custom decoder,no,L3-NET-02
+unknown message discriminator,all,SKIP at peer read loop,MessageType::from_byte,N/A,decoder returns UnknownMessageType; peer loop continues
+unknown VoteStep,Vote,REJECT,VoteStep::decode,N/A,only 0/1
+unknown QC format,QC,REJECT,QuorumCertificateV1::decode_exact,N/A,only format 3
+unknown block enum/tag,Block,REJECT,typed decoders,N/A,protocol version/VRF suite/sortition/Option tags fail closed
+invalid bool/Option,Block PeerList and core bool fields,REJECT,typed/custom decoder,N/A,only 0/1; BlockResponse flags only bits 0..1
+count zero,PeerList/BlockResponse/bounded block lists,ACCEPT where empty is meaningful,bounded decoders,yes,semantic consumers decide contextual legality
+count one,all lists,ACCEPT if complete,bounded decoders,yes,canonical
+count maximum,PeerList 256; BlockResponse 50; core list-specific maxima,ACCEPT if complete,bounded decoders,yes,allocation occurs after bound
+count maximum+1,PeerList/BlockResponse/core lists,REJECT,bounded decoders,N/A,before capacity allocation
+very large count,u32 count fields,REJECT,bounded decoders,N/A,before allocation; raw slice reads also capped by frame
+nested length u32::MAX,Block/QC/BlockResponse,REJECT,VariableBytes/read_bytes,N/A,checked arithmetic/slice bounds and outer frame cap
+round 0,Vote/Block/QC/Status/RequestProposal,ACCEPT,validate_consensus_round,yes,legal
+round 1023,Vote/Block/QC/Status/RequestProposal,ACCEPT,validate_consensus_round,yes,legal
+round 1024,Vote/Block/QC/Status/RequestProposal,REJECT,validate_consensus_round,N/A,fail closed before consensus mutation
+round u32::MAX,Vote/Block/QC/Status/RequestProposal,REJECT,validate_consensus_round,N/A,fail closed before consensus mutation
+height 0,wire types,ACCEPT,integer decoder,yes,genesis uses height 0; live consumers enforce next-height/context
+height 1,wire types,ACCEPT,integer decoder,yes,normal first live block
+height u64::MAX,wire types,ACCEPT,integer decoder,yes,contextual comparisons/saturating range logic reject or constrain where needed
+Ed25519 length 63,Vote/Proposal,ACCEPT decode then REJECT crypto conversion,HybridSignature::decode then to_crypto_sig,yes,L3-NET-04
+Ed25519 length 64,Vote/Proposal,ACCEPT decode,HybridSignature::decode,yes,cryptographic validity checked later
+ML-DSA length 4626,Vote/Proposal,ACCEPT decode then REJECT crypto conversion,HybridSignature::decode then to_crypto_sig,yes,L3-NET-04
+ML-DSA length 4627,Vote/Proposal,ACCEPT decode,HybridSignature::decode,yes,cryptographic validity checked later
+signature maximum+1,Vote/Proposal/QC,REJECT,VariableBytes::decode,N/A,before copy
+structurally valid cryptographically invalid signature,Vote/Proposal/QC,ACCEPT parse then REJECT verification,relay and consensus verifiers,yes,no consensus mutation
+inner length prefix zero,any valid application body,ACCEPT,peer_manager strips first 4 bytes,no,L3-NET-01
+inner length prefix u32::MAX,any valid application body,ACCEPT,peer_manager strips first 4 bytes,no,L3-NET-01; enclosing authenticated frame cap still bounds allocation
+invalid UTF-8 address,PeerList,ACCEPT and replacement-decoded,custom from_utf8_lossy,no,L3-NET-03

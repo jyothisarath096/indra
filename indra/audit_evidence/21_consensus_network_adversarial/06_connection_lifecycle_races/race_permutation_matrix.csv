@@ -1,0 +1,10 @@
+scenario,production path,result,severity
+register A then B same validator,PeerManagerActor::register_peer tie-break,one winner; loser dropped,pass
+stale disconnect A after B,drop_peer validator+addr exact match,ignored when B current,pass
+B disconnect after A removed,drop_peer current lookup,no duplicate removal,pass
+inbound/outbound crossed,tie_break_keep_new deterministic,one winner,pass
+queued A message after replacement,read task carries validator+addr; actor ordering,old task aborted on replacement; no lifecycle mutation reproduced,pass
+stale invalid penalty,disconnect API receives address; peer table scores address,does not target replacement,pass
+limiter across replacement,limiters_by_validator,validator bucket persists,pass
+sync A replaced by B,accept_response/provisional exact socket,wrong socket rejected,pass
+authority removal plus stale event,admission uses current handshake/authority,stale event cannot resurrect,pass

@@ -1,0 +1,22 @@
+object,case,first_rejection_or_admission,crypto_performed,state_effect,request_or_gossip,timer_effect,bound
+Proposal,previous round same height,"valid proposal may be staged only if its proposal round/object passes current vote-safety selection; never retreats round","yes if current height and parent valid",bounded pending candidate only,no duplicate gossip after insertion,none,256 stalled entries and legal rounds
+Proposal,previous/finalized height,driver height check before snapshot,no,none,none,none,zero retained
+Proposal,current height +1 or farther,"height != next_height or wrong parent",no,none,none,none,L3-CS-02 no future buffer
+Proposal,round 1023,structurally legal; only exact next-height/current-parent then full admission,yes,bounded staging if valid,first-only broadcast,none,legal domain and bounded collections
+Proposal,round 1024/u32::MAX,network decoder and driver round validation,no,none,none,none,fail closed
+Vote,previous round same height,accepted only within current-8..current+8 admission window; verified evidence remains bounded,yes,bounded collector/evidence if not already seen,first-only relay/request,none,256 entries and pruning
+Vote,previous/finalized height,"vote.height != next_height",no,none,none,none,zero retained
+Vote,current height +1/current +2/far future,"vote.height != next_height",no,none,none,none,zero retained
+Vote,current round +1 through +8,full authority validation then bounded evidence/collector,yes,may advance only with >2/3 authenticated stake; otherwise bounded,missing-proposal request once,phase changes only on quorum evidence,MAX_ACCEPTED_ROUND_JUMP=8
+Vote,current round +9 through 1023,"round > current+8",no,none,none,none,zero retained
+Vote,round 1024/u32::MAX,network/driver legal-round validation,no,none,none,none,fail closed
+QCResponse,previous/finalized height,"height != current committed height or last QC not stale",no,none,none,none,zero retained
+QCResponse,current committed height,only while persisted last QC is stale; exact-wire network dedup then QC verification,yes once,updates last_qc once,no gossip,none,2048/10m network cache and stale guard
+QCResponse,future height,"height != current committed height",no,none,none,none,zero retained
+BlockResponse,stale/no outstanding,no outstanding binding,no,none,none,none,single outstanding request
+BlockResponse,future/out-of-range,response range check,no,none,none,none,max 50 blocks; single outstanding request
+Status,historical height,validator claim replacement,no,no consensus state,none,none,claim TTL 30s
+Status,future height,validator claim replacement and stake corroboration,no,bounded sync target/request,at most one outstanding sync request,none,validator-keyed claims; one outstanding
+RequestProposal,any height,exact pending/store lookup,no,no consensus mutation,one response if exact object found,none,rate-limited; no request cache
+RequestBlocks,any range,range validation/storage availability path,no,no consensus mutation,one bounded response,none,max 50 response entries and transport/rate bounds
+RequestQC,any height,current tip or retained previous-height lookup,no,no consensus mutation,one response if available,none,rate-limited; no request cache

@@ -1,0 +1,390 @@
+diff --git a/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md b/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
+index 0d44a74a..5c427ae5 100644
+--- a/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
++++ b/indra/docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
+@@ -390,6 +390,31 @@ the same value is re-enveloped. A proposer cannot substitute arbitrary entropy:
+ the retained origin proof and stake-threshold result are reverified at every
+ proposal trust boundary.
+ 
++#### 6.0.1 VRF-007 stable-value commitment addendum
++
++The stable value identity commits the complete immutable entropy record rather
++than relying on a verifier's ephemeral memory of the first proposal. Define:
++
++```text
++entropy_commitment =
++    SHA-256("INDRA-PROPOSAL-ENTROPY-COMMIT-v1" ||
++            canonical_encode(ProposalEntropyV1))
++```
++
++and include `entropy_commitment` as a fixed 32-byte input to the canonical
++`value_hash` preimage. Canonical encoding length-prefixes the bounded VRF output
++and proof and uses the protocol codec's unique little-endian representation for
++`origin_round`; the other fields are fixed width. Consequently every mutation
++of origin identity, origin round, output, or proof changes the stable value
++identity. Current-round proposer identity, round, VRF output, VRF proof, and
++priority remain excluded, so a legitimate later-round envelope for unchanged
++entropy retains the same stable value identity.
++
++Live proposal admission recomputes projected state, validator, and stable-value
++commitments before staging a proposal or permitting vote/lock mutation. This is
++required because a peer-supplied `value_hash` is only a claim until the complete
++value transition has been projected.
++
+ This is a breaking header change in the existing batched redeploy wave:
+ 
+ ```text
+@@ -500,6 +525,7 @@ BlockHeaderVNext {
+     election_seed: Bytes64,
+     proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+     proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
++    value_entropy: ProposalEntropyV1,
+     sortition_claim: SortitionClaimV1, // PraosThreshold = 1
+     proposer_priority: Bytes64,
+ }
+@@ -644,10 +670,13 @@ Persisting one ML-DSA-87 signature per block creates material storage growth. Im
+ MAX_STANDARD_VRF_OUTPUT_BYTES = 64
+ MAX_STANDARD_VRF_PROOF_BYTES  = 80
+ VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 = 1
+-BlockHeader protocol version: 1 -> 2
++BlockHeader protocol version: 2 -> 3
+ ```
+ 
+-The old value is the repository's current `BLOCK_FORMAT_VERSION: u16 = 1`; the new value is exactly one greater. This is a wire break, not a compatibility discriminator: after clean redeploy only version 2 is decoded.
++VRF-007 changes stable-value consensus semantics without adding a header field,
++so the block protocol version increments from 2 to 3. This is a wire and
++consensus break, not a compatibility discriminator: after clean redeploy only
++version 3 is decoded. There is no version-2 value-hash fallback.
+ 
+ ## 8. Invariants and required verification tests
+ 
+diff --git a/indra/indra-core/src/types/block.rs b/indra/indra-core/src/types/block.rs
+index 8b7de03a..dcda2293 100644
+--- a/indra/indra-core/src/types/block.rs
++++ b/indra/indra-core/src/types/block.rs
+@@ -98,6 +98,17 @@ pub struct ProposalEntropyV1 {
+ }
+ 
+ impl ProposalEntropyV1 {
++    /// Canonical commitment used by the round-stable consensus value identity.
++    ///
++    /// The versioned domain is deliberately distinct from the seed-evolution
++    /// transcript. The canonical codec makes every component unambiguous,
++    /// including the bounded VRF output and proof lengths.
++    pub fn commitment(&self) -> Bytes32 {
++        let mut material = b"INDRA-PROPOSAL-ENTROPY-COMMIT-v1".to_vec();
++        self.encode(&mut material);
++        Bytes32::from(sha256(&material))
++    }
++
+     /// Empty form used only by the height-zero genesis anchor.
+     pub fn genesis() -> Self {
+         Self {
+@@ -202,16 +213,18 @@ impl BlockHeaderVNext {
+         state_root: Bytes32,
+         validator_set_root: Bytes32,
+         mempool_set_root: Bytes32,
++        value_entropy: &ProposalEntropyV1,
+         base_fee: u64,
+         total_supply: u64,
+     ) -> Bytes32 {
+-        let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 8 + 8);
++        let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 8);
+         height.encode(&mut buf);
+         prev_hash.encode(&mut buf);
+         timestamp.encode(&mut buf);
+         state_root.encode(&mut buf);
+         validator_set_root.encode(&mut buf);
+         mempool_set_root.encode(&mut buf);
++        value_entropy.commitment().encode(&mut buf);
+         base_fee.encode(&mut buf);
+         total_supply.encode(&mut buf);
+         Bytes32::from(sha256(&buf))
+@@ -429,6 +442,7 @@ impl BlockVNext {
+             self.header.state_root,
+             self.header.validator_set_root,
+             self.header.mempool_set_root,
++            &self.header.value_entropy,
+             self.header.base_fee,
+             total_supply,
+         )
+@@ -515,6 +529,7 @@ mod tests {
+             h.state_root,
+             h.validator_set_root,
+             h.mempool_set_root,
++            &h.value_entropy,
+             h.base_fee,
+             123,
+         );
+@@ -531,6 +546,7 @@ mod tests {
+             changed.state_root,
+             changed.validator_set_root,
+             changed.mempool_set_root,
++            &changed.value_entropy,
+             changed.base_fee,
+             123,
+         );
+@@ -538,6 +554,53 @@ mod tests {
+         assert_eq!(base, changed_hash);
+     }
+ 
++    #[test]
++    fn value_hash_commits_every_immutable_entropy_component() {
++        let base = dummy_header();
++        let hash = |entropy: &ProposalEntropyV1| {
++            BlockHeaderVNext::compute_value_hash(
++                base.height,
++                base.prev_hash,
++                base.timestamp,
++                base.state_root,
++                base.validator_set_root,
++                base.mempool_set_root,
++                entropy,
++                base.base_fee,
++                123,
++            )
++        };
++        let original = hash(&base.value_entropy);
++
++        let mut changed = base.value_entropy.clone();
++        changed.origin_proposer_id.0[0] ^= 1;
++        assert_ne!(original, hash(&changed));
++
++        let mut changed = base.value_entropy.clone();
++        changed.origin_round += 1;
++        assert_ne!(original, hash(&changed));
++
++        let mut changed = base.value_entropy.clone();
++        let mut output = changed.vrf_output.as_slice().to_vec();
++        output[0] ^= 1;
++        changed.vrf_output = VariableBytes::new(output).unwrap();
++        assert_ne!(original, hash(&changed));
++
++        let mut changed = base.value_entropy.clone();
++        let mut proof = changed.vrf_proof.as_slice().to_vec();
++        proof[0] ^= 1;
++        changed.vrf_proof = VariableBytes::new(proof).unwrap();
++        assert_ne!(original, hash(&changed));
++    }
++
++    #[test]
++    fn entropy_commitment_is_canonical_across_exact_round_trip() {
++        let entropy = dummy_header().value_entropy;
++        let decoded = ProposalEntropyV1::decode_exact(&entropy.encode_to_vec()).unwrap();
++        assert_eq!(entropy, decoded);
++        assert_eq!(entropy.commitment(), decoded.commitment());
++    }
++
+     #[test]
+     fn empty_block_round_trip() {
+         let b = BlockVNext {
+diff --git a/indra/indra-core/src/types/primitives.rs b/indra/indra-core/src/types/primitives.rs
+index b010758f..cf7fb9be 100644
+--- a/indra/indra-core/src/types/primitives.rs
++++ b/indra/indra-core/src/types/primitives.rs
+@@ -435,7 +435,7 @@ pub const PEER_TABLE_SAVE_INTERVAL_SECS: u64 = 1800;
+ pub const TRANSACTION_PROTOCOL_VERSION: u16 = 3;
+ 
+ /// Fixed discriminator for the sole genesis-native block format.
+-pub const BLOCK_FORMAT_VERSION: u16 = 2;
++pub const BLOCK_FORMAT_VERSION: u16 = 3;
+ 
+ /// Current schema version for all persisted structs.
+ ///
+@@ -748,8 +748,8 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn proposer_v2_wire_constants_are_pinned() {
+-        assert_eq!(BLOCK_FORMAT_VERSION, 2);
++    fn proposer_wire_constants_are_pinned() {
++        assert_eq!(BLOCK_FORMAT_VERSION, 3);
+         assert_eq!(MAX_STANDARD_VRF_OUTPUT_BYTES, 64);
+         assert_eq!(MAX_STANDARD_VRF_PROOF_BYTES, 80);
+         assert_eq!(
+diff --git a/indra/indra-node/src/driver.rs b/indra/indra-node/src/driver.rs
+index 98aee15d..e5188900 100644
+--- a/indra/indra-node/src/driver.rs
++++ b/indra/indra-node/src/driver.rs
+@@ -749,7 +749,7 @@ impl ConsensusDriver {
+             round,
+             self.engine.state.election_seed,
+             snapshot,
+-        )
++        )?
+         .election)
+     }
+ 
+@@ -1428,8 +1428,20 @@ impl ConsensusDriver {
+             }
+         }
+ 
+-        let mut projected_state = self.engine.state.clone();
+-        if indra_state::apply_block(&mut projected_state, &verified, 0).is_err() {
++        // Admission must validate the commitments before staging the proposal:
++        // Rule 3 reasons about `value_hash`, so accepting a peer-supplied hash
++        // without recomputing it would let a PoLC authorize different immutable
++        // value entropy under the same claimed identity.
++        let projected =
++            match indra_state::project_block_for_roots(&mut self.engine.state, verified.block(), 0)
++            {
++                Ok(projected) => projected,
++                Err(_) => return vec![DriverAction::None],
++            };
++        if projected.state_root != block.header.state_root
++            || projected.validator_set_root != block.header.validator_set_root
++            || projected.value_hash != block.header.value_hash
++        {
+             return vec![DriverAction::None];
+         }
+ 
+@@ -2948,10 +2960,15 @@ mod tests {
+             2,
+             indra_core::types::primitives::Bytes64([0x55; 64]),
+             &snapshot,
+-        );
++        )
++        .unwrap();
+         let voters = NodeEngine::registered_voters_for_height(301, &snapshot);
+         let qc = NodeEngine::qc_validators_for_height(301, &snapshot);
+ 
++        assert_eq!(
++            vrf.election.sortition_log,
++            snapshot.sortition_log_interval().unwrap()
++        );
+         assert_eq!(vrf.election.candidates.len(), voters.len());
+         assert_eq!(voters.len(), qc.len());
+         for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+@@ -3069,7 +3086,8 @@ mod tests {
+                         0,
+                         Bytes64([(*height % 251) as u8; 64]),
+                         snapshot,
+-                    );
++                    )
++                    .unwrap();
+                     assert_eq!(voters.len(), validators.len());
+                     assert_eq!(validators.len(), authority.election.candidates.len());
+                     for ((voter, validator), candidate) in voters
+@@ -5345,6 +5363,96 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn vrf007_substituted_entropy_is_rejected_before_vote_or_lock_mutation() {
++        let seed = [0x7Au8; 32];
++        let (mut driver, dir) = local_driver(seed, "vrf007_admission_order");
++        let local = install_active_validator(&mut driver, seed, "local");
++        driver.refresh_registered_voters();
++        driver.sync.mark_caught_up(driver.height());
++
++        let height = driver.next_height();
++        let round_zero = election_for_round(&driver, height, 0);
++        let original = driver
++            .engine
++            .propose(&round_zero, 1_700_000_001, driver.last_qc_bytes(), None)
++            .unwrap();
++        let local_id = validator_id_for(&local);
++        let local_vrf = VrfKeypair::from_seed(&seed);
++        let later = (1..4_096)
++            .map(|round| election_for_round(&driver, height, round))
++            .find(|election| {
++                indra_consensus::proposer::compute_proposer_vrf(local_id, &local_vrf, election)
++                    .is_ok_and(|claim| claim.eligible)
++            })
++            .expect("test validator becomes eligible in a later round");
++        let mut substituted = driver
++            .engine
++            .repropose(
++                &original,
++                later.round,
++                Some(0),
++                &later,
++                original.header.timestamp,
++                driver.last_qc_bytes(),
++            )
++            .unwrap();
++
++        // Reproduce VRF-007 exactly: install another genuine eligible entropy
++        // proof but retain the old stable value identity and post-state roots.
++        substituted.block.header.value_entropy = indra_core::types::block::ProposalEntropyV1 {
++            origin_proposer_id: substituted.header.proposer_id,
++            origin_round: substituted.header.proposer_round,
++            vrf_output: substituted.header.proposer_vrf_output.clone(),
++            vrf_proof: substituted.header.proposer_vrf_proof.clone(),
++        };
++        reauthorize_test_proposal(
++            &mut substituted,
++            seed,
++            driver.engine.state.chain_id.as_bytes(),
++        );
++        assert_ne!(
++            original.header.value_entropy,
++            substituted.header.value_entropy
++        );
++        assert_eq!(original.header.value_hash, substituted.header.value_hash);
++        assert!(verify_live_proposal(&driver, &substituted).is_ok());
++        assert_ne!(
++            substituted.header.value_hash,
++            substituted.compute_value_hash(driver.engine.state.total_supply),
++            "the substituted entropy has a different canonical stable identity"
++        );
++
++        driver.current_round = later.round;
++        driver.current_phase = RoundPhase::Propose;
++        let pending_before = driver.pending_blocks.len();
++        let collectors_before = driver.vote_collectors.len();
++        let lock_before = (
++            driver.locked_round,
++            driver.locked_value,
++            driver.locked_value_hash,
++        );
++        let actions = driver.process(DriverEvent::InboundBlock {
++            from: None,
++            proposal: substituted,
++        });
++
++        assert!(actions
++            .iter()
++            .all(|action| matches!(action, DriverAction::None)));
++        assert_eq!(driver.pending_blocks.len(), pending_before);
++        assert_eq!(driver.vote_collectors.len(), collectors_before);
++        assert_eq!(
++            (
++                driver.locked_round,
++                driver.locked_value,
++                driver.locked_value_hash
++            ),
++            lock_before
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
+     #[test]
+     fn repropose_matches_clone_based_reference() {
+         let (mut driver, dir) = local_driver([0x78u8; 32], "repropose_clone_reference");
+diff --git a/indra/indra-node/src/sync.rs b/indra/indra-node/src/sync.rs
+index 7dabd35b..b58b7fed 100644
+--- a/indra/indra-node/src/sync.rs
++++ b/indra/indra-node/src/sync.rs
+@@ -1126,12 +1126,8 @@ pub(crate) fn project_and_verify_block_state_root(
+         });
+     }
+ 
+-    // Skip value_hash verification for legacy blocks produced before the
+-    // value_hash feature was introduced. These blocks store Bytes32::ZERO.
+     let actual_value_hash = block.compute_value_hash(projected.total_supply);
+-    if block.header.value_hash != indra_core::Bytes32::ZERO
+-        && actual_value_hash != block.header.value_hash
+-    {
++    if actual_value_hash != block.header.value_hash {
+         return Err(NodeError::BlockInvalid {
+             height: block.header.height,
+             reason: format!(
+@@ -1307,6 +1303,7 @@ mod tests {
+             election_seed: state.election_seed,
+             snapshot_root: snapshot.snapshot_root,
+             active_slot_coefficient_numerator: state.active_slot_coefficient_numerator,
++            sortition_log: snapshot.sortition_log_interval().unwrap(),
+             height,
+             round,
+             candidates: snapshot

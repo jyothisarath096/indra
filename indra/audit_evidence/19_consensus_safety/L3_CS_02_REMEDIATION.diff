@@ -1,0 +1,31 @@
+L3-CS-02 task-scoped semantic diff
+==================================
+
+indra-node/src/driver.rs
+------------------------
+- remove DriverAction::ActivateBufferedProposal
+- remove ConsensusDriver.future_proposals
+- remove initialization, reset, sync, prune and commit cleanup for that field
+- remove prune_future_proposals_bounded()
+- remove prune_future_proposals()
+- remove activate_buffered_proposals_for_new_tip()
+- replace future/wrong-parent buffering in process_proposal() with:
+
+    if block.header.height != next_height
+        || block.header.prev_hash != self.engine.state.tip_hash
+    {
+        return vec![DriverAction::None];
+    }
+
+- replace the bounded-future-container test with the adversarial strict-admission
+  mutation test
+- retain current-height and proposal-request recovery regressions
+
+indra-node/src/bin/node.rs
+--------------------------
+- remove recursive ActivateBufferedProposal action processing
+- mark the now-unused action-handler height/handshake parameters explicitly unused
+
+No consensus wire/storage schema changed. No legacy or alternate buffering path
+was added. `rg -n 'future_proposals|ActivateBufferedProposal' indra-node/src`
+returns no matches.

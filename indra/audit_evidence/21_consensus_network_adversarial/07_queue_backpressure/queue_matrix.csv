@@ -1,0 +1,10 @@
+queue/channel,producer,consumer,item,capacity,backpressure,attacker_controlled,max_item,resident_bound
+peer-manager control_rx,network tasks,actor,control message,config command_buffer,bounded send await,indirect,frame/message bounded,config capacity
+peer-manager event_tx,actor,node bridge,NetworkEvent,config command_buffer,bounded await,yes,MAX_MSG_BYTES,capacity*item
+node async_event_tx,peer manager,node event loop,NetworkEvent,1024,bounded await,yes,MAX_MSG_BYTES,1024*MAX_MSG_BYTES theoretical
+per-peer small_tx,relay/send callers,writer task,OutboundMessage,256,try_send/drop or disconnect,yes,MAX_MSG_BYTES,256*MAX_MSG_BYTES theoretical
+per-peer large_tx,relay/send callers,writer task,OutboundMessage,4,try_send/drop or disconnect,yes,MAX_MSG_BYTES,4*MAX_MSG_BYTES theoretical
+node write_tx,rpc producers,rpc writer,Message,64,send await,indirect,MAX_MSG_BYTES,64*MAX_MSG_BYTES theoretical
+handshake semaphore,inbound accepts,handshake tasks,permit,50,waits permit,yes,small handshake buffers,50 tasks
+frame reader, socket,read task,plaintext Vec,1 frame,read_exact bounded length,yes,MAX_MSG_BYTES,MAX_MSG_BYTES per peer
+relay seen,peer manager,TTL cache,key,finite capacities,drop oldest/expired,yes,hash only,hard bounded

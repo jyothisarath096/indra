@@ -1,0 +1,4 @@
+
+# Cargo build cache from cross-platform determinism evidence gathering —
+# non-reproducible, platform-specific, must never be committed.
+audit_evidence/**/target*/

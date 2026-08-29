@@ -1,0 +1,59 @@
+=== GIT STATUS ===
+?? 14340
+?? 6148
+?? 8196
+?? audit_evidence/
+
+=== COMMIT ===
+b6404ccacc508d92a022f50ad1af3da4d4e31a02
+
+=== BRANCH ===
+main
+
+=== DESCRIBE ===
+testnet-v1-316-gb6404cca
+
+=== SUBMODULES ===
+
+=== RUSTC ===
+rustc 1.96.0 (ac68faa20 2026-05-25)
+binary: rustc
+commit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96
+commit-date: 2026-05-25
+host: aarch64-apple-darwin
+release: 1.96.0
+LLVM version: 22.1.2
+
+=== CARGO ===
+cargo 1.96.0 (30a34c682 2026-05-25)
+
+=== RUSTUP ===
+Default host: aarch64-apple-darwin
+rustup home:  /Users/bonkai/.rustup
+
+installed toolchains
+--------------------
+stable-aarch64-apple-darwin (active, default)
+nightly-aarch64-apple-darwin
+
+active toolchain
+----------------
+name: stable-aarch64-apple-darwin
+active because: it's the default toolchain
+installed targets:
+  aarch64-apple-darwin
+  aarch64-apple-ios
+  aarch64-apple-ios-sim
+  aarch64-linux-android
+  armv7-linux-androideabi
+  i686-linux-android
+  x86_64-apple-ios
+  x86_64-linux-android
+  x86_64-unknown-linux-gnu
+  x86_64-unknown-linux-musl
+
+=== SYSTEM ===
+Darwin Unknown_f2:3a:62:12:47:5f 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:26 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T8132 arm64
+
+=== CARGO.LOCK HASH ===
+5479dc079feaa81055de2a26ef585c9778b5257ace77d5e805229bc2679ab7b7  Cargo.lock

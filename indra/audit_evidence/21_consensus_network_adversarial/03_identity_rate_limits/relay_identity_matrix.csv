@@ -1,0 +1,7 @@
+message type,transport identity,signed/logical identity,limiter identity,peer-score identity,equivocation identity,rebroadcast exclusion identity
+Vote,authenticated peer validator ID,Vote.validator_id,transport validator ID,transport address/validator,signed Vote.validator_id,transport sender plus relay key
+Block/proposal,authenticated peer validator ID,block proposer_id,transport validator ID,transport address/validator,signed proposer_id,transport sender plus relay key
+QC/QC response,authenticated peer validator ID,QC signer set,transport validator ID,transport address/validator,QC signer set,transport sender and bounded response hash
+Transaction,authenticated peer validator ID,operation signer,transport validator ID,transport address/validator,operation signer,relay seen key where applicable
+StakingOp,authenticated peer validator ID,operation signer,transport validator ID,transport address/validator,operation signer,relay seen key where applicable
+GovernanceOp,authenticated peer validator ID,operation signer,transport validator ID,transport address/validator,operation signer,relay seen key where applicable

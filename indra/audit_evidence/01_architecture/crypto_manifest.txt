@@ -1,0 +1,46 @@
+=== INDRA-CRYPTO CARGO.TOML ===
+[package]
+name        = "indra-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace               = true
+hmac.workspace               = true
+thiserror.workspace          = true
+hex.workspace                = true
+bip39.workspace              = true
+ed25519-dalek.workspace      = true
+curve25519-dalek.workspace   = true
+curve25519-dalek-v5.workspace = true
+sha2-11.workspace            = true
+zeroize                      = { version = "1", features = ["derive"] }
+ml-dsa.workspace             = true
+subtle.workspace             = true
+rand_core.workspace          = true
+
+=== WORKSPACE REFERENCES TO CRYPTO DEPENDENCIES ===
+Cargo.toml:25:sha2               = { version = "0.10", default-features = false }
+Cargo.toml:30:ed25519-dalek      = { version = "2.1", default-features = false, features = ["alloc"] }
+Cargo.toml:31:curve25519-dalek   = { version = "4.1", default-features = false, features = ["alloc", "digest"] }
+Cargo.toml:32:curve25519-dalek-v5 = { package = "curve25519-dalek", version = "5.0", default-features = false, features = ["alloc", "digest", "group", "legacy_compatibility"] }
+Cargo.toml:33:sha2-11            = { package = "sha2", version = "0.11", default-features = false }
+Cargo.toml:40:zeroize            = { version = "1.7", default-features = false, features = ["alloc", "derive"] }
+Cargo.toml:41:rand_core          = { version = "0.6", default-features = false, features = ["getrandom"] }
+indra-cli/Cargo.toml:22:zeroize.workspace = true
+indra-core/Cargo.toml:11:sha2.workspace     = true
+indra-crypto/Cargo.toml:9:sha2.workspace               = true
+indra-crypto/Cargo.toml:14:ed25519-dalek.workspace      = true
+indra-crypto/Cargo.toml:15:curve25519-dalek.workspace   = true
+indra-crypto/Cargo.toml:16:curve25519-dalek-v5.workspace = true
+indra-crypto/Cargo.toml:17:sha2-11.workspace            = true
+indra-crypto/Cargo.toml:18:zeroize                      = { version = "1", features = ["derive"] }
+indra-crypto/Cargo.toml:21:rand_core.workspace          = true
+indra-ffi/Cargo.toml:18:zeroize.workspace  = true
+indra-keystore/Cargo.toml:12:curve25519-dalek.workspace = true
+indra-keystore/Cargo.toml:13:sha2.workspace = true
+indra-keystore/Cargo.toml:22:zeroize.workspace = true
+indra-node/Cargo.toml:11:sha2.workspace = true
+indra-rpc/Cargo.toml:17:rand_core.workspace = true

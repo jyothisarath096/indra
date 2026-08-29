@@ -1,0 +1,100 @@
+# PHASE 3 STEP 16B — FINAL SOURCE GAPS
+
+## seal_test_genesis_fixture
+FILE: indra-node/src/genesis.rs
+SYMBOL: seal_test_genesis_fixture
+CURRENT FILE SHA-256: 4eefa6e51b815e7e4327756395dd5885e552467758026a542d14f4cba9240c6b
+
+The complete current function is `indra-node/src/genesis.rs:324-350`:
+
+```rust
+pub fn seal_test_genesis_fixture(content: &str) -> String {
+    if let Ok(manifest) = toml::from_str::<GenesisManifest>(content) {
+        let hash = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
+        return content.replacen(
+            &manifest.genesis.genesis_precommit_hash,
+            &hex::encode(hash.0),
+            1,
+        );
+    }
+    let placeholder = hex::encode([0u8; 32]);
+    let mut provisional = content.replacen(
+        "[genesis]\n",
+        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
+        1,
+    );
+    let validator_offsets = provisional
+        .match_indices("[[validators]]\n")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    for (validator_index, offset) in validator_offsets.into_iter().enumerate().rev() {
+        let insertion = offset + "[[validators]]\n".len();
+        provisional.insert_str(
+            insertion,
+            &format!(
+                "genesis_commitment_nonce = \"{}\"\n",
+                hex::encode([0x70u8.checked_add(validator_index as u8).unwrap(); 32])
+            ),
+        );
+    }
+    let manifest: GenesisManifest = toml::from_str(&provisional).unwrap();
+    let hash = genesis_precommit_hash(&manifest.genesis, &manifest.validators).unwrap();
+    provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
+}
+```
+
+This iterates every validator section, inserts deterministic commitment nonces,
+parses the complete manifest, computes the precommit over all validators, and
+returns the sealed manifest.
+
+## NodeConfig::local_test
+FILE: indra-node/src/config.rs
+SYMBOL: NodeConfig::local_test
+CURRENT FILE SHA-256: b076755948a0100c14d18c8668c22a12b2c25877be301385535fc16879641d80
+
+Complete function: `indra-node/src/config.rs:162-255`. Its return construction
+sets `data_dir`, `genesis_path`, `genesis_validator_minimum: 1`, independent
+`validator_seed`, `vrf_seed`, `pq_seed`, and `pq_pk`, plus ordinary network and
+storage defaults. The full current body is preserved in
+`PHASE3_FIXTURE_SOURCE_BUNDLE.txt` lines 319 onward; the return fields are:
+
+```rust
+Self {
+    data_dir,
+    genesis_path: Some(genesis_path.to_string_lossy().to_string()),
+    genesis_validator_minimum: 1,
+    validator_seed: Some([0x42u8; 32]),
+    vrf_seed: Some([0x42u8; 32]),
+    pq_seed: Some(vec![0x43; indra_crypto::PQ_SK_BYTES]),
+    pq_pk: Some( /* derived from the fixed PQ seed */ ),
+    /* distinct data-path-derived peers_file and remaining defaults */
+}
+```
+
+## NodeEngine local-membership validation
+FILE: indra-node/src/engine.rs
+SYMBOL: NodeEngine::init validator setup
+CURRENT FILE SHA-256: a2530cd955cf758d912edcbd469c4e33ca7bf23a44c638271a37f8267b2894d7
+
+The complete relevant source is `indra-node/src/engine.rs:540-618`: it derives
+the hybrid identity from configured classical/PQ public keys, requires paired
+validator and VRF seeds, looks up the derived identity in the loaded registry,
+and rejects absent identities or mismatched registered VRF public keys with
+`NodeError::ValidatorConfigIncomplete`. PQ public-key bytes are reconstructed
+from configured seed/public bytes; invalid configured bytes fall back to a
+generated key and consequently cannot match the registered identity.
+
+Genesis loading at `indra-node/src/engine.rs:490-494` calls
+`build_finalized_genesis_state_with_minimum(config.genesis_path,
+config.genesis_validator_minimum)`. `NodeConfig::local_test` uses minimum 1;
+production/full-node configuration uses minimum 4.
+
+## Design conclusion
+
+DESIGN CONFIRMED BY SOURCE
+
+Multiple `[[validators]]` records are supported by `GenesisManifest.validators`
+and by `seal_test_genesis_fixture`'s all-record iteration. A shared sealed
+manifest can therefore be referenced by multiple configs, each with independent
+local key material and data paths, provided each selected identity and VRF key
+matches one manifest record.

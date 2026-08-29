@@ -1,0 +1,15 @@
+INIT A/B/C/D shared four-validator fixture
+HEIGHT 1 ROUND 0
+ELIGIBLE proposer set selected by production proposer_election_for_height
+SELECT proposer from eligible set deterministically
+BUILD production NodeEngine::propose
+ACCEPT proposer-local via DriverEvent::InboundBlock
+ENQUEUE proposal -> each remaining validator
+DELIVER proposal -> B/C/D
+ACCEPT B/C/D identical block hash/value hash/proposer
+ASSERT committed_height A/B/C/D = 0
+REPLAY exact proposal -> receiver
+REPLAY no-op; proposal verification metrics unchanged
+TEST PASS
+Workspace no-run PASS
+git diff --check PASS

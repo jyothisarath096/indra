@@ -1,0 +1,111 @@
+diff --git a/indra-network/src/message.rs b/indra-network/src/message.rs
+--- a/indra-network/src/message.rs
++++ b/indra-network/src/message.rs
+@@ -247,11 +247,44 @@ impl Message {
+     pub fn decode_wire(data: &[u8]) -> NetworkResult<Self> {
+         let Some((&msg_type_byte, payload)) = data.split_first() else {
+             return Err(NetworkError::DecodeFailed {
+                 reason: "empty message".to_string(),
+             });
+         };
+ 
+         let msg_type = MessageType::from_byte(msg_type_byte)?;
+ 
+         Self::decode_payload(msg_type, payload)
+     }
++
++    /// Decode one complete inner wire object, including its 4-byte length prefix.
++    ///
++    /// The declared length covers the message-type byte plus payload, but not
++    /// the length prefix itself. The authenticated transport frame must contain
++    /// exactly that one declared object.
++    pub fn decode_framed_wire(data: &[u8]) -> NetworkResult<Self> {
++        let length_bytes: [u8; 4] = data
++            .get(..4)
++            .ok_or(NetworkError::DecodeFailed {
++                reason: "message length prefix truncated".to_string(),
++            })?
++            .try_into()
++            .map_err(|_| NetworkError::DecodeFailed {
++                reason: "invalid message length prefix".to_string(),
++            })?;
++        let declared_len = u32::from_le_bytes(length_bytes) as usize;
++        if declared_len > MAX_MSG_BYTES {
++            return Err(NetworkError::MessageTooLarge {
++                size: declared_len,
++                max: MAX_MSG_BYTES,
++            });
++        }
++        let actual_len = data.len() - 4;
++        if declared_len != actual_len {
++            return Err(NetworkError::DecodeFailed {
++                reason: format!(
++                    "message length mismatch: declared {declared_len} bytes, frame contains {actual_len}"
++                ),
++            });
++        }
++        Self::decode_wire(&data[4..])
++    }
+@@ -1198,7 +1233,42 @@ mod tests {
+     fn wire_format_has_length_prefix() {
+         let msg = Message::Ping(1);
+         let wire = msg.encode_wire().unwrap();
+         let len = u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize;
+         assert_eq!(len + 4, wire.len());
+     }
++
++    #[test]
++    fn framed_decoder_enforces_declared_inner_length() {
++        let canonical = Message::Ping(1).encode_wire().unwrap();
++        assert!(matches!(
++            Message::decode_framed_wire(&canonical),
++            Ok(Message::Ping(1))
++        ));
++
++        let declared = u32::from_le_bytes(canonical[..4].try_into().unwrap());
++        for mutated in [declared - 1, declared + 1, 0, u32::MAX] {
++            let mut wire = canonical.clone();
++            wire[..4].copy_from_slice(&mutated.to_le_bytes());
++            assert!(Message::decode_framed_wire(&wire).is_err());
++        }
++
++        let mut missing_byte = canonical.clone();
++        missing_byte.pop();
++        assert!(Message::decode_framed_wire(&missing_byte).is_err());
++
++        assert!(Message::decode_framed_wire(&canonical[..3]).is_err());
++    }
++
++    #[test]
++    fn framed_decoder_accepts_outer_transport_maximum_when_declared_exactly() {
++        let declared_len = MAX_MSG_BYTES - 4;
++        let mut wire = vec![0u8; MAX_MSG_BYTES];
++        wire[..4].copy_from_slice(&(declared_len as u32).to_le_bytes());
++        wire[4] = MessageType::Ping as u8;
++
++        assert!(matches!(
++            Message::decode_framed_wire(&wire),
++            Ok(Message::Ping(0))
++        ));
++    }
+ }
+diff --git a/indra-network/src/peer_manager.rs b/indra-network/src/peer_manager.rs
+--- a/indra-network/src/peer_manager.rs
++++ b/indra-network/src/peer_manager.rs
+@@ -1040,15 +1040,10 @@ impl PeerManagerActor {
+                 let plaintext = match reader.read_frame().await {
+                     Ok(bytes) => bytes,
+                     Err(_) => break,
+                 };
+                 let msg_size = plaintext.len();
+-                let payload = if plaintext.len() >= 4 {
+-                    &plaintext[4..]
+-                } else {
+-                    &plaintext[..]
+-                };
+-                let msg = match Message::decode_wire(payload) {
++                let msg = match Message::decode_framed_wire(&plaintext) {
+                     Ok(msg) => msg,
+                     Err(NetworkError::UnknownMessageType { .. }) => continue,
+                     Err(_) => break,
+                 };

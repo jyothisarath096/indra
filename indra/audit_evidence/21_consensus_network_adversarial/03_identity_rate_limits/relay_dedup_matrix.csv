@@ -1,0 +1,7 @@
+message class,same-peer duplicate,cross-peer duplicate,invalid-first poisoning,crypto/consensus work,relay bound,result
+Vote,connection duplicate filter,node canonical vote key plus relay seen,no,at most bounded admission path; no repeated relay,fanout <=16,pass
+Block/proposal,connection path and relay seen,relay key includes content hash,no,signature verification only before first relay,fanout <=24,pass
+QC response,node-wide wire-hash BoundedTtlSet,node-wide bounded wire-hash cache,no,duplicate suppressed before limiter,2048 entries/TTL,pass
+Transaction,normal message path,transport validator limiter and operation handling,no cache poisoning observed,validator budget applies,actor queues bounded,pass
+StakingOp,normal message path,transport validator limiter and operation handling,no cache poisoning observed,validator budget applies,actor queues bounded,pass
+GovernanceOp,normal message path,transport validator limiter and operation handling,no cache poisoning observed,validator budget applies,actor queues bounded,pass

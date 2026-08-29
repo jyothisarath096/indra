@@ -1,0 +1,13 @@
+INIT A/B/C/D shared fixture
+PARTITION 2+2: A,B | C,D
+DELIVER votes only intra-side; each side stake=2/4; QUORUM=false; HEIGHT=0; QC=None
+TIMEOUT: production prevote/precommit nil path; HEIGHT=0
+HEAL partition; production round recovery
+RECOVERY proposal and signed votes delivered to all four
+FINALIZE all four: height=1, identical tip/QC
+VALIDATION PASS
+SECOND ROUND eligibility checked with side-restricted proposal/empty timeout; final reset and replay root equality PASS
+HARDENING: initial eligible round determined dynamically; empty timeout rounds synchronized
+PARTITION ROUNDS: two complete rounds exercised; every node height=0, QC=None
+HEAL: recovery proposer selected only when engine.is_proposer=true; all four finalized and converged
+ASSERTIONS: dynamic initial round; exact partition prevotes and nil precommit; two no-QC rounds; four QC snapshot verification; stale pre-heal replay no-op

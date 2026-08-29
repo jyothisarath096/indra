@@ -1,0 +1,1863 @@
+=== VRF/SORTITION FILES ===
+./releases/genesis.toml
+./indra-ffi/src/staking.rs
+./indra-node/src/bin/indra-sync-recover.rs
+./indra-node/src/net_driver.rs
+./indra-node/src/sync.rs
+./indra-node/src/genesis.rs
+./indra-node/src/driver.rs
+./indra-node/src/engine.rs
+./docs/archive/CS05_VRF_AUDIT.md
+./docs/PQ_VRF_RESIDUAL_RISK.md
+./docs/VRF_TIMING_WINDOWS_SCALE_VALIDATION.md
+./docs/PROPOSER_AUTHORIZATION_VRF_DESIGN_SPEC.md
+./docs/SYNC_RECOVERY.md
+./docs/TRANCHE_BASED_STAKING_MODEL_SPEC.md
+./indra-core/src/types/proposal.rs
+./indra-core/src/types/staking.rs
+./indra-core/src/types/consensus_snapshot.rs
+./indra-core/src/sortition.rs
+./indra-consensus/src/producer.rs
+./indra-crypto/src/vrf.rs
+./indra-cli/src/bin/genesis.rs
+./indra-cli/src/genesis_cmd.rs
+./indra-cli/src/staking.rs
+
+=== VRF SYMBOL REFERENCES ===
+./indra-storage/src/vote_safety.rs:14:    types::{block::BlockProposalVNext, primitives::Bytes32, vote::VoteV1},
+./indra-storage/src/vote_safety.rs:36:    pub proposal: BlockProposalVNext,
+./indra-storage/src/vote_safety.rs:203:            let proposal = BlockProposalVNext::decode_exact(
+./indra-storage/src/state_store.rs:581:            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0x43; 32]).public_key()),
+./indra-storage/src/state_store.rs:582:            vrf_key_activation_epoch: 0,
+./indra-storage/src/state_store.rs:583:            pending_vrf_pk: None,
+./indra-storage/src/state_store.rs:584:            pending_vrf_activation_epoch: None,
+./indra-storage/src/state_store.rs:855:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-storage/src/state_store.rs:857:                proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-storage/src/state_store.rs:858:                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-storage/src/state_store.rs:859:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-storage/src/state_store.rs:862:                    vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-storage/src/state_store.rs:863:                    vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-storage/src/segmented_block_store.rs:17:    types::{block::BlockProposalVNext, primitives::MIN_PRUNE_KEEP_BLOCKS},
+./indra-storage/src/segmented_block_store.rs:78:    pub fn get(&self, height: u64) -> StorageResult<BlockProposalVNext> {
+./indra-storage/src/segmented_block_store.rs:111:    pub fn append(&mut self, block: &BlockProposalVNext) -> StorageResult<()> {
+./indra-storage/src/segmented_block_store.rs:151:    pub fn get(&mut self, height: u64) -> StorageResult<BlockProposalVNext> {
+./indra-storage/src/segmented_block_store.rs:155:    pub fn get_read_only(&self, height: u64) -> StorageResult<BlockProposalVNext> {
+./indra-storage/src/segmented_block_store.rs:434:                BlockProposalVNext::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
+./indra-storage/src/segmented_block_store.rs:484:fn read_location(height: u64, location: &Location) -> StorageResult<BlockProposalVNext> {
+./indra-storage/src/segmented_block_store.rs:516:    BlockProposalVNext::decode_exact(&bytes).map_err(|e| StorageError::Corruption {
+./indra-storage/src/segmented_block_store.rs:527:            block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-storage/src/segmented_block_store.rs:528:            primitives::{Bytes64, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES},
+./indra-storage/src/segmented_block_store.rs:540:    fn block(height: u64) -> BlockProposalVNext {
+./indra-storage/src/segmented_block_store.rs:541:        BlockProposalVNext {
+./indra-storage/src/segmented_block_store.rs:556:                    vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-storage/src/segmented_block_store.rs:558:                    proposer_vrf_output:
+./indra-storage/src/segmented_block_store.rs:559:                        VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(&[0; 64])
+./indra-storage/src/segmented_block_store.rs:561:                    proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+./indra-storage/src/segmented_block_store.rs:565:                    value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-storage/src/segmented_block_store.rs:568:                        vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+./indra-storage/src/segmented_block_store.rs:569:                        vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+./indra-ffi/src/lib.rs:50:/// Length of a VRF public key.
+./indra-ffi/src/lib.rs:51:pub const INDRA_VRF_PK_BYTES: usize = 32;
+./indra-ffi/src/lib.rs:87:    pub vrf_pk: [u8; INDRA_VRF_PK_BYTES],
+./indra-ffi/src/lib.rs:114:            vrf_pk: [0u8; INDRA_VRF_PK_BYTES],
+./indra-ffi/src/lib.rs:817:        assert_ne!(public.vrf_pk, [0u8; 32]);
+./indra-ffi/src/lib.rs:820:            INDRA_VALIDATOR_ID_BYTES + CLASSICAL_PK_BYTES + PQ_PK_BYTES + INDRA_VRF_PK_BYTES
+./indra-ffi/src/lib.rs:853:        assert_eq!(public.vrf_pk, direct.public.vrf_pk);
+./indra-ffi/src/lib.rs:861:        assert_eq!(fetched.vrf_pk, public.vrf_pk);
+./indra-ffi/src/lib.rs:2217:    offsetof(IndraPublicKeyInfo, pq_pk), offsetof(IndraPublicKeyInfo, vrf_pk));
+./indra-ffi/src/lib.rs:2274:            std::mem::offset_of!(IndraPublicKeyInfo, vrf_pk),
+./indra-ffi/src/staking.rs:149:/// The VRF public key is derived from the handle's stored public metadata.
+./indra-ffi/src/staking.rs:186:                hot_public.vrf_pk,
+./indra-ffi/src/handles.rs:86:        vrf_seed: [u8; BYTES32_LEN],
+./indra-ffi/src/handles.rs:107:                vrf_pk: keys.public.vrf_pk,
+./indra-ffi/src/handles.rs:111:            vrf_seed: keys.vrf_seed,
+./indra-ffi/src/handles.rs:172:                vrf_seed,
+./indra-ffi/src/handles.rs:177:                vrf_seed.zeroize();
+./indra-network/src/message.rs:14:        block::BlockProposalVNext, governance::GovernanceOpV2, primitives::Bytes32,
+./indra-network/src/message.rs:131:    Block(BlockProposalVNext),
+./indra-network/src/message.rs:157:        blocks: Vec<BlockProposalVNext>,
+./indra-network/src/message.rs:348:                let block = BlockProposalVNext::decode_exact(payload).map_err(|e| {
+./indra-network/src/message.rs:537:                    let block = BlockProposalVNext::decode_exact(bytes).map_err(|e| {
+./indra-network/src/message.rs:700:        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-network/src/message.rs:705:            MAX_PQ_SIG_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-network/src/message.rs:727:                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-network/src/message.rs:729:                proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+./indra-network/src/message.rs:733:                proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+./indra-network/src/message.rs:737:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-network/src/message.rs:740:                    vrf_output: VariableBytes::from_slice(&[0x47; 64]).unwrap(),
+./indra-network/src/message.rs:741:                    vrf_proof: VariableBytes::from_slice(&[0x48; 80]).unwrap(),
+./indra-network/src/message.rs:754:    fn test_proposal(height: u64) -> indra_core::types::block::BlockProposalVNext {
+./indra-network/src/message.rs:755:        indra_core::types::block::BlockProposalVNext {
+./indra-network/src/message.rs:1065:        let blocks: Vec<indra_core::types::block::BlockProposalVNext> = (0
+./indra-network/src/peer_manager.rs:386:    block: &indra_core::types::block::BlockProposalVNext,
+./indra-network/src/peer_manager.rs:583:        block: &indra_core::types::block::BlockProposalVNext,
+./indra-network/src/peer_manager.rs:1388:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-network/src/peer_manager.rs:1394:            MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-network/src/peer_manager.rs:1398:    use indra_crypto::{vrf_prove, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-network/src/peer_manager.rs:1641:            vrf_pk: Some(VrfKeypair::from_seed(&validator_id.0).public_key()),
+./indra-network/src/peer_manager.rs:1712:        vrf: &VrfKeypair,
+./indra-network/src/peer_manager.rs:1718:    ) -> BlockProposalVNext {
+./indra-network/src/peer_manager.rs:1724:        let (output, proof) = vrf_prove(vrf, &input);
+./indra-network/src/peer_manager.rs:1739:                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-network/src/peer_manager.rs:1741:                proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+./indra-network/src/peer_manager.rs:1745:                proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+./indra-network/src/peer_manager.rs:1749:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-network/src/peer_manager.rs:1752:                    vrf_output: VariableBytes::from_slice(&output.0).unwrap(),
+./indra-network/src/peer_manager.rs:1753:                    vrf_proof: VariableBytes::from_slice(&proof.0).unwrap(),
+./indra-network/src/peer_manager.rs:1764:        let mut proposal = BlockProposalVNext {
+./indra-network/src/peer_manager.rs:2415:    fn block_relay_verifies_embedded_proposer_vrf_not_election_authority() {
+./indra-network/src/peer_manager.rs:2417:        let vrf = VrfKeypair::from_seed(&validator_id.0);
+./indra-network/src/peer_manager.rs:2420:        let block = relay_test_block(validator_id, &vrf, &keypair, 9, 3, prev_hash, Bytes32::ZERO);
+./indra-network/src/peer_manager.rs:2422:        key.vrf_pk = Some(vrf.public_key());
+./indra-network/src/peer_manager.rs:2432:        let vrf = VrfKeypair::from_seed(&validator_id.0);
+./indra-network/src/peer_manager.rs:2438:        key.vrf_pk = Some(vrf.public_key());
+./indra-network/src/peer_manager.rs:2444:            &vrf,
+./indra-network/src/peer_manager.rs:2453:            &vrf,
+./indra-network/src/peer_manager.rs:2479:        let vrf = VrfKeypair::from_seed(&validator_id.0);
+./indra-network/src/peer_manager.rs:2485:        key.vrf_pk = Some(vrf.public_key());
+./indra-network/src/peer_manager.rs:2491:            &vrf,
+./indra-network/src/peer_manager.rs:2500:            &vrf,
+./indra-network/src/peer_manager.rs:2520:        let vrf = VrfKeypair::from_seed(&validator_id.0);
+./indra-network/src/peer_manager.rs:2526:        key.vrf_pk = Some(vrf.public_key());
+./indra-network/src/peer_manager.rs:2532:            &vrf,
+./indra-network/src/net_types.rs:19:    /// Registered proposer-election VRF public key, when available.
+./indra-network/src/net_types.rs:20:    pub vrf_pk: Option<[u8; 32]>,
+./indra-rpc/src/handlers.rs:957:            r#""proposer_id":"{}","vrf_suite":{},"election_seed":"{}","proposer_vrf_output":"{}","proposer_vrf_proof_len":{},"proposer_priority":"{}","quorum_certificate_len":{},"#,
+./indra-rpc/src/handlers.rs:973:        header.vrf_suite as u8,
+./indra-rpc/src/handlers.rs:975:        hex::encode(header.proposer_vrf_output.as_slice()),
+./indra-rpc/src/handlers.rs:976:        header.proposer_vrf_proof.len(),
+./indra-rpc/src/handlers.rs:2891:    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-rpc/src/handlers.rs:2949:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-rpc/src/handlers.rs:2951:                proposer_vrf_output: VariableBytes::from_slice(&[byte.wrapping_add(4); 64])
+./indra-rpc/src/handlers.rs:2953:                proposer_vrf_proof: VariableBytes::from_slice(&[byte; 80]).unwrap(),
+./indra-rpc/src/handlers.rs:2954:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-rpc/src/handlers.rs:2957:                    vrf_output: VariableBytes::from_slice(&[byte.wrapping_add(4); 64]).unwrap(),
+./indra-rpc/src/handlers.rs:2958:                    vrf_proof: VariableBytes::from_slice(&[byte; 80]).unwrap(),
+./indra-rpc/src/handlers.rs:3784:        let vrf = VrfKeypair::from_seed(&[0xA3; 32]);
+./indra-rpc/src/handlers.rs:3791:                vrf.public_key(),
+./indra-rpc/src/handlers.rs:3792:                indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-rpc/src/handlers.rs:3860:                vrf_pk: None,
+./indra-rpc/src/handlers.rs:3861:                vrf_key_activation_epoch: 0,
+./indra-rpc/src/handlers.rs:3862:                pending_vrf_pk: None,
+./indra-rpc/src/handlers.rs:3863:                pending_vrf_activation_epoch: None,
+./indra-rpc/src/handlers.rs:3889:                vrf_pk: None,
+./indra-rpc/src/handlers.rs:3890:                vrf_key_activation_epoch: 0,
+./indra-rpc/src/handlers.rs:3891:                pending_vrf_pk: None,
+./indra-rpc/src/handlers.rs:3892:                pending_vrf_activation_epoch: None,
+./indra-node/tests/node.rs:7:    proposer::{compute_proposer_vrf, ProposerCandidate},
+./indra-node/tests/node.rs:22:    VrfKeypair,
+./indra-node/tests/node.rs:81:) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/tests/node.rs:84:    let vrf = VrfKeypair::from_seed(&proposer_seed);
+./indra-node/tests/node.rs:98:                    vrf_pubkey: entry.vrf_pk,
+./indra-node/tests/node.rs:107:                .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+./indra-node/tests/node.rs:109:                    compute_proposer_vrf(candidate.validator_id, &vrf, election)
+./indra-node/tests/node.rs:115:        proposer_vrf_keypair: vrf,
+./indra-node/tests/node.rs:130:    let mut proposal = indra_core::types::block::BlockProposalVNext {
+./indra-node/tests/node.rs:177:    let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+./indra-node/tests/node.rs:190:            vrf_pk: Some(vrf_pk),
+./indra-node/tests/node.rs:191:            vrf_key_activation_epoch: 0,
+./indra-node/tests/node.rs:192:            pending_vrf_pk: None,
+./indra-node/tests/node.rs:193:            pending_vrf_activation_epoch: None,
+./indra-node/tests/node.rs:220:    let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+./indra-node/tests/node.rs:245:            vrf_pk: Some(vrf_pk),
+./indra-node/tests/node.rs:246:            vrf_key_activation_epoch: 0,
+./indra-node/tests/node.rs:247:            pending_vrf_pk: None,
+./indra-node/tests/node.rs:248:            pending_vrf_activation_epoch: None,
+./indra-node/tests/node.rs:278:    let vrf = VrfKeypair::from_seed(&seed);
+./indra-node/tests/node.rs:290:    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/tests/node.rs:293:        &Bytes32::from(vrf.public_key()),
+./indra-node/tests/node.rs:297:    let (vrf_possession_output, vrf_possession_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/tests/node.rs:300:        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+./indra-node/tests/node.rs:305:        hex::encode(vrf.public_key()),
+./indra-node/tests/node.rs:306:        hex::encode(vrf_possession_output.0),
+./indra-node/tests/node.rs:307:        hex::encode(vrf_possession_proof.0),
+./indra-node/tests/node.rs:360:    config.vrf_seed = Some(seed);
+./indra-node/tests/node.rs:371:    let mut previous: Option<indra_core::types::block::BlockProposalVNext> = None;
+./indra-node/tests/node.rs:376:        let decoded = indra_core::types::block::BlockProposalVNext::decode_exact(&encoded).unwrap();
+./indra-node/tests/node.rs:528:    config.vrf_seed = Some(seed);
+./indra-node/src/consensus_authority.rs:4:pub(crate) struct VrfConsensusAuthority {
+./indra-node/src/consensus_authority.rs:8:pub(crate) fn vrf_authority_from_snapshot(
+./indra-node/src/consensus_authority.rs:14:) -> VrfConsensusAuthority {
+./indra-node/src/consensus_authority.rs:20:            vrf_pubkey: entry.vrf_pk,
+./indra-node/src/consensus_authority.rs:24:    VrfConsensusAuthority {
+./indra-node/src/bin/audit_block_log.rs:5:    types::block::BlockProposalVNext,
+./indra-node/src/bin/audit_block_log.rs:64:    let mut previous: Option<BlockProposalVNext> = None;
+./indra-node/src/bin/audit_block_log.rs:71:        let decoded = BlockProposalVNext::decode_exact(&encoded)
+./indra-node/src/bin/observer.rs:398:    proposal: indra_core::types::block::BlockProposalVNext,
+./indra-node/src/bin/node.rs:800:    proposal: &indra_core::types::block::BlockProposalVNext,
+./indra-node/src/bin/node.rs:1019:                vrf_pk: member.vrf_pk,
+./indra-node/src/bin/node.rs:1740:                tokio::sync::broadcast::channel::<indra_core::types::block::BlockProposalVNext>(64);
+./indra-node/src/bin/node.rs:1774:    block_tx: tokio::sync::broadcast::Sender<indra_core::types::block::BlockProposalVNext>,
+./indra-node/src/bin/node.rs:1804:    block_rx: &mut tokio::sync::broadcast::Receiver<indra_core::types::block::BlockProposalVNext>,
+./indra-node/src/bin/node.rs:1929:    Vec<indra_core::types::block::BlockProposalVNext>,
+./indra-node/src/bin/node.rs:1942:    Vec<indra_core::types::block::BlockProposalVNext>,
+./indra-node/src/bin/node.rs:2278:    config.vrf_seed = Some(keys_data.vrf_seed);
+./indra-node/src/bin/node.rs:4256:        vrf_seed: keys.vrf_seed,
+./indra-node/src/bin/node.rs:5631:        let vrf = indra_crypto::VrfKeypair::from_seed(&seed);
+./indra-node/src/bin/node.rs:5640:        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/bin/node.rs:5643:            &indra_core::Bytes32::from(vrf.public_key()),
+./indra-node/src/bin/node.rs:5647:        let (vrf_possession_output, vrf_possession_proof) =
+./indra-node/src/bin/node.rs:5648:            indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/bin/node.rs:5652:                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+./indra-node/src/bin/node.rs:5656:                hex::encode(vrf.public_key()),
+./indra-node/src/bin/node.rs:5657:                hex::encode(vrf_possession_output.0),
+./indra-node/src/bin/node.rs:5658:                hex::encode(vrf_possession_proof.0),
+./indra-node/src/bin/node.rs:5665:        config.vrf_seed = Some(seed);
+./indra-node/src/bin/node.rs:5691:                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+./indra-node/src/bin/node.rs:5692:                vrf_key_activation_epoch: 0,
+./indra-node/src/bin/node.rs:5693:                pending_vrf_pk: None,
+./indra-node/src/bin/node.rs:5694:                pending_vrf_activation_epoch: None,
+./indra-node/src/bin/node.rs:5726:            assert_eq!(left.vrf_pubkey, right.vrf_pubkey);
+./indra-node/src/bin/node.rs:6222:        assert_eq!(loaded.vrf_seed, keys.vrf_seed);
+./indra-node/src/bin/node.rs:7142:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-node/src/bin/node.rs:7144:                proposer_vrf_output: indra_core::VariableBytes::from_slice(&[0x15; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7145:                proposer_vrf_proof: indra_core::VariableBytes::<
+./indra-node/src/bin/node.rs:7146:                    { indra_core::types::primitives::MAX_STANDARD_VRF_PROOF_BYTES },
+./indra-node/src/bin/node.rs:7149:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-node/src/bin/node.rs:7152:                    vrf_output: indra_core::VariableBytes::from_slice(&[0x15; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7153:                    vrf_proof: indra_core::VariableBytes::from_slice(&[0x16; 80]).unwrap(),
+./indra-node/src/bin/node.rs:7164:        let block = indra_core::types::block::BlockProposalVNext {
+./indra-node/src/bin/node.rs:7520:    fn request_proposal_test_block() -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/bin/node.rs:7522:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-node/src/bin/node.rs:7541:                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-node/src/bin/node.rs:7543:                proposer_vrf_output: VariableBytes::from_slice(&[0x05; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7544:                proposer_vrf_proof: VariableBytes::from_slice(&[0x06; 80]).unwrap(),
+./indra-node/src/bin/node.rs:7545:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-node/src/bin/node.rs:7548:                    vrf_output: VariableBytes::from_slice(&[0x05; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7549:                    vrf_proof: VariableBytes::from_slice(&[0x06; 80]).unwrap(),
+./indra-node/src/bin/node.rs:7560:        BlockProposalVNext {
+./indra-node/src/bin/node.rs:7569:    fn block_response_test_block(height: u64) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/bin/node.rs:7571:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-node/src/bin/node.rs:7590:                vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-node/src/bin/node.rs:7592:                proposer_vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7593:                proposer_vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+./indra-node/src/bin/node.rs:7594:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-node/src/bin/node.rs:7597:                    vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+./indra-node/src/bin/node.rs:7598:                    vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+./indra-node/src/bin/node.rs:7609:        BlockProposalVNext {
+./indra-node/src/config.rs:35:    /// The node's VRF seed (32 bytes).
+./indra-node/src/config.rs:37:    pub vrf_seed: Option<[u8; 32]>,
+./indra-node/src/config.rs:176:            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]);
+./indra-node/src/config.rs:177:            let vrf_public = vrf.public_key();
+./indra-node/src/config.rs:185:            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/config.rs:188:                &indra_core::Bytes32::from(vrf_public),
+./indra-node/src/config.rs:191:            .expect("local test VRF challenge");
+./indra-node/src/config.rs:192:            let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/config.rs:194:                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+./indra-node/src/config.rs:196:                hex::encode(hot_public.pq.0), hex::encode(vrf_public),
+./indra-node/src/config.rs:197:                hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
+./indra-node/src/config.rs:208:            vrf_seed: Some([0x42u8; 32]),
+./indra-node/src/config.rs:243:            vrf_seed: None,
+./indra-node/src/config.rs:275:            vrf_seed: None,
+./indra-node/src/config_file.rs:26:    /// VRF seed.
+./indra-node/src/config_file.rs:27:    pub vrf_seed: [u8; 32],
+./indra-node/src/config_file.rs:398:        let (validator_seed, vrf_seed, pq_seed, pq_pk) = if mode == "observer" {
+./indra-node/src/config_file.rs:405:                Some(keys.vrf_seed),
+./indra-node/src/config_file.rs:419:            vrf_seed,
+./indra-node/src/config_file.rs:621:            vrf_seed: [3u8; 32],
+./indra-node/src/sync.rs:21:use indra_core::types::block::{BlockProposalVNext, BlockVNext};
+./indra-node/src/sync.rs:73:    pub block: BlockProposalVNext,
+./indra-node/src/sync.rs:435:        blocks: &[BlockProposalVNext],
+./indra-node/src/sync.rs:472:        block: BlockProposalVNext,
+./indra-node/src/sync.rs:629:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:652:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:676:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:702:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:766:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:805:    proposal: &'a indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:887:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:901:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:917:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:918:    carrier: &BlockProposalVNext,
+./indra-node/src/sync.rs:926:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:927:    carrier: &BlockProposalVNext,
+./indra-node/src/sync.rs:935:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:936:    carrier: &BlockProposalVNext,
+./indra-node/src/sync.rs:999:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:1008:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:1017:    provisional: &BlockProposalVNext,
+./indra-node/src/sync.rs:1157:    proposal: &BlockProposalVNext,
+./indra-node/src/sync.rs:1170:        proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection},
+./indra-node/src/sync.rs:1185:        VrfKeypair,
+./indra-node/src/sync.rs:1225:        with_vrf_key: bool,
+./indra-node/src/sync.rs:1232:        let vrf = VrfKeypair::from_seed(&[seed; 32]);
+./indra-node/src/sync.rs:1250:                vrf_pk: with_vrf_key.then(|| vrf.public_key()),
+./indra-node/src/sync.rs:1251:                vrf_key_activation_epoch: 0,
+./indra-node/src/sync.rs:1252:                pending_vrf_pk: None,
+./indra-node/src/sync.rs:1253:                pending_vrf_activation_epoch: None,
+./indra-node/src/sync.rs:1273:        if state.height == 0 && with_vrf_key && with_pq_key {
+./indra-node/src/sync.rs:1317:                    vrf_pubkey: entry.vrf_pk,
+./indra-node/src/sync.rs:1336:    ) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/sync.rs:1337:        let proposer = VrfKeypair::from_seed(&[proposer_seed; 32]);
+./indra-node/src/sync.rs:1344:                    .find(|candidate| candidate.vrf_pubkey == proposer.public_key())?;
+./indra-node/src/sync.rs:1345:                compute_proposer_vrf(candidate.validator_id, &proposer, &election)
+./indra-node/src/sync.rs:1352:            proposer_vrf_keypair: proposer,
+./indra-node/src/sync.rs:1367:        let mut proposal = indra_core::types::block::BlockProposalVNext {
+./indra-node/src/sync.rs:1457:    fn make_block(state: &ChainState) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/sync.rs:1464:            .find(|seed| VrfKeypair::from_seed(&[*seed; 32]).public_key() == candidate.vrf_pubkey)
+./indra-node/src/sync.rs:1465:            .expect("test proposer VRF seed must be recoverable");
+./indra-node/src/sync.rs:1467:        // `canonical_test_genesis` deliberately uses independent hot and VRF
+./indra-node/src/sync.rs:1485:        proposal: &mut indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:1492:        proposal: &mut indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:1511:        proposal: &mut indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:1533:        proposal: &indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:1551:        proposal: &'a indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:1566:        block: &indra_core::types::block::BlockProposalVNext,
+./indra-node/src/sync.rs:3055:    fn strict_valid_block_with_vrf_qc_and_state_root_passes() {
+./indra-node/src/genesis.rs:13:    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-node/src/genesis.rs:18:        MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-node/src/genesis.rs:166:    /// VRF public key.
+./indra-node/src/genesis.rs:167:    pub vrf_pk: String,
+./indra-node/src/genesis.rs:168:    /// RFC 9381 output proving possession of the genesis VRF secret key.
+./indra-node/src/genesis.rs:169:    pub vrf_possession_output: String,
+./indra-node/src/genesis.rs:171:    pub vrf_possession_proof: String,
+./indra-node/src/genesis.rs:243:    let mut vrf = HashSet::new();
+./indra-node/src/genesis.rs:253:        let vrf_pk = decode_hex_exact::<32>(&validator.vrf_pk, "vrf_pk")?;
+./indra-node/src/genesis.rs:254:        let vrf_output =
+./indra-node/src/genesis.rs:255:            decode_hex_exact::<64>(&validator.vrf_possession_output, "vrf_possession_output")?;
+./indra-node/src/genesis.rs:256:        let vrf_proof =
+./indra-node/src/genesis.rs:257:            decode_hex_exact::<80>(&validator.vrf_possession_proof, "vrf_possession_proof")?;
+./indra-node/src/genesis.rs:278:        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/genesis.rs:281:            &Bytes32::from(vrf_pk),
+./indra-node/src/genesis.rs:285:        indra_crypto::vrf_verify(
+./indra-node/src/genesis.rs:286:            &vrf_pk,
+./indra-node/src/genesis.rs:288:            &indra_crypto::VrfOutput(vrf_output),
+./indra-node/src/genesis.rs:289:            &indra_crypto::VrfProof(vrf_proof.to_vec()),
+./indra-node/src/genesis.rs:293:                "genesis validator {} VRF possession proof is invalid",
+./indra-node/src/genesis.rs:304:            (vrf.insert(vrf_pk.to_vec()), "VRF key"),
+./indra-node/src/genesis.rs:432:            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-node/src/genesis.rs:434:            proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::default(),
+./indra-node/src/genesis.rs:435:            proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::default(),
+./indra-node/src/genesis.rs:436:            value_entropy: indra_core::types::block::ProposalEntropyV1::genesis(),
+./indra-node/src/genesis.rs:449:pub fn build_genesis_proposal(state: &ChainState) -> Result<BlockProposalVNext, String> {
+./indra-node/src/genesis.rs:450:    Ok(BlockProposalVNext {
+./indra-node/src/genesis.rs:471:    use indra_crypto::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-node/src/genesis.rs:485:    let vrf_pk = VrfKeypair::from_seed(&[0xD5; 32]).public_key();
+./indra-node/src/genesis.rs:499:            vrf_pk: Some(vrf_pk),
+./indra-node/src/genesis.rs:500:            vrf_key_activation_epoch: 0,
+./indra-node/src/genesis.rs:501:            pending_vrf_pk: None,
+./indra-node/src/genesis.rs:502:            pending_vrf_activation_epoch: None,
+./indra-node/src/genesis.rs:616:            vrf_pk: Some(decode_hex_exact::<32>(&v.vrf_pk, "vrf_pk")?),
+./indra-node/src/genesis.rs:617:            vrf_key_activation_epoch: 0,
+./indra-node/src/genesis.rs:618:            pending_vrf_pk: None,
+./indra-node/src/genesis.rs:619:            pending_vrf_activation_epoch: None,
+./indra-node/src/genesis.rs:745:                let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&[index + 41; 32]);
+./indra-node/src/genesis.rs:746:                let vrf_pk = Bytes32::from(vrf_keypair.public_key());
+./indra-node/src/genesis.rs:747:                let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/genesis.rs:750:                    &vrf_pk,
+./indra-node/src/genesis.rs:754:                let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf_keypair, &challenge);
+./indra-node/src/genesis.rs:760:                    vrf_pk: hex::encode(vrf_pk.0),
+./indra-node/src/genesis.rs:761:                    vrf_possession_output: hex::encode(vrf_output.0),
+./indra-node/src/genesis.rs:762:                    vrf_possession_proof: hex::encode(vrf_proof.0),
+./indra-node/src/genesis.rs:795:            rendered.push_str(&format!("\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\n", validator.name, validator.validator_id, validator.hybrid_classical_pk, validator.hybrid_pq_pk, validator.vrf_pk, validator.vrf_possession_output, validator.vrf_possession_proof));
+./indra-node/src/genesis.rs:892:            .all(|entry| entry.vrf_key_activation_epoch == 0));
+./indra-node/src/genesis.rs:894:            validator.vrf_pk.is_some()
+./indra-node/src/genesis.rs:895:                && validator.pending_vrf_pk.is_none()
+./indra-node/src/genesis.rs:896:                && validator.pending_vrf_activation_epoch.is_none()
+./indra-node/src/genesis.rs:926:                3 => duplicate.validators[1].vrf_pk = duplicate.validators[0].vrf_pk.clone(),
+./indra-node/src/genesis.rs:941:    fn genesis_rejects_vrf_squatting_cold_history_and_noncanonical_hex() {
+./indra-node/src/genesis.rs:944:        squatted.validators[0].vrf_pk = squatted.validators[1].vrf_pk.clone();
+./indra-node/src/genesis.rs:1058:        let vrf = indra_crypto::VrfKeypair::from_seed(&[0x11; 32]);
+./indra-node/src/genesis.rs:1059:        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/genesis.rs:1062:            &Bytes32::from(vrf.public_key()),
+./indra-node/src/genesis.rs:1066:        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/genesis.rs:1068:            "[genesis]\nchain_id = \"test\"\nactive_slot_coefficient_numerator = \"1\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"test-validator\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+./indra-node/src/genesis.rs:1072:            hex::encode(vrf.public_key()),
+./indra-node/src/genesis.rs:1073:            hex::encode(vrf_output.0),
+./indra-node/src/genesis.rs:1074:            hex::encode(vrf_proof.0),
+./indra-node/src/genesis.rs:1095:            let extra_vrf = indra_crypto::VrfKeypair::from_seed(&[0xA0 + i; 32]);
+./indra-node/src/genesis.rs:1096:            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/genesis.rs:1099:                &Bytes32::from(extra_vrf.public_key()),
+./indra-node/src/genesis.rs:1103:            let (extra_output, extra_proof) = indra_crypto::vrf_prove(&extra_vrf, &challenge);
+./indra-node/src/genesis.rs:1105:                "\n[[validators]]\nname = \"extra-{i}\"\nvalidator_id = \"{}\"\nstake = 100000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+./indra-node/src/genesis.rs:1109:                hex::encode(extra_vrf.public_key()),
+./indra-node/src/driver.rs:20:    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+./indra-node/src/driver.rs:29:    consensus_authority::vrf_authority_from_snapshot,
+./indra-node/src/driver.rs:58:/// Several driver paths are tick-driven: the node loop or VRF timeout
+./indra-node/src/driver.rs:83:        proposal: BlockProposalVNext,
+./indra-node/src/driver.rs:127:    BroadcastBlock(BlockProposalVNext),
+./indra-node/src/driver.rs:165:    ActivateBufferedProposal(BlockProposalVNext),
+./indra-node/src/driver.rs:200:    pending_blocks: HashMap<Bytes32, BlockProposalVNext>,
+./indra-node/src/driver.rs:202:    future_proposals: HashMap<(u64, Bytes32), Vec<BlockProposalVNext>>,
+./indra-node/src/driver.rs:224:    valid_proposal: Option<BlockProposalVNext>,
+./indra-node/src/driver.rs:746:        Ok(vrf_authority_from_snapshot(
+./indra-node/src/driver.rs:1140:    pub fn pending_proposal(&self, hash: &Bytes32) -> Option<BlockProposalVNext> {
+./indra-node/src/driver.rs:1352:        proposal: BlockProposalVNext,
+./indra-node/src/driver.rs:1387:        proposal: BlockProposalVNext,
+./indra-node/src/driver.rs:2288:        VrfKeypair,
+./indra-node/src/driver.rs:2304:    fn make_block(state: &ChainState) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/driver.rs:2319:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-node/src/driver.rs:2321:                proposer_vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+./indra-node/src/driver.rs:2322:                proposer_vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+./indra-node/src/driver.rs:2323:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-node/src/driver.rs:2326:                    vrf_output: VariableBytes::from_slice(&[0; 64]).unwrap(),
+./indra-node/src/driver.rs:2327:                    vrf_proof: VariableBytes::from_slice(&[0; 80]).unwrap(),
+./indra-node/src/driver.rs:2345:        indra_core::types::block::BlockProposalVNext {
+./indra-node/src/driver.rs:2454:        let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+./indra-node/src/driver.rs:2474:                vrf_pk: Some(vrf_pk),
+./indra-node/src/driver.rs:2475:                vrf_key_activation_epoch: 0,
+./indra-node/src/driver.rs:2476:                pending_vrf_pk: None,
+./indra-node/src/driver.rs:2477:                pending_vrf_activation_epoch: None,
+./indra-node/src/driver.rs:2514:        let vrf = VrfKeypair::from_seed(&seed);
+./indra-node/src/driver.rs:2527:        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-node/src/driver.rs:2530:            &indra_core::types::primitives::Bytes32(vrf.public_key()),
+./indra-node/src/driver.rs:2534:        let (vrf_possession_output, vrf_possession_proof) =
+./indra-node/src/driver.rs:2535:            indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/driver.rs:2539:            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+./indra-node/src/driver.rs:2543:            hex::encode(vrf.public_key()),
+./indra-node/src/driver.rs:2544:            hex::encode(vrf_possession_output.0),
+./indra-node/src/driver.rs:2545:            hex::encode(vrf_possession_proof.0),
+./indra-node/src/driver.rs:2552:        config.vrf_seed = Some(seed);
+./indra-node/src/driver.rs:2581:                .find(|candidate| candidate.vrf_pubkey == vrf.public_key())
+./indra-node/src/driver.rs:2583:            if indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:2585:                &vrf,
+./indra-node/src/driver.rs:2617:    ) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/driver.rs:2618:        let vrf = VrfKeypair::from_seed(&proposer_seed);
+./indra-node/src/driver.rs:2627:                    .find(|candidate| candidate.vrf_pubkey == vrf.public_key())?;
+./indra-node/src/driver.rs:2628:                indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:2630:                    &vrf,
+./indra-node/src/driver.rs:2639:            proposer_vrf_keypair: vrf,
+./indra-node/src/driver.rs:2658:        let mut proposal = indra_core::types::block::BlockProposalVNext {
+./indra-node/src/driver.rs:2673:        proposal: &indra_core::types::block::BlockProposalVNext,
+./indra-node/src/driver.rs:2692:        proposal: indra_core::types::block::BlockProposalVNext,
+./indra-node/src/driver.rs:2709:        proposal: &mut indra_core::types::block::BlockProposalVNext,
+./indra-node/src/driver.rs:2761:        invalid.block.header.proposer_vrf_proof = VariableBytes::from_slice(&[0xA5; 32]).unwrap();
+./indra-node/src/driver.rs:2786:    fn proposal_requires_both_hybrid_components_and_independent_vrf_validity() {
+./indra-node/src/driver.rs:2788:        let (driver, dir) = local_driver(seed, "proposal_hybrid_and_vrf_independence");
+./indra-node/src/driver.rs:2829:            .proposer_vrf_output
+./indra-node/src/driver.rs:2833:        forged_eligibility.block.header.proposer_vrf_output =
+./indra-node/src/driver.rs:2842:            .vrf_output
+./indra-node/src/driver.rs:2846:        forged_entropy.block.header.value_entropy.vrf_output =
+./indra-node/src/driver.rs:2938:    fn proposer_vrf_vote_and_qc_authority_are_snapshot_identical() {
+./indra-node/src/driver.rs:2945:        let vrf = vrf_authority_from_snapshot(
+./indra-node/src/driver.rs:2955:        assert_eq!(vrf.election.candidates.len(), voters.len());
+./indra-node/src/driver.rs:2957:        for ((candidate, voter), validator) in vrf.election.candidates.iter().zip(&voters).zip(&qc)
+./indra-node/src/driver.rs:2964:                candidate.vrf_pubkey,
+./indra-node/src/driver.rs:2965:                snapshot.entries()[validator.position].vrf_pk
+./indra-node/src/driver.rs:3066:                    let authority = vrf_authority_from_snapshot(
+./indra-node/src/driver.rs:3116:                            let result = indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:3118:                                &VrfKeypair::from_seed(seed),
+./indra-node/src/driver.rs:3122:                            (result.vrf_output.0, result.eligible, result.priority)
+./indra-node/src/driver.rs:3155:    fn governed_proposer_and_vrf_quorum_fail_closed_without_snapshot() {
+./indra-node/src/driver.rs:3156:        let (mut driver, dir) = local_driver([0xB7; 32], "missing_vrf_snapshot");
+./indra-node/src/driver.rs:3409:        let a_vrf = VrfKeypair::from_seed(&[0x46; 32]);
+./indra-node/src/driver.rs:3410:        let b_vrf = VrfKeypair::from_seed(&[0x47; 32]);
+./indra-node/src/driver.rs:3414:                indra_consensus::proposer::compute_proposer_vrf(a_id, &a_vrf, &election)
+./indra-node/src/driver.rs:3416:                    && indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, &election)
+./indra-node/src/driver.rs:4498:        let local_vrf = VrfKeypair::from_seed(&[0xB5; 32]);
+./indra-node/src/driver.rs:4502:                indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:4504:                    &local_vrf,
+./indra-node/src/driver.rs:4882:        config.vrf_seed = Some(seed);
+./indra-node/src/driver.rs:5237:        let local_vrf = VrfKeypair::from_seed(&[0x73; 32]);
+./indra-node/src/driver.rs:5241:                indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:5243:                    &local_vrf,
+./indra-node/src/driver.rs:5304:            indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:5306:                &VrfKeypair::from_seed(&[0x77; 32]),
+./indra-node/src/driver.rs:5312:        let local_vrf = VrfKeypair::from_seed(&[0x77; 32]);
+./indra-node/src/driver.rs:5316:                indra_consensus::proposer::compute_proposer_vrf(
+./indra-node/src/driver.rs:5318:                    &local_vrf,
+./indra-node/src/driver.rs:5448:        let a_vrf = VrfKeypair::from_seed(&[0x81; 32]);
+./indra-node/src/driver.rs:5452:                indra_consensus::proposer::compute_proposer_vrf(a_id, &a_vrf, election)
+./indra-node/src/driver.rs:5515:        let b_vrf = VrfKeypair::from_seed(&[0x82; 32]);
+./indra-node/src/driver.rs:5519:                indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, election)
+./indra-node/src/pending_dependencies.rs:254:            vrf_pk,
+./indra-node/src/pending_dependencies.rs:271:                DependencyKey::ValidatorKey(component_key(4, vrf_pk)),
+./indra-node/src/pending_dependencies.rs:347:        StakingOpBody::RegisterVrfKey {
+./indra-node/src/pending_dependencies.rs:581:                vrf_pk: [0x55; 32],
+./indra-node/src/engine.rs:22:    proposer::{compute_proposer_vrf, ProposerElection},
+./indra-node/src/engine.rs:28:    block::{BlockProposalVNext, BlockVNext, NO_POLC_ROUND},
+./indra-node/src/engine.rs:64:    VrfKeypair,
+./indra-node/src/engine.rs:121:    /// The validator's VRF keypair.
+./indra-node/src/engine.rs:122:    vrf_keypair: Option<VrfKeypair>,
+./indra-node/src/engine.rs:154:    /// VRF verification key, when present on the legacy path.
+./indra-node/src/engine.rs:155:    pub vrf_pk: Option<[u8; 32]>,
+./indra-node/src/engine.rs:544:        let (hybrid_keypair, vrf_keypair, validator_id) =
+./indra-node/src/engine.rs:545:            match (config.validator_seed, config.vrf_seed) {
+./indra-node/src/engine.rs:546:                (Some(vs), Some(vrfs)) => {
+./indra-node/src/engine.rs:556:                    let vrf = VrfKeypair::from_seed(&vrfs);
+./indra-node/src/engine.rs:567:                    (Some(hybrid), Some(vrf), Some(id))
+./indra-node/src/engine.rs:571:                        detail: "validator_seed was provided but vrf_seed was missing".to_string(),
+./indra-node/src/engine.rs:576:                        detail: "vrf_seed was provided but validator_seed was missing".to_string(),
+./indra-node/src/engine.rs:581:        if let (Some(id), Some(vrf)) = (validator_id, vrf_keypair.as_ref()) {
+./indra-node/src/engine.rs:591:            if registered.vrf_pk != Some(vrf.public_key()) {
+./indra-node/src/engine.rs:594:                        "configured VRF secret key does not match registered VRF public key for validator {id}"
+./indra-node/src/engine.rs:627:            vrf_keypair,
+./indra-node/src/engine.rs:1188:        let (Some(validator_id), Some(vrf_keypair)) =
+./indra-node/src/engine.rs:1189:            (self.validator_id, self.vrf_keypair.as_ref())
+./indra-node/src/engine.rs:1193:        compute_proposer_vrf(validator_id, vrf_keypair, election).is_ok_and(|slot| slot.eligible)
+./indra-node/src/engine.rs:1196:    fn authorize_proposal(&self, block: BlockVNext) -> NodeResult<BlockProposalVNext> {
+./indra-node/src/engine.rs:1215:        let mut proposal = BlockProposalVNext {
+./indra-node/src/engine.rs:1256:    ) -> NodeResult<BlockProposalVNext> {
+./indra-node/src/engine.rs:1264:        let vrf_keypair = self
+./indra-node/src/engine.rs:1265:            .vrf_keypair
+./indra-node/src/engine.rs:1273:            proposer_vrf_keypair: vrf_keypair,
+./indra-node/src/engine.rs:1297:    ) -> NodeResult<BlockProposalVNext> {
+./indra-node/src/engine.rs:1305:        let vrf_keypair = self.vrf_keypair.as_ref().ok_or(NodeError::NotProposer {
+./indra-node/src/engine.rs:1311:        let slot = compute_proposer_vrf(validator_id, vrf_keypair, election)
+./indra-node/src/engine.rs:1330:        block.header.vrf_suite = indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2;
+./indra-node/src/engine.rs:1332:        block.header.proposer_vrf_output =
+./indra-node/src/engine.rs:1333:            VariableBytes::from_slice(&slot.vrf_output.0).map_err(|error| {
+./indra-node/src/engine.rs:1339:        block.header.proposer_vrf_proof =
+./indra-node/src/engine.rs:1340:            VariableBytes::from_slice(&slot.vrf_proof.0).map_err(|error| {
+./indra-node/src/engine.rs:1441:                vrf_pk: Some(entry.vrf_pk),
+./indra-node/src/engine.rs:1561:    pub fn commit_proposal(&mut self, proposal: &BlockProposalVNext) -> NodeResult<()> {
+./indra-node/src/engine.rs:1569:        proposal: &BlockProposalVNext,
+./indra-node/src/engine.rs:1902:        let vrf_pk = VrfKeypair::from_seed(&seed).public_key();
+./indra-node/src/engine.rs:1921:                vrf_pk: Some(vrf_pk),
+./indra-node/src/engine.rs:1922:                vrf_key_activation_epoch: 0,
+./indra-node/src/engine.rs:1923:                pending_vrf_pk: None,
+./indra-node/src/engine.rs:1924:                pending_vrf_activation_epoch: None,
+./indra-node/src/engine.rs:1947:        // this fixture installs into consensus state. Authorization and VRF
+./indra-node/src/engine.rs:1955:        engine.vrf_keypair = Some(VrfKeypair::from_seed(&seed));
+./indra-node/src/engine.rs:1973:        let vrf = VrfKeypair::from_seed(&seed);
+./indra-node/src/engine.rs:1986:        let challenge = StakingOp::vrf_possession_challenge(
+./indra-node/src/engine.rs:1989:            &Bytes32::from(vrf.public_key()),
+./indra-node/src/engine.rs:1993:        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/engine.rs:1996:            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
+./indra-node/src/engine.rs:2000:            hex::encode(vrf.public_key()),
+./indra-node/src/engine.rs:2001:            hex::encode(vrf_output.0),
+./indra-node/src/engine.rs:2002:            hex::encode(vrf_proof.0),
+./indra-node/src/engine.rs:2013:        config.vrf_seed = Some(seed);
+./indra-node/src/engine.rs:2371:    ) -> indra_core::types::block::BlockProposalVNext {
+./indra-node/src/engine.rs:2374:        let proposer_vrf = VrfKeypair::from_seed(&proposer_seed);
+./indra-node/src/engine.rs:2380:                vrf_pubkey: entry.vrf_pk,
+./indra-node/src/engine.rs:2398:                    .find(|candidate| candidate.vrf_pubkey == proposer_vrf.public_key())?;
+./indra-node/src/engine.rs:2399:                compute_proposer_vrf(candidate.validator_id, &proposer_vrf, &election)
+./indra-node/src/engine.rs:2406:            proposer_vrf_keypair: proposer_vrf,
+./indra-node/src/engine.rs:2421:        let mut proposal = BlockProposalVNext {
+./indra-node/src/engine.rs:2451:                    vrf_pubkey: entry.vrf_pk,
+./indra-node/src/engine.rs:2461:        vrf: &VrfKeypair,
+./indra-node/src/engine.rs:2469:                    .find(|candidate| candidate.vrf_pubkey == vrf.public_key())?;
+./indra-node/src/engine.rs:2470:                compute_proposer_vrf(candidate.validator_id, vrf, &election)
+./indra-node/src/engine.rs:2480:        proposal: &BlockProposalVNext,
+./indra-node/src/engine.rs:3686:        config.vrf_seed = None;
+./indra-node/src/engine.rs:3695:    fn validator_init_requires_vrf_seed() {
+./indra-node/src/engine.rs:3696:        let dir = temp_dir("b_missing_vrf");
+./indra-node/src/engine.rs:3698:        config.vrf_seed = None;
+./indra-node/src/engine.rs:4087:        let vrf = VrfKeypair::from_seed(&[0x42; 32]);
+./indra-node/src/engine.rs:4088:        let old_challenge = StakingOp::vrf_possession_challenge(
+./indra-node/src/engine.rs:4091:            &Bytes32::from(vrf.public_key()),
+./indra-node/src/engine.rs:4095:        let new_challenge = StakingOp::vrf_possession_challenge(
+./indra-node/src/engine.rs:4098:            &Bytes32::from(vrf.public_key()),
+./indra-node/src/engine.rs:4102:        let (old_output, old_proof) = indra_crypto::vrf_prove(&vrf, &old_challenge);
+./indra-node/src/engine.rs:4103:        let (new_output, new_proof) = indra_crypto::vrf_prove(&vrf, &new_challenge);
+./indra-node/src/engine.rs:4162:    fn engine_initialization_rejects_local_vrf_key_mismatch() {
+./indra-node/src/engine.rs:4163:        let dir = temp_dir("startup_vrf_mismatch");
+./indra-node/src/engine.rs:4165:        config.vrf_seed = Some([0x99; 32]);
+./indra-node/src/engine.rs:4169:                if detail.contains("VRF secret key does not match")
+./indra-node/src/engine.rs:4279:        let vrf = VrfKeypair::from_seed(&[0x22u8; 32]);
+./indra-node/src/engine.rs:4287:        let challenge = StakingOp::vrf_possession_challenge(
+./indra-node/src/engine.rs:4290:            &Bytes32::from(vrf.public_key()),
+./indra-node/src/engine.rs:4294:        let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-node/src/engine.rs:4297:            "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"9223372036854775808\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"alice\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 100000000000\n",
+./indra-node/src/engine.rs:4301:            hex::encode(vrf.public_key()),
+./indra-node/src/engine.rs:4302:            hex::encode(vrf_output.0),
+./indra-node/src/engine.rs:4303:            hex::encode(vrf_proof.0),
+./indra-node/src/engine.rs:4310:        config.vrf_seed = Some([0x22; 32]);
+./indra-node/src/engine.rs:4351:            first_eligible_test_election(&engine.state, 1, &VrfKeypair::from_seed(&[0x42; 32]));
+./indra-node/src/engine.rs:4367:    fn is_proposer_rejects_registered_vrf_key_mismatch() {
+./indra-node/src/engine.rs:4368:        let dir = temp_dir("height1_vrf_mismatch");
+./indra-node/src/engine.rs:4377:        engine.state.validators.get_mut(&local_id).unwrap().vrf_pk =
+./indra-node/src/engine.rs:4378:            Some(VrfKeypair::from_seed(&[0x99u8; 32]).public_key());
+./indra-node/src/engine.rs:4385:            "a node must not claim proposer eligibility when its local VRF key does not match the registered validator VRF key"
+./indra-node/src/engine.rs:4393:                if reason == "local VRF key is not in election candidates"
+./indra-node/src/engine.rs:4913:            proposer_vrf_keypair: VrfKeypair::from_seed(&[0x42; 32]),
+./indra-core/tests/serialisation.rs:74:        vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-core/tests/serialisation.rs:76:        proposer_vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
+./indra-core/tests/serialisation.rs:77:        proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+./indra-core/tests/serialisation.rs:78:        value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-core/tests/serialisation.rs:81:            vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
+./indra-core/tests/serialisation.rs:82:            vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+./indra-core/src/types/proposal.rs:7:        block::{transaction_set_root, BlockProposalVNext, VrfSuiteV1, NO_POLC_ROUND},
+./indra-core/src/types/proposal.rs:13:    verify_hybrid, vrf_verify, ClassicalPublicKey, HybridPublicKey, PqPublicKey, VrfOutput,
+./indra-core/src/types/proposal.rs:14:    VrfProof,
+./indra-core/src/types/proposal.rs:22:    proposal: &'a BlockProposalVNext,
+./indra-core/src/types/proposal.rs:26:    pub fn proposal(&self) -> &'a BlockProposalVNext {
+./indra-core/src/types/proposal.rs:35:/// Build the complete domain-separated VRF input.
+./indra-core/src/types/proposal.rs:36:pub fn proposer_vrf_alpha(
+./indra-core/src/types/proposal.rs:80:    material.extend_from_slice(h.value_entropy.vrf_output.as_slice());
+./indra-core/src/types/proposal.rs:90:    proposal: &'a BlockProposalVNext,
+./indra-core/src/types/proposal.rs:106:    if h.vrf_suite != VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 {
+./indra-core/src/types/proposal.rs:107:        return Err(IndraError::VrfProofInvalid);
+./indra-core/src/types/proposal.rs:114:    if entry.vrf_suite != h.vrf_suite {
+./indra-core/src/types/proposal.rs:115:        return Err(IndraError::VrfProofInvalid);
+./indra-core/src/types/proposal.rs:131:    let alpha = proposer_vrf_alpha(
+./indra-core/src/types/proposal.rs:140:        .proposer_vrf_output
+./indra-core/src/types/proposal.rs:143:        .map_err(|_| IndraError::VrfProofInvalid)?;
+./indra-core/src/types/proposal.rs:144:    let proof = h.proposer_vrf_proof.as_slice().to_vec();
+./indra-core/src/types/proposal.rs:145:    vrf_verify(&entry.vrf_pk, &alpha, &VrfOutput(output), &VrfProof(proof))
+./indra-core/src/types/proposal.rs:146:        .map_err(|_| IndraError::VrfProofInvalid)?;
+./indra-core/src/types/proposal.rs:175:    let entropy_alpha = proposer_vrf_alpha(
+./indra-core/src/types/proposal.rs:185:        .vrf_output
+./indra-core/src/types/proposal.rs:188:        .map_err(|_| IndraError::VrfProofInvalid)?;
+./indra-core/src/types/proposal.rs:189:    vrf_verify(
+./indra-core/src/types/proposal.rs:190:        &entropy_entry.vrf_pk,
+./indra-core/src/types/proposal.rs:192:        &VrfOutput(entropy_output),
+./indra-core/src/types/proposal.rs:193:        &VrfProof(h.value_entropy.vrf_proof.as_slice().to_vec()),
+./indra-core/src/types/proposal.rs:195:    .map_err(|_| IndraError::VrfProofInvalid)?;
+./indra-core/src/types/proposal.rs:210:            || h.value_entropy.vrf_output.as_slice() != h.proposer_vrf_output.as_slice()
+./indra-core/src/types/proposal.rs:211:            || h.value_entropy.vrf_proof.as_slice() != h.proposer_vrf_proof.as_slice())
+./indra-core/src/types/proposal.rs:214:            "first proposal does not bind entropy to its current-round VRF proof".into(),
+./indra-core/src/types/proposal.rs:225:    fn vrf_alpha_binds_every_seed_bit_and_every_context() {
+./indra-core/src/types/proposal.rs:230:        let baseline = proposer_vrf_alpha(chain, &seed, 7, 9, &root, &proposer).unwrap();
+./indra-core/src/types/proposal.rs:235:                proposer_vrf_alpha(chain, &changed, 7, 9, &root, &proposer).unwrap(),
+./indra-core/src/types/proposal.rs:240:            proposer_vrf_alpha(b"other", &seed, 7, 9, &root, &proposer).unwrap(),
+./indra-core/src/types/proposal.rs:244:            proposer_vrf_alpha(chain, &seed, 8, 9, &root, &proposer).unwrap(),
+./indra-core/src/types/proposal.rs:248:            proposer_vrf_alpha(chain, &seed, 7, 10, &root, &proposer).unwrap(),
+./indra-core/src/types/proposal.rs:252:            proposer_vrf_alpha(chain, &seed, 7, 9, &Bytes32::from([5; 32]), &proposer).unwrap(),
+./indra-core/src/types/proposal.rs:256:            proposer_vrf_alpha(chain, &seed, 7, 9, &root, &Bytes32::from([6; 32])).unwrap(),
+./indra-core/src/types/primitives.rs:136:/// Maximum VRF proof size (bytes).
+./indra-core/src/types/primitives.rs:137:pub const MAX_VRF_PROOF_BYTES: usize = 1_024;
+./indra-core/src/types/primitives.rs:139:pub const MAX_STANDARD_VRF_OUTPUT_BYTES: usize = 64;
+./indra-core/src/types/primitives.rs:141:pub const MAX_STANDARD_VRF_PROOF_BYTES: usize = 80;
+./indra-core/src/types/primitives.rs:753:        assert_eq!(MAX_STANDARD_VRF_OUTPUT_BYTES, 64);
+./indra-core/src/types/primitives.rs:754:        assert_eq!(MAX_STANDARD_VRF_PROOF_BYTES, 80);
+./indra-core/src/types/primitives.rs:756:            crate::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2 as u8,
+./indra-core/src/types/slash_membership.rs:341:    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-core/src/types/slash_membership.rs:347:        let vrf = VrfKeypair::from_seed(&[id.wrapping_add(2); 32]);
+./indra-core/src/types/slash_membership.rs:353:            vrf.public_key(),
+./indra-core/src/types/slash_membership.rs:354:            crate::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-core/src/types/staking.rs:13:        block::VrfSuiteV1,
+./indra-core/src/types/staking.rs:16:            Bytes32, Bytes64, VariableBytes, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-core/src/types/staking.rs:37:const TAG_REGISTER_VRF_KEY: u8 = 14;
+./indra-core/src/types/staking.rs:147:        /// Validator's VRF public key for proposer election.
+./indra-core/src/types/staking.rs:148:        vrf_pk: [u8; 32],
+./indra-core/src/types/staking.rs:209:    /// Rotate the validator's VRF key for the next snapshot epoch.
+./indra-core/src/types/staking.rs:210:    RegisterVrfKey {
+./indra-core/src/types/staking.rs:214:        vrf_suite: VrfSuiteV1,
+./indra-core/src/types/staking.rs:216:        vrf_pubkey: Bytes32,
+./indra-core/src/types/staking.rs:219:        /// RFC 9381 output proving possession of the registered VRF secret key.
+./indra-core/src/types/staking.rs:220:        vrf_possession_output: Bytes64,
+./indra-core/src/types/staking.rs:222:        vrf_possession_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+./indra-core/src/types/staking.rs:227:    /// Canonical challenge proved with the VRF secret key during registration.
+./indra-core/src/types/staking.rs:228:    pub fn vrf_possession_challenge(
+./indra-core/src/types/staking.rs:231:        vrf_pubkey: &Bytes32,
+./indra-core/src/types/staking.rs:241:        let mut out = b"INDRA-VRF-KEY-POSSESSION-v1".to_vec();
+./indra-core/src/types/staking.rs:245:        vrf_pubkey.encode(&mut out);
+./indra-core/src/types/staking.rs:366:            vrf_pk,
+./indra-core/src/types/staking.rs:379:        payload.extend_from_slice(vrf_pk);
+./indra-core/src/types/staking.rs:485:            | StakingOpBody::RegisterVrfKey { validator_id, .. }
+./indra-core/src/types/staking.rs:585:            StakingOpBody::RegisterVrfKey { vrf_pubkey, .. } => {
+./indra-core/src/types/staking.rs:586:                indra_crypto::validate_vrf_public_key(&vrf_pubkey.0)
+./indra-core/src/types/staking.rs:587:                    .map_err(|_| crate::error::IndraError::VrfProofInvalid)?;
+./indra-core/src/types/staking.rs:645:                vrf_pk,
+./indra-core/src/types/staking.rs:653:                buf.extend_from_slice(vrf_pk);
+./indra-core/src/types/staking.rs:714:            StakingOpBody::RegisterVrfKey {
+./indra-core/src/types/staking.rs:716:                vrf_suite,
+./indra-core/src/types/staking.rs:717:                vrf_pubkey,
+./indra-core/src/types/staking.rs:719:                vrf_possession_output,
+./indra-core/src/types/staking.rs:720:                vrf_possession_proof,
+./indra-core/src/types/staking.rs:722:                buf.push(TAG_REGISTER_VRF_KEY);
+./indra-core/src/types/staking.rs:724:                vrf_suite.encode(buf);
+./indra-core/src/types/staking.rs:725:                vrf_pubkey.encode(buf);
+./indra-core/src/types/staking.rs:727:                vrf_possession_output.encode(buf);
+./indra-core/src/types/staking.rs:728:                vrf_possession_proof.encode(buf);
+./indra-core/src/types/staking.rs:806:            StakingOpBody::RegisterVrfKey {
+./indra-core/src/types/staking.rs:807:                vrf_possession_output,
+./indra-core/src/types/staking.rs:808:                vrf_possession_proof,
+./indra-core/src/types/staking.rs:814:                    + vrf_possession_output.encoded_len()
+./indra-core/src/types/staking.rs:815:                    + vrf_possession_proof.encoded_len()
+./indra-core/src/types/staking.rs:846:                let vrf_pk = r.read_bytes32()?;
+./indra-core/src/types/staking.rs:853:                    vrf_pk,
+./indra-core/src/types/staking.rs:882:            TAG_REGISTER_VRF_KEY => Ok(StakingOpBody::RegisterVrfKey {
+./indra-core/src/types/staking.rs:884:                vrf_suite: VrfSuiteV1::decode(r)?,
+./indra-core/src/types/staking.rs:885:                vrf_pubkey: Bytes32::decode(r)?,
+./indra-core/src/types/staking.rs:887:                vrf_possession_output: Bytes64::decode(r)?,
+./indra-core/src/types/staking.rs:888:                vrf_possession_proof: VariableBytes::decode(r)?,
+./indra-core/src/types/staking.rs:1075:                vrf_pk: [4u8; 32],
+./indra-core/src/types/staking.rs:1214:            vrf_pk: [9u8; 32],
+./indra-core/src/types/staking.rs:1292:            vrf_pk: [0u8; 32],
+./indra-core/src/types/staking.rs:1312:            vrf_pk: [0u8; 32],
+./indra-core/src/types/block.rs:13:            MAX_STAKING_OPS_PER_BLOCK, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-core/src/types/block.rs:35:/// Sole accepted standard VRF suite.
+./indra-core/src/types/block.rs:37:pub enum VrfSuiteV1 {
+./indra-core/src/types/block.rs:38:    /// RFC 9381 ECVRF-EDWARDS25519-SHA512-ELL2.
+./indra-core/src/types/block.rs:39:    EcvrfEdwards25519Sha512Ell2 = 1,
+./indra-core/src/types/block.rs:41:impl Encode for VrfSuiteV1 {
+./indra-core/src/types/block.rs:49:impl Decode for VrfSuiteV1 {
+./indra-core/src/types/block.rs:52:            1 => Ok(Self::EcvrfEdwards25519Sha512Ell2),
+./indra-core/src/types/block.rs:54:                "unsupported VRF suite {v}"
+./indra-core/src/types/block.rs:89:pub struct ProposalEntropyV1 {
+./indra-core/src/types/block.rs:95:    pub vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+./indra-core/src/types/block.rs:96:    /// RFC 9381 proof authenticating `vrf_output`.
+./indra-core/src/types/block.rs:97:    pub vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+./indra-core/src/types/block.rs:100:impl ProposalEntropyV1 {
+./indra-core/src/types/block.rs:106:            vrf_output: VariableBytes::default(),
+./indra-core/src/types/block.rs:107:            vrf_proof: VariableBytes::default(),
+./indra-core/src/types/block.rs:112:impl Encode for ProposalEntropyV1 {
+./indra-core/src/types/block.rs:116:        self.vrf_output.encode(buf);
+./indra-core/src/types/block.rs:117:        self.vrf_proof.encode(buf);
+./indra-core/src/types/block.rs:120:        32 + 4 + self.vrf_output.encoded_len() + self.vrf_proof.encoded_len()
+./indra-core/src/types/block.rs:124:impl Decode for ProposalEntropyV1 {
+./indra-core/src/types/block.rs:129:            vrf_output: VariableBytes::decode(r)?,
+./indra-core/src/types/block.rs:130:            vrf_proof: VariableBytes::decode(r)?,
+./indra-core/src/types/block.rs:175:    /// Standard VRF suite.
+./indra-core/src/types/block.rs:176:    pub vrf_suite: VrfSuiteV1,
+./indra-core/src/types/block.rs:179:    /// Full standard VRF output.
+./indra-core/src/types/block.rs:180:    pub proposer_vrf_output: VariableBytes<MAX_STANDARD_VRF_OUTPUT_BYTES>,
+./indra-core/src/types/block.rs:181:    /// Full standard VRF proof.
+./indra-core/src/types/block.rs:182:    pub proposer_vrf_proof: VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+./indra-core/src/types/block.rs:184:    pub value_entropy: ProposalEntropyV1,
+./indra-core/src/types/block.rs:236:        self.vrf_suite.encode(buf);
+./indra-core/src/types/block.rs:238:        self.proposer_vrf_output.encode(buf);
+./indra-core/src/types/block.rs:239:        self.proposer_vrf_proof.encode(buf);
+./indra-core/src/types/block.rs:259:            + self.proposer_vrf_output.encoded_len()
+./indra-core/src/types/block.rs:260:            + self.proposer_vrf_proof.encoded_len()
+./indra-core/src/types/block.rs:289:            vrf_suite: VrfSuiteV1::decode(r)?,
+./indra-core/src/types/block.rs:291:            proposer_vrf_output: VariableBytes::decode(r)?,
+./indra-core/src/types/block.rs:292:            proposer_vrf_proof: VariableBytes::decode(r)?,
+./indra-core/src/types/block.rs:293:            value_entropy: ProposalEntropyV1::decode(r)?,
+./indra-core/src/types/block.rs:299:            && header.proposer_vrf_output.is_empty()
+./indra-core/src/types/block.rs:300:            && header.proposer_vrf_proof.is_empty()
+./indra-core/src/types/block.rs:301:            && header.value_entropy == ProposalEntropyV1::genesis();
+./indra-core/src/types/block.rs:303:            && (header.proposer_vrf_output.len() != 64
+./indra-core/src/types/block.rs:304:                || header.proposer_vrf_proof.len() != 80
+./indra-core/src/types/block.rs:305:                || header.value_entropy.vrf_output.len() != 64
+./indra-core/src/types/block.rs:306:                || header.value_entropy.vrf_proof.len() != 80)
+./indra-core/src/types/block.rs:308:            return Err(crate::error::IndraError::VrfProofInvalid);
+./indra-core/src/types/block.rs:363:pub struct BlockProposalVNext {
+./indra-core/src/types/block.rs:369:impl BlockProposalVNext {
+./indra-core/src/types/block.rs:391:impl Encode for BlockProposalVNext {
+./indra-core/src/types/block.rs:400:impl Decode for BlockProposalVNext {
+./indra-core/src/types/block.rs:409:impl core::ops::Deref for BlockProposalVNext {
+./indra-core/src/types/block.rs:415:impl core::ops::DerefMut for BlockProposalVNext {
+./indra-core/src/types/block.rs:456:            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-core/src/types/block.rs:458:            proposer_vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
+./indra-core/src/types/block.rs:459:            proposer_vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+./indra-core/src/types/block.rs:460:            value_entropy: ProposalEntropyV1 {
+./indra-core/src/types/block.rs:463:                vrf_output: VariableBytes::from_slice(&[0x44u8; 64]).unwrap(),
+./indra-core/src/types/block.rs:464:                vrf_proof: VariableBytes::from_slice(&[0xAAu8; 80]).unwrap(),
+./indra-core/src/types/block.rs:525:        changed.proposer_vrf_output = VariableBytes::from_slice(&[0x55u8; 64]).unwrap();
+./indra-core/src/types/block.rs:562:        let proposal = BlockProposalVNext {
+./indra-core/src/types/block.rs:578:            BlockProposalVNext::decode_exact(&encoded).unwrap()
+./indra-core/src/types/block.rs:582:        assert!(BlockProposalVNext::decode_exact(&trailing).is_err());
+./indra-core/src/types/consensus_snapshot.rs:8:        block::VrfSuiteV1,
+./indra-core/src/types/consensus_snapshot.rs:13:    sha256, validate_classical_public_key, validate_pq_public_key, validate_vrf_public_key,
+./indra-core/src/types/consensus_snapshot.rs:36:    /// Canonical RFC 9381 Edwards25519 VRF verification key.
+./indra-core/src/types/consensus_snapshot.rs:37:    pub vrf_pk: [u8; 32],
+./indra-core/src/types/consensus_snapshot.rs:38:    /// VRF suite active for this snapshot.
+./indra-core/src/types/consensus_snapshot.rs:39:    pub vrf_suite: VrfSuiteV1,
+./indra-core/src/types/consensus_snapshot.rs:40:    /// Epoch at which this VRF key first became active.
+./indra-core/src/types/consensus_snapshot.rs:41:    pub vrf_key_activation_epoch: u64,
+./indra-core/src/types/consensus_snapshot.rs:51:        vrf_pk: [u8; 32],
+./indra-core/src/types/consensus_snapshot.rs:52:        vrf_suite: VrfSuiteV1,
+./indra-core/src/types/consensus_snapshot.rs:53:        vrf_key_activation_epoch: u64,
+./indra-core/src/types/consensus_snapshot.rs:60:            vrf_pk,
+./indra-core/src/types/consensus_snapshot.rs:61:            vrf_suite,
+./indra-core/src/types/consensus_snapshot.rs:62:            vrf_key_activation_epoch,
+./indra-core/src/types/consensus_snapshot.rs:77:        validate_vrf_public_key(&self.vrf_pk)
+./indra-core/src/types/consensus_snapshot.rs:78:            .map_err(|err| invalid_error(format!("malformed VRF key: {err}")))?;
+./indra-core/src/types/consensus_snapshot.rs:89:        buf.extend_from_slice(&self.vrf_pk);
+./indra-core/src/types/consensus_snapshot.rs:90:        self.vrf_suite.encode(buf);
+./indra-core/src/types/consensus_snapshot.rs:91:        self.vrf_key_activation_epoch.encode(buf);
+./indra-core/src/types/consensus_snapshot.rs:106:            vrf_pk: read_array::<32>(reader)?,
+./indra-core/src/types/consensus_snapshot.rs:107:            vrf_suite: VrfSuiteV1::decode(reader)?,
+./indra-core/src/types/consensus_snapshot.rs:108:            vrf_key_activation_epoch: u64::decode(reader)?,
+./indra-core/src/types/consensus_snapshot.rs:339:    use indra_crypto::{ClassicalKeypair, PqKeypair, VrfKeypair};
+./indra-core/src/types/consensus_snapshot.rs:352:        let vrf = VrfKeypair::from_seed(&[key_seed; 32]);
+./indra-core/src/types/consensus_snapshot.rs:359:            vrf.public_key(),
+./indra-core/src/types/consensus_snapshot.rs:360:            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-core/src/types/consensus_snapshot.rs:441:            entry(2, 1, 12).vrf_pk,
+./indra-core/src/types/consensus_snapshot.rs:442:            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-core/src/types/consensus_snapshot.rs:463:    fn rejects_malformed_or_missing_vrf_key() {
+./indra-core/src/types/consensus_snapshot.rs:465:        malformed.vrf_pk = [0; 32];
+./indra-core/src/types/consensus_snapshot.rs:525:            oracle.extend_from_slice(&entry.vrf_pk);
+./indra-core/src/types/consensus_snapshot.rs:526:            oracle.push(entry.vrf_suite as u8);
+./indra-core/src/types/consensus_snapshot.rs:527:            oracle.extend_from_slice(&entry.vrf_key_activation_epoch.to_le_bytes());
+./indra-core/src/types/consensus_snapshot.rs:584:        let mut changed_vrf = baseline.entries()[0].clone();
+./indra-core/src/types/consensus_snapshot.rs:585:        changed_vrf.vrf_pk = replacement_keys.vrf_pk;
+./indra-core/src/types/consensus_snapshot.rs:587:            test_snapshot(301, 300, vec![changed_vrf, baseline.entries()[1].clone()])
+./indra-core/src/error.rs:158:    /// VRF proof failed.
+./indra-core/src/error.rs:159:    #[error("VRF proof verification failed")]
+./indra-core/src/error.rs:160:    VrfProofInvalid,
+./indra-core/src/lib.rs:29:    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-consensus/tests/consensus.rs:8:    proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection},
+./indra-consensus/tests/consensus.rs:132:    let vrf_keypair = indra_crypto::VrfKeypair::from_seed(&seed);
+./indra-consensus/tests/consensus.rs:133:    let vrf_pubkey = vrf_keypair.public_key();
+./indra-consensus/tests/consensus.rs:134:    let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
+./indra-consensus/tests/consensus.rs:151:            vrf_pk: Some(vrf_pubkey),
+./indra-consensus/tests/consensus.rs:152:            vrf_key_activation_epoch: 0,
+./indra-consensus/tests/consensus.rs:153:            pending_vrf_pk: None,
+./indra-consensus/tests/consensus.rs:154:            pending_vrf_activation_epoch: None,
+./indra-consensus/tests/consensus.rs:219:                vrf_pubkey,
+./indra-consensus/tests/consensus.rs:224:            compute_proposer_vrf(validator_id, &vrf_keypair, election)
+./indra-consensus/tests/consensus.rs:229:        proposer_vrf_keypair: vrf_keypair,
+./indra-consensus/src/producer.rs:7://!   2. Computes the proposer's VRF output and proof
+./indra-consensus/src/producer.rs:8://!   3. Fills the block header (height, prev_hash, base_fee, VRF fields)
+./indra-consensus/src/producer.rs:21:        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-consensus/src/producer.rs:25:            MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-consensus/src/producer.rs:32:use indra_crypto::VrfKeypair;
+./indra-consensus/src/producer.rs:37:    proposer::{compute_proposer_vrf, ProposerElection},
+./indra-consensus/src/producer.rs:42:    /// The proposer's VRF keypair.
+./indra-consensus/src/producer.rs:43:    pub proposer_vrf_keypair: VrfKeypair,
+./indra-consensus/src/producer.rs:76:    let slot = compute_proposer_vrf(
+./indra-consensus/src/producer.rs:80:            .find(|candidate| candidate.vrf_pubkey == template.proposer_vrf_keypair.public_key())
+./indra-consensus/src/producer.rs:83:                ConsensusError::wrong_proposer("local VRF key is not in election candidates")
+./indra-consensus/src/producer.rs:85:        &template.proposer_vrf_keypair,
+./indra-consensus/src/producer.rs:97:    // Build VRF proof bytes for header
+./indra-consensus/src/producer.rs:98:    let vrf_proof_bytes = VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+./indra-consensus/src/producer.rs:99:        &slot.vrf_proof.0,
+./indra-consensus/src/producer.rs:102:        detail: "VRF proof too large".to_string(),
+./indra-consensus/src/producer.rs:126:        vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-consensus/src/producer.rs:128:        proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+./indra-consensus/src/producer.rs:129:            &slot.vrf_output.0,
+./indra-consensus/src/producer.rs:134:        proposer_vrf_proof: vrf_proof_bytes,
+./indra-consensus/src/producer.rs:135:        value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-consensus/src/producer.rs:138:            vrf_output: VariableBytes::from_slice(&slot.vrf_output.0).map_err(|e| {
+./indra-consensus/src/producer.rs:143:            vrf_proof: VariableBytes::from_slice(&slot.vrf_proof.0).map_err(|e| {
+./indra-consensus/src/producer.rs:197:    use indra_crypto::VrfKeypair;
+./indra-consensus/src/producer.rs:203:    fn finalized_state(vrf_seed: &[u8; 32]) -> ChainState {
+./indra-consensus/src/producer.rs:216:        let vrf_pk = VrfKeypair::from_seed(vrf_seed).public_key();
+./indra-consensus/src/producer.rs:217:        let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pk));
+./indra-consensus/src/producer.rs:225:                vrf_pk: Some(vrf_pk),
+./indra-consensus/src/producer.rs:226:                vrf_key_activation_epoch: 0,
+./indra-consensus/src/producer.rs:227:                pending_vrf_pk: None,
+./indra-consensus/src/producer.rs:228:                pending_vrf_activation_epoch: None,
+./indra-consensus/src/producer.rs:255:        vrf_seed: [u8; 32],
+./indra-consensus/src/producer.rs:258:        let vrf_pubkey = VrfKeypair::from_seed(&vrf_seed).public_key();
+./indra-consensus/src/producer.rs:259:        let validator_id = Bytes32::from(indra_crypto::sha256(&vrf_pubkey));
+./indra-consensus/src/producer.rs:269:                vrf_pubkey: vrf_pubkey,
+./indra-consensus/src/producer.rs:278:        vrf_seed: [u8; 32],
+./indra-consensus/src/producer.rs:282:            let election = make_election(seed, height, round, vrf_seed, stake);
+./indra-consensus/src/producer.rs:284:            if compute_proposer_vrf(
+./indra-consensus/src/producer.rs:286:                &VrfKeypair::from_seed(&vrf_seed),
+./indra-consensus/src/producer.rs:381:            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+./indra-consensus/src/producer.rs:414:            proposer_vrf_keypair: VrfKeypair::from_seed(&wrong_seed),
+./indra-consensus/src/producer.rs:434:                if reason == "local VRF key is not in election candidates"
+./indra-consensus/src/producer.rs:445:            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+./indra-consensus/src/producer.rs:473:            proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+./indra-consensus/src/producer.rs:514:                proposer_vrf_keypair: VrfKeypair::from_seed(&seed),
+./indra-consensus/src/lib.rs:15://! - **Proposer election**: VRF-based slot assignment. Each validator uses
+./indra-consensus/src/lib.rs:16://!   their secret key and the epoch seed to produce a VRF output. The
+./indra-consensus/src/lib.rs:58:pub use proposer::{compute_proposer_vrf, ProposerCandidate, ProposerElection, SlotResult};
+./indra-consensus/src/proposer.rs:1://! RFC-VRF proposer eligibility and deterministic priority.
+./indra-consensus/src/proposer.rs:7:        proposal::proposer_vrf_alpha,
+./indra-consensus/src/proposer.rs:10:use indra_crypto::{vrf_prove, VrfKeypair, VrfOutput, VrfProof};
+./indra-consensus/src/proposer.rs:16:    /// Registered standard VRF key.
+./indra-consensus/src/proposer.rs:17:    pub vrf_pubkey: [u8; 32],
+./indra-consensus/src/proposer.rs:45:    pub vrf_output: VrfOutput,
+./indra-consensus/src/proposer.rs:47:    pub vrf_proof: VrfProof,
+./indra-consensus/src/proposer.rs:49:    pub vrf_input: Vec<u8>,
+./indra-consensus/src/proposer.rs:61:    pub fn vrf_input(&self, id: &Bytes32) -> ConsensusResult<Vec<u8>> {
+./indra-consensus/src/proposer.rs:62:        proposer_vrf_alpha(
+./indra-consensus/src/proposer.rs:82:pub fn compute_proposer_vrf(
+./indra-consensus/src/proposer.rs:84:    keypair: &VrfKeypair,
+./indra-consensus/src/proposer.rs:90:        .find(|c| c.validator_id == id && c.vrf_pubkey == keypair.public_key())
+./indra-consensus/src/proposer.rs:92:            ConsensusError::wrong_proposer("local VRF key is absent from governing snapshot")
+./indra-consensus/src/proposer.rs:94:    let input = election.vrf_input(&id)?;
+./indra-consensus/src/proposer.rs:95:    let (output, proof) = vrf_prove(keypair, &input);
+./indra-consensus/src/proposer.rs:116:        vrf_output: output,
+./indra-consensus/src/proposer.rs:117:        vrf_proof: proof,
+./indra-consensus/src/proposer.rs:118:        vrf_input: input,
+./indra-consensus/src/proposer.rs:136:        let a = e.vrf_input(&Bytes32([5; 32])).unwrap();
+./indra-consensus/src/proposer.rs:139:        assert_ne!(a, e2.vrf_input(&Bytes32([5; 32])).unwrap())
+./indra-consensus/src/proposer.rs:144:        let a = VrfKeypair::from_seed(&[0x31; 32]);
+./indra-consensus/src/proposer.rs:145:        let b = VrfKeypair::from_seed(&[0x32; 32]);
+./indra-consensus/src/proposer.rs:157:                    vrf_pubkey: a.public_key(),
+./indra-consensus/src/proposer.rs:162:                    vrf_pubkey: b.public_key(),
+./indra-consensus/src/proposer.rs:167:        let before = compute_proposer_vrf(a_id, &a, &election).unwrap();
+./indra-consensus/src/proposer.rs:171:        let after = compute_proposer_vrf(a_id, &a, &election).unwrap();
+./indra-consensus/src/proposer.rs:172:        assert_eq!(before.vrf_input, after.vrf_input);
+./indra-consensus/src/proposer.rs:173:        assert_eq!(before.vrf_output, after.vrf_output);
+./indra-crypto/tests/audit_phase1.rs:8:    PqKeypair, VrfKeypair, VrfOutput,
+./indra-crypto/tests/audit_phase1.rs:11:fn candidate_output(vrf_pubkey: &[u8; 32], vrf_input: &[u8; 32]) -> VrfOutput {
+./indra-crypto/tests/audit_phase1.rs:12:    let mut data = Vec::with_capacity(vrf_pubkey.len() + vrf_input.len());
+./indra-crypto/tests/audit_phase1.rs:13:    data.extend_from_slice(vrf_pubkey);
+./indra-crypto/tests/audit_phase1.rs:14:    data.extend_from_slice(vrf_input);
+./indra-crypto/tests/audit_phase1.rs:19:    VrfOutput(output)
+./indra-crypto/tests/audit_phase1.rs:49:fn audit_vrf_public_candidate_output_is_grindable() {
+./indra-crypto/tests/audit_phase1.rs:50:    let vrf_input = sha256(b"fixed public election input");
+./indra-crypto/tests/audit_phase1.rs:57:        let keypair = VrfKeypair::from_seed(&seed_bytes);
+./indra-crypto/tests/audit_phase1.rs:58:        let output = candidate_output(&keypair.public_key(), &vrf_input);
+./indra-crypto/src/error.rs:45:    /// VRF proof verification failed.
+./indra-crypto/src/error.rs:46:    #[error("VRF proof verification failed")]
+./indra-crypto/src/error.rs:47:    VrfProofFailed,
+./indra-crypto/src/lib.rs:14:pub mod vrf;
+./indra-crypto/src/lib.rs:33:pub use vrf::{validate_vrf_public_key, vrf_prove, vrf_verify, VrfKeypair, VrfOutput, VrfProof};
+./indra-crypto/src/vrf.rs:1://! RFC 9381 ECVRF-EDWARDS25519-SHA512-ELL2 (`suite_string = 0x04`).
+./indra-crypto/src/vrf.rs:19:const DST: &[u8] = b"ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
+./indra-crypto/src/vrf.rs:22:pub struct VrfOutput(pub [u8; 64]);
+./indra-crypto/src/vrf.rs:25:pub struct VrfProof(pub Vec<u8>);
+./indra-crypto/src/vrf.rs:26:/// Seed-derived VRF keypair.
+./indra-crypto/src/vrf.rs:28:pub struct VrfKeypair {
+./indra-crypto/src/vrf.rs:45:impl VrfKeypair {
+./indra-crypto/src/vrf.rs:60:pub fn validate_vrf_public_key(pk: &[u8; 32]) -> CryptoResult<()> {
+./indra-crypto/src/vrf.rs:64:            scheme: "ECVRF-EDWARDS25519-SHA512-ELL2",
+./indra-crypto/src/vrf.rs:69:            scheme: "ECVRF-EDWARDS25519-SHA512-ELL2",
+./indra-crypto/src/vrf.rs:104:fn output(g: &EdwardsPoint) -> VrfOutput {
+./indra-crypto/src/vrf.rs:111:    VrfOutput(b)
+./indra-crypto/src/vrf.rs:114:pub fn vrf_prove(kp: &VrfKeypair, alpha: &[u8]) -> (VrfOutput, VrfProof) {
+./indra-crypto/src/vrf.rs:129:    (output(&g), VrfProof(pi))
+./indra-crypto/src/vrf.rs:132:pub fn vrf_verify(
+./indra-crypto/src/vrf.rs:135:    beta: &VrfOutput,
+./indra-crypto/src/vrf.rs:136:    pi: &VrfProof,
+./indra-crypto/src/vrf.rs:138:    validate_vrf_public_key(pk)?;
+./indra-crypto/src/vrf.rs:140:        return Err(CryptoError::VrfProofFailed);
+./indra-crypto/src/vrf.rs:151:        return Err(CryptoError::VrfProofFailed);
+./indra-crypto/src/vrf.rs:159:        .ok_or(CryptoError::VrfProofFailed)?;
+./indra-crypto/src/vrf.rs:164:        return Err(CryptoError::VrfProofFailed);
+./indra-crypto/src/vrf.rs:181:        let kp = VrfKeypair::from_seed(&seed);
+./indra-crypto/src/vrf.rs:182:        let (output, proof) = vrf_prove(&kp, &alpha);
+./indra-crypto/src/vrf.rs:186:        vrf_verify(&kp.public_key(), &alpha, &output, &proof).unwrap();
+./indra-crypto/src/vrf.rs:212:        let kp = VrfKeypair::from_seed(&[7; 32]);
+./indra-crypto/src/vrf.rs:213:        let (o, p) = vrf_prove(&kp, b"alpha");
+./indra-crypto/src/vrf.rs:214:        assert!(validate_vrf_public_key(&[0; 32]).is_err());
+./indra-crypto/src/vrf.rs:219:                vrf_verify(&kp.public_key(), b"alpha", &o, &VrfProof(bytes)).is_err(),
+./indra-crypto/src/vrf.rs:225:        assert!(vrf_verify(&kp.public_key(), b"alpha", &o, &VrfProof(noncanonical)).is_err());
+./indra-crypto/src/vrf.rs:228:        assert!(vrf_verify(&kp.public_key(), b"alpha", &wrong, &p).is_err())
+./indra-crypto/src/hash.rs:86:    /// Hash domain for VRF input derivation.
+./indra-crypto/src/hash.rs:87:    pub const VRF_INPUT: &[u8] = b"INDRA-VRF-INPUT-v1";
+./indra-crypto/src/mnemonic.rs:27:    /// VRF keypair seed.
+./indra-crypto/src/mnemonic.rs:28:    pub vrf_seed: [u8; 32],
+./indra-crypto/src/mnemonic.rs:56:    let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1");
+./indra-crypto/src/mnemonic.rs:60:        vrf_seed,
+./indra-crypto/src/mnemonic.rs:112:        assert_eq!(derived1.vrf_seed, derived2.vrf_seed);
+./indra-crypto/src/mnemonic.rs:148:    fn hybrid_and_vrf_seeds_are_different() {
+./indra-crypto/src/mnemonic.rs:153:        assert_ne!(derived.ed25519_seed, derived.vrf_seed);
+./indra-crypto/src/mnemonic.rs:154:        assert_ne!(derived.ml_dsa_seed, derived.vrf_seed);
+./indra-crypto/src/mnemonic.rs:171:            hex::encode(derived.vrf_seed),
+./indra-state/tests/state_machine.rs:22:use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-state/tests/state_machine.rs:123:            vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+./indra-state/tests/state_machine.rs:124:            vrf_key_activation_epoch: 0,
+./indra-state/tests/state_machine.rs:125:            pending_vrf_pk: None,
+./indra-state/tests/state_machine.rs:126:            pending_vrf_activation_epoch: None,
+./indra-state/tests/state_machine.rs:260:            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/tests/state_machine.rs:262:            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/state_machine.rs:263:            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/tests/state_machine.rs:264:            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-state/tests/state_machine.rs:267:                vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/state_machine.rs:268:                vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/tests/state_machine.rs:294:                    vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+./indra-state/tests/state_machine.rs:295:                    vrf_key_activation_epoch: 0,
+./indra-state/tests/state_machine.rs:296:                    pending_vrf_pk: None,
+./indra-state/tests/state_machine.rs:297:                    pending_vrf_activation_epoch: None,
+./indra-state/tests/audit_phase2.rs:19:use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-state/tests/audit_phase2.rs:51:            vrf_pk: Some(VrfKeypair::from_seed(&seed).public_key()),
+./indra-state/tests/audit_phase2.rs:52:            vrf_key_activation_epoch: 0,
+./indra-state/tests/audit_phase2.rs:53:            pending_vrf_pk: None,
+./indra-state/tests/audit_phase2.rs:54:            pending_vrf_activation_epoch: None,
+./indra-state/tests/audit_phase2.rs:194:            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/tests/audit_phase2.rs:196:            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/audit_phase2.rs:197:            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/tests/audit_phase2.rs:198:            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-state/tests/audit_phase2.rs:201:                vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/audit_phase2.rs:202:                vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/tests/monetary_invariants.rs:12:use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+./indra-state/tests/monetary_invariants.rs:54:        vrf_pk: Some(VrfKeypair::from_seed(&[7; 32]).public_key()),
+./indra-state/tests/monetary_invariants.rs:55:        vrf_key_activation_epoch: 0,
+./indra-state/tests/monetary_invariants.rs:56:        pending_vrf_pk: None,
+./indra-state/tests/monetary_invariants.rs:57:        pending_vrf_activation_epoch: None,
+./indra-state/tests/monetary_invariants.rs:141:            vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/tests/monetary_invariants.rs:143:            proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/monetary_invariants.rs:144:            proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/tests/monetary_invariants.rs:145:            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-state/tests/monetary_invariants.rs:148:                vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/tests/monetary_invariants.rs:149:                vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/src/tranche_tombstone.rs:41:    /// VRF key.
+./indra-state/src/tranche_tombstone.rs:42:    pub vrf_pk: [u8; 32],
+./indra-state/src/tranche_tombstone.rs:160:        last_vrf_pk: authority.vrf_pk,
+./indra-state/src/tranche_tombstone.rs:427:            vrf_pk: [5; 32],
+./indra-state/src/tranche_tombstone.rs:630:            last_vrf_pk: [5; 32],
+./indra-state/src/stake_positions.rs:630:        let vrf = indra_crypto::VrfKeypair::from_seed(&[0x77; 32]);
+./indra-state/src/stake_positions.rs:636:            vrf_pk: Some(vrf.public_key()),
+./indra-state/src/stake_positions.rs:637:            vrf_key_activation_epoch: 0,
+./indra-state/src/stake_positions.rs:638:            pending_vrf_pk: None,
+./indra-state/src/stake_positions.rs:639:            pending_vrf_activation_epoch: None,
+./indra-state/src/chain.rs:16:    block::VrfSuiteV1,
+./indra-state/src/chain.rs:662:            let (vrf_pk, vrf_key_activation_epoch) = match (
+./indra-state/src/chain.rs:663:                validator.pending_vrf_pk,
+./indra-state/src/chain.rs:664:                validator.pending_vrf_activation_epoch,
+./indra-state/src/chain.rs:670:                    validator.vrf_pk.ok_or_else(|| {
+./indra-state/src/chain.rs:672:                            "active validator {} has no VRF key",
+./indra-state/src/chain.rs:676:                    validator.vrf_key_activation_epoch,
+./indra-state/src/chain.rs:685:                    vrf_pk,
+./indra-state/src/chain.rs:686:                    VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/chain.rs:687:                    vrf_key_activation_epoch,
+./indra-state/src/chain.rs:936:    /// commission, or VRF-key changes before the next epoch boundary.
+./indra-state/src/chain.rs:1214:        indra_crypto::validate_vrf_public_key(&tombstone.last_vrf_pk).map_err(|error| {
+./indra-state/src/chain.rs:1215:            IndraError::InvalidSlashMembershipProof(format!("malformed tombstone VRF key: {error}"))
+./indra-state/src/chain.rs:1854:        let vrf = indra_crypto::VrfKeypair::from_seed(&[key_seed.wrapping_add(2); 32]);
+./indra-state/src/chain.rs:1860:            vrf_pk: Some(vrf.public_key()),
+./indra-state/src/chain.rs:1861:            vrf_key_activation_epoch: 0,
+./indra-state/src/chain.rs:1862:            pending_vrf_pk: None,
+./indra-state/src/chain.rs:1863:            pending_vrf_activation_epoch: None,
+./indra-state/src/chain.rs:1971:    fn finalized_slash_revokes_frozen_qc_and_vrf_authority_at_next_height() {
+./indra-state/src/chain.rs:2046:        // a VRF key, even though it was valid at the slash-inclusion height.
+./indra-state/src/chain.rs:2145:                last_vrf_pk: tombstone_keys.vrf_pk,
+./indra-state/src/state_commitment.rs:350:    if let Some(vrf_pk) = validator.vrf_pk {
+./indra-state/src/state_commitment.rs:351:        value.extend_from_slice(&vrf_pk);
+./indra-state/src/state_commitment.rs:413:            vrf_pk: Some(
+./indra-state/src/state_commitment.rs:414:                indra_crypto::VrfKeypair::from_seed(&[byte.wrapping_add(2); 32]).public_key(),
+./indra-state/src/state_commitment.rs:416:            vrf_key_activation_epoch: 0,
+./indra-state/src/state_commitment.rs:417:            pending_vrf_pk: None,
+./indra-state/src/state_commitment.rs:418:            pending_vrf_activation_epoch: None,
+./indra-state/src/state_commitment.rs:446:        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xA3; 32]);
+./indra-state/src/state_commitment.rs:455:                vrf.public_key(),
+./indra-state/src/state_commitment.rs:456:                indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/state_commitment.rs:902:            last_vrf_pk: [0x03; 32],
+./indra-state/src/lib.rs:14://! - VRF / proposer-election verification (handled by block import and consensus layers,
+./indra-state/src/validator.rs:78:    /// VRF public key bytes for proposer verification.
+./indra-state/src/validator.rs:79:    pub vrf_pk: Option<[u8; 32]>,
+./indra-state/src/validator.rs:80:    /// Epoch in which the current VRF key first became snapshot-active.
+./indra-state/src/validator.rs:81:    pub vrf_key_activation_epoch: u64,
+./indra-state/src/validator.rs:83:    pub pending_vrf_pk: Option<[u8; 32]>,
+./indra-state/src/validator.rs:84:    /// Epoch at which `pending_vrf_pk` becomes authoritative.
+./indra-state/src/validator.rs:85:    pub pending_vrf_activation_epoch: Option<u64>,
+./indra-state/src/validator.rs:140:        self.vrf_pk.is_some().encode(buf);
+./indra-state/src/validator.rs:141:        if let Some(pk) = self.vrf_pk {
+./indra-state/src/validator.rs:144:        self.vrf_key_activation_epoch.encode(buf);
+./indra-state/src/validator.rs:145:        self.pending_vrf_pk.is_some().encode(buf);
+./indra-state/src/validator.rs:146:        if let Some(pk) = self.pending_vrf_pk {
+./indra-state/src/validator.rs:149:        self.pending_vrf_activation_epoch.is_some().encode(buf);
+./indra-state/src/validator.rs:150:        if let Some(epoch) = self.pending_vrf_activation_epoch {
+./indra-state/src/validator.rs:213:            + self.vrf_pk.map(|_| 32).unwrap_or(0)
+./indra-state/src/validator.rs:216:            + self.pending_vrf_pk.map(|_| 32).unwrap_or(0)
+./indra-state/src/validator.rs:218:            + self.pending_vrf_activation_epoch.map(|_| 8).unwrap_or(0)
+./indra-state/src/validator.rs:298:    let vrf_pk = if bool::decode(r)? {
+./indra-state/src/validator.rs:303:                    message: "invalid vrf pk length in snapshot",
+./indra-state/src/validator.rs:309:    let vrf_key_activation_epoch = u64::decode(r)?;
+./indra-state/src/validator.rs:310:    let pending_vrf_pk = if bool::decode(r)? {
+./indra-state/src/validator.rs:315:                    message: "invalid pending VRF pk length in snapshot",
+./indra-state/src/validator.rs:321:    let pending_vrf_activation_epoch = if bool::decode(r)? {
+./indra-state/src/validator.rs:326:    if pending_vrf_pk.is_some() != pending_vrf_activation_epoch.is_some() {
+./indra-state/src/validator.rs:328:            "pending VRF key and activation epoch must be present together".into(),
+./indra-state/src/validator.rs:331:    if let Some(key) = vrf_pk {
+./indra-state/src/validator.rs:332:        indra_crypto::validate_vrf_public_key(&key)
+./indra-state/src/validator.rs:335:    if let Some(key) = pending_vrf_pk {
+./indra-state/src/validator.rs:336:        indra_crypto::validate_vrf_public_key(&key)
+./indra-state/src/validator.rs:421:        vrf_pk,
+./indra-state/src/validator.rs:422:        vrf_key_activation_epoch,
+./indra-state/src/validator.rs:423:        pending_vrf_pk,
+./indra-state/src/validator.rs:424:        pending_vrf_activation_epoch,
+./indra-state/src/validator.rs:731:        if entry.pending_vrf_pk.is_some() != entry.pending_vrf_activation_epoch.is_some() {
+./indra-state/src/validator.rs:733:                "pending VRF key and activation epoch must be present together".into(),
+./indra-state/src/validator.rs:736:        if let Some(pending) = entry.pending_vrf_pk {
+./indra-state/src/validator.rs:737:            indra_crypto::validate_vrf_public_key(&pending).map_err(|error| {
+./indra-state/src/validator.rs:739:                    "malformed pending VRF key: {error}"
+./indra-state/src/validator.rs:828:            vrf_pk: None,
+./indra-state/src/validator.rs:829:            vrf_key_activation_epoch: 0,
+./indra-state/src/validator.rs:830:            pending_vrf_pk: None,
+./indra-state/src/validator.rs:831:            pending_vrf_activation_epoch: None,
+./indra-state/src/validator.rs:1097:    /// Last validated VRF key.
+./indra-state/src/validator.rs:1098:    pub last_vrf_pk: [u8; 32],
+./indra-state/src/validator.rs:1147:        buf.extend_from_slice(&self.last_vrf_pk);
+./indra-state/src/validator.rs:1193:        let last_vrf_pk = reader.read_bytes32()?;
+./indra-state/src/validator.rs:1210:            last_vrf_pk,
+./indra-state/src/smt.rs:224:    pub fn prove(&self, key: [u8; 32]) -> CompressedProof {
+./indra-state/src/smt.rs:225:        let mut proof = compressed_prove(&self.root, key);
+./indra-state/src/smt.rs:369:    pub fn prove(&self, key: [u8; 32]) -> MerkleProof {
+./indra-state/src/smt.rs:738:fn compressed_prove(node: &AuthTreeNode, key: [u8; 32]) -> CompressedProof {
+./indra-state/src/smt.rs:793:                let mut proof = compressed_prove(child, key);
+./indra-state/src/smt.rs:1055:        let proof = smt.prove(k);
+./indra-state/src/smt.rs:1066:        let proof = smt.prove(k);
+./indra-state/src/smt.rs:1120:        let proof_a = a.prove(pairs[0].0);
+./indra-state/src/smt.rs:1121:        let proof_b = b.prove(pairs[0].0);
+./indra-state/src/smt.rs:1201:            let proof = smt.prove(*k);
+./indra-state/src/smt.rs:1205:        let proof = smt.prove(absent);
+./indra-state/src/smt.rs:1283:        let proof = tree.prove(k1);
+./indra-state/src/smt.rs:1294:        let proof = tree.prove(missing);
+./indra-state/src/smt.rs:1308:        let proof = tree.prove(missing);
+./indra-state/src/smt.rs:1326:        let proof = tree.prove(missing);
+./indra-state/src/smt.rs:1343:        let mut proof = tree.prove(k1);
+./indra-state/src/smt.rs:1355:        let proof = tree.prove(k1);
+./indra-state/src/smt.rs:1390:        let mut missing_child_proof = two_leaf_tree.prove(missing_child_key);
+./indra-state/src/smt.rs:1401:        let mut prefix_mismatch_proof = two_leaf_tree.prove(prefix_mismatch_key);
+./indra-state/src/smt.rs:1413:        let mut divergent_leaf_proof = single_leaf_tree.prove(k2);
+./indra-state/src/smt.rs:1457:        let mut proof = tree.prove(k1);
+./indra-state/src/smt.rs:1498:            let proof = reverse.prove(*key);
+./indra-state/src/smt.rs:1507:        let missing = batch.prove(k1);
+./indra-state/src/apply.rs:725:                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+./indra-state/src/apply.rs:726:                vrf_key_activation_epoch: 0,
+./indra-state/src/apply.rs:727:                pending_vrf_pk: None,
+./indra-state/src/apply.rs:728:                pending_vrf_activation_epoch: None,
+./indra-state/src/apply.rs:929:                vrf_pk: indra_crypto::VrfKeypair::from_seed(&seed).public_key(),
+./indra-state/src/apply.rs:1068:                vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&seed).public_key()),
+./indra-state/src/apply.rs:1069:                vrf_key_activation_epoch: 0,
+./indra-state/src/apply.rs:1070:                pending_vrf_pk: None,
+./indra-state/src/apply.rs:1071:                pending_vrf_activation_epoch: None,
+./indra-state/src/apply.rs:1807:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/apply.rs:1809:                proposer_vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/src/apply.rs:1810:                proposer_vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/src/apply.rs:1811:                value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-state/src/apply.rs:1814:                    vrf_output: VariableBytes::from_slice(&[0u8; 64]).unwrap(),
+./indra-state/src/apply.rs:1815:                    vrf_proof: VariableBytes::from_slice(&[0u8; 80]).unwrap(),
+./indra-state/src/apply.rs:2994:                vrf_pk: validator.vrf_pk.unwrap(),
+./indra-state/src/apply.rs:3112:                vrf_pk: state.validators.get(&validator_id).unwrap().vrf_pk.unwrap(),
+./indra-state/src/apply.rs:3259:                last_vrf_pk: validator.vrf_pk.unwrap(),
+./indra-state/src/delegation.rs:231:            StakingOpBody::RegisterVrfKey {
+./indra-state/src/delegation.rs:233:                vrf_pubkey,
+./indra-state/src/delegation.rs:235:                vrf_possession_output,
+./indra-state/src/delegation.rs:236:                vrf_possession_proof,
+./indra-state/src/delegation.rs:254:                let challenge = StakingOp::vrf_possession_challenge(
+./indra-state/src/delegation.rs:257:                    vrf_pubkey,
+./indra-state/src/delegation.rs:261:                indra_crypto::vrf_verify(
+./indra-state/src/delegation.rs:262:                    &vrf_pubkey.0,
+./indra-state/src/delegation.rs:264:                    &indra_crypto::VrfOutput(vrf_possession_output.0),
+./indra-state/src/delegation.rs:265:                    &indra_crypto::VrfProof(vrf_possession_proof.as_slice().to_vec()),
+./indra-state/src/delegation.rs:269:                        "VRF secret-key possession proof is invalid".into(),
+./indra-state/src/delegation.rs:392:            vrf_pk,
+./indra-state/src/delegation.rs:400:            *vrf_pk,
+./indra-state/src/delegation.rs:420:        StakingOpBody::RegisterVrfKey {
+./indra-state/src/delegation.rs:422:            vrf_pubkey,
+./indra-state/src/delegation.rs:429:                    StateError::InvalidStakingOp("VRF activation epoch overflow".into())
+./indra-state/src/delegation.rs:433:                    "VRF key must activate in next snapshot epoch {expected}"
+./indra-state/src/delegation.rs:436:            indra_crypto::validate_vrf_public_key(&vrf_pubkey.0)
+./indra-state/src/delegation.rs:441:                .any(|v| v.vrf_pk == Some(vrf_pubkey.0) || v.pending_vrf_pk == Some(vrf_pubkey.0))
+./indra-state/src/delegation.rs:444:                    "VRF public key is already registered".into(),
+./indra-state/src/delegation.rs:458:                validator.pending_vrf_pk,
+./indra-state/src/delegation.rs:459:                validator.pending_vrf_activation_epoch,
+./indra-state/src/delegation.rs:462:                    validator.vrf_pk = Some(pending);
+./indra-state/src/delegation.rs:463:                    validator.vrf_key_activation_epoch = activation;
+./indra-state/src/delegation.rs:466:            validator.pending_vrf_pk = Some(vrf_pubkey.0);
+./indra-state/src/delegation.rs:467:            validator.pending_vrf_activation_epoch = Some(*activation_epoch_id);
+./indra-state/src/delegation.rs:695:    vrf_pk: [u8; 32],
+./indra-state/src/delegation.rs:764:        if existing.vrf_pk == Some(vrf_pk) {
+./indra-state/src/delegation.rs:766:                reason: "vrf_pk already registered".into(),
+./indra-state/src/delegation.rs:811:        vrf_pk: Some(vrf_pk),
+./indra-state/src/delegation.rs:812:        vrf_key_activation_epoch: 0,
+./indra-state/src/delegation.rs:813:        pending_vrf_pk: None,
+./indra-state/src/delegation.rs:814:        pending_vrf_activation_epoch: None,
+./indra-state/src/delegation.rs:900:    let vrf = match (
+./indra-state/src/delegation.rs:901:        validator.pending_vrf_pk,
+./indra-state/src/delegation.rs:902:        validator.pending_vrf_activation_epoch,
+./indra-state/src/delegation.rs:906:            .vrf_pk
+./indra-state/src/delegation.rs:913:    indra_crypto::validate_vrf_public_key(&vrf)
+./indra-state/src/delegation.rs:949:            vrf_pk: vrf,
+./indra-state/src/delegation.rs:1791:        vrf_pk: [u8; 32],
+./indra-state/src/delegation.rs:1799:                vrf_pk,
+./indra-state/src/delegation.rs:1892:            vrf_pk: Some([seed; 32]),
+./indra-state/src/delegation.rs:1893:            vrf_key_activation_epoch: 0,
+./indra-state/src/delegation.rs:1894:            pending_vrf_pk: None,
+./indra-state/src/delegation.rs:1895:            pending_vrf_activation_epoch: None,
+./indra-state/src/delegation.rs:1916:    fn vrf_registration_op(
+./indra-state/src/delegation.rs:1918:        vrf_pubkey: Bytes32,
+./indra-state/src/delegation.rs:1921:        vrf_keypair: &indra_crypto::VrfKeypair,
+./indra-state/src/delegation.rs:1924:        let challenge = StakingOp::vrf_possession_challenge(
+./indra-state/src/delegation.rs:1927:            &vrf_pubkey,
+./indra-state/src/delegation.rs:1931:        let (output, proof) = indra_crypto::vrf_prove(vrf_keypair, &challenge);
+./indra-state/src/delegation.rs:1933:            StakingOpBody::RegisterVrfKey {
+./indra-state/src/delegation.rs:1935:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/delegation.rs:1936:                vrf_pubkey,
+./indra-state/src/delegation.rs:1938:                vrf_possession_output: indra_core::types::primitives::Bytes64(output.0),
+./indra-state/src/delegation.rs:1939:                vrf_possession_proof: VariableBytes::from_slice(&proof.0).unwrap(),
+./indra-state/src/delegation.rs:1948:    fn vrf_rotation_is_snapshot_delayed_and_public_key_squatting_is_rejected() {
+./indra-state/src/delegation.rs:1952:        let old_vrf = indra_crypto::VrfKeypair::from_seed(&[31; 32]).public_key();
+./indra-state/src/delegation.rs:1953:        state.validators.get_mut(&validator_id).unwrap().vrf_pk = Some(old_vrf);
+./indra-state/src/delegation.rs:1957:        let new_vrf_keypair = indra_crypto::VrfKeypair::from_seed(&[99; 32]);
+./indra-state/src/delegation.rs:1958:        let new_vrf = Bytes32::from(new_vrf_keypair.public_key());
+./indra-state/src/delegation.rs:1959:        let op = vrf_registration_op(
+./indra-state/src/delegation.rs:1961:            new_vrf,
+./indra-state/src/delegation.rs:1964:            &new_vrf_keypair,
+./indra-state/src/delegation.rs:1975:        assert_eq!(activated.vrf_pk, new_vrf.0);
+./indra-state/src/delegation.rs:1976:        assert_eq!(activated.vrf_key_activation_epoch, 1);
+./indra-state/src/delegation.rs:1978:        let victim_vrf = indra_crypto::VrfKeypair::from_seed(&[100; 32]);
+./indra-state/src/delegation.rs:1979:        let replacement = Bytes32::from(victim_vrf.public_key());
+./indra-state/src/delegation.rs:1980:        let attacker_vrf = indra_crypto::VrfKeypair::from_seed(&[101; 32]);
+./indra-state/src/delegation.rs:1982:            StakingOp::vrf_possession_challenge(&chain_id, &validator_id, &replacement, 1).unwrap();
+./indra-state/src/delegation.rs:1983:        let (attacker_output, attacker_proof) = indra_crypto::vrf_prove(&attacker_vrf, &challenge);
+./indra-state/src/delegation.rs:1985:            StakingOpBody::RegisterVrfKey {
+./indra-state/src/delegation.rs:1987:                vrf_suite: indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/delegation.rs:1988:                vrf_pubkey: replacement,
+./indra-state/src/delegation.rs:1990:                vrf_possession_output: indra_core::types::primitives::Bytes64(attacker_output.0),
+./indra-state/src/delegation.rs:1991:                vrf_possession_proof: VariableBytes::from_slice(&attacker_proof.0).unwrap(),
+./indra-state/src/delegation.rs:2001:    fn vrf_registration_rejects_slashed_and_exited_validators() {
+./indra-state/src/delegation.rs:2006:            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x6B; 32]);
+./indra-state/src/delegation.rs:2007:            let op = vrf_registration_op(
+./indra-state/src/delegation.rs:2009:                Bytes32::from(vrf.public_key()),
+./indra-state/src/delegation.rs:2012:                &vrf,
+./indra-state/src/delegation.rs:2527:                vrf_pk: [0xB2; 32],
+./indra-state/src/delegation.rs:2739:                vrf_pk: [0x44; 32],
+./indra-state/src/delegation.rs:2772:                vrf_pk: [0x45; 32],
+./indra-state/src/governance_apply.rs:1126:                vrf_pk: Some(
+./indra-state/src/governance_apply.rs:1127:                    indra_crypto::VrfKeypair::from_seed(&[validator_id.0[0]; 32]).public_key(),
+./indra-state/src/governance_apply.rs:1129:                vrf_key_activation_epoch: 0,
+./indra-state/src/governance_apply.rs:1130:                pending_vrf_pk: None,
+./indra-state/src/governance_apply.rs:1131:                pending_vrf_activation_epoch: None,
+./indra-state/src/txn.rs:203:                                &validator.vrf_pk,
+./indra-state/src/txn.rs:213:                                &validator.vrf_pk,
+./indra-state/src/txn.rs:993:        let vrf = indra_crypto::VrfKeypair::from_seed(&[0xE3; 32]);
+./indra-state/src/txn.rs:1003:                    vrf.public_key(),
+./indra-state/src/txn.rs:1004:                    indra_core::types::block::VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-state/src/persistent.rs:421:    pub fn prove(&self, key: [u8; 32]) -> MerkleProof {
+./indra-state/src/persistent.rs:941:    pub fn prove(&self, key: [u8; 32]) -> AuthTreeProof {
+./indra-state/src/persistent.rs:942:        AuthTreeProof::V2Compressed(persistent_prove(&self.root, key))
+./indra-state/src/persistent.rs:1178:fn persistent_prove(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> CompressedProof {
+./indra-state/src/persistent.rs:1233:                let mut proof = persistent_prove(child, key);
+./indra-state/src/persistent.rs:1556:        let proof = tree.prove(k1);
+./indra-state/src/persistent.rs:1565:        let missing = tree.prove(k2);
+./indra-state/src/persistent.rs:1670:            let proof = persistent.prove(key);
+./indra-state/src/persistent.rs:1671:            assert_eq!(proof, oracle.prove(key));
+./indra-state/src/persistent.rs:1707:                let persistent_proof = persistent.prove(query);
+./indra-state/src/persistent.rs:1708:                let oracle_proof = oracle.prove(query);
+./indra-state/src/persistent.rs:1737:        let proof = tree.prove(k1);
+./indra-state/src/persistent.rs:1741:        let missing = tree.prove(k2);
+./indra-state/src/persistent.rs:1847:            let proof = persistent.prove(key);
+./indra-state/src/utxo.rs:368:        self.compressed.prove(id.0)
+./indra-state/src/epoch.rs:701:            vrf_pk: Some(indra_crypto::VrfKeypair::from_seed(&[0xFB; 32]).public_key()),
+./indra-state/src/epoch.rs:702:            vrf_key_activation_epoch: 0,
+./indra-state/src/epoch.rs:703:            pending_vrf_pk: None,
+./indra-state/src/epoch.rs:704:            pending_vrf_activation_epoch: None,
+./indra-state/src/epoch.rs:1428:            vrf_pk: Some(
+./indra-state/src/epoch.rs:1429:                indra_crypto::VrfKeypair::from_seed(&[id_byte.wrapping_add(2); 32]).public_key(),
+./indra-state/src/epoch.rs:1431:            vrf_key_activation_epoch: 0,
+./indra-state/src/epoch.rs:1432:            pending_vrf_pk: None,
+./indra-state/src/epoch.rs:1433:            pending_vrf_activation_epoch: None,
+./indra-state/src/epoch.rs:1460:        validator.vrf_pk =
+./indra-state/src/epoch.rs:1461:            Some(indra_crypto::VrfKeypair::from_seed(&[id_byte.wrapping_add(2); 32]).public_key());
+./indra-state/src/epoch.rs:1555:                last_vrf_pk: [3; 32],
+./indra-keystore/src/lib.rs:25:    mnemonic_to_seed, PaymentAddressV1, VrfKeypair,
+./indra-keystore/src/lib.rs:101:    /// VRF public key (32 bytes).
+./indra-keystore/src/lib.rs:102:    pub vrf_pk: [u8; 32],
+./indra-keystore/src/lib.rs:114:    /// VRF keypair seed (keep secret).
+./indra-keystore/src/lib.rs:115:    pub vrf_seed: [u8; 32],
+./indra-keystore/src/lib.rs:264:    vrf_seed: [u8; 32],
+./indra-keystore/src/lib.rs:271:    let vrf = VrfKeypair::from_seed(&vrf_seed);
+./indra-keystore/src/lib.rs:284:            vrf_pk: vrf.public_key(),
+./indra-keystore/src/lib.rs:287:        vrf_seed,
+./indra-keystore/src/lib.rs:299:        derived.vrf_seed,
+./indra-keystore/src/lib.rs:548:    vrf_pk: String,
+./indra-keystore/src/lib.rs:556:            vrf_pk: hex::encode(keys.public.vrf_pk),
+./indra-keystore/src/lib.rs:573:            vrf_pk: decode_hex_fixed::<32>(&self.vrf_pk, "public.vrf_pk")?,
+./indra-keystore/src/lib.rs:582:    vrf_seed: String,
+./indra-keystore/src/lib.rs:596:                vrf_seed: hex::encode(keys.vrf_seed),
+./indra-keystore/src/lib.rs:607:            vrf_seed: decode_hex_fixed::<32>(&self.private.vrf_seed, "vrf_seed")?,
+./indra-keystore/src/lib.rs:856:        keys.vrf_seed,
+./indra-keystore/src/lib.rs:861:        || derived.public.vrf_pk != keys.public.vrf_pk
+./indra-keystore/src/lib.rs:1183:            assert_ne!(cold_seed, hot.vrf_seed);
+./indra-keystore/src/lib.rs:1253:        let wrong_vrf = hex::encode([9u8; 32]);
+./indra-keystore/src/lib.rs:1254:        json = json.replacen(&hex::encode(keys.public.vrf_pk), &wrong_vrf, 1);
+./indra-bench/benches/full_bench.rs:18:    bench_vrf(200);
+./indra-bench/src/lib.rs:13://! | `bench_vrf`            | VRF prove + verify                                |
+./indra-bench/src/fixtures.rs:5:        block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-bench/src/fixtures.rs:9:            MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+./indra-bench/src/fixtures.rs:18:    VrfKeypair,
+./indra-bench/src/fixtures.rs:52:    let vrf = VrfKeypair::from_seed(&[0x42; 32]);
+./indra-bench/src/fixtures.rs:53:    let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, b"INDRA-BENCH-VRF-FIXTURE-v1");
+./indra-bench/src/fixtures.rs:68:            vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+./indra-bench/src/fixtures.rs:70:            proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+./indra-bench/src/fixtures.rs:71:                &vrf_output.0,
+./indra-bench/src/fixtures.rs:74:            proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+./indra-bench/src/fixtures.rs:75:                &vrf_proof.0,
+./indra-bench/src/fixtures.rs:78:            value_entropy: indra_core::types::block::ProposalEntropyV1 {
+./indra-bench/src/fixtures.rs:81:                vrf_output: VariableBytes::from_slice(&vrf_output.0).unwrap(),
+./indra-bench/src/fixtures.rs:82:                vrf_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
+./indra-bench/src/fixtures.rs:96:pub fn dummy_proposal(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockProposalVNext {
+./indra-bench/src/fixtures.rs:97:    BlockProposalVNext {
+./indra-bench/src/fixtures.rs:113:/// A VRF keypair for benchmarks.
+./indra-bench/src/fixtures.rs:114:pub fn vrf_keypair(seed: u8) -> VrfKeypair {
+./indra-bench/src/fixtures.rs:115:    VrfKeypair::from_seed(&[seed; 32])
+./indra-bench/src/crypto_bench.rs:8:    vrf::{vrf_prove, vrf_verify},
+./indra-bench/src/crypto_bench.rs:12:    fixtures::{hybrid_keypair, vrf_keypair},
+./indra-bench/src/crypto_bench.rs:90:/// Benchmark VRF prove + verify.
+./indra-bench/src/crypto_bench.rs:91:pub fn bench_vrf(iterations: u64) {
+./indra-bench/src/crypto_bench.rs:92:    let kp = vrf_keypair(0x01);
+./indra-bench/src/crypto_bench.rs:93:    let input = sha256(b"INDRA VRF benchmark input");
+./indra-bench/src/crypto_bench.rs:95:    let r = bench("vrf_prove", iterations, || {
+./indra-bench/src/crypto_bench.rs:96:        let _ = vrf_prove(&kp, &input);
+./indra-bench/src/crypto_bench.rs:101:    let (output, proof) = vrf_prove(&kp, &input);
+./indra-bench/src/crypto_bench.rs:104:    let r = bench("vrf_verify", iterations, || {
+./indra-bench/src/crypto_bench.rs:105:        let _ = vrf_verify(&pk, &input, &output, &proof);
+./indra-bench/src/crypto_bench.rs:136:    fn bench_vrf_runs() {
+./indra-bench/src/crypto_bench.rs:137:        bench_vrf(100);
+./indra-cli/tests/cli.rs:45:    let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+./indra-cli/tests/cli.rs:46:    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-cli/tests/cli.rs:49:        &Bytes32::from(vrf.public_key()),
+./indra-cli/tests/cli.rs:53:    let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-cli/tests/cli.rs:54:    entry.vrf_possession_output = hex::encode(output.0);
+./indra-cli/tests/cli.rs:55:    entry.vrf_possession_proof = hex::encode(proof.0);
+./indra-cli/tests/cli.rs:98:    assert_eq!(keys.public.vrf_pk.len(), 32);
+./indra-cli/tests/cli.rs:130:        "vrf_pk",
+./indra-cli/tests/cli.rs:551:        let proof_path = dir.join(format!("vrf-proof-{i}.json"));
+./indra-cli/tests/cli.rs:553:        let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+./indra-cli/tests/cli.rs:554:        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-cli/tests/cli.rs:557:            &Bytes32::from(vrf.public_key()),
+./indra-cli/tests/cli.rs:561:        let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-cli/tests/cli.rs:565:                "vrf_possession_output": hex::encode(output.0),
+./indra-cli/tests/cli.rs:566:                "vrf_possession_proof": hex::encode(proof.0),
+./indra-cli/src/bin/stake.rs:77:        keys.public.vrf_pk,
+./indra-cli/src/bin/genesis.rs:10:struct GenesisVrfProofFile {
+./indra-cli/src/bin/genesis.rs:11:    vrf_possession_output: String,
+./indra-cli/src/bin/genesis.rs:12:    vrf_possession_proof: String,
+./indra-cli/src/bin/genesis.rs:19:        Some("create-vrf-proof") => create_vrf_proof(&args[2..]),
+./indra-cli/src/bin/genesis.rs:34:fn create_vrf_proof(args: &[String]) -> Result<(), String> {
+./indra-cli/src/bin/genesis.rs:43:    let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+./indra-cli/src/bin/genesis.rs:44:    let vrf_pk = indra_core::Bytes32::from(vrf.public_key());
+./indra-cli/src/bin/genesis.rs:45:    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-cli/src/bin/genesis.rs:48:        &vrf_pk,
+./indra-cli/src/bin/genesis.rs:52:    let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-cli/src/bin/genesis.rs:54:        "vrf_possession_output": hex::encode(vrf_output.0),
+./indra-cli/src/bin/genesis.rs:55:        "vrf_possession_proof": hex::encode(vrf_proof.0),
+./indra-cli/src/bin/genesis.rs:59:    println!("Genesis VRF possession proof written to {output}");
+./indra-cli/src/bin/genesis.rs:107:                "--validator must be NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON,VRF_PROOF_JSON"
+./indra-cli/src/bin/genesis.rs:121:            .map_err(|error| format!("cannot read VRF proof file {}: {error}", parts[4]))?;
+./indra-cli/src/bin/genesis.rs:122:        let proof: GenesisVrfProofFile = serde_json::from_str(&proof_json)
+./indra-cli/src/bin/genesis.rs:123:            .map_err(|error| format!("invalid VRF proof file {}: {error}", parts[4]))?;
+./indra-cli/src/bin/genesis.rs:127:        entry.vrf_possession_output = proof.vrf_possession_output;
+./indra-cli/src/bin/genesis.rs:128:        entry.vrf_possession_proof = proof.vrf_possession_proof;
+./indra-cli/src/bin/genesis.rs:334:    println!("    --validator NAME,STAKE_SPARK,HOT_KEYS_JSON,COLD_FILE_JSON,VRF_PROOF_JSON [--validator ...]");
+./indra-cli/src/bin/genesis.rs:336:    println!("  indra-genesis create-vrf-proof --chain-id ID --hot-keys keys.json --output vrf-proof.json [password options]");
+./indra-cli/src/bin/governance.rs:761:                vrf_pk: Some([0x95; 32]),
+./indra-cli/src/bin/governance.rs:762:                vrf_key_activation_epoch: 0,
+./indra-cli/src/bin/governance.rs:763:                pending_vrf_pk: None,
+./indra-cli/src/bin/governance.rs:764:                pending_vrf_activation_epoch: None,
+./indra-cli/src/bin/keygen.rs:177:            println!("VRF PK:         {}", hex::encode(public.vrf_pk));
+./indra-cli/src/lib.rs:10://! - VRF keypair (for proposer election)
+./indra-cli/src/genesis_cmd.rs:30://! vrf_pk              = "<hex>"
+./indra-cli/src/genesis_cmd.rs:51:    /// VRF public key (hex).
+./indra-cli/src/genesis_cmd.rs:52:    pub vrf_pk: String,
+./indra-cli/src/genesis_cmd.rs:53:    /// RFC 9381 output proving possession of the VRF secret key (hex).
+./indra-cli/src/genesis_cmd.rs:54:    pub vrf_possession_output: String,
+./indra-cli/src/genesis_cmd.rs:56:    pub vrf_possession_proof: String,
+./indra-cli/src/genesis_cmd.rs:131:            out.push_str(&format!("vrf_pk              = \"{}\"\n", v.vrf_pk));
+./indra-cli/src/genesis_cmd.rs:133:                "vrf_possession_output = \"{}\"\n",
+./indra-cli/src/genesis_cmd.rs:134:                v.vrf_possession_output
+./indra-cli/src/genesis_cmd.rs:137:                "vrf_possession_proof = \"{}\"\n",
+./indra-cli/src/genesis_cmd.rs:138:                v.vrf_possession_proof
+./indra-cli/src/genesis_cmd.rs:239:        vrf_pk: hex::encode(keys.public.vrf_pk),
+./indra-cli/src/genesis_cmd.rs:240:        vrf_possession_output: String::new(),
+./indra-cli/src/genesis_cmd.rs:241:        vrf_possession_proof: String::new(),
+./indra-cli/src/genesis_cmd.rs:261:        vrf_pk: hex::encode(public.vrf_pk),
+./indra-cli/src/genesis_cmd.rs:262:        vrf_possession_output: String::new(),
+./indra-cli/src/genesis_cmd.rs:263:        vrf_possession_proof: String::new(),
+./indra-cli/src/genesis_cmd.rs:285:    let vrf_pk: [u8; 32] = hex::decode(&entry.vrf_pk)
+./indra-cli/src/genesis_cmd.rs:286:        .map_err(|_| CliError::Genesis("VRF key is invalid hex".into()))?
+./indra-cli/src/genesis_cmd.rs:288:        .map_err(|_| CliError::Genesis("VRF key has wrong length".into()))?;
+./indra-cli/src/genesis_cmd.rs:294:        vrf_pk,
+./indra-cli/src/genesis_cmd.rs:387:                let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
+./indra-cli/src/genesis_cmd.rs:388:                let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+./indra-cli/src/genesis_cmd.rs:391:                    &indra_core::Bytes32::from(vrf.public_key()),
+./indra-cli/src/genesis_cmd.rs:395:                let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+./indra-cli/src/genesis_cmd.rs:396:                entry.vrf_possession_output = hex::encode(output.0);
+./indra-cli/src/genesis_cmd.rs:397:                entry.vrf_possession_proof = hex::encode(proof.0);
+./indra-cli/src/keygen.rs:76:        assert!(!json.contains("\"vrf_seed\""));
+./indra-cli/src/tx_builder.rs:341:    vrf_pk: [u8; 32],
+./indra-cli/src/tx_builder.rs:357:            vrf_pk,
+./indra-cli/src/tx_builder.rs:880:                vrf_pk,
+./indra-cli/src/tx_builder.rs:882:            } if id == deposit_utxo_id && vrf_pk == [0xAA; 32]
+
+=== SORTITION REFERENCES ===
+./indra-storage/src/state_store.rs:856:                election_seed: state.election_seed,
+./indra-storage/src/state_store.rs:865:                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-storage/src/segmented_block_store.rs:527:            block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-storage/src/segmented_block_store.rs:557:                    election_seed: Bytes64([0x78; 64]),
+./indra-storage/src/segmented_block_store.rs:571:                    sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-ffi/src/governance.rs:172:        "SetSlashLivenessThresholdEpochs" => {
+./indra-ffi/src/governance.rs:173:            Ok(GovernableAction::SetSlashLivenessThresholdEpochs {
+./indra-network/src/message.rs:700:        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-network/src/message.rs:728:                election_seed: Bytes64([0x46; 64]),
+./indra-network/src/message.rs:743:                sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-network/src/peer_manager.rs:646:    async fn relay_if_eligible(&mut self, sender: Bytes32, msg: &Message) {
+./indra-network/src/peer_manager.rs:940:                self.relay_if_eligible(validator_id, &msg).await;
+./indra-network/src/peer_manager.rs:1388:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-network/src/peer_manager.rs:1688:                .relay_if_eligible(Bytes32::from([0xB4; 32]), &forged)
+./indra-network/src/peer_manager.rs:1701:                .relay_if_eligible(Bytes32::from([0xB4; 32]), &valid)
+./indra-network/src/peer_manager.rs:1740:                election_seed: Bytes64([0x55; 64]),
+./indra-network/src/peer_manager.rs:1755:                sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-network/src/peer_manager.rs:2075:        actor.relay_if_eligible(sender, &msg).await;
+./indra-network/src/peer_manager.rs:2077:        actor.relay_if_eligible(sender, &msg).await;
+./indra-network/src/peer_manager.rs:2084:        actor.relay_if_eligible(invalid_sender, &invalid_msg).await;
+./indra-network/src/peer_manager.rs:2099:            .relay_if_eligible(no_target_sender, &no_target_msg)
+./indra-network/src/peer_manager.rs:2185:        actor.relay_if_eligible(echoing_peer, &msg).await;
+./indra-network/src/peer_manager.rs:2255:        actor.relay_if_eligible(peer, &msg).await;
+./indra-network/src/peer_manager.rs:2315:        actor.relay_if_eligible(sender, &msg).await;
+./indra-network/src/peer_manager.rs:2340:            .relay_if_eligible(sender, &Message::Vote(signed_vote(sender, &keypair)))
+./indra-network/src/peer_manager.rs:2370:        actor.relay_if_eligible(sender, &msg).await;
+./indra-network/src/peer_manager.rs:2371:        actor.relay_if_eligible(sender, &msg).await;
+./indra-network/src/peer_manager.rs:2388:        actor.relay_if_eligible(sender, &Message::Vote(vote)).await;
+./indra-network/src/peer_manager.rs:2405:            .relay_if_eligible(sender, &Message::Vote(signed_vote(sender, &keypair)))
+./indra-network/src/peer_manager.rs:2460:        actor.relay_if_eligible(validator_id, &block_a).await;
+./indra-network/src/peer_manager.rs:2461:        actor.relay_if_eligible(validator_id, &block_b).await;
+./indra-network/src/peer_manager.rs:2507:        actor.relay_if_eligible(validator_id, &block_round_2).await;
+./indra-network/src/peer_manager.rs:2508:        actor.relay_if_eligible(validator_id, &block_round_3).await;
+./indra-network/src/peer_manager.rs:2539:        actor.relay_if_eligible(validator_id, &block).await;
+./indra-network/src/net_types.rs:10:/// eligibility checks.
+./indra-rpc/src/handlers.rs:957:            r#""proposer_id":"{}","vrf_suite":{},"election_seed":"{}","proposer_vrf_output":"{}","proposer_vrf_proof_len":{},"proposer_priority":"{}","quorum_certificate_len":{},"#,
+./indra-rpc/src/handlers.rs:974:        hex::encode(header.election_seed.0),
+./indra-rpc/src/handlers.rs:2398:        "{{\"slash_liveness_threshold_epochs\":{},\"min_delegation_spark\":{},\"proposal_deposit_spark\":{},\"slash_liveness_bps\":{},\"slash_double_precommit_bps\":{},\"max_commission_bps\":{},\"governance_delay_epochs\":{},\"governance_quorum_bps\":{},\"governance_critical_quorum_bps\":{}}}",
+./indra-rpc/src/handlers.rs:2399:        params.slash_liveness_threshold_epochs,
+./indra-rpc/src/handlers.rs:2560:        indra_core::types::governance::GovernableAction::SetSlashLivenessThresholdEpochs {
+./indra-rpc/src/handlers.rs:2562:        } => "SetSlashLivenessThresholdEpochs",
+./indra-rpc/src/handlers.rs:2950:                election_seed: indra_core::types::primitives::Bytes64([byte; 64]),
+./indra-rpc/src/handlers.rs:2960:                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-node/tests/node.rs:88:            election_seed: state.election_seed,
+./indra-node/tests/node.rs:110:                        .is_ok_and(|result| result.eligible)
+./indra-node/tests/node.rs:113:        .expect("test proposer must become eligible in bounded rounds");
+./indra-node/src/consensus_authority.rs:12:    election_seed: Bytes64,
+./indra-node/src/consensus_authority.rs:27:            election_seed,
+./indra-node/src/bin/node.rs:21:    DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
+./indra-node/src/bin/node.rs:1501:                            // Apply eligibility before diversity selection so the signed-DNS
+./indra-node/src/bin/node.rs:1504:                            let eligibility_now = Instant::now();
+./indra-node/src/bin/node.rs:1531:                                    .blocked_at(&cooldown_key, eligibility_now)
+./indra-node/src/bin/node.rs:3252:                                            "[consensus] proposal eligibility unavailable at height={} round={}: {}",
+./indra-node/src/bin/node.rs:3271:                            // Observing another eligible proposal does not cancel our own
+./indra-node/src/bin/node.rs:3272:                            // eligibility. Multiple proposals are collected until the
+./indra-node/src/bin/node.rs:3962:    if available < DISK_CRITICAL_THRESHOLD_BYTES {
+./indra-node/src/bin/node.rs:3967:    } else if available < DISK_WARN_THRESHOLD_BYTES {
+./indra-node/src/bin/node.rs:5720:        assert_eq!(left.election_seed, right.election_seed);
+./indra-node/src/bin/node.rs:7143:                election_seed: indra_core::types::primitives::Bytes64([0x15; 64]),
+./indra-node/src/bin/node.rs:7155:                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-node/src/bin/node.rs:7522:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-node/src/bin/node.rs:7542:                election_seed: indra_core::types::primitives::Bytes64([0x05; 64]),
+./indra-node/src/bin/node.rs:7551:                sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-node/src/bin/node.rs:7571:            BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1,
+./indra-node/src/bin/node.rs:7591:                election_seed: indra_core::types::primitives::Bytes64::ZERO,
+./indra-node/src/bin/node.rs:7600:                sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-node/src/sync.rs:87:    /// The provisional proposal envelope itself is unauthorized or ineligible.
+./indra-node/src/sync.rs:268:        // A cooled source is not currently eligible for graceful-degradation
+./indra-node/src/sync.rs:801:/// Verify proposer authorization and eligibility against the governing snapshot.
+./indra-node/src/sync.rs:812:        &state.election_seed,
+./indra-node/src/sync.rs:817:        reason: format!("proposal authorization or eligibility failed: {error}"),
+./indra-node/src/sync.rs:1307:            election_seed: state.election_seed,
+./indra-node/src/sync.rs:1347:                    .eligible
+./indra-node/src/sync.rs:1350:            .expect("requested test proposer must become eligible within the bounded round search");
+./indra-node/src/sync.rs:1469:        // hybrid key; eligibility and authorization are independent proofs.
+./indra-node/src/sync.rs:1542:            &state.election_seed,
+./indra-node/src/sync.rs:1559:            &state.election_seed,
+./indra-node/src/sync.rs:1576:            &state.election_seed,
+./indra-node/src/sync.rs:2089:    fn single_peer_graceful_degradation_never_relaxes_stake_threshold() {
+./indra-node/src/genesis.rs:13:    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-node/src/genesis.rs:131:/// Deterministically derive the signed genesis election seed.
+./indra-node/src/genesis.rs:132:pub fn derive_genesis_election_seed(settings: &GenesisSettings) -> Result<Bytes64, String> {
+./indra-node/src/genesis.rs:133:    indra_core::sortition::validate_f(settings.active_slot_coefficient_numerator)
+./indra-node/src/genesis.rs:144:    let mut seed_material = b"INDRA-GENESIS-ELECTION-SEED-v1".to_vec();
+./indra-node/src/genesis.rs:239:    derive_genesis_election_seed(&manifest.genesis)?;
+./indra-node/src/genesis.rs:409:    preimage.extend_from_slice(&state.election_seed.0);
+./indra-node/src/genesis.rs:433:            election_seed: state.election_seed,
+./indra-node/src/genesis.rs:437:            sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-node/src/genesis.rs:476:    state.election_seed = Bytes64([0xA5; 64]);
+./indra-node/src/genesis.rs:584:    state.election_seed = derive_genesis_election_seed(&manifest.genesis)?;
+./indra-node/src/genesis.rs:586:    state.election_seed_height = 1;
+./indra-node/src/genesis.rs:859:        let seed = derive_genesis_election_seed(&manifest.genesis).unwrap();
+./indra-node/src/genesis.rs:862:            derive_genesis_election_seed(&manifest.genesis).unwrap()
+./indra-node/src/genesis.rs:867:        assert_ne!(seed, derive_genesis_election_seed(&other_chain).unwrap());
+./indra-node/src/genesis.rs:871:        assert_ne!(seed, derive_genesis_election_seed(&other_source).unwrap());
+./indra-node/src/genesis.rs:875:        assert_ne!(seed, derive_genesis_election_seed(&other_header).unwrap());
+./indra-node/src/genesis.rs:885:        assert_eq!(state.election_seed, seed);
+./indra-node/src/genesis.rs:886:        assert_eq!(state.election_seed_height, 1);
+./indra-node/src/genesis.rs:973:        changed.election_seed.0[0] ^= 1;
+./indra-node/src/driver.rs:635:    /// Proposal eligibility is enforced inside block construction, where the
+./indra-node/src/driver.rs:750:            self.engine.state.election_seed,
+./indra-node/src/driver.rs:825:            &self.engine.state.election_seed,
+./indra-node/src/driver.rs:1127:            // Multiple validators may legitimately be eligible in one slot.
+./indra-node/src/driver.rs:1401:            &self.engine.state.election_seed,
+./indra-node/src/driver.rs:1486:        // deterministic collection boundary: a better eligible priority may
+./indra-node/src/driver.rs:2320:                election_seed: state.election_seed,
+./indra-node/src/driver.rs:2329:                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-node/src/driver.rs:2575:            driver.engine.state.election_seed =
+./indra-node/src/driver.rs:2576:                crate::genesis::derive_genesis_election_seed(&settings).unwrap();
+./indra-node/src/driver.rs:2589:            .eligible
+./indra-node/src/driver.rs:2597:                // deterministic eligible fixture seed; rebuild from an empty
+./indra-node/src/driver.rs:2609:        panic!("test genesis could not find an eligible deterministic election seed")
+./indra-node/src/driver.rs:2634:                .eligible
+./indra-node/src/driver.rs:2637:            .expect("test proposer must become eligible within the bounded round search");
+./indra-node/src/driver.rs:2683:            &driver.engine.state.election_seed,
+./indra-node/src/driver.rs:2825:        let mut forged_eligibility = valid.clone();
+./indra-node/src/driver.rs:2826:        let mut output_bytes = forged_eligibility
+./indra-node/src/driver.rs:2833:        forged_eligibility.block.header.proposer_vrf_output =
+./indra-node/src/driver.rs:2835:        assert!(verify_live_proposal(&driver, &forged_eligibility).is_err());
+./indra-node/src/driver.rs:2867:            &driver.engine.state.election_seed,
+./indra-node/src/driver.rs:3112:                    let sortition = signers
+./indra-node/src/driver.rs:3122:                            (result.vrf_output.0, result.eligible, result.priority)
+./indra-node/src/driver.rs:3125:                    (snapshot.snapshot_root, sortition, qc.encode_to_vec())
+./indra-node/src/driver.rs:3388:    fn empty_round_timeouts_do_not_advance_election_seed() {
+./indra-node/src/driver.rs:3392:        let seed = driver.engine.state.election_seed;
+./indra-node/src/driver.rs:3397:        assert_eq!(driver.engine.state.election_seed, seed);
+./indra-node/src/driver.rs:3415:                    .is_ok_and(|r| r.eligible)
+./indra-node/src/driver.rs:3417:                        .is_ok_and(|r| r.eligible)
+./indra-node/src/driver.rs:3419:            .expect("two deterministic candidates must share an eligible test round");
+./indra-node/src/driver.rs:4507:                .is_ok_and(|result| result.eligible)
+./indra-node/src/driver.rs:4509:            .expect("local validator must become eligible within the bounded round search");
+./indra-node/src/driver.rs:4843:        let seed_at_height_one = driver.engine.state.election_seed;
+./indra-node/src/driver.rs:4847:        assert_ne!(driver.engine.state.election_seed, seed_at_height_one);
+./indra-node/src/driver.rs:4848:        let seed_at_height_two = driver.engine.state.election_seed;
+./indra-node/src/driver.rs:4853:        assert_eq!(driver.engine.state.election_seed, seed_at_height_two);
+./indra-node/src/driver.rs:5246:                .is_ok_and(|result| result.eligible)
+./indra-node/src/driver.rs:5248:            .expect("local proposer must become eligible for a later test round");
+./indra-node/src/driver.rs:5310:            .eligible
+./indra-node/src/driver.rs:5321:                .is_ok_and(|result| result.eligible)
+./indra-node/src/driver.rs:5323:            .expect("local proposer must become eligible for a later test round");
+./indra-node/src/driver.rs:5387:            &clone_reference.election_seed,
+./indra-node/src/driver.rs:5453:                    .is_ok_and(|result| result.eligible)
+./indra-node/src/driver.rs:5455:            .expect("A must become eligible in the bounded test search");
+./indra-node/src/driver.rs:5465:            .expect("A should propose its eligible round");
+./indra-node/src/driver.rs:5520:                    .is_ok_and(|result| result.eligible)
+./indra-node/src/driver.rs:5522:            .expect("B must become eligible in a later bounded test round");
+./indra-node/src/engine.rs:32:        Bytes32, VariableBytes, DISK_CRITICAL_THRESHOLD_BYTES, MAX_CLASSICAL_SIG_BYTES,
+./indra-node/src/engine.rs:46:        Ok(bytes) if bytes >= DISK_CRITICAL_THRESHOLD_BYTES => Ok(()),
+./indra-node/src/engine.rs:50:                bytes, DISK_CRITICAL_THRESHOLD_BYTES
+./indra-node/src/engine.rs:1186:    /// Check whether this node is independently eligible for the slot.
+./indra-node/src/engine.rs:1193:        compute_proposer_vrf(validator_id, vrf_keypair, election).is_ok_and(|slot| slot.eligible)
+./indra-node/src/engine.rs:1313:        if !slot.eligible || new_round != election.round {
+./indra-node/src/engine.rs:1331:        block.header.election_seed = election.election_seed;
+./indra-node/src/engine.rs:1346:        block.header.sortition_claim = indra_core::types::block::SortitionClaimV1::PraosThreshold;
+./indra-node/src/engine.rs:1948:        // eligibility are deliberately independent, but both must refer to
+./indra-node/src/engine.rs:2388:                    election_seed: state.election_seed,
+./indra-node/src/engine.rs:2401:                    .eligible
+./indra-node/src/engine.rs:2404:            .expect("test proposer must become eligible within bounded round search");
+./indra-node/src/engine.rs:2441:            election_seed: state.election_seed,
+./indra-node/src/engine.rs:2458:    fn first_eligible_test_election(
+./indra-node/src/engine.rs:2472:                    .eligible
+./indra-node/src/engine.rs:2475:            .expect("test proposer must become eligible within bounded round search")
+./indra-node/src/engine.rs:2489:            &state.election_seed,
+./indra-node/src/engine.rs:4351:            first_eligible_test_election(&engine.state, 1, &VrfKeypair::from_seed(&[0x42; 32]));
+./indra-node/src/engine.rs:4355:            "single local validator should be eligible to produce height 1"
+./indra-node/src/engine.rs:4385:            "a node must not claim proposer eligibility when its local VRF key does not match the registered validator VRF key"
+./indra-node/src/engine.rs:4967:    fn disk_pressure_is_fail_closed_at_threshold_and_on_query_failure() {
+./indra-node/src/engine.rs:4968:        assert!(evaluate_disk_writable(Ok(DISK_CRITICAL_THRESHOLD_BYTES)).is_ok());
+./indra-node/src/engine.rs:4970:            evaluate_disk_writable(Ok(DISK_CRITICAL_THRESHOLD_BYTES - 1)),
+./indra-core/tests/serialisation.rs:75:        election_seed: indra_core::types::primitives::Bytes64([0x45; 64]),
+./indra-core/tests/serialisation.rs:84:        sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-core/src/types/proposal.rs:5:    sortition::{evaluate, priority, CertifiedLogInterval},
+./indra-core/src/types/proposal.rs:19:/// Evidence that authorization, eligibility, and priority were independently verified.
+./indra-core/src/types/proposal.rs:49:    let mut out = b"INDRA-PROPOSER-SORTITION-v2".to_vec();
+./indra-core/src/types/proposal.rs:61:pub fn next_election_seed(
+./indra-core/src/types/proposal.rs:73:    let mut material = b"INDRA-ELECTION-SEED-v2".to_vec();
+./indra-core/src/types/proposal.rs:97:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:101:    if h.election_seed != *expected_seed {
+./indra-core/src/types/proposal.rs:102:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:103:            "proposal election seed differs from committed state".into(),
+./indra-core/src/types/proposal.rs:112:            IndraError::InvalidSortition("proposer is absent from governing snapshot".into())
+./indra-core/src/types/proposal.rs:148:        lo: BigUint::from_bytes_be(&snapshot.sortition_log_lo),
+./indra-core/src/types/proposal.rs:149:        hi: BigUint::from_bytes_be(&snapshot.sortition_log_hi),
+./indra-core/src/types/proposal.rs:157:    if !result.eligible {
+./indra-core/src/types/proposal.rs:158:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:159:            "proposer is not eligible".into(),
+./indra-core/src/types/proposal.rs:163:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:171:            IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:202:    if !entropy_result.eligible {
+./indra-core/src/types/proposal.rs:203:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/proposal.rs:204:            "value-entropy origin was not eligible".into(),
+./indra-core/src/types/proposal.rs:213:        return Err(IndraError::InvalidSortition(
+./indra-core/src/types/primitives.rs:74:/// Liveness slash: 0.1% per missed epoch after threshold.
+./indra-core/src/types/primitives.rs:78:pub const SLASH_LIVENESS_THRESHOLD_EPOCHS: u64 = 3;
+./indra-core/src/types/primitives.rs:239:/// Phase 1 total-stake threshold for validator set expansion.
+./indra-core/src/types/primitives.rs:242:/// Phase 2 total-stake threshold for validator set expansion.
+./indra-core/src/types/primitives.rs:245:/// Phase 3 total-stake threshold for validator set expansion.
+./indra-core/src/types/primitives.rs:323:/// Disk space warning threshold in bytes (5 GB).
+./indra-core/src/types/primitives.rs:324:pub const DISK_WARN_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+./indra-core/src/types/primitives.rs:326:/// Disk space critical threshold in bytes (500 MB).
+./indra-core/src/types/primitives.rs:327:pub const DISK_CRITICAL_THRESHOLD_BYTES: u64 = 500 * 1024 * 1024;
+./indra-core/src/types/primitives.rs:353:/// exactly. A rounded basis-point threshold is not equivalent at integer
+./indra-core/src/types/qc.rs:132:/// threshold against the immutable authority snapshot governing `qc.height`.
+./indra-core/src/types/governance.rs:140:    /// Set liveness miss threshold.
+./indra-core/src/types/governance.rs:141:    SetSlashLivenessThresholdEpochs {
+./indra-core/src/types/governance.rs:142:        /// New threshold value.
+./indra-core/src/types/governance.rs:175:    /// Set standard governance YES-stake threshold.
+./indra-core/src/types/governance.rs:177:    /// This threshold is applied to total proposal snapshot stake, not
+./indra-core/src/types/governance.rs:178:    /// participating stake. See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-core/src/types/governance.rs:180:        /// New standard YES-stake threshold in basis points.
+./indra-core/src/types/governance.rs:183:    /// Set critical governance YES-stake threshold.
+./indra-core/src/types/governance.rs:185:    /// This threshold is applied to total proposal snapshot stake, not
+./indra-core/src/types/governance.rs:186:    /// participating stake. See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-core/src/types/governance.rs:188:        /// New critical YES-stake threshold in basis points.
+./indra-core/src/types/governance.rs:197:            Self::SetSlashLivenessThresholdEpochs { .. }
+./indra-core/src/types/governance.rs:208:            Self::SetSlashLivenessThresholdEpochs { value } => {
+./indra-core/src/types/governance.rs:249:            Self::SetSlashLivenessThresholdEpochs { .. }
+./indra-core/src/types/governance.rs:261:            0 => Ok(Self::SetSlashLivenessThresholdEpochs {
+./indra-core/src/types/block.rs:53:            v => Err(crate::error::IndraError::InvalidSortition(format!(
+./indra-core/src/types/block.rs:59:/// Sole accepted sortition construction.
+./indra-core/src/types/block.rs:61:pub enum SortitionClaimV1 {
+./indra-core/src/types/block.rs:62:    /// Certified Praos threshold.
+./indra-core/src/types/block.rs:63:    PraosThreshold = 1,
+./indra-core/src/types/block.rs:65:impl Encode for SortitionClaimV1 {
+./indra-core/src/types/block.rs:73:impl Decode for SortitionClaimV1 {
+./indra-core/src/types/block.rs:76:            1 => Ok(Self::PraosThreshold),
+./indra-core/src/types/block.rs:77:            v => Err(crate::error::IndraError::InvalidSortition(format!(
+./indra-core/src/types/block.rs:78:                "unsupported sortition claim {v}"
+./indra-core/src/types/block.rs:177:    /// Locally-derived election seed.
+./indra-core/src/types/block.rs:178:    pub election_seed: Bytes64,
+./indra-core/src/types/block.rs:185:    /// Sortition claim.
+./indra-core/src/types/block.rs:186:    pub sortition_claim: SortitionClaimV1,
+./indra-core/src/types/block.rs:237:        self.election_seed.encode(buf);
+./indra-core/src/types/block.rs:241:        self.sortition_claim.encode(buf);
+./indra-core/src/types/block.rs:290:            election_seed: Bytes64::decode(r)?,
+./indra-core/src/types/block.rs:294:            sortition_claim: SortitionClaimV1::decode(r)?,
+./indra-core/src/types/block.rs:457:            election_seed: Bytes64([0x42; 64]),
+./indra-core/src/types/block.rs:466:            sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-core/src/types/consensus_snapshot.rs:6:    sortition::{certified_log, validate_f},
+./indra-core/src/types/consensus_snapshot.rs:129:    /// Certified Q768 lower endpoint for `-ln(1-f)`, big-endian padded.
+./indra-core/src/types/consensus_snapshot.rs:130:    pub sortition_log_lo: [u8; 128],
+./indra-core/src/types/consensus_snapshot.rs:131:    /// Certified Q768 upper endpoint for `-ln(1-f)`, big-endian padded.
+./indra-core/src/types/consensus_snapshot.rs:132:    pub sortition_log_hi: [u8; 128],
+./indra-core/src/types/consensus_snapshot.rs:147:        let sortition_log_lo = encode_q768(&log.lo)?;
+./indra-core/src/types/consensus_snapshot.rs:148:        let sortition_log_hi = encode_q768(&log.hi)?;
+./indra-core/src/types/consensus_snapshot.rs:157:            sortition_log_lo,
+./indra-core/src/types/consensus_snapshot.rs:158:            sortition_log_hi,
+./indra-core/src/types/consensus_snapshot.rs:167:            sortition_log_lo,
+./indra-core/src/types/consensus_snapshot.rs:168:            sortition_log_hi,
+./indra-core/src/types/consensus_snapshot.rs:201:        if self.sortition_log_lo != encode_q768(&log.lo)?
+./indra-core/src/types/consensus_snapshot.rs:202:            || self.sortition_log_hi != encode_q768(&log.hi)?
+./indra-core/src/types/consensus_snapshot.rs:204:            return invalid("stored sortition logarithm certificate does not match F");
+./indra-core/src/types/consensus_snapshot.rs:230:            self.sortition_log_lo,
+./indra-core/src/types/consensus_snapshot.rs:231:            self.sortition_log_hi,
+./indra-core/src/types/consensus_snapshot.rs:248:        buf.extend_from_slice(&self.sortition_log_lo);
+./indra-core/src/types/consensus_snapshot.rs:249:        buf.extend_from_slice(&self.sortition_log_hi);
+./indra-core/src/types/consensus_snapshot.rs:267:            sortition_log_lo: read_array::<128>(reader)?,
+./indra-core/src/types/consensus_snapshot.rs:268:            sortition_log_hi: read_array::<128>(reader)?,
+./indra-core/src/types/consensus_snapshot.rs:276:fn encode_q768(value: &num_bigint::BigUint) -> IndraResult<[u8; 128]> {
+./indra-core/src/types/consensus_snapshot.rs:279:        return invalid("Q768 endpoint exceeds 1024 bits");
+./indra-core/src/types/consensus_snapshot.rs:303:    sortition_log_lo: [u8; 128],
+./indra-core/src/types/consensus_snapshot.rs:304:    sortition_log_hi: [u8; 128],
+./indra-core/src/types/consensus_snapshot.rs:316:    material.extend_from_slice(&sortition_log_lo);
+./indra-core/src/types/consensus_snapshot.rs:317:    material.extend_from_slice(&sortition_log_hi);
+./indra-core/src/types/consensus_snapshot.rs:382:            encode_q768(&certified_log(1).unwrap().lo).unwrap(),
+./indra-core/src/types/consensus_snapshot.rs:383:            encode_q768(&certified_log(1).unwrap().hi).unwrap(),
+./indra-core/src/types/consensus_snapshot.rs:392:            sortition_log_lo: encode_q768(&certified_log(1).unwrap().lo).unwrap(),
+./indra-core/src/types/consensus_snapshot.rs:393:            sortition_log_hi: encode_q768(&certified_log(1).unwrap().hi).unwrap(),
+./indra-core/src/types/consensus_snapshot.rs:531:        oracle.extend_from_slice(&snapshot.sortition_log_lo);
+./indra-core/src/types/consensus_snapshot.rs:532:        oracle.extend_from_slice(&snapshot.sortition_log_hi);
+./indra-core/src/types/consensus_snapshot.rs:548:            baseline.sortition_log_lo,
+./indra-core/src/types/consensus_snapshot.rs:549:            baseline.sortition_log_hi,
+./indra-core/src/error.rs:161:    /// Praos sortition parameter or certified-arithmetic failure.
+./indra-core/src/error.rs:162:    #[error("invalid proposer sortition: {0}")]
+./indra-core/src/error.rs:163:    InvalidSortition(String),
+./indra-core/src/error.rs:165:    /// QC below the required quorum threshold.
+./indra-core/src/error.rs:166:    #[error("QC below 2/3 threshold: {weight_bps} bps")]
+./indra-core/src/lib.rs:23:pub mod sortition;
+./indra-core/src/lib.rs:29:    block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-core/src/sortition.rs:1://! Praos/Minotaur sortition with deterministic outward-rounded Q768 arithmetic.
+./indra-core/src/sortition.rs:24:        Err(IndraError::InvalidSortition(format!(
+./indra-core/src/sortition.rs:67:pub struct SortitionResult {
+./indra-core/src/sortition.rs:68:    /// Eligibility.
+./indra-core/src/sortition.rs:69:    pub eligible: bool,
+./indra-core/src/sortition.rs:70:    /// Downward-rounded 512-bit threshold.
+./indra-core/src/sortition.rs:71:    pub threshold: BigUint,
+./indra-core/src/sortition.rs:78:        Err(IndraError::InvalidSortition(
+./indra-core/src/sortition.rs:149:/// Evaluate the full 512-bit output against the conservative threshold.
+./indra-core/src/sortition.rs:155:) -> IndraResult<SortitionResult> {
+./indra-core/src/sortition.rs:157:        return Err(IndraError::InvalidSortition(
+./indra-core/src/sortition.rs:169:        return Err(IndraError::InvalidSortition("inverted interval".into()));
+./indra-core/src/sortition.rs:173:        return Err(IndraError::InvalidSortition(
+./indra-core/src/sortition.rs:174:            "runtime Q768 width exceeds 2^24".into(),
+./indra-core/src/sortition.rs:177:    let threshold = &pl >> (Q_BITS - 512);
+./indra-core/src/sortition.rs:178:    Ok(SortitionResult {
+./indra-core/src/sortition.rs:179:        eligible: BigUint::from_bytes_be(out) < threshold,
+./indra-core/src/sortition.rs:180:        threshold,
+./indra-core/src/sortition.rs:200:    fn mpfr_threshold(f: u64, weight: u64, total: u64) -> BigUint {
+./indra-core/src/sortition.rs:219:        assert!(r.eligible);
+./indra-core/src/sortition.rs:231:                    assert!(result.threshold.bits() <= 512);
+./indra-core/src/sortition.rs:238:    fn q768_threshold_matches_high_precision_oracle_on_reduced_exhaustive_grid() {
+./indra-core/src/sortition.rs:245:                    let oracle = mpfr_threshold(f, weight, total);
+./indra-core/src/sortition.rs:247:                        result.threshold <= oracle,
+./indra-core/src/sortition.rs:248:                        "canonical downward threshold exceeded oracle for F={f}, w={weight}, W={total}"
+./indra-core/src/sortition.rs:251:                        &oracle - &result.threshold <= BigUint::one(),
+./indra-core/src/sortition.rs:252:                        "Q768 result diverged by more than one 512-bit threshold unit for F={f}, w={weight}, W={total}"
+./indra-core/src/sortition.rs:264:        assert!(!result.threshold.is_zero());
+./indra-core/src/sortition.rs:265:        let below = &result.threshold - BigUint::one();
+./indra-core/src/sortition.rs:266:        let at = result.threshold.clone();
+./indra-core/src/sortition.rs:273:        assert!(evaluate(&log, 1, 1, &below_out).unwrap().eligible);
+./indra-core/src/sortition.rs:274:        assert!(!evaluate(&log, 1, 1, &at_out).unwrap().eligible);
+./indra-core/src/sortition.rs:278:    fn threshold_is_monotone_in_stake_and_f() {
+./indra-core/src/sortition.rs:283:            let threshold = evaluate(&high, stake, 200, &[0; 64]).unwrap().threshold;
+./indra-core/src/sortition.rs:284:            assert!(threshold >= prior);
+./indra-core/src/sortition.rs:285:            prior = threshold;
+./indra-core/src/sortition.rs:287:                evaluate(&low, stake, 200, &[0; 64]).unwrap().threshold <= prior,
+./indra-core/src/sortition.rs:288:                "increasing F must not reduce eligibility"
+./indra-core/src/sortition.rs:306:    fn consensus_sortition_source_contains_no_floating_point_types() {
+./indra-core/src/sortition.rs:307:        let production = include_str!("sortition.rs")
+./indra-consensus/tests/consensus.rs:125:    state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
+./indra-consensus/tests/consensus.rs:212:            election_seed: state.election_seed,
+./indra-consensus/tests/consensus.rs:225:                .is_ok_and(|result| result.eligible)
+./indra-consensus/tests/consensus.rs:227:        .expect("single validator must become eligible in bounded test rounds");
+./indra-consensus/tests/consensus.rs:320:fn age_eligible_txs_included_first() {
+./indra-consensus/tests/consensus.rs:325:    // Old tx (age-eligible) with low fee
+./indra-consensus/tests/consensus.rs:356:    // At height 51+ the first tx is age-eligible
+./indra-consensus/tests/consensus.rs:359:    // Age-eligible tx (fee=1_000) must come first
+./indra-consensus/src/producer.rs:6://!   1. Selects transactions from the mempool (age-eligible first, then by fee)
+./indra-consensus/src/producer.rs:21:        block::{BlockHeaderVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1, NO_POLC_ROUND},
+./indra-consensus/src/producer.rs:89:    if !slot.eligible {
+./indra-consensus/src/producer.rs:91:            "local validator is not eligible for this round",
+./indra-consensus/src/producer.rs:127:        election_seed: election.election_seed,
+./indra-consensus/src/producer.rs:149:        sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-consensus/src/producer.rs:206:        state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
+./indra-consensus/src/producer.rs:262:            election_seed: indra_core::types::primitives::Bytes64([seed[0]; 64]),
+./indra-consensus/src/producer.rs:275:    fn eligible_election(
+./indra-consensus/src/producer.rs:282:            let election = make_election(seed, height, round, vrf_seed, stake);
+./indra-consensus/src/producer.rs:290:            .eligible
+./indra-consensus/src/producer.rs:295:        panic!("test proposer did not become eligible within the protocol round bound")
+./indra-consensus/src/producer.rs:378:        let election = eligible_election(&seed, 1, seed, 1_000_000);
+./indra-consensus/src/producer.rs:411:        // Election uses seed 0x42, but template uses wrong_seed
+./indra-consensus/src/producer.rs:412:        let election = eligible_election(&seed, 1, seed, 1_000_000);
+./indra-consensus/src/producer.rs:443:        let election = eligible_election(&seed, 1, seed, 1_000_000);
+./indra-consensus/src/producer.rs:471:        let election = eligible_election(&seed, 1, seed, 1_000_000);
+./indra-consensus/src/producer.rs:512:            let election = eligible_election(&seed, height, seed, 1_000_000);
+./indra-consensus/src/error.rs:88:    /// Signer stake does not meet the QC threshold.
+./indra-consensus/src/lib.rs:25://! - **Quorum Certificate**: collects votes until 2/3 stake threshold is
+./indra-consensus/src/mempool.rs:14://! consecutive blocks without being included is "age-eligible". The block
+./indra-consensus/src/mempool.rs:15://! producer MUST include all age-eligible transactions (up to block limits).
+./indra-consensus/src/mempool.rs:36:/// Number of blocks a transaction can wait before becoming age-eligible.
+./indra-consensus/src/mempool.rs:83:    /// age-eligible (the proposer must include it).
+./indra-consensus/src/mempool.rs:84:    pub fn is_age_eligible(&self, current_height: u64) -> bool {
+./indra-consensus/src/mempool.rs:478:    ///   1. Age-eligible transactions (MUST be included), sorted by fee_rate desc, tx_id asc
+./indra-consensus/src/mempool.rs:481:        let mut age_eligible: Vec<&MempoolEntry> = self
+./indra-consensus/src/mempool.rs:484:            .filter(|e| e.is_age_eligible(current_height))
+./indra-consensus/src/mempool.rs:486:        age_eligible.sort_by(|a, b| {
+./indra-consensus/src/mempool.rs:495:            .filter(|e| !e.is_age_eligible(current_height))
+./indra-consensus/src/mempool.rs:503:        age_eligible.extend(remaining);
+./indra-consensus/src/mempool.rs:504:        age_eligible.truncate(max_count);
+./indra-consensus/src/mempool.rs:505:        age_eligible
+./indra-consensus/src/mempool.rs:508:    /// Return all age-eligible transactions regardless of count.
+./indra-consensus/src/mempool.rs:509:    pub fn age_eligible(&self, current_height: u64) -> Vec<&MempoolEntry> {
+./indra-consensus/src/mempool.rs:512:            .filter(|e| e.is_age_eligible(current_height))
+./indra-consensus/src/mempool.rs:801:    fn age_eligible_after_threshold() {
+./indra-consensus/src/mempool.rs:806:        // Not yet eligible
+./indra-consensus/src/mempool.rs:807:        assert!(mp.age_eligible(10).is_empty());
+./indra-consensus/src/mempool.rs:808:        // Eligible after AGE_INCLUSION_BLOCKS
+./indra-consensus/src/mempool.rs:809:        assert_eq!(mp.age_eligible(1 + AGE_INCLUSION_BLOCKS).len(), 1);
+./indra-consensus/src/mempool.rs:813:    fn select_prioritises_age_eligible() {
+./indra-consensus/src/mempool.rs:817:        // Low fee tx submitted long ago (age-eligible)
+./indra-consensus/src/mempool.rs:821:        // Age-eligible tx must come first despite lower fee
+./indra-consensus/src/vote.rs:174:        // Check if any hash crossed the quorum threshold
+./indra-consensus/src/vote.rs:504:    fn two_thirds_stake_threshold() {
+./indra-consensus/src/vote.rs:519:        // First two votes total 66%, which is below the strict > 2/3 threshold.
+./indra-consensus/src/proposer.rs:1://! RFC-VRF proposer eligibility and deterministic priority.
+./indra-consensus/src/proposer.rs:4:    sortition::{certified_log, evaluate, priority},
+./indra-consensus/src/proposer.rs:27:    pub election_seed: Bytes64,
+./indra-consensus/src/proposer.rs:39:/// Locally proven eligibility material.
+./indra-consensus/src/proposer.rs:50:    /// Whether the validator is eligible.
+./indra-consensus/src/proposer.rs:51:    pub eligible: bool,
+./indra-consensus/src/proposer.rs:64:            &self.election_seed,
+./indra-consensus/src/proposer.rs:119:        eligible: result.eligible,
+./indra-consensus/src/proposer.rs:129:            election_seed: Bytes64([1; 64]),
+./indra-consensus/src/proposer.rs:138:        e2.election_seed.0[63] ^= 1;
+./indra-consensus/src/proposer.rs:149:            election_seed: Bytes64([1; 64]),
+./indra-consensus/src/proposer.rs:170:        // denominator, threshold, output, eligibility, or priority.
+./indra-consensus/src/proposer.rs:174:        assert_eq!(before.eligible, after.eligible);
+./indra-crypto/tests/audit_phase1.rs:67:        "with 2048 public-key trials, an attacker should be able to grind a very low public election byte; best={best} seed={best_seed}"
+./indra-state/tests/state_machine.rs:261:            election_seed: state.election_seed,
+./indra-state/tests/state_machine.rs:270:            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-state/tests/audit_phase2.rs:195:            election_seed: state.election_seed,
+./indra-state/tests/audit_phase2.rs:204:            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-state/tests/monetary_invariants.rs:142:            election_seed: state.election_seed,
+./indra-state/tests/monetary_invariants.rs:151:            sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-state/src/chain.rs:111:    /// Current QC-certified election seed.
+./indra-state/src/chain.rs:112:    pub election_seed: Bytes64,
+./indra-state/src/chain.rs:117:    pub election_seed_version: u8,
+./indra-state/src/chain.rs:118:    /// First height to which `election_seed` applies.
+./indra-state/src/chain.rs:119:    pub election_seed_height: u64,
+./indra-state/src/chain.rs:280:        self.election_seed.encode(buf);
+./indra-state/src/chain.rs:282:        self.election_seed_version.encode(buf);
+./indra-state/src/chain.rs:283:        self.election_seed_height.encode(buf);
+./indra-state/src/chain.rs:365:        indra_core::sortition::validate_f(active_slot_coefficient_numerator)?;
+./indra-state/src/chain.rs:366:        let election_seed = Bytes64::decode(r)?;
+./indra-state/src/chain.rs:368:        let election_seed_version = u8::decode(r)?;
+./indra-state/src/chain.rs:369:        let election_seed_height = u64::decode(r)?;
+./indra-state/src/chain.rs:370:        if election_seed_version != 1 {
+./indra-state/src/chain.rs:371:            return Err(IndraError::InvalidSortition(
+./indra-state/src/chain.rs:372:                "unsupported election seed version".into(),
+./indra-state/src/chain.rs:430:            election_seed,
+./indra-state/src/chain.rs:432:            election_seed_version,
+./indra-state/src/chain.rs:433:            election_seed_height,
+./indra-state/src/chain.rs:554:            election_seed: Bytes64::ZERO,
+./indra-state/src/chain.rs:556:            election_seed_version: 1,
+./indra-state/src/chain.rs:557:            election_seed_height: 1,
+./indra-state/src/chain.rs:2044:        // Both QC signer resolution and proposer sortition consume this same
+./indra-state/src/state_root.rs:53:    metadata.extend_from_slice(&state.election_seed.0);
+./indra-state/src/state_root.rs:54:    metadata.push(state.election_seed_version);
+./indra-state/src/state_root.rs:55:    metadata.extend_from_slice(&state.election_seed_height.to_le_bytes());
+./indra-state/src/state_root.rs:129:    fn election_seed_and_genesis_entropy_record_are_committed() {
+./indra-state/src/state_root.rs:132:        changed_seed.election_seed = indra_core::Bytes64([0xA5; 64]);
+./indra-state/src/validator.rs:30:    /// Active: eligible to propose and vote.
+./indra-state/src/validator.rs:692:    /// Total stake of all validators eligible for active-set selection.
+./indra-state/src/validator.rs:697:    /// Total self-stake eligible for selection under the rules at `height`.
+./indra-state/src/governance.rs:14:            SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+./indra-state/src/governance.rs:42:/// Deposit return support threshold.
+./indra-state/src/governance.rs:48:    /// Liveness threshold.
+./indra-state/src/governance.rs:49:    pub slash_liveness_threshold_epochs: u64,
+./indra-state/src/governance.rs:62:    /// Standard proposal YES-stake threshold in basis points of total
+./indra-state/src/governance.rs:64:    /// docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-state/src/governance.rs:66:    /// Critical proposal YES-stake threshold in basis points of total
+./indra-state/src/governance.rs:68:    /// docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-state/src/governance.rs:76:            slash_liveness_threshold_epochs: SLASH_LIVENESS_THRESHOLD_EPOCHS,
+./indra-state/src/governance.rs:91:            GovernableAction::SetSlashLivenessThresholdEpochs { value } => {
+./indra-state/src/governance.rs:193:            GovernableAction::SetSlashLivenessThresholdEpochs { value } => {
+./indra-state/src/governance.rs:194:                self.slash_liveness_threshold_epochs = *value;
+./indra-state/src/governance.rs:232:        self.slash_liveness_threshold_epochs.encode(buf);
+./indra-state/src/governance.rs:251:            slash_liveness_threshold_epochs: u64::decode(r)?,
+./indra-state/src/governance.rs:325:    /// threshold. Despite the historical name, this is not a participation
+./indra-state/src/governance.rs:326:    /// quorum; see docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-state/src/governance.rs:332:    /// threshold under the arithmetic active at `height`.
+./indra-state/src/governance.rs:546:    /// YES-stake threshold frozen when the proposal is admitted.
+./indra-state/src/governance.rs:1120:            GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
+./indra-state/src/governance.rs:1191:            GovernableAction::SetSlashLivenessThresholdEpochs { .. }
+./indra-state/src/governance.rs:1208:            params.slash_liveness_threshold_epochs,
+./indra-state/src/governance.rs:1209:            SLASH_LIVENESS_THRESHOLD_EPOCHS
+./indra-state/src/governance.rs:1383:                action: GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
+./indra-state/src/apply.rs:1808:                election_seed: state.election_seed,
+./indra-state/src/apply.rs:1817:                sortition_claim: indra_core::types::block::SortitionClaimV1::PraosThreshold,
+./indra-state/src/apply.rs:3516:        let eligible = UnbondingTrancheV1::new(
+./indra-state/src/apply.rs:3528:            .insert(eligible.tranche_id, eligible.clone());
+./indra-state/src/apply.rs:3583:        assert!(!state.unbonding_tranches.contains_key(&eligible.tranche_id));
+./indra-state/src/apply.rs:4071:        // exclusion from future reward eligibility through `Slashed` status.
+./indra-state/src/apply.rs:4502:    let next_seed = indra_core::types::proposal::next_election_seed(
+./indra-state/src/apply.rs:4504:        &txn.state().election_seed,
+./indra-state/src/apply.rs:4740:    txn.set_election_seed(next_seed, block.header.height.saturating_add(1))?;
+./indra-state/src/governance_apply.rs:343:        return invalid("signer is not eligible in snapshot1");
+./indra-state/src/governance_apply.rs:521:/// such as "governance YES-stake thresholds can only increase" even when
+./indra-state/src/governance_apply.rs:1844:            GovernableAction::SetSlashLivenessThresholdEpochs { value: 2 },
+./indra-state/src/governance_apply.rs:2268:            GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
+./indra-state/src/txn.rs:45:    election_seed: Bytes64,
+./indra-state/src/txn.rs:46:    election_seed_height: u64,
+./indra-state/src/txn.rs:396:            election_seed: self.state.election_seed,
+./indra-state/src/txn.rs:397:            election_seed_height: self.state.election_seed_height,
+./indra-state/src/txn.rs:601:    pub(crate) fn set_election_seed(&mut self, seed: Bytes64, height: u64) -> StateResult<()> {
+./indra-state/src/txn.rs:603:        self.state.election_seed = seed;
+./indra-state/src/txn.rs:604:        self.state.election_seed_height = height;
+./indra-state/src/txn.rs:791:                    self.state.election_seed = snapshot.election_seed;
+./indra-state/src/txn.rs:792:                    self.state.election_seed_height = snapshot.election_seed_height;
+./indra-state/src/epoch.rs:455:        // Governance "quorum" fields are intentionally YES-stake thresholds
+./indra-state/src/epoch.rs:456:        // over total proposal snapshot stake, not participation thresholds.
+./indra-state/src/epoch.rs:457:        // See docs/GOVERNANCE_THRESHOLD_DESIGN.md.
+./indra-state/src/epoch.rs:1019:            message: "nonzero reward pool has no eligible recipient",
+./indra-state/src/epoch.rs:1111:    let threshold = state.governance.params.slash_liveness_threshold_epochs;
+./indra-state/src/epoch.rs:1147:        if missed >= threshold && stake > 0 {
+./indra-state/src/epoch.rs:1210:                SLASH_LIVENESS_BPS, SLASH_LIVENESS_THRESHOLD_EPOCHS, SPARK_PER_INDRA,
+./indra-state/src/epoch.rs:1532:        state.governance.params.slash_liveness_threshold_epochs = 1;
+./indra-state/src/epoch.rs:1959:    fn tally_uses_threshold_frozen_at_proposal_creation() {
+./indra-state/src/epoch.rs:2234:    fn liveness_penalty_applied_after_threshold() {
+./indra-state/src/epoch.rs:2264:    fn liveness_no_penalty_within_threshold() {
+./indra-state/src/epoch.rs:2347:            params.slash_liveness_threshold_epochs,
+./indra-state/src/epoch.rs:2348:            SLASH_LIVENESS_THRESHOLD_EPOCHS
+./indra-state/src/epoch.rs:2351:        assert!(SLASH_LIVENESS_THRESHOLD_EPOCHS > 0);
+./indra-keystore/src/cold_shamir.rs:70:    pub threshold: u8,
+./indra-keystore/src/cold_shamir.rs:101:fn validate_threshold(threshold: u8, share_count: u8) -> KeystoreResult<()> {
+./indra-keystore/src/cold_shamir.rs:102:    if threshold < 2 {
+./indra-keystore/src/cold_shamir.rs:103:        return Err(share_error("threshold must be at least 2"));
+./indra-keystore/src/cold_shamir.rs:105:    if threshold > share_count {
+./indra-keystore/src/cold_shamir.rs:106:        return Err(share_error("threshold cannot exceed share count"));
+./indra-keystore/src/cold_shamir.rs:199:            if row.len() != manifest.threshold as usize {
+./indra-keystore/src/cold_shamir.rs:200:                return Err(share_error("Pedersen row length does not equal threshold"));
+./indra-keystore/src/cold_shamir.rs:218:    validate_threshold(manifest.threshold, manifest.share_count)?;
+./indra-keystore/src/cold_shamir.rs:376:    threshold: u8,
+./indra-keystore/src/cold_shamir.rs:381:    validate_threshold(threshold, share_count)?;
+./indra-keystore/src/cold_shamir.rs:387:        Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
+./indra-keystore/src/cold_shamir.rs:389:        Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
+./indra-keystore/src/cold_shamir.rs:429:        threshold,
+./indra-keystore/src/cold_shamir.rs:509:    if shares.len() < first.manifest.threshold as usize {
+./indra-keystore/src/cold_shamir.rs:512:            first.manifest.threshold,
+./indra-keystore/src/cold_shamir.rs:538:    let basis = &parsed[..first.manifest.threshold as usize];
+./indra-keystore/src/cold_shamir.rs:655:    fn threshold_subsets_reconstruct_exact_original() {
+./indra-keystore/src/cold_shamir.rs:744:    fn threshold_and_unknown_fields_fail_closed() {
+./indra-bench/benches/full_bench.rs:36:    bench_mempool_age_eligible(500);
+./indra-bench/src/timer.rs:38:    /// Assert that the average operation time is below a threshold.
+./indra-bench/src/timer.rs:41:    pub fn assert_faster_than(&self, threshold: Duration) {
+./indra-bench/src/timer.rs:43:        if per_op > threshold {
+./indra-bench/src/timer.rs:47:                threshold.as_secs_f64() * 1000.0,
+./indra-bench/src/timer.rs:53:                threshold.as_secs_f64() * 1000.0,
+./indra-bench/src/mempool_bench.rs:60:/// Benchmark age-eligible selection (priority path).
+./indra-bench/src/mempool_bench.rs:61:pub fn bench_mempool_age_eligible(iterations: u64) {
+./indra-bench/src/mempool_bench.rs:64:    // Half old (age-eligible), half new
+./indra-bench/src/mempool_bench.rs:75:    let r = bench("mempool_age_eligible_50", iterations, || {
+./indra-bench/src/mempool_bench.rs:76:        let _ = mp.age_eligible(current_height);
+./indra-bench/src/mempool_bench.rs:102:    fn bench_mempool_age_eligible_runs() {
+./indra-bench/src/mempool_bench.rs:103:        bench_mempool_age_eligible(200);
+./indra-bench/src/fixtures.rs:5:        block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
+./indra-bench/src/fixtures.rs:69:            election_seed: Bytes64([0; 64]),
+./indra-bench/src/fixtures.rs:84:            sortition_claim: SortitionClaimV1::PraosThreshold,
+./indra-cli/tests/cli.rs:242:            "--threshold",
+./indra-cli/tests/cli.rs:317:            "--threshold",
+./indra-cli/src/bin/governance.rs:286:        "slash-liveness-threshold-epochs" => {
+./indra-cli/src/bin/governance.rs:287:            Ok(GovernableAction::SetSlashLivenessThresholdEpochs {
+./indra-cli/src/bin/keygen.rs:357:        ceremony.manifest.threshold, ceremony.manifest.share_count
+./indra-cli/src/bin/keygen.rs:380:        parse_u8_flag(args, "--threshold"),
+./indra-cli/src/bin/keygen.rs:541:        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path] [--force]\n  indra-keygen cold ceremony --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold split --cold-keys <path> --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold verify --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> [--verification-output <receipt.json>]\n  indra-keygen cold recover --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --output <encrypted.json> --acknowledge-destroy-after-use\n  indra-keygen cold dealer-rekey --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen inspect --keys keys.json"

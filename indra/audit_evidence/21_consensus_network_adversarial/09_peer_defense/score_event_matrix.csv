@@ -1,0 +1,8 @@
+event,delta,source,attribution,evidence,authenticated
+ValidBlock,+5,validated block,transport validator,cryptographic validation,yes
+ValidVote,+1,validated vote,transport validator,cryptographic validation,yes
+ValidTx,+1,validated tx,transport validator,cryptographic validation,yes
+InvalidMessage,-10,invalid admission,transport socket/validator,parser or authoritative failure,yes at peer-manager boundary
+Timeout,-5,sync/dial timeout,selected validator,timeout state,yes
+DuplicateVote,-20,consensus duplicate,transport validator,collector evidence,yes
+EquivocatingBlock,-50,consensus conflict,transport validator,conflicting block evidence,yes

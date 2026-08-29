@@ -1,0 +1,41 @@
+{
+  "model_version": 1,
+  "production_source_date": "2026-08-18",
+  "vrf": {
+    "output_bits": 512,
+    "assumptions": [
+      "RFC 9381 pseudorandomness and uniqueness hold",
+      "validator secret keys are independently generated",
+      "the full chain/seed/height/round/snapshot/validator transcript is injective",
+      "outputs for distinct validator keys and round transcripts are computationally independent"
+    ]
+  },
+  "sortition": {
+    "ideal_probability": "1-(1-f)^(w/W)",
+    "production_threshold_note": "Q768 is downward conservative and differs from the ideal 512-bit threshold by at most one under the separately audited mathematical assumption",
+    "finite_grid_split_bound": "at most k/2^512 threshold mass for k identities, ignoring the smaller Q768 term"
+  },
+  "network": {
+    "round_independence": "fresh round-bound VRF alpha is modeled as an independent sample",
+    "honest_proposal_delivery": "an online honest eligible proposal reaches quorum within its round",
+    "adaptive_upper_bound": "if only the adversarial coalition is eligible, it can inspect the candidate next seed and decide whether to publish before timeout",
+    "priority_caveat": "mixed honest/adversarial eligible rounds are conservatively awarded to honest progress in the adaptive grinding model"
+  },
+  "operational": {
+    "current_repository_example_F": "9223372036854775808",
+    "current_repository_example_f": "0.5",
+    "current_manifest_shape": "four equal-stake validators",
+    "propose_timeout_seconds": 8,
+    "F_status": "genesis-selected and immutable; no production calibration record was located"
+  },
+  "bitcoin": {
+    "confirmation_floor": 100,
+    "catchup_model": "biased random-walk eventual catch-up probability (q/(1-q))^z for q<1/2",
+    "not_modeled_without_external_data": [
+      "current Bitcoin network hash rate",
+      "rental/attack hash price and available capacity",
+      "block subsidy and fee revenue",
+      "INDRA economic value exposed at ceremony time"
+    ]
+  }
+}

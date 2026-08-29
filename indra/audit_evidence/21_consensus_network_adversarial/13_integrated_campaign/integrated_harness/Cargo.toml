@@ -1,0 +1,13 @@
+[package]
+name = "indra-integrated-audit-harness"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
