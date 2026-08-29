@@ -45,6 +45,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+mod dandelion;
 pub mod error;
 pub mod frame;
 pub mod handshake;

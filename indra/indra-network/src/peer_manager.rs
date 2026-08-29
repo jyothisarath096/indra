@@ -24,6 +24,9 @@ use indra_core::{codec::Encode, ssz::sha256};
 use indra_crypto::{verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES};
 
 use crate::{
+    dandelion::{
+        Action as DandelionAction, FluffReason, RelayPeer, State as DandelionState, SWEEP_INTERVAL,
+    },
     error::NetworkError,
     frame::{FrameReader, FrameWriter},
     handshake::HandshakeResult,
@@ -112,6 +115,7 @@ struct PeerManagerActor {
     relay_seen: RelaySeenCache,
     block_relay_slots: HashMap<BlockRelaySlotKey, Bytes32>,
     relay_metrics: HashMap<RelayMessageClass, RelayMetrics>,
+    dandelion: DandelionState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -807,6 +811,8 @@ impl PeerManagerActor {
     async fn run(mut self) {
         let mut cleanup = tokio::time::interval(BAN_CLEANUP_INTERVAL);
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dandelion_sweep = tokio::time::interval(SWEEP_INTERVAL);
+        dandelion_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 maybe_command = self.command_rx.recv() => {
@@ -827,6 +833,12 @@ impl PeerManagerActor {
                         eprintln!("[p2p] failed to persist expired-ban cleanup: {error}");
                     }
                 }
+                _ = dandelion_sweep.tick() => {
+                    let now = Instant::now();
+                    let peers = self.dandelion_peers();
+                    let actions = self.dandelion.tick(now, &peers, self.relay_keys.len());
+                    self.execute_dandelion_actions(actions).await;
+                }
             }
         }
     }
@@ -841,6 +853,28 @@ impl PeerManagerActor {
             }
             NetworkCommand::SendTo { validator_id, msg } => {
                 self.send_to_validator(validator_id, msg).await;
+            }
+            NetworkCommand::StartTxStem(tx) => {
+                let peers = self.dandelion_peers();
+                let actions =
+                    self.dandelion
+                        .start_local(tx, Instant::now(), &peers, self.relay_keys.len());
+                self.execute_dandelion_actions(actions).await;
+            }
+            NetworkCommand::AcceptedTxStem { from, tx } => {
+                let peers = self.dandelion_peers();
+                let actions = self.dandelion.accept_stem(
+                    from,
+                    tx,
+                    Instant::now(),
+                    &peers,
+                    self.relay_keys.len(),
+                );
+                self.execute_dandelion_actions(actions).await;
+            }
+            NetworkCommand::ObserveTxFluff { tx_id } => {
+                let actions = self.dandelion.observe_fluff(tx_id, Instant::now());
+                self.execute_dandelion_actions(actions).await;
             }
             NetworkCommand::Disconnect { validator_id } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
@@ -880,6 +914,50 @@ impl PeerManagerActor {
                 self.relay_fanout = derive_consensus_relay_fanout(validators.len());
                 self.relay_keys = relay_key_map(validators);
                 self.relay_chain_id = chain_id;
+            }
+        }
+    }
+
+    fn dandelion_peers(&self) -> Vec<RelayPeer> {
+        self.peers_by_validator
+            .iter()
+            .map(|(validator_id, peer)| RelayPeer {
+                validator_id: *validator_id,
+                is_outbound: peer.is_outbound,
+            })
+            .collect()
+    }
+
+    async fn execute_dandelion_actions(&mut self, actions: Vec<DandelionAction>) {
+        for action in actions {
+            match action {
+                DandelionAction::Stem { tx_id, to, tx } => {
+                    let sent = self
+                        .try_send_to_validator(
+                            to,
+                            OutboundMessage {
+                                msg: Message::TxStem(tx),
+                                point_to_point: false,
+                            },
+                        )
+                        .await;
+                    if !sent {
+                        self.dandelion.stem_send_failed(tx_id, Instant::now());
+                    }
+                }
+                DandelionAction::Fluff { tx, except, reason } => {
+                    if reason == FluffReason::NoRelay {
+                        // Aggregate alert only: transaction IDs and peer addresses are
+                        // deliberately excluded to avoid creating a correlation log.
+                        eprintln!("[p2p][alert] no eligible Dandelion transaction relay after bounded reconnect window; fluffing");
+                    }
+                    let msg = Message::Tx(tx);
+                    if let Some(except) = except {
+                        self.broadcast_to_all_connected_except(except, msg).await;
+                    } else {
+                        self.broadcast_to_all_connected(msg).await;
+                    }
+                }
             }
         }
     }
@@ -1365,6 +1443,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
         block_relay_slots: HashMap::new(),
         relay_metrics: HashMap::new(),
+        dandelion: DandelionState::new(Instant::now()),
     };
     tokio::spawn(actor.run());
     PeerManagerHandle {
@@ -1434,6 +1513,7 @@ mod tests {
             relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
             block_relay_slots: HashMap::new(),
             relay_metrics: HashMap::new(),
+            dandelion: DandelionState::new(Instant::now()),
         }
     }
 

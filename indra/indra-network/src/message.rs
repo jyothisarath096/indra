@@ -73,6 +73,8 @@ pub enum MessageType {
     StakingOp = 0x11,
     /// A pending governance operation.
     GovernanceOp = 0x12,
+    /// A pending transaction in the Dandelion stem phase.
+    TxStem = 0x13,
 }
 
 impl MessageType {
@@ -93,6 +95,7 @@ impl MessageType {
             0x0C => Ok(Self::QCResponse),
             0x11 => Ok(Self::StakingOp),
             0x12 => Ok(Self::GovernanceOp),
+            0x13 => Ok(Self::TxStem),
             other => Err(NetworkError::UnknownMessageType { got: other }),
         }
     }
@@ -138,6 +141,11 @@ pub enum Message {
     Vote(VoteV1),
     /// A pending transaction for the mempool.
     Tx(TransactionV1),
+    /// A pending transaction on one Dandelion stem hop.
+    ///
+    /// The payload is byte-identical to [`Message::Tx`]. Only the outer message
+    /// discriminant differs; the signed transaction and its consensus ID do not.
+    TxStem(TransactionV1),
     /// A pending staking operation for the staking mempool.
     StakingOp(StakingOp),
     /// A pending governance operation for the governance mempool.
@@ -254,6 +262,7 @@ impl Message {
             Self::Block(_) => MessageType::Block,
             Self::Vote(_) => MessageType::Vote,
             Self::Tx(_) => MessageType::Tx,
+            Self::TxStem(_) => MessageType::TxStem,
             Self::StakingOp(_) => MessageType::StakingOp,
             Self::GovernanceOp(_) => MessageType::GovernanceOp,
             Self::PeerList(_) => MessageType::PeerList,
@@ -345,7 +354,7 @@ impl Message {
         match self {
             Self::Block(b) => b.encode_to_vec(),
             Self::Vote(v) => v.encode_to_vec(),
-            Self::Tx(tx) => tx.encode_to_vec(),
+            Self::Tx(tx) | Self::TxStem(tx) => tx.encode_to_vec(),
             Self::StakingOp(op) => op.encode_to_vec(),
             Self::GovernanceOp(op) => op.encode_to_vec(),
             Self::PeerList(peers) => {
@@ -462,6 +471,15 @@ impl Message {
                 })?;
                 require_exact_hybrid_signature(&tx.signature)?;
                 Ok(Self::Tx(tx))
+            }
+            MessageType::TxStem => {
+                let tx = TransactionV1::decode_exact(payload).map_err(|e| {
+                    NetworkError::DecodeFailed {
+                        reason: e.to_string(),
+                    }
+                })?;
+                require_exact_hybrid_signature(&tx.signature)?;
+                Ok(Self::TxStem(tx))
             }
             MessageType::StakingOp => {
                 let op =
@@ -993,10 +1011,25 @@ mod tests {
                 snapshot_root: Bytes32::from([0x63; 32]),
                 signature: signature.clone(),
             }),
-            Message::Tx(tx),
+            Message::Tx(tx.clone()),
+            Message::TxStem(tx),
             Message::StakingOp(staking),
             Message::GovernanceOp(governance),
         ]
+    }
+
+    #[test]
+    fn tx_stem_changes_only_the_outer_discriminant() {
+        let tx = test_transaction();
+        let fluff = Message::Tx(tx.clone()).encode_wire().unwrap();
+        let stem = Message::TxStem(tx.clone()).encode_wire().unwrap();
+        assert_eq!(fluff[0..4], stem[0..4]);
+        assert_ne!(fluff[4], stem[4]);
+        assert_eq!(fluff[5..], stem[5..]);
+        assert!(matches!(
+            Message::decode_framed_wire(&stem).unwrap(),
+            Message::TxStem(decoded) if decoded == tx
+        ));
     }
 
     #[test]

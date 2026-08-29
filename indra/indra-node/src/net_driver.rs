@@ -24,7 +24,7 @@ pub fn message_to_event(
         Message::Vote(vote) => Some(DriverEvent::InboundVote { from, vote }),
         // Transactions use the node's single authoritative path, which wraps
         // mempool validation with deduplication and identity scoring.
-        Message::Tx(_) => None,
+        Message::Tx(_) | Message::TxStem(_) => None,
         Message::Status {
             height,
             tip_hash,

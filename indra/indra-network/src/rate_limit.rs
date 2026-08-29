@@ -110,7 +110,7 @@ impl MessageClass {
             Message::RequestBlocks { .. }
             | Message::RequestProposal { .. }
             | Message::RequestQC { .. } => Self::BlockRequest,
-            Message::Tx(_) => Self::Tx,
+            Message::Tx(_) | Message::TxStem(_) => Self::Tx,
             Message::StakingOp(_) => Self::StakingOp,
             Message::GovernanceOp(_) => Self::GovernanceOp,
             Message::Ping(_) | Message::Pong(_) => Self::PingPong,
@@ -138,6 +138,7 @@ impl MessageClass {
                 | Message::QCResponse { .. }
                 | Message::Vote(_)
                 | Message::Tx(_)
+                | Message::TxStem(_)
                 | Message::StakingOp(_)
                 | Message::GovernanceOp(_)
         )
@@ -332,6 +333,7 @@ mod tests {
         governance::{GovernanceActionType, GovernanceOpV2, GovernancePayload},
         primitives::{Bytes32, VariableBytes},
         staking::{StakingOp, StakingOpBody},
+        transaction::{InputV1, OutputV1, TransactionV1},
         vote::{VoteStep, VoteV1},
     };
 
@@ -381,6 +383,45 @@ mod tests {
             },
             signature: dummy_signature(),
         })
+    }
+
+    fn dummy_transaction() -> TransactionV1 {
+        TransactionV1 {
+            version: indra_core::ProtocolVersion(
+                indra_core::types::primitives::TRANSACTION_PROTOCOL_VERSION,
+            ),
+            signature_module_id: 1,
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::from([0x41; 32]),
+            }],
+            outputs: vec![OutputV1 {
+                value_spark: 2,
+                owner_pubkey: indra_core::types::crypto::HybridPubKey {
+                    classical_pk: Bytes32::from([0x42; 32]),
+                    pq_pk: VariableBytes::from_slice(&[0x43; 32]).unwrap(),
+                },
+                lock_height: 0,
+            }],
+            fee_amount: 1,
+            signature: dummy_signature(),
+        }
+    }
+
+    #[test]
+    fn tx_stem_and_fluff_share_the_transaction_rate_limit_bucket() {
+        let tx = dummy_transaction();
+        assert_eq!(
+            MessageClass::from_message(&Message::Tx(tx.clone())),
+            MessageClass::Tx
+        );
+        assert_eq!(
+            MessageClass::from_message(&Message::TxStem(tx.clone())),
+            MessageClass::Tx
+        );
+        assert_eq!(
+            MessageClass::needs_per_peer_byte_limit(&Message::Tx(tx.clone())),
+            MessageClass::needs_per_peer_byte_limit(&Message::TxStem(tx))
+        );
     }
 
     #[test]

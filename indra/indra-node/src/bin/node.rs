@@ -482,6 +482,26 @@ impl NetworkBridge {
             .send_blocking(NetworkCommand::Broadcast(msg.clone()));
     }
 
+    fn start_tx_stem(&self, tx: indra_core::types::transaction::TransactionV1) {
+        let _ = self.handle.send_blocking(NetworkCommand::StartTxStem(tx));
+    }
+
+    fn accepted_tx_stem(
+        &self,
+        from: indra_core::Bytes32,
+        tx: indra_core::types::transaction::TransactionV1,
+    ) {
+        let _ = self
+            .handle
+            .send_blocking(NetworkCommand::AcceptedTxStem { from, tx });
+    }
+
+    fn observe_tx_fluff(&self, tx_id: indra_core::Bytes32) {
+        let _ = self
+            .handle
+            .send_blocking(NetworkCommand::ObserveTxFluff { tx_id });
+    }
+
     fn broadcast_except(&self, except: indra_core::Bytes32, msg: &Message) {
         let _ = self.handle.send_blocking(NetworkCommand::BroadcastExcept {
             except,
@@ -1976,6 +1996,7 @@ async fn handle_observer_connection(
                     Message::Block(_)
                     | Message::BlockResponse { .. }
                     | Message::Tx(_)
+                    | Message::TxStem(_)
                     | Message::StakingOp(_)
                     | Message::GovernanceOp(_) => {}
                 }
@@ -2735,6 +2756,7 @@ fn main() {
                             }
                             Message::Tx(tx) => {
                                 let tx_id = indra_core::Bytes32::from(sha256(&tx.encode_to_vec()));
+                                gossip.observe_tx_fluff(tx_id);
                                 if op_relay_seen
                                     .lock()
                                     .map(|mut cache| {
@@ -2766,6 +2788,54 @@ fn main() {
                                             gossip.score_peer(validator_id, event);
                                         }
                                         gossip.broadcast_except(validator_id, &msg);
+                                    }
+                                    Err(_) => {
+                                        if let Some(event) = admission_score_event(
+                                            InboundAdmissionKind::Transaction,
+                                            false,
+                                        ) {
+                                            gossip.score_peer(validator_id, event);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            Message::TxStem(tx) => {
+                                let tx_id = indra_core::Bytes32::from(sha256(&tx.encode_to_vec()));
+                                if op_relay_seen
+                                    .lock()
+                                    .map(|mut cache| {
+                                        cache.transactions.contains_at(&tx_id, Instant::now())
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    // A repeated admitted stem is a loop signal. The
+                                    // peer manager immediately transitions it to fluff.
+                                    gossip.accepted_tx_stem(validator_id, tx.clone());
+                                    continue;
+                                }
+                                let result = driver
+                                    .lock()
+                                    .map_err(|_| "consensus driver lock poisoned".to_string())
+                                    .and_then(|mut guard| {
+                                        guard
+                                            .engine
+                                            .add_transaction(tx.clone())
+                                            .map_err(|error| error.to_string())
+                                    });
+                                match result {
+                                    Ok(_) => {
+                                        if let Ok(mut cache) = op_relay_seen.lock() {
+                                            let _ =
+                                                cache.transactions.insert_at(tx_id, Instant::now());
+                                        }
+                                        if let Some(event) = admission_score_event(
+                                            InboundAdmissionKind::Transaction,
+                                            true,
+                                        ) {
+                                            gossip.score_peer(validator_id, event);
+                                        }
+                                        gossip.accepted_tx_stem(validator_id, tx.clone());
                                     }
                                     Err(_) => {
                                         if let Some(event) = admission_score_event(
@@ -5407,7 +5477,7 @@ fn handle_rpc(
                                 if let Ok(mut cache) = op_relay_seen.lock() {
                                     let _ = cache.transactions.insert_at(tx_id, Instant::now());
                                 }
-                                gossip.broadcast(&Message::Tx(tx));
+                                gossip.start_tx_stem(tx);
                                 RpcResponse::ok(
                                     req.id.clone(),
                                     format!(

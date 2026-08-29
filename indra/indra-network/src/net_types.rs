@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 
+use indra_core::types::transaction::TransactionV1;
 use indra_core::types::{primitives::Bytes32, slashing::SlashEvidenceV1};
 
 use crate::{message::Message, peer::ScoreEvent};
@@ -77,6 +78,20 @@ pub enum NetworkCommand {
         validator_id: Bytes32,
         /// Message to send.
         msg: Message,
+    },
+    /// Start a locally admitted transaction in the Dandelion stem phase.
+    StartTxStem(TransactionV1),
+    /// Continue or fluff an admitted inbound stem transaction.
+    AcceptedTxStem {
+        /// Authenticated validator that sent the stem message.
+        from: Bytes32,
+        /// Transaction that passed the node's normal admission path.
+        tx: TransactionV1,
+    },
+    /// Record observed diffusion and cancel any local embargo for this transaction.
+    ObserveTxFluff {
+        /// Consensus transaction ID (SHA-256 of canonical transaction bytes).
+        tx_id: Bytes32,
     },
     /// Disconnect a peer.
     Disconnect {
