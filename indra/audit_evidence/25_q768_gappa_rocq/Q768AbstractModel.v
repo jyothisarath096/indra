@@ -89,10 +89,22 @@ Definition NR (n : N) : R := IZR (Z.of_N n).
 
 Open Scope R_scope.
 
-Definition true_probability (f w total : N) : R :=
+Definition phi_argument (f w total : N) : R :=
   let fr := NR f / NR (2 ^ 64)%N in
   let alpha := NR w / NR total in
-  1 - exp (- (alpha * (- ln (1 - fr)))).
+  alpha * (- ln (1 - fr)).
+
+Definition true_probability (f w total : N) : R :=
+  1 - exp (- phi_argument f w total).
+
+Lemma true_probability_at_zero_phi_argument :
+  forall f w total : N,
+    phi_argument f w total = 0 ->
+    true_probability f w total = 0.
+Proof.
+  intros f w total Hzero.
+  unfold true_probability. rewrite Hzero, Ropp_0, exp_0. ring.
+Qed.
 
 Definition admissible (f w total : N) : Prop :=
   (1 <= f <= 2 ^ 63)%N /\ (1 <= w)%N /\ (w <= total)%N /\
@@ -110,5 +122,8 @@ Proof.
   intros f w total Hadmissible.
   (* This is the exact end theorem. The finite recurrence arithmetic and
      composition pieces are checked in companion files; the two series-tail
-     theorems in Q768AnalyticObligations.v remain to be supplied. *)
+     theorems in Q768AnalyticObligations.v remain to be supplied. A future
+     proof must use the strict phi theorem only after establishing
+     [0 < phi_argument f w total]; the exact-zero case is discharged separately
+     by [true_probability_at_zero_phi_argument]. *)
 Abort.

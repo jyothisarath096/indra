@@ -27,6 +27,30 @@ Fixpoint phi_partial (terms : nat) (x : R) : R :=
 Definition true_log_from_y (y : R) : R := ln ((1 + y) / (1 - y)).
 Definition true_phi (x : R) : R := 1 - exp (-x).
 
+Lemma phi_partial_at_zero :
+  forall terms : nat, phi_partial terms 0 = 0.
+Proof.
+  induction terms as [|n IH].
+  - reflexivity.
+  - change
+      ((phi_partial n 0 +
+       (if Nat.even (S n)
+        then -(0 ^ (S n) / factorial_R (S n))
+        else 0 ^ (S n) / factorial_R (S n))) = 0).
+    rewrite (pow_i (S n) (Nat.lt_0_succ n)), IH.
+    destruct (Nat.even (S n)); unfold Rdiv; ring.
+Qed.
+
+Lemma phi_at_zero_is_exact :
+  true_phi 0 = 0 /\
+  phi_partial 128%nat 0 = 0 /\
+  phi_partial 129%nat 0 = 0.
+Proof.
+  split.
+  - unfold true_phi. rewrite Ropp_0, exp_0. ring.
+  - split; apply phi_partial_at_zero.
+Qed.
+
 (* First unclosed analytic obligation: the exact 256-term production series. *)
 Theorem log_tail_after_exactly_256_terms :
   forall y : R,
@@ -43,7 +67,7 @@ Abort.
 (* Second unclosed analytic obligation: the exact 128/129 production sums. *)
 Theorem phi_bracket_at_exactly_128_and_129_terms :
   forall x : R,
-    0 <= x < 7 / 10 ->
+    0 < x < 7 / 10 ->
     phi_partial 128%nat x <= true_phi x <= phi_partial 129%nat x /\
     true_phi x - phi_partial 128%nat x
       < x ^ 129 / factorial_R 129%nat /\
