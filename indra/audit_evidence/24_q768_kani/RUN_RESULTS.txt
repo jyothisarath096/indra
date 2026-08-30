@@ -1,0 +1,39 @@
+Toolchain
+=========
+cargo-kani 0.67.0
+CBMC 6.8.0 (64-bit arm64 macOS)
+Kani nightly: nightly-2025-11-21-aarch64-apple-darwin
+
+Smoke test
+==========
+Command: cargo kani (isolated /tmp/indra_kani_smoke crate)
+Result: SUCCESS; 1 harness, 0 failures; reported verification time 0.666098s
+
+Harness discovery
+=================
+Command: cargo kani list
+Result: SUCCESS; all 5 proof harnesses discovered.
+Warning: unsupported constructs present in compiled graph: caller_location (1),
+foreign function (2). Reachability was not established.
+
+Real attempt
+============
+Command: cargo kani --harness certified_log_interval_is_ordered
+Result: INCONCLUSIVE; manually interrupted during GOTO model generation after
+dynamic num-bigint/Vec allocation and arithmetic loop expansion produced a very
+large trace. CBMC did not begin SAT solving. No property failure or counterexample
+was reported. An internal num-bigint subtraction loop had passed 200 unwind
+iterations before interruption.
+
+Second real attempt
+===================
+Command: cargo kani -Z unstable-options --harness-timeout 20s --output-into-files
+Result: INCONCLUSIVE; Kani selected
+vrf_big_endian_conversion_matches_eligibility_comparison first. CBMC timed out
+during GOTO model generation while expanding dynamic num-bigint arithmetic. It
+did not reach SAT solving and reported no counterexample. Kani stopped after the
+timed-out harness, so the remaining three properties were not executed.
+
+All five harnesses compiled and were discovered. Every harness calls
+certified_log; four call evaluate at least once, and the stake monotonicity
+harness calls evaluate twice.
