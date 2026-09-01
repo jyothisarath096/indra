@@ -1153,6 +1153,1086 @@ Proof.
   - apply stake_scaled_bounded; assumption.
 Qed.
 
+(* Signed phi-recurrence correspondence.  The real quantities below are
+   unscaled; interval endpoints and the signed accumulator are Q768 integers. *)
+Definition phi_exact_term (k : nat) (x : R) : R :=
+  x ^ k / factorial_R k.
+
+Definition phi_previous_term (k : nat) (x : R) : R :=
+  if Nat.eqb k 1%nat then x else phi_exact_term (k - 1) x.
+
+Definition next_phi_term (k : nat) (zi term : interval) : interval :=
+  if Nat.eqb k 1%nat then term
+  else idivi (imul term zi) (N.of_nat k).
+
+Definition next_phi_bound
+    (k : nat) (x_hi term_hi term_width : N) : N * N :=
+  if Nat.eqb k 1%nat then (term_hi, term_width)
+  else
+    let '(mul_hi, mul_width) :=
+      Q768FiniteBounds.mul_bound term_hi x_hi term_width 0 in
+    Q768FiniteBounds.div_scalar_bound mul_hi mul_width (N.of_nat k).
+
+Definition next_phi_sum
+    (lower : bool) (k : nat) (term : interval) (sum : Z) : Z :=
+  let odd := Nat.odd k in
+  let v := Z.of_N (selected_endpoint lower odd term) in
+  if odd then (sum + v)%Z else (sum - v)%Z.
+
+Definition phi_sum_sound
+    (lower : bool) (sum : Z) (exact : R) (error : N) : Prop :=
+  if lower then
+    0 <= NR q768_scale * exact - IZR sum <= NR error
+  else
+    0 <= IZR sum - NR q768_scale * exact <= NR error.
+
+Lemma factorial_R_positive : forall k : nat, 0 < factorial_R k.
+Proof.
+  induction k as [|k IH].
+  - cbn [factorial_R]. lra.
+  - cbn [factorial_R]. apply Rmult_lt_0_compat.
+    + apply lt_0_INR. lia.
+    + exact IH.
+Qed.
+
+Lemma phi_term_transition : forall k x,
+  (1 <= k)%nat ->
+  (if Nat.eqb k 1%nat then phi_previous_term k x
+   else phi_previous_term k x * x / INR k) = phi_exact_term k x.
+Proof.
+  intros [|[|k]] x Hk; try lia.
+  - rewrite Nat.eqb_refl. unfold phi_previous_term, phi_exact_term.
+    rewrite Nat.eqb_refl. cbn [factorial_R].
+    rewrite pow_1, INR_1, Rmult_1_r, Rdiv_1_r. reflexivity.
+  - assert (Hnotone : Nat.eqb (S (S k)) 1%nat = false) by reflexivity.
+    rewrite Hnotone. unfold phi_previous_term, phi_exact_term.
+    rewrite Hnotone.
+    replace (S (S k) - 1)%nat with (S k)%nat by lia.
+    cbn [factorial_R pow].
+    field.
+    split.
+    + apply Rgt_not_eq, factorial_R_positive.
+    + split; apply not_0_INR; lia.
+Qed.
+
+Lemma phi_previous_term_succ : forall k x,
+  (1 <= k)%nat ->
+  phi_previous_term (S k) x = phi_exact_term k x.
+Proof.
+  intros [|k] x Hk; [lia |].
+  cbn [phi_previous_term]. reflexivity.
+Qed.
+
+Lemma phi_partial_step : forall k x,
+  (1 <= k)%nat ->
+  phi_partial k x =
+    if Nat.odd k then phi_partial (k - 1) x + phi_exact_term k x
+    else phi_partial (k - 1) x - phi_exact_term k x.
+Proof.
+  intros [|k] x Hk; [lia |].
+  cbn [phi_partial phi_exact_term].
+  rewrite <- Nat.negb_odd.
+  destruct (Nat.odd (S k)); unfold phi_exact_term; simpl;
+    rewrite Nat.sub_0_r; reflexivity.
+Qed.
+
+Lemma next_phi_term_bounded : forall k zi term x_hi term_hi term_width,
+  (1 <= k)%nat ->
+  interval_bounded zi x_hi 0 ->
+  interval_bounded term term_hi term_width ->
+  interval_bounded (next_phi_term k zi term)
+    (fst (next_phi_bound k x_hi term_hi term_width))
+    (snd (next_phi_bound k x_hi term_hi term_width)).
+Proof.
+  intros k zi term x_hi term_hi term_width Hk Hzi Hterm.
+  unfold next_phi_term, next_phi_bound.
+  destruct (Nat.eqb k 1%nat) eqn:Hone; [exact Hterm |].
+  assert (Hkn : (N.of_nat k <> 0)%N).
+  { intro Heq. change (N.of_nat k = N.of_nat 0) in Heq.
+    apply Nat2N.inj_iff in Heq. lia. }
+  apply idivi_bounded; [exact Hkn |].
+  apply imul_bounded; assumption.
+Qed.
+
+Lemma next_phi_term_contains : forall k zi term x,
+  (1 <= k)%nat ->
+  interval_contains zi (NR q768_scale * x) ->
+  interval_contains term (NR q768_scale * phi_previous_term k x) ->
+  interval_contains (next_phi_term k zi term)
+    (NR q768_scale * phi_exact_term k x).
+Proof.
+  intros k zi term x Hk Hzi Hterm.
+  unfold next_phi_term.
+  destruct (Nat.eqb k 1%nat) eqn:Hone.
+  - apply Nat.eqb_eq in Hone. subst k.
+    pose proof (phi_term_transition 1%nat x (le_n 1%nat)) as Htransition.
+    rewrite Nat.eqb_refl in Htransition.
+    rewrite <- Htransition. exact Hterm.
+  - assert (Hkn : (N.of_nat k <> 0)%N).
+    { intro Heq. change (N.of_nat k = N.of_nat 0) in Heq.
+      apply Nat2N.inj_iff in Heq. lia. }
+    pose proof (imul_scaled_contains term zi
+      (phi_previous_term k x) x Hterm Hzi) as Hmul.
+    pose proof (idivi_scaled_contains (imul term zi)
+      (phi_previous_term k x * x) (N.of_nat k) Hkn Hmul) as Hdiv.
+    rewrite NR_of_nat in Hdiv.
+    rewrite <- (phi_term_transition k x Hk).
+    rewrite Hone. exact Hdiv.
+Qed.
+
+Lemma interval_rounding_errors : forall t exact upper width,
+  interval_contains t exact ->
+  interval_bounded t upper width ->
+  (0 <= exact - NR t.(ilo) <= NR width) /\
+  (0 <= NR t.(ihi) - exact <= NR width).
+Proof.
+  intros t exact upper width Hcontains Hbounded.
+  destruct Hcontains as [Hlo Hhi].
+  destruct Hbounded as [Hupper [Hwidth Horder]].
+  assert (Hrealwidth : NR t.(ihi) - NR t.(ilo) <= NR width).
+  {
+    rewrite <- NR_sub by exact Horder.
+    apply NR_le. exact Hwidth.
+  }
+  split; lra.
+Qed.
+
+Lemma phi_sum_sound_step : forall
+    (lower odd : bool) (sum : Z) (exact_sum : R) (error : N)
+    (t : interval) (exact_term : R) (upper width : N),
+  phi_sum_sound lower sum exact_sum error ->
+  interval_contains t (NR q768_scale * exact_term) ->
+  interval_bounded t upper width ->
+  phi_sum_sound lower
+    (if odd then (sum + Z.of_N (selected_endpoint lower odd t))%Z
+     else (sum - Z.of_N (selected_endpoint lower odd t))%Z)
+    (if odd then exact_sum + exact_term else exact_sum - exact_term)
+    (error + width).
+Proof.
+  intros lower odd sum exact_sum error t exact_term upper width
+    Hsum Hcontains Hbounded.
+  pose proof (interval_rounding_errors t
+    (NR q768_scale * exact_term) upper width Hcontains Hbounded)
+    as [Hlower Hupper].
+  destruct lower, odd;
+    cbn [phi_sum_sound selected_endpoint] in Hsum |- *;
+    rewrite ?plus_IZR, ?minus_IZR, NR_add;
+    fold (NR t.(ilo)) (NR t.(ihi)); nra.
+Qed.
+
+Lemma phi_recurrence_step : forall remaining k zi lower st,
+  phi_recurrence (S remaining) k zi lower st =
+  phi_recurrence remaining (S k) zi lower
+    {| phi_term := next_phi_term k zi st.(phi_term);
+       phi_sum := next_phi_sum lower k
+         (next_phi_term k zi st.(phi_term)) st.(phi_sum) |}.
+Proof.
+  intros remaining k zi lower st.
+  unfold next_phi_term, next_phi_sum. reflexivity.
+Qed.
+
+Lemma phi_terms_step : forall remaining k x_hi term_hi term_width error,
+  Q768FiniteBounds.phi_terms (S remaining) k
+    x_hi term_hi term_width error =
+  Q768FiniteBounds.phi_terms remaining (S k) x_hi
+    (fst (next_phi_bound k x_hi term_hi term_width))
+    (snd (next_phi_bound k x_hi term_hi term_width))
+    (error + snd (next_phi_bound k x_hi term_hi term_width)).
+Proof.
+  intros remaining k x_hi term_hi term_width error.
+  unfold next_phi_bound. reflexivity.
+Qed.
+
+Lemma phi_recurrence_sound : forall
+    remaining k zi lower st x x_hi term_hi term_width error,
+  (1 <= k)%nat ->
+  interval_bounded zi x_hi 0 ->
+  interval_contains zi (NR q768_scale * x) ->
+  interval_bounded st.(phi_term) term_hi term_width ->
+  interval_contains st.(phi_term)
+    (NR q768_scale * phi_previous_term k x) ->
+  phi_sum_sound lower st.(phi_sum) (phi_partial (k - 1) x) error ->
+  phi_sum_sound lower
+    (phi_recurrence remaining k zi lower st).(phi_sum)
+    (phi_partial (k - 1 + remaining) x)
+    (Q768FiniteBounds.phi_terms remaining k
+      x_hi term_hi term_width error).
+Proof.
+  induction remaining as [|remaining IH];
+    intros k zi lower st x x_hi term_hi term_width error
+      Hk Hzibounded Hzicontains Htermbounded Htermcontains Hsum.
+  - cbn [phi_recurrence Q768FiniteBounds.phi_terms].
+    rewrite Nat.add_0_r. exact Hsum.
+  - rewrite phi_recurrence_step, phi_terms_step.
+    set (current := next_phi_term k zi st.(phi_term)).
+    set (current_bound := next_phi_bound k x_hi term_hi term_width).
+    assert (Hcurrentbounded : interval_bounded current
+      (fst current_bound) (snd current_bound)).
+    {
+      unfold current, current_bound.
+      apply next_phi_term_bounded; assumption.
+    }
+    assert (Hcurrentcontains : interval_contains current
+      (NR q768_scale * phi_exact_term k x)).
+    {
+      unfold current.
+      apply next_phi_term_contains; assumption.
+    }
+    assert (Hnextsum : phi_sum_sound lower
+      (next_phi_sum lower k current st.(phi_sum))
+      (phi_partial k x) (error + snd current_bound)).
+    {
+      pose proof (phi_sum_sound_step lower (Nat.odd k) st.(phi_sum)
+        (phi_partial (k - 1) x) error current (phi_exact_term k x)
+        (fst current_bound) (snd current_bound)
+        Hsum Hcurrentcontains Hcurrentbounded) as Hstep.
+      unfold next_phi_sum.
+      rewrite (phi_partial_step k x Hk). exact Hstep.
+    }
+    replace (k - 1 + S remaining)%nat with (S k - 1 + remaining)%nat
+      by lia.
+    apply IH with (x := x) (x_hi := x_hi)
+      (term_hi := fst current_bound)
+      (term_width := snd current_bound)
+      (error := (error + snd current_bound)%N).
+    + lia.
+    + exact Hzibounded.
+    + exact Hzicontains.
+    + exact Hcurrentbounded.
+    + rewrite phi_previous_term_succ by exact Hk.
+      exact Hcurrentcontains.
+    + replace (S k - 1)%nat with k by lia. exact Hnextsum.
+Qed.
+
+Definition phi_raw_sum (z : N) (terms : nat) (lower : bool) : Z :=
+  let zi := {| ilo := z; ihi := z |} in
+  (phi_recurrence terms 1%nat zi lower
+    {| phi_term := zi; phi_sum := 0%Z |}).(phi_sum).
+
+Lemma point_interval_bounded : forall z upper,
+  (z <= upper)%N ->
+  interval_bounded {| ilo := z; ihi := z |} upper 0.
+Proof.
+  intros z upper Hz. unfold interval_bounded; simpl. repeat split; lia.
+Qed.
+
+Lemma point_interval_contains_scaled : forall z,
+  interval_contains {| ilo := z; ihi := z |}
+    (NR q768_scale * (NR z / NR q768_scale)).
+Proof.
+  intro z.
+  assert (HS : NR q768_scale <> 0) by
+    (apply Rgt_not_eq, positive_NR; exact q768_nonzero).
+  replace (NR q768_scale * (NR z / NR q768_scale)) with (NR z)
+    by (field; exact HS).
+  unfold interval_contains; simpl. split; apply Rle_refl.
+Qed.
+
+Lemma phi_raw_sum_sound : forall z terms lower,
+  (z <= Q768FiniteBounds.log_hi)%N ->
+  phi_sum_sound lower (phi_raw_sum z terms lower)
+    (phi_partial terms (NR z / NR q768_scale))
+    (Q768FiniteBounds.phi_rounding_width terms).
+Proof.
+  intros z terms lower Hz.
+  set (zi := {| ilo := z; ihi := z |}).
+  set (x := NR z / NR q768_scale).
+  set (initial := {| phi_term := zi; phi_sum := 0%Z |}).
+  assert (Hzibounded : interval_bounded zi Q768FiniteBounds.log_hi 0).
+  { unfold zi. apply point_interval_bounded. exact Hz. }
+  assert (Hzicontains : interval_contains zi (NR q768_scale * x)).
+  { unfold zi, x. apply point_interval_contains_scaled. }
+  assert (Hinitialterm : interval_contains initial.(phi_term)
+    (NR q768_scale * phi_previous_term 1%nat x)).
+  {
+    unfold initial. simpl. unfold phi_previous_term. rewrite Nat.eqb_refl.
+    exact Hzicontains.
+  }
+  assert (Hinitialsum : phi_sum_sound lower initial.(phi_sum)
+    (phi_partial 0%nat x) 0).
+  {
+    unfold initial, phi_sum_sound. simpl.
+    destruct lower; unfold NR; simpl; lra.
+  }
+  pose proof (phi_recurrence_sound terms 1%nat zi lower initial x
+    Q768FiniteBounds.log_hi Q768FiniteBounds.log_hi 0 0
+    (le_n 1%nat) Hzibounded Hzicontains Hzibounded Hinitialterm Hinitialsum)
+    as Hsound.
+  unfold Q768FiniteBounds.phi_rounding_width.
+  replace (1 - 1 + terms)%nat with terms in Hsound by lia.
+  unfold phi_raw_sum. fold zi initial. exact Hsound.
+Qed.
+
+Lemma NR_pow : forall a : N, forall n : nat,
+  NR (a ^ (N.of_nat n)) = NR a ^ n.
+Proof.
+  intros a n. induction n as [|n IH].
+  - simpl. unfold NR. simpl. reflexivity.
+  - rewrite Nat2N.inj_succ, N.pow_succ_r'.
+    rewrite NR_mul, IH. simpl. ring.
+Qed.
+
+Lemma NR_pow_N : forall a n : N,
+  NR (a ^ n) = NR a ^ N.to_nat n.
+Proof.
+  intros a n. induction n using N.peano_ind.
+  - simpl. unfold NR. simpl. reflexivity.
+  - rewrite N.pow_succ_r', NR_mul, N2Nat.inj_succ, IHn.
+    simpl. ring.
+Qed.
+
+Lemma finite_factorial_eq_nat_factorial : forall n : nat,
+  Q768FiniteBounds.factorial n = N.of_nat (fact n).
+Proof.
+  induction n as [|n IH].
+  - reflexivity.
+  - cbn [Q768FiniteBounds.factorial fact].
+    rewrite IH, <- Nat2N.inj_mul. reflexivity.
+Qed.
+
+Lemma NR_finite_factorial : forall n : nat,
+  NR (Q768FiniteBounds.factorial n) = factorial_R n.
+Proof.
+  intro n. rewrite finite_factorial_eq_nat_factorial, NR_of_nat.
+  symmetry. apply factorial_R_eq_INR_fact.
+Qed.
+
+Lemma phi_endpoint_domain : forall z,
+  (0 < z <= Q768FiniteBounds.log_hi)%N ->
+  0 < NR z / NR q768_scale < 7 / 10.
+Proof.
+  intros z [Hzpos Hzhi].
+  assert (HS : 0 < NR q768_scale) by
+    (apply positive_NR; exact q768_nonzero).
+  assert (HzRpos : 0 < NR z) by
+    (change (NR 0 < NR z); apply NR_lt; exact Hzpos).
+  assert (HzRhi : NR z <= NR Q768FiniteBounds.log_hi) by
+    (apply NR_le; exact Hzhi).
+  pose proof Q768FiniteBounds.certified_log_upper_is_below_seven_tenths
+    as Hfinite.
+  apply NR_lt in Hfinite.
+  repeat rewrite NR_mul in Hfinite.
+  replace (NR 10) with (10 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  replace (NR 7) with (7 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  change (NR Q768FiniteBounds.q768_scale) with (NR q768_scale) in Hfinite.
+  split.
+  - apply Rdiv_lt_0_compat; assumption.
+  - apply (Rmult_lt_reg_r (NR q768_scale)); [exact HS |].
+    replace (NR z / NR q768_scale * NR q768_scale) with (NR z)
+      by (field; lra).
+    apply (Rmult_lt_reg_r 10); [lra |].
+    replace (7 / 10 * NR q768_scale * 10)
+      with (7 * NR q768_scale) by field.
+    nra.
+Qed.
+
+Lemma exp_tail_129_scaled_lt_one :
+  NR q768_scale * ((7 / 10) ^ 129 / factorial_R 129%nat) < 1.
+Proof.
+  pose proof Q768FiniteBounds.exp_tail_129_is_below_one_q768_unit
+    as Hfinite.
+  apply NR_lt in Hfinite.
+  repeat rewrite NR_mul in Hfinite.
+  replace (NR (7 ^ 129)%N) with ((NR 7) ^ 129) in Hfinite.
+  2: { rewrite NR_pow_N. reflexivity. }
+  replace (NR (10 ^ 129)%N) with ((NR 10) ^ 129) in Hfinite.
+  2: { rewrite NR_pow_N. reflexivity. }
+  rewrite NR_finite_factorial in Hfinite.
+  replace (NR 7) with (7 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  replace (NR 10) with (10 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  change (NR Q768FiniteBounds.q768_scale) with (NR q768_scale) in Hfinite.
+  assert (Hfact : 0 < factorial_R 129%nat) by apply factorial_R_positive.
+  assert (Hten : 0 < (10 : R) ^ 129) by (apply pow_lt; lra).
+  replace (NR q768_scale * ((7 / 10) ^ 129 / factorial_R 129%nat))
+    with
+    ((NR q768_scale * 7 ^ 129) /
+      (10 ^ 129 * factorial_R 129%nat)).
+  2: { field; nra. }
+  apply (Rmult_lt_reg_r (10 ^ 129 * factorial_R 129%nat)); [nra |].
+  replace
+    ((NR q768_scale * 7 ^ 129 /
+      (10 ^ 129 * factorial_R 129%nat)) *
+      (10 ^ 129 * factorial_R 129%nat))
+    with (NR q768_scale * 7 ^ 129) by (field; nra).
+  nra.
+Qed.
+
+Lemma exp_tail_130_scaled_lt_one :
+  NR q768_scale * ((7 / 10) ^ 130 / factorial_R 130%nat) < 1.
+Proof.
+  pose proof Q768FiniteBounds.exp_tail_130_is_below_one_q768_unit
+    as Hfinite.
+  apply NR_lt in Hfinite.
+  repeat rewrite NR_mul in Hfinite.
+  replace (NR (7 ^ 130)%N) with ((NR 7) ^ 130) in Hfinite.
+  2: { rewrite NR_pow_N. reflexivity. }
+  replace (NR (10 ^ 130)%N) with ((NR 10) ^ 130) in Hfinite.
+  2: { rewrite NR_pow_N. reflexivity. }
+  rewrite NR_finite_factorial in Hfinite.
+  replace (NR 7) with (7 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  replace (NR 10) with (10 : R) in Hfinite by
+    (unfold NR; simpl; ring).
+  change (NR Q768FiniteBounds.q768_scale) with (NR q768_scale) in Hfinite.
+  assert (Hfact : 0 < factorial_R 130%nat) by apply factorial_R_positive.
+  assert (Hten : 0 < (10 : R) ^ 130) by (apply pow_lt; lra).
+  replace (NR q768_scale * ((7 / 10) ^ 130 / factorial_R 130%nat))
+    with
+    ((NR q768_scale * 7 ^ 130) /
+      (10 ^ 130 * factorial_R 130%nat)).
+  2: { field; nra. }
+  apply (Rmult_lt_reg_r (10 ^ 130 * factorial_R 130%nat)); [nra |].
+  replace
+    ((NR q768_scale * 7 ^ 130 /
+      (10 ^ 130 * factorial_R 130%nat)) *
+      (10 ^ 130 * factorial_R 130%nat))
+    with (NR q768_scale * 7 ^ 130) by (field; nra).
+  nra.
+Qed.
+
+Lemma true_phi_positive : forall x, 0 < x -> 0 < true_phi x.
+Proof.
+  intros x Hx. unfold true_phi.
+  pose proof (exp_increasing (-x) 0) as Hexp.
+  rewrite exp_0 in Hexp. lra.
+Qed.
+
+Lemma scaled_phi_remainders_lt_one : forall x,
+  0 < x < 7 / 10 ->
+  NR q768_scale * (true_phi x - phi_partial 128%nat x) < 1 /\
+  NR q768_scale * (phi_partial 129%nat x - true_phi x) < 1.
+Proof.
+  intros x Hdomain.
+  pose proof (phi_bracket_at_exactly_128_and_129_terms x Hdomain)
+    as Hanalytic.
+  destruct Hanalytic as [Hbracket [Hlower Hupper]].
+  assert (Hfact129 : 0 < factorial_R 129%nat) by apply factorial_R_positive.
+  assert (Hfact130 : 0 < factorial_R 130%nat) by apply factorial_R_positive.
+  assert (Hpow129 : x ^ 129 <= (7 / 10) ^ 129).
+  { apply pow_incr. lra. }
+  assert (Hpow130 : x ^ 130 <= (7 / 10) ^ 130).
+  { apply pow_incr. lra. }
+  assert (Hterm129 :
+    x ^ 129 / factorial_R 129%nat <=
+      (7 / 10) ^ 129 / factorial_R 129%nat).
+  {
+    unfold Rdiv. apply Rmult_le_compat_r.
+    - apply Rlt_le, Rinv_0_lt_compat. exact Hfact129.
+    - exact Hpow129.
+  }
+  assert (Hterm130 :
+    x ^ 130 / factorial_R 130%nat <=
+      (7 / 10) ^ 130 / factorial_R 130%nat).
+  {
+    unfold Rdiv. apply Rmult_le_compat_r.
+    - apply Rlt_le, Rinv_0_lt_compat. exact Hfact130.
+    - exact Hpow130.
+  }
+  assert (HS : 0 < NR q768_scale) by
+    (apply positive_NR; exact q768_nonzero).
+  split.
+  - eapply Rlt_trans.
+    + apply Rmult_lt_compat_l; [exact HS | exact Hlower].
+    + eapply Rle_lt_trans.
+      * apply Rmult_le_compat_l; [lra | exact Hterm129].
+      * exact exp_tail_129_scaled_lt_one.
+  - eapply Rlt_trans.
+    + apply Rmult_lt_compat_l; [exact HS | exact Hupper].
+    + eapply Rle_lt_trans.
+      * apply Rmult_le_compat_l; [lra | exact Hterm130].
+      * exact exp_tail_130_scaled_lt_one.
+Qed.
+
+Lemma phi_lower_raw_error : forall z,
+  (0 < z <= Q768FiniteBounds.log_hi)%N ->
+  let x := NR z / NR q768_scale in
+  0 <= NR q768_scale * true_phi x -
+    IZR (phi_raw_sum z 128%nat true) /\
+  NR q768_scale * true_phi x -
+    IZR (phi_raw_sum z 128%nat true) < 255.
+Proof.
+  intros z Hz. cbn zeta.
+  set (x := NR z / NR q768_scale).
+  pose proof (phi_endpoint_domain z Hz) as Hdomain.
+  fold x in Hdomain.
+  pose proof (phi_raw_sum_sound z 128%nat true (proj2 Hz)) as Hsound.
+  fold x in Hsound.
+  cbn [phi_sum_sound] in Hsound.
+  rewrite Q768FiniteBounds.phi_128_rounding_width_is_254 in Hsound.
+  replace (NR 254) with (254 : R) in Hsound by
+    (unfold NR; simpl; ring).
+  pose proof (phi_bracket_at_exactly_128_and_129_terms x Hdomain)
+    as Hanalytic.
+  pose proof (scaled_phi_remainders_lt_one x Hdomain) as Htails.
+  change (0 <= NR q768_scale * true_phi x -
+    IZR (phi_raw_sum z 128%nat true) /\
+    NR q768_scale * true_phi x -
+    IZR (phi_raw_sum z 128%nat true) < 255).
+  destruct Hanalytic as [Hbracket _].
+  destruct Htails as [Htail _].
+  assert (HS0 : 0 <= NR q768_scale) by apply NR_nonnegative.
+  assert (Hscaledbracket :
+    NR q768_scale * phi_partial 128%nat x <=
+      NR q768_scale * true_phi x).
+  { apply Rmult_le_compat_l; [exact HS0 | exact (proj1 Hbracket)]. }
+  assert (Hdecompose :
+    NR q768_scale * true_phi x - IZR (phi_raw_sum z 128%nat true) =
+    NR q768_scale * (true_phi x - phi_partial 128%nat x) +
+      (NR q768_scale * phi_partial 128%nat x -
+        IZR (phi_raw_sum z 128%nat true))) by lra.
+  split.
+  - pose proof (proj1 Hsound). lra.
+  - rewrite Hdecompose. pose proof (proj2 Hsound). lra.
+Qed.
+
+Lemma phi_upper_raw_error : forall z,
+  (0 < z <= Q768FiniteBounds.log_hi)%N ->
+  let x := NR z / NR q768_scale in
+  0 <= IZR (phi_raw_sum z 129%nat false) - NR q768_scale * true_phi x /\
+  IZR (phi_raw_sum z 129%nat false) - NR q768_scale * true_phi x < 257.
+Proof.
+  intros z Hz. cbn zeta.
+  set (x := NR z / NR q768_scale).
+  pose proof (phi_endpoint_domain z Hz) as Hdomain.
+  fold x in Hdomain.
+  pose proof (phi_raw_sum_sound z 129%nat false (proj2 Hz)) as Hsound.
+  fold x in Hsound.
+  cbn [phi_sum_sound] in Hsound.
+  rewrite Q768FiniteBounds.phi_129_rounding_width_is_256 in Hsound.
+  replace (NR 256) with (256 : R) in Hsound by
+    (unfold NR; simpl; ring).
+  pose proof (phi_bracket_at_exactly_128_and_129_terms x Hdomain)
+    as Hanalytic.
+  pose proof (scaled_phi_remainders_lt_one x Hdomain) as Htails.
+  destruct Hanalytic as [Hbracket _].
+  destruct Htails as [_ Htail].
+  assert (HS0 : 0 <= NR q768_scale) by apply NR_nonnegative.
+  assert (Hscaledbracket :
+    NR q768_scale * true_phi x <=
+      NR q768_scale * phi_partial 129%nat x).
+  { apply Rmult_le_compat_l; [exact HS0 | exact (proj2 Hbracket)]. }
+  assert (Hdecompose :
+    IZR (phi_raw_sum z 129%nat false) - NR q768_scale * true_phi x =
+    (IZR (phi_raw_sum z 129%nat false) -
+      NR q768_scale * phi_partial 129%nat x) +
+    NR q768_scale * (phi_partial 129%nat x - true_phi x)) by lra.
+  split.
+  - pose proof (proj1 Hsound). lra.
+  - rewrite Hdecompose. pose proof (proj2 Hsound). lra.
+Qed.
+
+Lemma phi_model_as_raw_sum : forall z terms lower,
+  phi_model z terms lower = Z.to_N (phi_raw_sum z terms lower).
+Proof. reflexivity. Qed.
+
+Lemma NR_Z_to_N_nonnegative : forall sum : Z,
+  (0 <= sum)%Z -> NR (Z.to_N sum) = IZR sum.
+Proof.
+  intros sum Hsum. unfold NR. rewrite Z2N.id by exact Hsum. reflexivity.
+Qed.
+
+Lemma Z_to_N_negative : forall sum : Z,
+  (sum < 0)%Z -> Z.to_N sum = 0%N.
+Proof.
+  intros [|p|p] Hsum; simpl; lia.
+Qed.
+
+Lemma IZR_negative : forall sum : Z,
+  (sum < 0)%Z -> IZR sum < 0.
+Proof.
+  intros sum Hsum. change (IZR sum < IZR 0).
+  apply IZR_lt. exact Hsum.
+Qed.
+
+Lemma lower_Z_to_N_preserves_error : forall sum exact budget,
+  0 <= exact ->
+  0 <= exact - IZR sum /\ exact - IZR sum < budget ->
+  0 <= exact - NR (Z.to_N sum) /\
+    exact - NR (Z.to_N sum) < budget.
+Proof.
+  intros sum exact budget Hexact Herror.
+  destruct (Z_lt_ge_dec sum 0) as [Hneg | Hnonneg].
+  - rewrite Z_to_N_negative by exact Hneg.
+    replace (NR 0) with (0 : R) by (unfold NR; simpl; reflexivity).
+    pose proof (IZR_negative sum Hneg). lra.
+  - assert (H0 : (0 <= sum)%Z) by lia.
+    rewrite NR_Z_to_N_nonnegative by exact H0. exact Herror.
+Qed.
+
+Lemma upper_Z_to_N_preserves_error : forall sum exact budget,
+  0 <= exact ->
+  0 <= IZR sum - exact /\ IZR sum - exact < budget ->
+  0 <= NR (Z.to_N sum) - exact /\
+    NR (Z.to_N sum) - exact < budget.
+Proof.
+  intros sum exact budget Hexact Herror.
+  assert (Hnonneg : (0 <= sum)%Z).
+  {
+    destruct (Z_lt_ge_dec sum 0) as [Hneg | Hnonneg]; [|lia].
+    pose proof (IZR_negative sum Hneg). lra.
+  }
+  rewrite NR_Z_to_N_nonnegative by exact Hnonneg. exact Herror.
+Qed.
+
+Lemma phi_lower_model_error : forall z,
+  (0 < z <= Q768FiniteBounds.log_hi)%N ->
+  let x := NR z / NR q768_scale in
+  0 <= NR q768_scale * true_phi x - NR (phi_model z 128%nat true) /\
+  NR q768_scale * true_phi x - NR (phi_model z 128%nat true) < 255.
+Proof.
+  intros z Hz. cbn zeta.
+  set (x := NR z / NR q768_scale).
+  pose proof (phi_endpoint_domain z Hz) as Hdomain. fold x in Hdomain.
+  pose proof (phi_lower_raw_error z Hz) as Hraw. fold x in Hraw.
+  rewrite phi_model_as_raw_sum.
+  apply lower_Z_to_N_preserves_error.
+  - pose proof (true_phi_positive x (proj1 Hdomain)).
+    pose proof (positive_NR q768_scale q768_nonzero). nra.
+  - exact Hraw.
+Qed.
+
+Lemma phi_upper_model_error : forall z,
+  (0 < z <= Q768FiniteBounds.log_hi)%N ->
+  let x := NR z / NR q768_scale in
+  0 <= NR (phi_model z 129%nat false) - NR q768_scale * true_phi x /\
+  NR (phi_model z 129%nat false) - NR q768_scale * true_phi x < 257.
+Proof.
+  intros z Hz. cbn zeta.
+  set (x := NR z / NR q768_scale).
+  pose proof (phi_endpoint_domain z Hz) as Hdomain. fold x in Hdomain.
+  pose proof (phi_upper_raw_error z Hz) as Hraw. fold x in Hraw.
+  rewrite phi_model_as_raw_sum.
+  apply upper_Z_to_N_preserves_error.
+  - pose proof (true_phi_positive x (proj1 Hdomain)).
+    pose proof (positive_NR q768_scale q768_nonzero). nra.
+  - exact Hraw.
+Qed.
+
+Lemma log_recurrence_sum_monotone : forall remaining n y2 st,
+  (st.(log_sum).(ilo) <=
+    (log_recurrence remaining n y2 st).(log_sum).(ilo))%N.
+Proof.
+  induction remaining as [|remaining IH]; intros n y2 st.
+  - apply N.le_refl.
+  - cbn [log_recurrence]. destruct remaining as [|remaining'].
+    + simpl. apply N.le_add_r.
+    + apply (N.le_trans _
+        (st.(log_sum).(ilo) +
+          (idivi st.(log_power) (N.of_nat (2 * n + 1))).(ilo))%N).
+      * simpl. apply N.le_add_r.
+      * pose proof (IH (Nat.succ n) y2
+          {| log_power := imul st.(log_power) y2;
+             log_sum :=
+               {| ilo := st.(log_sum).(ilo) +
+                    (idivi st.(log_power)
+                      (N.of_nat (2 * n + 1))).(ilo);
+                  ihi := st.(log_sum).(ihi) +
+                    (idivi st.(log_power)
+                      (N.of_nat (2 * n + 1))).(ihi) |} |}) as Hrec.
+        exact Hrec.
+Qed.
+
+Lemma log_recurrence_first_term_lower : forall remaining n y2 st,
+  (st.(log_sum).(ilo) +
+      st.(log_power).(ilo) / N.of_nat (2 * n + 1) <=
+    (log_recurrence (S remaining) n y2 st).(log_sum).(ilo))%N.
+Proof.
+  intros [|remaining] n y2 st.
+  - cbn [log_recurrence]. apply N.le_refl.
+  - change
+      (st.(log_sum).(ilo) +
+          st.(log_power).(ilo) / N.of_nat (2 * n + 1) <=
+       (log_recurrence (S remaining) (Nat.succ n) y2
+          {| log_power := imul st.(log_power) y2;
+             log_sum :=
+               {| ilo := st.(log_sum).(ilo) +
+                    st.(log_power).(ilo) / N.of_nat (2 * n + 1);
+                  ihi := st.(log_sum).(ihi) +
+                    ceil_div st.(log_power).(ihi)
+                      (N.of_nat (2 * n + 1)) |} |}).(log_sum).(ilo))%N.
+    exact (log_recurrence_sum_monotone (S remaining) (Nat.succ n) y2
+      {| log_power := imul st.(log_power) y2;
+         log_sum :=
+           {| ilo := st.(log_sum).(ilo) +
+                st.(log_power).(ilo) / N.of_nat (2 * n + 1);
+              ihi := st.(log_sum).(ihi) +
+                ceil_div st.(log_power).(ihi)
+                  (N.of_nat (2 * n + 1)) |} |}).
+Qed.
+
+Lemma certified_log_model_lower_bound : forall f,
+  (1 <= f <= 2 ^ 63)%N ->
+  (2 ^ 704 <= (certified_log_model f).(ilo))%N.
+Proof.
+  intros f [Hfpos Hfmax].
+  unfold certified_log_model.
+  set (fq := (f * 2 ^ (768 - 64))%N).
+  set (den := (2 * q768_scale - fq)%N).
+  set (y := {| ilo := (fq * q768_scale) / den;
+               ihi := ceil_div (fq * q768_scale) den |}).
+  set (y2 := imul y y).
+  set (initial := {| log_power := y;
+                     log_sum := {| ilo := 0; ihi := 0 |} |}).
+  set (final := log_recurrence 256%nat 0%nat y2 initial).
+  assert (Hfqlo : (2 ^ 704 <= fq)%N).
+  {
+    unfold fq.
+    replace (2 ^ 704)%N with (1 * 2 ^ (768 - 64))%N by
+      (vm_compute; reflexivity).
+    apply N.mul_le_mono_r. exact Hfpos.
+  }
+  assert (Hfqhi : (2 * fq <= q768_scale)%N).
+  {
+    unfold fq. pose proof (N.mul_le_mono_r f (2 ^ 63)
+      (2 ^ (768 - 64)) Hfmax) as Hmul.
+    rewrite <- q768_shift_identity. nia.
+  }
+  assert (Hden : (den <> 0)%N).
+  { unfold den. pose proof q768_nonzero. nia. }
+  assert (Hdenle : (den <= 2 * q768_scale)%N).
+  { unfold den. nia. }
+  assert (Hidentity :
+    ((2 * q768_scale) * 2 ^ 703 = (2 ^ 704) * q768_scale)%N).
+  { unfold q768_scale. vm_compute. reflexivity. }
+  assert (Hnumer : (den * 2 ^ 703 <= fq * q768_scale)%N).
+  {
+    eapply N.le_trans.
+    - apply N.mul_le_mono_r. exact Hdenle.
+    - rewrite Hidentity. apply N.mul_le_mono_r. exact Hfqlo.
+  }
+  assert (Hylo : (2 ^ 703 <= y.(ilo))%N).
+  {
+    unfold y. simpl. apply N.div_le_lower_bound; assumption.
+  }
+  pose proof (log_recurrence_first_term_lower 255%nat 0%nat y2 initial)
+    as Hfirst.
+  fold final in Hfirst.
+  cbn [initial] in Hfirst.
+  rewrite N.div_1_r in Hfirst.
+  assert (Hdouble : (2 ^ 704 = 2 * 2 ^ 703)%N) by
+    (vm_compute; reflexivity).
+  rewrite Hdouble. apply N.mul_le_mono_l.
+  eapply N.le_trans; eauto.
+Qed.
+
+Lemma stake_lower_endpoint_bound : forall f w total,
+  admissible f w total ->
+  let l := certified_log_model f in
+  (2 ^ 640 <= (l.(ilo) * w) / total)%N.
+Proof.
+  intros f w total [Hf [Hw [Hwtotal Htotalmax]]]. cbn zeta.
+  assert (Htotal : (total <> 0)%N) by lia.
+  pose proof (certified_log_model_lower_bound f Hf) as Hlog.
+  apply N.div_le_lower_bound; [exact Htotal |].
+  assert (Htotal64 : (total <= 2 ^ 64)%N).
+  {
+    assert (Hstep : (2 ^ 64 - 1 <= 2 ^ 64)%N) by
+      apply N.le_sub_l.
+    exact (N.le_trans _ _ _ Htotalmax Hstep).
+  }
+  assert (Hleft : (total * 2 ^ 640 <= (2 ^ 64) * 2 ^ 640)%N).
+  { apply N.mul_le_mono_r. exact Htotal64. }
+  assert (Hidentity : ((2 ^ 64) * 2 ^ 640 = 2 ^ 704)%N) by
+    (vm_compute; reflexivity).
+  assert (Hright : (2 ^ 704 <= (certified_log_model f).(ilo) * w)%N).
+  {
+    eapply N.le_trans; [exact Hlog |].
+    replace ((certified_log_model f).(ilo)) with
+      ((certified_log_model f).(ilo) * 1)%N at 1 by lia.
+    apply N.mul_le_mono_l. exact Hw.
+  }
+  rewrite Hidentity in Hleft. eapply N.le_trans; eauto.
+Qed.
+
+Lemma true_phi_monotone_lipschitz : forall a b,
+  0 <= a <= b ->
+  0 <= true_phi b - true_phi a <= b - a.
+Proof.
+  intros a b [Ha Hab].
+  set (d := b - a).
+  assert (Hd : 0 <= d) by (unfold d; lra).
+  assert (Hed : 0 < exp (-d) <= 1).
+  {
+    split; [apply exp_pos |].
+    destruct (Req_dec d 0) as [-> | Hdn].
+    - rewrite Ropp_0, exp_0. lra.
+    - pose proof (exp_increasing (-d) 0) as Hinc.
+      rewrite exp_0 in Hinc. lra.
+  }
+  assert (Hea : 0 < exp (-a) <= 1).
+  {
+    split; [apply exp_pos |].
+    destruct (Req_dec a 0) as [-> | Han].
+    - rewrite Ropp_0, exp_0. lra.
+    - pose proof (exp_increasing (-a) 0) as Hinc.
+      rewrite exp_0 in Hinc. lra.
+  }
+  pose proof (exp_ineq1_le (-d)) as Hlinear.
+  assert (Hfactor : 0 <= 1 - exp (-d) <= d) by lra.
+  assert (Hsplit : exp (-b) = exp (-a) * exp (-d)).
+  {
+    rewrite <- exp_plus. f_equal. unfold d. ring.
+  }
+  unfold true_phi. rewrite Hsplit. nra.
+Qed.
+
+Lemma scaled_true_phi_endpoint_gap : forall zlo zhi,
+  (zlo <= zhi)%N ->
+  0 <= NR q768_scale *
+      (true_phi (NR zhi / NR q768_scale) -
+       true_phi (NR zlo / NR q768_scale)) <=
+    NR (zhi - zlo).
+Proof.
+  intros zlo zhi Horder.
+  assert (HS : 0 < NR q768_scale) by
+    apply positive_NR, q768_nonzero.
+  assert (Hzorder : NR zlo <= NR zhi).
+  { apply NR_le. exact Horder. }
+  pose proof (true_phi_monotone_lipschitz
+    (NR zlo / NR q768_scale) (NR zhi / NR q768_scale)) as Hlip.
+  assert (Hdomain :
+    0 <= NR zlo / NR q768_scale <= NR zhi / NR q768_scale).
+  {
+    assert (Hinv : 0 < / NR q768_scale) by
+      (apply Rinv_0_lt_compat; lra).
+    split.
+    - unfold Rdiv. apply Rmult_le_pos;
+        [apply NR_nonnegative | left; exact Hinv].
+    - unfold Rdiv. apply Rmult_le_compat_r; [lra | exact Hzorder].
+  }
+  specialize (Hlip Hdomain).
+  assert (Hscaled :
+    NR q768_scale *
+      (NR zhi / NR q768_scale - NR zlo / NR q768_scale) =
+    NR (zhi - zlo)).
+  {
+    rewrite NR_sub by exact Horder.
+    field. lra.
+  }
+  nra.
+Qed.
+
+Lemma true_phi_unit_interval : forall x,
+  0 <= x -> 0 <= true_phi x < 1.
+Proof.
+  intros x Hx.
+  pose proof (true_phi_monotone_lipschitz 0 x) as Hmono.
+  assert (Hzero : true_phi 0 = 0).
+  { unfold true_phi. rewrite Ropp_0, exp_0. ring. }
+  specialize (Hmono (conj (Rle_refl 0) Hx)).
+  pose proof (exp_pos (-x)). unfold true_phi in *. rewrite Hzero in Hmono.
+  lra.
+Qed.
+
+Lemma lower_q768_clamp_identity : forall p exact,
+  NR p <= NR q768_scale * exact ->
+  exact < 1 ->
+  N.min q768_scale p = p.
+Proof.
+  intros p exact Hbelow Hunit.
+  destruct (N.le_ge_cases p q768_scale) as [Hps | Hsp].
+  - apply N.min_r. exact Hps.
+  - destruct (N.eq_dec p q768_scale) as [-> | Hneq].
+    + apply N.min_id.
+    + assert (Hstrict : (q768_scale < p)%N) by lia.
+      pose proof (NR_lt q768_scale p Hstrict).
+      pose proof (positive_NR q768_scale q768_nonzero). nra.
+Qed.
+
+Lemma upper_q768_clamp_preserves : forall p exact,
+  exact <= 1 ->
+  NR q768_scale * exact <= NR p ->
+  NR q768_scale * exact <= NR (N.min q768_scale p) <= NR p.
+Proof.
+  intros p exact Hunit Habove.
+  destruct (N.le_ge_cases p q768_scale) as [Hps | Hsp].
+  - rewrite N.min_r by exact Hps. split; [exact Habove | lra].
+  - rewrite N.min_l by exact Hsp. split.
+    + pose proof (positive_NR q768_scale q768_nonzero). nra.
+    + apply NR_le. exact Hsp.
+Qed.
+
+Lemma NR_reflect_le : forall a b : N, NR a <= NR b -> (a <= b)%N.
+Proof.
+  intros a b Hab. unfold NR in Hab. apply N2Z.inj_le. now apply le_IZR.
+Qed.
+
+Lemma NR_reflect_lt : forall a b : N, NR a < NR b -> (a < b)%N.
+Proof.
+  intros a b Hab. unfold NR in Hab. apply N2Z.inj_lt. now apply lt_IZR.
+Qed.
+
+Lemma certificate_model_shape : forall f w total,
+  certificate_model f w total =
+    let l := certified_log_model f in
+    let zlo := ((l.(ilo) * w) / total)%N in
+    let zhi := ceil_div (l.(ihi) * w) total in
+    (N.min q768_scale (phi_model zlo 128%nat true),
+     N.min q768_scale (phi_model zhi 129%nat false)).
+Proof. reflexivity. Qed.
+
+Lemma full_q768_abstract_assembly :
+  forall f w total zlo zhi pl ph lo hi : N,
+    admissible f w total ->
+    interval_contains {| ilo := zlo; ihi := zhi |}
+      (NR q768_scale * phi_argument f w total) /\
+    interval_bounded {| ilo := zlo; ihi := zhi |}
+      Q768FiniteBounds.log_hi (Q768FiniteBounds.log_width + 1) ->
+    (2 ^ 640 <= zlo)%N ->
+    pl = phi_model zlo 128%nat true ->
+    ph = phi_model zhi 129%nat false ->
+    lo = N.min q768_scale pl ->
+    hi = N.min q768_scale ph ->
+    (NR lo / NR q768_scale <= true_probability f w total <= NR hi / NR q768_scale) /\
+    (hi - lo <= 1537)%N /\
+    (0 <= true_probability f w total - NR lo / NR q768_scale
+      < NR 1281 / NR q768_scale).
+Proof.
+  intros f w total zlo zhi pl ph lo hi Hadmissible Hbridge
+    Hzlo_floor Hpl_def Hph_def Hlo_def Hhi_def.
+  assert (HS : 0 < NR q768_scale) by
+    apply positive_NR, q768_nonzero.
+  cbv beta iota zeta delta [interval_contains interval_bounded] in Hbridge.
+  destruct Hbridge as
+    [[Hzlo_arg Harg_zhi] [Hzhi_upper [Hzwidth Hzorder]]].
+  assert (Hzlo_upper : (zlo <= Q768FiniteBounds.log_hi)%N).
+  { exact (N.le_trans zlo zhi Q768FiniteBounds.log_hi
+      Hzorder Hzhi_upper). }
+  assert (Hzlo_pos : (0 < zlo)%N).
+  { eapply N.lt_le_trans; [|exact Hzlo_floor]. vm_compute. reflexivity. }
+  assert (Hzhi_pos : (0 < zhi)%N).
+  { exact (N.lt_le_trans 0 zlo zhi Hzlo_pos Hzorder). }
+  assert (Hzwidth1026 : (zhi - zlo <= 1026)%N).
+  {
+    rewrite Q768FiniteBounds.certified_log_width_is_1025 in Hzwidth.
+    exact Hzwidth.
+  }
+
+  set (xlo := NR zlo / NR q768_scale).
+  set (xhi := NR zhi / NR q768_scale).
+  set (x := phi_argument f w total).
+  set (tp := true_probability f w total).
+  set (glo := true_phi xlo).
+  set (ghi := true_phi xhi).
+  assert (HxloS : xlo * NR q768_scale = NR zlo).
+  { unfold xlo. field. lra. }
+  assert (HxhiS : xhi * NR q768_scale = NR zhi).
+  { unfold xhi. field. lra. }
+  assert (Hxrange : xlo <= x <= xhi).
+  {
+    split.
+    - apply (Rmult_le_reg_r (NR q768_scale)); [exact HS |].
+      rewrite HxloS. replace (x * NR q768_scale)
+        with (NR q768_scale * x) by ring. exact Hzlo_arg.
+    - apply (Rmult_le_reg_r (NR q768_scale)); [exact HS |].
+      rewrite HxhiS. replace (x * NR q768_scale)
+        with (NR q768_scale * x) by ring. exact Harg_zhi.
+  }
+  assert (Hxlo_nonneg : 0 <= xlo).
+  {
+    unfold xlo, Rdiv. apply Rmult_le_pos;
+      [apply NR_nonnegative | left; apply Rinv_0_lt_compat; exact HS].
+  }
+  assert (Hx_nonneg : 0 <= x) by lra.
+  assert (Hxhi_nonneg : 0 <= xhi) by lra.
+  assert (Htp_phi : tp = true_phi x).
+  { unfold tp, true_probability, true_phi, x. reflexivity. }
+  pose proof (true_phi_monotone_lipschitz xlo x
+    (conj Hxlo_nonneg (proj1 Hxrange))) as Hmono_lo.
+  pose proof (true_phi_monotone_lipschitz x xhi
+    (conj Hx_nonneg (proj2 Hxrange))) as Hmono_hi.
+  fold glo ghi in Hmono_lo, Hmono_hi.
+  rewrite <- Htp_phi in Hmono_lo, Hmono_hi.
+  pose proof (true_phi_unit_interval x Hx_nonneg) as Htp_unit.
+  rewrite <- Htp_phi in Htp_unit.
+
+  pose proof (phi_lower_model_error zlo
+    (conj Hzlo_pos Hzlo_upper)) as Hpl.
+  cbv beta iota zeta in Hpl.
+  rewrite <- Hpl_def in Hpl.
+  change (0 <= NR q768_scale * glo - NR pl /\
+          NR q768_scale * glo - NR pl < 255) in Hpl.
+  pose proof (phi_upper_model_error zhi
+    (conj Hzhi_pos Hzhi_upper)) as Hph.
+  cbv beta iota zeta in Hph.
+  rewrite <- Hph_def in Hph.
+  change (0 <= NR ph - NR q768_scale * ghi /\
+          NR ph - NR q768_scale * ghi < 257) in Hph.
+  pose proof (scaled_true_phi_endpoint_gap zlo zhi Hzorder) as Hgap.
+  change (0 <= NR q768_scale * (ghi - glo) <=
+          NR (zhi - zlo)) in Hgap.
+  assert (Hraw_bracket :
+    NR pl <= NR q768_scale * tp <= NR ph) by nra.
+  assert (Hlo_id : lo = pl).
+  {
+    rewrite Hlo_def. apply lower_q768_clamp_identity with (exact := tp);
+      [exact (proj1 Hraw_bracket) | exact (proj2 Htp_unit)].
+  }
+  pose proof (upper_q768_clamp_preserves ph tp
+    (Rlt_le _ _ (proj2 Htp_unit)) (proj2 Hraw_bracket)) as Hhi_clamp.
+  rewrite <- Hhi_def in Hhi_clamp.
+  assert (Hscaled_bracket :
+    NR lo <= NR q768_scale * tp <= NR hi).
+  { rewrite Hlo_id. split; [exact (proj1 Hraw_bracket) | exact (proj1 Hhi_clamp)]. }
+
+  assert (HzgapR : NR (zhi - zlo) <= 1026).
+  {
+    pose proof (NR_le (zhi - zlo) 1026 Hzwidth1026) as H.
+    replace (NR 1026) with (1026 : R) in H by
+      (unfold NR; simpl; ring). exact H.
+  }
+  assert (Hraw_width : NR ph - NR pl < 1538) by nra.
+  assert (Hclamped_width : NR hi - NR lo < 1538).
+  { rewrite Hlo_id. nra. }
+  assert (Hlohi : (lo <= hi)%N).
+  { apply NR_reflect_le. nra. }
+  assert (HwidthN : (hi - lo <= 1537)%N).
+  {
+    assert (HwidthR : NR (hi - lo) < NR 1538).
+    {
+      rewrite NR_sub by exact Hlohi.
+      replace (NR 1538) with (1538 : R) by
+        (unfold NR; simpl; ring). exact Hclamped_width.
+    }
+    pose proof (NR_reflect_lt (hi - lo) 1538 HwidthR). lia.
+  }
+  assert (Hscaled_lower_error :
+    0 <= NR q768_scale * tp - NR lo < 1281).
+  {
+    rewrite Hlo_id.
+    assert (Htp_gap :
+      0 <= NR q768_scale * (tp - glo) <= 1026) by nra.
+    nra.
+  }
+
+  repeat split.
+  - apply (Rmult_le_reg_r (NR q768_scale)); [exact HS |].
+    replace (NR lo / NR q768_scale * NR q768_scale)
+      with (NR lo) by (field; lra).
+    nra.
+  - apply (Rmult_le_reg_r (NR q768_scale)); [exact HS |].
+    replace (NR hi / NR q768_scale * NR q768_scale)
+      with (NR hi) by (field; lra).
+    nra.
+  - exact HwidthN.
+  - apply (Rmult_le_reg_r (NR q768_scale)); [exact HS |].
+    replace ((tp - NR lo / NR q768_scale) * NR q768_scale)
+      with (NR q768_scale * tp - NR lo) by (field; lra).
+    nra.
+  - apply (Rmult_lt_reg_r (NR q768_scale)); [exact HS |].
+    replace ((tp - NR lo / NR q768_scale) * NR q768_scale)
+      with (NR q768_scale * tp - NR lo) by (field; lra).
+    replace (NR 1281 / NR q768_scale * NR q768_scale)
+      with (NR 1281) by (field; lra).
+    replace (NR 1281) with (1281 : R) by
+      (unfold NR; simpl; ring).
+    exact (proj2 Hscaled_lower_error).
+Qed.
+
 Theorem full_q768_abstract_target :
   forall f w total : N,
     admissible f w total ->
@@ -1163,9 +2243,14 @@ Theorem full_q768_abstract_target :
       < NR 1281 / NR q768_scale).
 Proof.
   intros f w total Hadmissible.
-  (* The exact log recurrence, analytic log tail, and stake scaling are
-     connected above by [certificate_log_and_stake_bridge]. The remaining
-     obligation is the signed phi recurrence: its directed endpoint choices,
-     [Z.to_N] clamp, analytic 128/129 brackets, final [N.min] clamp, and the
-     1537/1281 budget assembly. *)
-Abort.
+  rewrite certificate_model_shape.
+  cbv beta iota zeta.
+  eapply full_q768_abstract_assembly.
+  - exact Hadmissible.
+  - apply certificate_log_and_stake_bridge. exact Hadmissible.
+  - apply stake_lower_endpoint_bound. exact Hadmissible.
+  - reflexivity.
+  - reflexivity.
+  - reflexivity.
+  - reflexivity.
+Qed.
