@@ -784,6 +784,128 @@ pub fn evaluate(
     })
 }
 
+/// Observation-only stage trace for the standalone differential-test crate.
+///
+/// This feature is disabled by default and does not alter the arithmetic path
+/// used by `certified_log` or `evaluate`. The trace deliberately repeats that
+/// path with the same private fixed-limb primitives, then the differential
+/// harness checks its public outputs back against those two shipped shadow APIs.
+#[cfg(feature = "differential-trace")]
+pub mod differential_trace {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LogTrace {
+        pub y_lo: Uint,
+        pub y_hi: Uint,
+        pub y2_lo: Uint,
+        pub y2_hi: Uint,
+        pub certificate: CertifiedLogInterval,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct EvaluateTrace {
+        pub zlo: Uint,
+        pub zhi: Uint,
+        pub phi_lower_raw: Uint,
+        pub phi_upper_raw: Uint,
+        pub probability_lo: Uint,
+        pub probability_hi: Uint,
+        pub result: SortitionResult,
+    }
+
+    pub fn certified_log_trace(f: u64) -> Result<LogTrace, ArithmeticError> {
+        if f == 0 || f > MAX_F {
+            return Err(ArithmeticError::InvalidF);
+        }
+        let scale = scale();
+        let fq = Uint::from_u64(f).checked_shl(Q_BITS - 64)?;
+        let denominator = scale.checked_shl(1)?.checked_sub(&fq)?;
+        let numerator = fq.mul(&scale);
+        let cancelled_numerator = numerator.shr_to_uint(Q_BITS - 64)?;
+        let cancelled_denominator = denominator.shr(Q_BITS - 64).as_u128()?;
+        let y = Interval {
+            lo: cancelled_numerator.floor_div_small_u128(cancelled_denominator)?,
+            hi: cancelled_numerator.ceil_div_small_u128(cancelled_denominator)?,
+        };
+        let y2 = mul_interval(&y, &y)?;
+        let mut power = y;
+        let mut lo = Uint::ZERO;
+        let mut hi = Uint::ZERO;
+        let mut n = 0u64;
+        while n < 256 {
+            let term = div_interval_u64(&power, 2 * n + 1)?;
+            lo = lo.checked_add(&term.lo)?;
+            hi = hi.checked_add(&term.hi)?;
+            if n != 255 {
+                power = mul_interval(&power, &y2)?;
+            }
+            n += 1;
+        }
+        let y513 = mul_interval(&power, &y2)?;
+        let tail_numerator = y513.hi.mul(&scale).checked_mul_u64(2)?;
+        let tail_denominator = scale.checked_sub(&y2.hi)?.mul_u64(513).narrow()?;
+        let tail = tail_numerator.ceil_div_uint(&tail_denominator)?;
+        let certificate = CertifiedLogInterval {
+            lo: lo.checked_shl(1)?,
+            hi: hi.checked_shl(1)?.checked_add(&tail)?,
+        };
+        Ok(LogTrace {
+            y_lo: y.lo,
+            y_hi: y.hi,
+            y2_lo: y2.lo,
+            y2_hi: y2.hi,
+            certificate,
+        })
+    }
+
+    pub fn evaluate_trace(
+        log: &CertifiedLogInterval,
+        validator_stake: u64,
+        total_stake: u64,
+        output: &[u8; 64],
+    ) -> Result<EvaluateTrace, ArithmeticError> {
+        if validator_stake == 0 || total_stake == 0 || validator_stake > total_stake {
+            return Err(ArithmeticError::InvalidStake);
+        }
+        let zlo = log
+            .lo
+            .mul_u64(validator_stake)
+            .floor_div_u64_to_uint(total_stake)?;
+        let zhi = log
+            .hi
+            .mul_u64(validator_stake)
+            .ceil_div_u64_to_uint(total_stake)?;
+        let scale = scale();
+        let phi_lower_raw = phi(zlo, 128, true)?;
+        let phi_upper_raw = phi(zhi, 129, false)?;
+        let probability_lo = phi_lower_raw.min(scale);
+        let probability_hi = phi_upper_raw.min(scale);
+        if probability_hi < probability_lo {
+            return Err(ArithmeticError::InvertedInterval);
+        }
+        let interval_width = probability_hi.checked_sub(&probability_lo)?;
+        if interval_width > Uint::from_u64(PRODUCTION_MAX_INTERVAL_WIDTH) {
+            return Err(ArithmeticError::WidthGuardExceeded);
+        }
+        let threshold = Threshold512::from_q768_lower(&probability_lo)?;
+        let eligible = Threshold512::output_is_below(output, &threshold);
+        Ok(EvaluateTrace {
+            zlo,
+            zhi,
+            phi_lower_raw,
+            phi_upper_raw,
+            probability_lo,
+            probability_hi,
+            result: SortitionResult {
+                eligible,
+                threshold,
+                interval_width,
+            },
+        })
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
