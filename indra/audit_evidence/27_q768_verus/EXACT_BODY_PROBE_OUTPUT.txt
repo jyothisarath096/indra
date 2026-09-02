@@ -1,0 +1,59 @@
+Verus
+  Version: 0.2026.08.30.b432e82
+  Profile: release
+  Platform: macos_aarch64
+  Toolchain: 1.97.1-aarch64-apple-darwin
+
+Command (after applying EXACT_BODY_ANNOTATION_PROBE.patch and regenerating Cargo.lock):
+
+  PATH=/path/to/verus-arm64-macos:$PATH cargo verus focus -- --no-cheating
+
+Output:
+
+    Checking indra-q768-fixed-shadow v0.0.0 (.../audit_evidence/26_q768_shadow_implementation)
+error: cannot use type `indra_q768_fixed_shadow::Uint` which is ignored because it is either declared outside the verus! macro or it is marked as `external`.
+  --> src/lib.rs:50:20
+   |
+50 |          pub fn is_zero(&self) -> bool {
+   |                         ^^^^^
+   = help: The following declaration may resolve this error:
+           #[verifier::external_type_specification]
+           pub struct ExUint(crate::Uint);
+
+error: cannot use function `indra_q768_fixed_shadow::VALUE_LIMBS` which is ignored because it is either declared outside the verus! macro or it is marked as `external`.
+  --> src/lib.rs:53:19
+   |
+52 |         #[cfg_attr(verus_only, verus_spec(invariant i <= VALUE_LIMBS))]
+   |                                                          -----------
+53 |         while i < VALUE_LIMBS {
+   |                   ^^^^^^^^^^^
+
+error: cannot use type `indra_q768_fixed_shadow::ArithmeticError` which is ignored because it is either declared outside the verus! macro or it is marked as `external`.
+  --> src/lib.rs:78:46
+   |
+78 | pub fn checked_add(&self, rhs: &Self) -> Result<Self, ArithmeticError> {
+   |                                                       ^^^^^^^^^^^^^^^
+   = help: The following declaration may resolve this error:
+           #[verifier::external_type_specification]
+           pub struct ExArithmeticError(crate::ArithmeticError);
+
+error: `core::num::impl&%9::overflowing_add` is not supported (note: you may be able to add a Verus specification to this function with `assume_specification`) (note: the vstd library provides some specification for the Rust std library, but it is currently limited)
+  --> src/lib.rs:84:40
+   |
+84 |             let (first, carry_first) = self.0[i].overflowing_add(rhs.0[i]);
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+85 |             let (second, carry_second) = first.overflowing_add(carry as u64);
+   |                                          -----------------------------------
+   |
+   = help: The following declaration may resolve this error:
+           pub assume_specification [core::num::<impl u64>::overflowing_add] (_0: u64, _1: u64) -> (u64, bool);
+
+error: could not compile `indra-q768-fixed-shadow` (lib) due to 4 previous errors
+real 0.69
+user 0.52
+sys 0.11
+
+Notes:
+
+- The path prefix was shortened to `...` in the first line only. Diagnostic text is otherwise retained.
+- The first attempt forwarded `--no-cheating` to `vstd` itself and failed on vstd's own trusted `admit`/`assume` declarations. `cargo verus focus` applies the flag to the root crate while treating the released vstd artifact as part of the declared Verus trusted base.

@@ -1,0 +1,60 @@
+diff --git a/audit_evidence/26_q768_shadow_implementation/Cargo.toml b/audit_evidence/26_q768_shadow_implementation/Cargo.toml
+index 2efc928e..df18338e 100644
+--- a/audit_evidence/26_q768_shadow_implementation/Cargo.toml
++++ b/audit_evidence/26_q768_shadow_implementation/Cargo.toml
+@@ -7,7 +7,13 @@ publish = false
+ [features]
+ differential-trace = []
+ 
++[dependencies]
++vstd = "=0.0.0-2026-08-30-0159"
++
++[package.metadata.verus]
++verify = true
++
+ [workspace]
+ 
+ [lints.rust]
+-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
++unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_only)"] }
+diff --git a/audit_evidence/26_q768_shadow_implementation/src/lib.rs b/audit_evidence/26_q768_shadow_implementation/src/lib.rs
+index 7fd64e87..dc1fb648 100644
+--- a/audit_evidence/26_q768_shadow_implementation/src/lib.rs
++++ b/audit_evidence/26_q768_shadow_implementation/src/lib.rs
+@@ -1,10 +1,12 @@
+ #![no_std]
++#![cfg_attr(verus_only, feature(proc_macro_hygiene))]
+ //! Verification-only fixed-limb shadow of INDRA's Q768 sortition arithmetic.
+ //!
+ //! This crate is standalone evidence. It is not imported by any production
+ //! crate and deliberately exposes no integration surface for consensus code.
+ 
+ use core::cmp::Ordering;
++use vstd::prelude::*;
+ 
+ pub const Q_BITS: usize = 768;
+ pub const VALUE_LIMBS: usize = 16;
+@@ -44,8 +46,10 @@ impl Uint {
+         Self(words)
+     }
+ 
++    #[verus_spec]
+     pub fn is_zero(&self) -> bool {
+         let mut i = 0;
++        #[cfg_attr(verus_only, verus_spec(invariant i <= VALUE_LIMBS))]
+         while i < VALUE_LIMBS {
+             if self.0[i] != 0 {
+                 return false;
+@@ -70,10 +74,12 @@ impl Uint {
+         self.0[bit / 64] |= 1u64 << (bit % 64);
+     }
+ 
++    #[verus_spec]
+     pub fn checked_add(&self, rhs: &Self) -> Result<Self, ArithmeticError> {
+         let mut out = [0; VALUE_LIMBS];
+         let mut carry = false;
+         let mut i = 0;
++        #[cfg_attr(verus_only, verus_spec(invariant i <= VALUE_LIMBS))]
+         while i < VALUE_LIMBS {
+             let (first, carry_first) = self.0[i].overflowing_add(rhs.0[i]);
+             let (second, carry_second) = first.overflowing_add(carry as u64);
