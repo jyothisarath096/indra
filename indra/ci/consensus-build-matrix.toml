@@ -17,7 +17,7 @@ rustflags = ""
 target_cpu = "target default"
 target_features = "target default"
 runtime_cpu_dispatch = "allowed only for semantically byte-identical primitive implementations"
-cargo_lock_sha256 = "5479dc079feaa81055de2a26ef585c9778b5257ace77d5e805229bc2679ab7b7"
+cargo_lock_sha256 = "24eea7cb276c93345c19667483d452b64e2bab9abb72beb9678d6a58dae43f46"
 
 [[platform]]
 name = "macOS ARM64"
