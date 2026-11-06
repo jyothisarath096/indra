@@ -12,7 +12,7 @@ One billion INDRA maximum lifetime issuance. No foundation treasury or pre-mine.
 
 → **[indraprotocol.com](https://indraprotocol.com)**
 → **[Whitepaper](docs/WHITEPAPER.md)**
-→ **[Testnet RPC](https://rpc.indraprotocol.com)**
+→ **Testnet:** As of November 2026, no public network is running.
 
 ---
 
@@ -392,16 +392,12 @@ See [whitepaper Section 6](docs/WHITEPAPER.md) for full governance specification
 
 ## Testnet
 
-```
-Chain ID:    indra-testnet-1
-RPC:         https://rpc.indraprotocol.com
-P2P:         116.203.185.28:30303
-Observer:    116.203.185.28:30304
-Explorer:    https://indraprotocol.com/#explorer
-Schema:      v4
-```
+As of November 2026, no public network is currently running. The checked-in deployment information
+is a historical Testnet-3 record; see
+[`docs/DEPLOYMENT_MANIFEST.md`](docs/DEPLOYMENT_MANIFEST.md). Do not treat the
+obsolete `indra-testnet-1` genesis artifact as live network information.
 
-Genesis validators:
+Obsolete Testnet-1 genesis validators (not a live network):
 
 | Name | Validator ID |
 |------|-------------|
@@ -451,7 +447,7 @@ fails with `INDRA_ERR_WRONG_KEY_ROLE`; there is no hot fallback.
 Found a vulnerability? Do not open a public issue.
 Email: security@indraprotocol.com
 
-A professional third-party security audit is planned before mainnet.
+A professional third-party security audit is still required before mainnet.
 The audit report will be published in full.
 
 ---

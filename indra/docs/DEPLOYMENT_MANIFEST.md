@@ -6,6 +6,9 @@
 > the next release manifest is intentionally deferred until a real future
 > Bitcoin entropy block has reached the declared confirmation depth.
 
+> As of November 2026, no public network is currently running; this file is historical Testnet-3
+> deployment information.
+
 ## Deployment
 
 - **Chain ID:** `indra-testnet-3`

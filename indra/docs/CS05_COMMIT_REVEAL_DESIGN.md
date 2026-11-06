@@ -1,5 +1,11 @@
 # CS-05 Commit-Reveal VRF Proposer Election Design
 
+> **Status note (superseded by `16d72bc9`):** The proposer-election
+> `VrfCommit`/`VrfReveal` implementation described below was removed from the
+> active protocol by commit `16d72bc9`. The active protocol uses standard VRF
+> proposer authorization and sortition. The commit-reveal material below is
+> historical design context, not an active wire protocol.
+
 ## Scope
 
 This document originally did two things:

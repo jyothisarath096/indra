@@ -2,6 +2,13 @@
 
 Status: design for review only. No relay implementation is included in this document.
 
+> **Status note (superseded by `16d72bc9`):** The `VrfCommit`, `VrfReveal`,
+> `RequestVrfReveals`, and `VrfRevealsResponse` entries below describe a
+> removed proposer-election protocol. They are not active message types; the
+> active protocol uses the current Block/Vote path. Slash observation moved
+> after relay-layer deduplication and signature verification in `dcb87aec`, as
+> recorded in `audit_evidence/22_gossip_origin_privacy/PARTIAL_MESH_DESIGN_STALENESS_AUDIT.md`.
+
 ## Summary
 
 INDRA should implement consensus-message relay inside the current authenticated

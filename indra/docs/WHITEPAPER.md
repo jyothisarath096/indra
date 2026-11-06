@@ -485,8 +485,8 @@ displaced validator remains registered — stake is not burned. They
 can re-enter by gaining more delegation.
 
 **Registered-validator cap:** The validator registry itself is bounded
-at 1,500 total registered validators. On the current testnet this
-replacement rule activates at block height 97,000. Before activation,
+at 1,500 total registered validators. During the former testnet, this
+replacement rule was specified to activate at block height 97,000. Before activation,
 a full registry rejects additional registrations. At or after activation,
 a new registration is accepted into a full registry only if its self-bond
 exceeds the lowest-ranked registered validator's self-stake; in that
@@ -746,8 +746,8 @@ Active proposals are retained unconditionally. Terminal proposal records
 the 1,024 most recent terminal proposals, ordered deterministically by
 proposal epoch and ID. Older terminal records may be absent from ordinary
 node RPC responses; deep historical governance lookup is an archive-node
-or indexer responsibility. This pruning rule is height-gated and is
-scheduled for activation on the current testnet at block height 97,000.
+or indexer responsibility. This pruning rule is height-gated and was
+scheduled for activation during the former testnet at block height 97,000.
 
 ---
 
@@ -755,10 +755,12 @@ scheduled for activation on the current testnet at block height 97,000.
 
 ### 7.1 Development status
 
-INDRA is a pre-mainnet protocol. A four-validator testnet has been
-running continuously producing blocks with full consensus, epoch
-transitions, governance state, and epoch history recording. The
-protocol has not yet been subjected to public adversarial conditions.
+INDRA is a pre-mainnet protocol. As of November 2026, no public network is currently running.
+The repository contains a historical four-validator Testnet-3 deployment
+record in `docs/DEPLOYMENT_MANIFEST.md`; that record is not evidence of a
+currently running network. The repository contains tested unit and integration
+scenarios, including simulated in-process adversarial scenarios, but those
+scenarios are not public adversarial network conditions.
 
 The repository contains a large unit and integration test suite across
 the workspace. Exact test counts change as hardening work continues and
@@ -771,9 +773,16 @@ professional third-party security audit by an independent firm is
 required and planned before mainnet launch. The audit report will
 be published in full.
 
-Unit tests catch implementation bugs. They are not a substitute for
-fuzzing, adversarial testnet conditions, formal verification, or
-professional cryptographic review. None of these have yet occurred.
+The evidence uses the following labels. `tested` means unit or integration
+tests. `simulated` means an in-process or model-based scenario. `differentially
+tested` means outputs were compared with an independent reference. `fuzzed`
+means a recorded fuzz campaign exists. `machine-checked` currently applies only
+to an abstract model of the Q768 sortition arithmetic, proved in Rocq. It does
+not cover the shipped Rust implementation, and the proof build is not yet
+reproducible from a clean checkout. An independent third-party audit is still
+required. These labels do not
+substitute for public network conditions or a professional cryptographic
+review.
 
 ### 7.3 Known limitations
 
@@ -787,21 +796,22 @@ post-quantum-appropriate view-key machinery.
 **No smart contracts.** INDRA is a settlement layer. This is a
 deliberate design choice.
 
-**Open public testnet period not yet complete.** A four-validator
-testnet is running, but a minimum three-month public testnet with open
-validator participation is still required before mainnet.
+**Open public testnet period not yet complete.** As of November 2026, no
+public network is currently running, so the minimum three-month public testnet
+with open validator participation remains outstanding before mainnet.
 
-**Key separation not yet implemented.** The current implementation
-uses a unified key derived from a 24-word recovery phrase. Hot/cold
-key separation (hot consensus key, cold withdrawal key) is planned
-before mainnet stake reaches significant value.
+**Hot/cold key separation exists, but live threshold signing is not
+implemented.** The current key-capability API has separate hot and cold
+capabilities, independently-derived cold seeds, role checks, and cold-key
+version and nonce checks. The offline Shamir cold-key ceremony is not live
+threshold signing.
 
 **StateCommitmentV2 and compressed authenticated trees are not active.**
 Incremental validator/delegation/staking commitments and compressed
 authenticated UTXO trees have been implemented behind hard-fork
 height gates, but both activation constants remain deliberately
-unscheduled (`u64::MAX`) pending further review. Live testnet state roots
-therefore still use the currently-active commitment rules.
+unscheduled (`u64::MAX`) pending further review. During the former testnet,
+state roots therefore used the then-current commitment rules.
 
 ---
 
@@ -897,7 +907,9 @@ QC consensus, hybrid PQ transport (X25519 + ML-KEM-1024), OutputV1 value
 commitment/range-proof machinery, BFT consensus with stability fixes, UTXO delegation,
 auto-delegation, five-phase commit-reveal governance, epoch history,
 canonical genesis-native state/storage formats, encrypted key storage, CLI tooling (stake +
-governance), JSON-RPC, and a four-validator testnet.
+governance), and JSON-RPC. Testnet-3 deployment information is retained as a
+historical record in `docs/DEPLOYMENT_MANIFEST.md`; as of November 2026, no
+public network is currently running.
 
 **Phase 2 — Public testnet**
 Public bootstrap nodes in multiple geographic regions. Public testnet
@@ -908,8 +920,7 @@ public testnet before proceeding.
 **Phase 3 — Audit and hardening**
 Professional security audit by independent firm. All findings resolved
 and published. Fuzz testing. Network stress testing. Economic security
-analysis published. Hot/cold
-key separation implemented.
+analysis published. Cold-key custody design decision (including whether live threshold signing is required).
 
 **Phase 4 — Mainnet**
 Reproducible genesis ceremony with publicly verifiable genesis hash.
