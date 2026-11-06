@@ -18,13 +18,11 @@
     use std::{path::PathBuf, time::Instant};
 
     fn temp_dir(suffix: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "indra_driver_test_{}_{}",
-            suffix,
-            std::process::id()
-        ));
-        p
+        tempfile::Builder::new()
+            .prefix(&format!("indra_driver_test_{suffix}_"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     fn make_block(state: &ChainState) -> indra_core::types::block::BlockProposalVNext {
@@ -265,7 +263,10 @@
     }
 
     fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
-        let dir = temp_dir(suffix);
+        local_driver_at_dir(seed, temp_dir(suffix))
+    }
+
+    fn local_driver_at_dir(seed: [u8; 32], dir: PathBuf) -> (ConsensusDriver, PathBuf) {
         let mut config = NodeConfig::local_test(dir.clone());
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let classical = ClassicalKeypair::from_seed(&seed);
@@ -7219,7 +7220,7 @@
         let dir = temp_dir("restore_qc");
         let seed = [0x62u8; 32];
         {
-            let (mut driver, _) = local_driver(seed, "restore_qc");
+            let (mut driver, _) = local_driver_at_dir(seed, dir.clone());
             let _local = install_active_validator(&mut driver, seed, "local");
             driver.refresh_registered_voters();
             let block = make_strict_block(&driver, seed, 0, vec![]);
