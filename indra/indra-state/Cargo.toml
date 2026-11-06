@@ -6,6 +6,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 hex.workspace = true
 indra-core   = { path = "../indra-core" }

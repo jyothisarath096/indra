@@ -58,7 +58,7 @@ pub(crate) mod txn;
 pub mod utxo;
 pub mod validator;
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[doc(hidden)]
 pub use apply::apply_block_for_test;
 pub use apply::{

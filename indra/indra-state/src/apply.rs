@@ -4320,7 +4320,7 @@ fn apply_block_contents(
     })
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[doc(hidden)]
 pub fn apply_block_for_test(
     state: &mut ChainState,
