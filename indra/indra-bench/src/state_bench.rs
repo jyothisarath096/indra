@@ -2,8 +2,7 @@
 
 use std::time::Duration;
 
-use indra_node::state_root::compute_state_root;
-use indra_state::{project_block_for_roots, ChainState};
+use indra_state::{compute_state_root, project_block_for_roots, ChainState};
 
 use crate::{fixtures::dummy_block, timer::bench};
 

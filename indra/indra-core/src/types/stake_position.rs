@@ -269,7 +269,7 @@ impl Decode for ActiveStakeAggregateV1 {
     }
 }
 
-/// Exact-height unbonding timing. No legacy epoch-only representation exists.
+/// Exact-height unbonding timing. No epoch-only representation exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnbondingTimingV1 {
     /// Principal began unbonding at an exact block height.

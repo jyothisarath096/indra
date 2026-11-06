@@ -146,7 +146,7 @@ impl VoteSafetyStore {
         }
     }
 
-    /// Load one canonical safety record. Old formats are deliberately rejected.
+    /// Load one canonical safety record. Unsupported formats are deliberately rejected.
     pub fn load(&self) -> VoteSafetyLoadResult {
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn old_format_is_rejected_without_legacy_decoder() {
+    fn unsupported_format_is_rejected_without_alternate_decoder() {
         let path = tmp_path("old_format");
         fs::write(&path, [0u8; 17]).unwrap();
         let store = VoteSafetyStore::open(&path);

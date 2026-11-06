@@ -710,7 +710,7 @@ impl ConsensusDriver {
             .is_some()
     }
 
-    /// External compatibility hook used after height advancement.
+    /// External round-reset hook used after height advancement.
     pub fn reset_round(&mut self) {
         self.valid_proposal = None;
         self.start_round(0).expect("round zero is always legal");

@@ -21,14 +21,13 @@ use indra_core::codec::Decode;
 use indra_core::types::block::{BlockProposalVNext, BlockVNext};
 use indra_core::types::primitives::Bytes32;
 use indra_core::EpochRecord;
-use indra_state::{apply_block_with_effects, CanonicalStateEffects, ChainState};
+use indra_state::{
+    apply_block_with_effects, compute_state_roots, CanonicalStateEffects, ChainState,
+};
 use indra_storage::state_store::SNAPSHOT_INTERVAL;
 use indra_storage::{BlockStore, StateStore};
 
-use crate::{
-    error::{NodeError, NodeResult},
-    state_root::compute_state_roots,
-};
+use crate::error::{NodeError, NodeResult};
 
 /// Maximum blocks to request in one sync batch.
 pub const SYNC_BATCH_SIZE: u64 = 50;
@@ -780,7 +779,7 @@ where
 /// including, durable block/snapshot writes.
 ///
 /// The eager test import calls this helper before storage append. Tests that need to
-/// exercise hard-fork boundary behavior at synthetic heights use this same
+/// exercise activation-boundary behavior at synthetic heights use this same
 /// path because `BlockStore` itself intentionally requires contiguous heights
 /// from genesis and cannot be jumped to `u64::MAX - 1`.
 fn validate_imported_block(
@@ -821,7 +820,7 @@ fn publish_committed_effects(
 
 /// Verify proposer authorization and eligibility against the governing snapshot.
 /// Snapshot lookup and both independent cryptographic checks fail closed at every
-/// imported height; there is no legacy or live-registry bypass.
+/// imported height; there is no live-registry bypass.
 fn verify_imported_proposal<'a>(
     proposal: &'a indra_core::types::block::BlockProposalVNext,
     state: &ChainState,
@@ -3108,7 +3107,7 @@ mod tests {
         )
         .unwrap();
 
-        // Original liveness attack: H commits C's stake increase. The legacy
+        // Original liveness attack: H commits C's stake increase. The earlier
         // post-H interpretation rejects the genuine A+B QC, while both final
         // governed verification paths continue to accept it under S(H).
         state.validators.get_mut(&c_id).unwrap().stake_spark = 140;
@@ -3141,7 +3140,7 @@ mod tests {
         assert!(verify_sync_qc(&qc_h, &state, u64::MAX).is_ok());
 
         // Original safety attack: A's increase appears committed after the
-        // certified block, and A presents a single-signer QC. The legacy
+        // certified block, and A presents a single-signer QC. The earlier
         // post-block interpretation accepts it, but the real live and sync
         // governed paths both reject it under the unchanged S(H).
         state.validators.get_mut(&a_id).unwrap().stake_spark = 500;

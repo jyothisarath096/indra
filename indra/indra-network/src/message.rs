@@ -1454,9 +1454,9 @@ mod tests {
 
     #[test]
     fn block_response_rejects_missing_mandatory_availability_flags() {
-        let mut legacy_truncated = vec![MessageType::BlockResponse as u8];
-        0u32.encode(&mut legacy_truncated);
-        assert!(Message::decode_wire(&legacy_truncated).is_err());
+        let mut old_format_truncated = vec![MessageType::BlockResponse as u8];
+        0u32.encode(&mut old_format_truncated);
+        assert!(Message::decode_wire(&old_format_truncated).is_err());
     }
 
     #[test]

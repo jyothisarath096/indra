@@ -1,6 +1,6 @@
 //! Checksummed, fixed-block-count segmented canonical block storage.
 //!
-//! Runtime code accepts only this format. No legacy monolithic decoder is
+//! Runtime code accepts only this format. No monolithic decoder is
 //! compiled anywhere in the workspace.
 
 use std::collections::BTreeMap;
@@ -82,19 +82,19 @@ impl BlockStoreReadHandle {
 }
 
 impl BlockStore {
-    /// Open a segmented store, refusing every legacy monolithic file.
-    pub fn open(legacy_path: impl AsRef<Path>, prune_cfg: PruneConfig) -> StorageResult<Self> {
-        let legacy_path = legacy_path.as_ref();
-        if legacy_path.exists() {
+    /// Open a segmented store, refusing a monolithic block log.
+    pub fn open(block_log_path: impl AsRef<Path>, prune_cfg: PruneConfig) -> StorageResult<Self> {
+        let block_log_path = block_log_path.as_ref();
+        if block_log_path.exists() {
             return Err(StorageError::LegacyBlockStore {
-                path: legacy_path.to_path_buf(),
-                data_dir: legacy_path
+                path: block_log_path.to_path_buf(),
+                data_dir: block_log_path
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
                     .to_path_buf(),
             });
         }
-        let parent = legacy_path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = block_log_path.parent().unwrap_or_else(|| Path::new("."));
         let dir = parent.join(SEGMENT_DIR);
         std::fs::create_dir_all(&dir)?;
         let (index, next_height, lowest) = scan_segments(&dir)?;
@@ -582,6 +582,24 @@ mod tests {
                 pq_sig: VariableBytes::default(),
             },
         }
+    }
+
+    #[test]
+    fn monolithic_block_log_is_rejected_without_segmented_read() {
+        let dir = temp_dir("monolithic_block_log");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let block_log = dir.join("blocks.log");
+        std::fs::write(&block_log, b"monolithic block bytes").unwrap();
+
+        let error = match BlockStore::open(&block_log, PruneConfig::archive()) {
+            Ok(_) => panic!("monolithic block log was opened as segmented storage"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StorageError::LegacyBlockStore { .. }));
+        assert!(!dir.join(SEGMENT_DIR).exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

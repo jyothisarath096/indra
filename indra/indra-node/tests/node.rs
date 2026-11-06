@@ -29,10 +29,10 @@ use indra_network::{
 use indra_node::{
     driver::{ConsensusDriver, DriverAction, DriverEvent},
     genesis::{build_genesis_state, genesis_block_hash},
-    state_root::compute_state_root,
     sync::{import_unfinalized_block_for_test, SyncState},
     NodeConfig, NodeEngine,
 };
+use indra_state::compute_state_root;
 use indra_state::ChainState;
 use indra_storage::{BlockStore, PruneConfig, StateStore};
 use std::{path::PathBuf, time::Instant};

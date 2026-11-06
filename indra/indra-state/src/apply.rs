@@ -449,14 +449,14 @@ fn apply_slash_v2_at_height_with_accounting_mode(
             reason: error.to_string(),
         }
     })?;
-    let legacy_shape = SlashEvidenceV1 {
+    let shared_shape = SlashEvidenceV1 {
         validator_id: evidence.validator_id,
         vote_1: evidence.vote_1.clone(),
         vote_2: evidence.vote_2.clone(),
     };
     apply_slash_common(
         state,
-        &legacy_shape,
+        &shared_shape,
         offense_id,
         Some((
             evidence.membership_proof.entry.classical_vote_pk,

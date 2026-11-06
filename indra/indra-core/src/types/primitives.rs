@@ -328,16 +328,16 @@ pub fn bps_of(value: u64, bps: u32) -> u64 {
     ((value as u128) * (bps as u128) / 10_000u128) as u64
 }
 
-/// Consensus hard-fork activation heights.
+/// Consensus activation-height review points.
 ///
 /// MAINNET GENESIS REQUIREMENT: every constant in this module is a single,
 /// global value with no per-chain-ID differentiation. Current values may be
-/// testnet-specific activation heights chosen for this already-running testnet's
+/// deployment-specific activation heights chosen for the running deployment's
 /// deployment history. Before building mainnet genesis, each one MUST be
 /// deliberately reset to the correct mainnet value (often 0 when the rule should
 /// be active from mainnet's first block). These values will NOT automatically
 /// differ between testnet and mainnet, and silently reusing testnet values would
-/// activate rules at arbitrary, meaningless points in mainnet's own history.
+/// activate rules at arbitrary, meaningless points in a future deployment's history.
 // ── Pruning ───────────────────────────────────────────────────────────────────
 
 /// Default number of blocks to retain in pruned mode.

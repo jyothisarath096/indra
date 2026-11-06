@@ -405,11 +405,11 @@ mod tests {
 
     #[test]
     fn pq_only_qc_bytes_are_rejected() {
-        let mut legacy = Vec::new();
-        3u64.encode(&mut legacy);
-        0u32.encode(&mut legacy);
-        Bytes32::from([0xAB; 32]).encode(&mut legacy);
-        legacy.extend_from_slice(&{
+        let mut old_format = Vec::new();
+        3u64.encode(&mut old_format);
+        0u32.encode(&mut old_format);
+        Bytes32::from([0xAB; 32]).encode(&mut old_format);
+        old_format.extend_from_slice(&{
             let mut bitfield = [0u8; SIGNER_BITFIELD_BYTES];
             bitfield[0] = 0b0000_0111;
             bitfield
@@ -428,10 +428,10 @@ mod tests {
                 pq_sig: VariableBytes::from_slice(&[0x33; 32]).unwrap(),
             },
         ];
-        encode_list(&pq_signatures, &mut legacy);
+        encode_list(&pq_signatures, &mut old_format);
 
         assert!(
-            QuorumCertificateV1::decode_exact(&legacy).is_err(),
+            QuorumCertificateV1::decode_exact(&old_format).is_err(),
             "old QC format without version byte must return Err"
         );
     }

@@ -1725,7 +1725,7 @@ mod tests {
         let validator_id = install_governance_validator(&mut state, &hot_pubkey);
         let (_, cold_keypair) = keypair(0xD6);
         activate_cold_key(&mut state, validator_id, &cold_keypair);
-        let mut legacy_hot = GovernanceOpV2 {
+        let mut hot_signed = GovernanceOpV2 {
             action_type: GovernanceActionType::CommitVote,
             signer_id: validator_id,
             nonce: 1,
@@ -1736,14 +1736,14 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_hot_governance_op(&mut legacy_hot, &hot_keypair, DEFAULT_CHAIN_ID);
+        sign_hot_governance_op(&mut hot_signed, &hot_keypair, DEFAULT_CHAIN_ID);
         assert!(matches!(
-            apply_governance_op(&mut state, &legacy_hot, 0, u64::MAX, DEFAULT_CHAIN_ID),
+            apply_governance_op(&mut state, &hot_signed, 0, u64::MAX, DEFAULT_CHAIN_ID),
             Err(StateError::InvalidGovernanceOp { reason })
                 if reason.contains("hot fallback is prohibited")
         ));
 
-        let mut cold_form_signed_hot = legacy_hot;
+        let mut cold_form_signed_hot = hot_signed;
         set_cold_authorization(&mut cold_form_signed_hot, 1);
         sign_cold_governance_op(&mut cold_form_signed_hot, &hot_keypair, DEFAULT_CHAIN_ID);
         assert!(matches!(
@@ -1829,33 +1829,33 @@ mod tests {
         };
         sign_cold_staking_op(&mut cold_commission, &active_cold_keypair, DEFAULT_CHAIN_ID);
 
-        let (legacy_pubkey, legacy_keypair) = keypair(0xE5);
-        let legacy_id = install_governance_validator(&mut base, &legacy_pubkey);
-        let legacy_deposit = base
+        let (hot_pubkey, hot_keypair) = keypair(0xE5);
+        let hot_id = install_governance_validator(&mut base, &hot_pubkey);
+        let hot_deposit = base
             .utxos
-            .insert(deposit_output(legacy_pubkey.clone(), 1_000), 0, 0, 2)
+            .insert(deposit_output(hot_pubkey.clone(), 1_000), 0, 0, 2)
             .unwrap();
-        let mut legacy_propose = propose_op_with_action(
-            legacy_id,
-            &legacy_keypair,
-            legacy_pubkey,
-            legacy_deposit,
+        let mut hot_propose = propose_op_with_action(
+            hot_id,
+            &hot_keypair,
+            hot_pubkey,
+            hot_deposit,
             1,
             GovernableAction::SetSlashLivenessThresholdEpochs { value: 2 },
         );
         if let GovernancePayload::Propose {
             cold_authorization, ..
-        } = &mut legacy_propose.payload
+        } = &mut hot_propose.payload
         {
             *cold_authorization = None;
         }
-        legacy_propose.nonce = 1;
-        sign_hot_governance_op(&mut legacy_propose, &legacy_keypair, DEFAULT_CHAIN_ID);
+        hot_propose.nonce = 1;
+        sign_hot_governance_op(&mut hot_propose, &hot_keypair, DEFAULT_CHAIN_ID);
 
         let replay = |state: &mut ChainState| {
             apply_governance_op(state, &cold_propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
             apply_staking_op(state, &cold_commission, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            let error = apply_governance_op(state, &legacy_propose, 0, u64::MAX, DEFAULT_CHAIN_ID)
+            let error = apply_governance_op(state, &hot_propose, 0, u64::MAX, DEFAULT_CHAIN_ID)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -1870,7 +1870,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.validators.get(&active_id).unwrap().cold_nonce, 2);
-        assert!(first.governance.gov_nonces.get(&legacy_id).is_none());
+        assert!(first.governance.gov_nonces.get(&hot_id).is_none());
         assert!(first.governance.gov_nonces.get(&active_id).is_none());
     }
 

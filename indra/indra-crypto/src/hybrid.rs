@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn ed25519_strict_rejects_small_order_r_accepted_by_ordinary_verification() {
         // ed25519-speccheck vector 2: mixed-order A, small-order R. Dalek's
-        // RFC-compatible `verify` accepts it; `verify_strict` must reject it.
+        // RFC `verify` accepts it; `verify_strict` must reject it.
         let message =
             hex::decode("aebf3f2601a0c8c5d39cc7d8911642f740b78168218da8471772b35f9d35b9ab")
                 .unwrap();

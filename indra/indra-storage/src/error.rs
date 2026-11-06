@@ -111,10 +111,10 @@ pub enum StorageError {
         component: &'static str,
     },
 
-    /// A legacy monolithic block log was found where segmented storage is required.
-    #[error("legacy block store detected at {path}; this node accepts only a clean data directory with segmented storage—stop the node, preserve {data_dir} as an offline backup, and configure a new empty data directory")]
+    /// A monolithic block log was found where segmented storage is required.
+    #[error("monolithic block store detected at {path}; this node accepts only a clean data directory with segmented storage—stop the node, preserve {data_dir} as an offline backup, and configure a new empty data directory")]
     LegacyBlockStore {
-        /// Legacy path that caused refusal.
+        /// Block-log path that caused refusal.
         path: std::path::PathBuf,
         /// Data directory that must be replaced with a clean directory.
         data_dir: std::path::PathBuf,

@@ -147,11 +147,11 @@ struct SelectedBlockContents {
 pub struct NetworkAuthorityMember {
     /// Validator identity authorized for the requested consensus height.
     pub validator_id: Bytes32,
-    /// Ed25519 consensus verification key, when present on the legacy path.
+    /// Ed25519 consensus verification key, when present.
     pub hybrid_classical_pk: Option<[u8; 32]>,
     /// ML-DSA-87 consensus/transport verification key.
     pub hybrid_pq_pk: Option<Vec<u8>>,
-    /// VRF verification key, when present on the legacy path.
+    /// VRF verification key, when present.
     pub vrf_pk: Option<[u8; 32]>,
     /// Current live network address for this authorized member, if available.
     pub network_addr: Option<String>,
@@ -1422,7 +1422,7 @@ impl NodeEngine {
 
     /// Resolve the voter authority for one consensus height.
     ///
-    /// Legacy heights preserve the original live-registry adapter exactly.
+    /// Resolve authority from the retained snapshot governing this height.
     /// Governed heights fail closed if their canonical snapshot is unavailable.
     pub fn voters_for_consensus_height(&self, height: u64) -> NodeResult<Vec<RegisteredVoter>> {
         let snapshot = self.state.snapshot_for_consensus_height(height)?;
@@ -1443,8 +1443,7 @@ impl NodeEngine {
 
     /// Resolve networking authority for one consensus height.
     ///
-    /// Legacy heights preserve the original live-Active membership and key
-    /// source. Snapshot-governed heights fail closed on lookup failure, take
+    /// Snapshot-governed heights fail closed on lookup failure, take
     /// membership and keys from `S(height)`, and join only mutable address
     /// metadata from the live registry. A removed snapshot member therefore
     /// remains authenticated but has no on-chain discovery address.

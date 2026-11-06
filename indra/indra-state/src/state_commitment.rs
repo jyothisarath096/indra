@@ -586,7 +586,7 @@ mod tests {
         }
     }
 
-    fn legacy_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
+    fn reference_state_commitment_v2_root(state: &ChainState, height: u64) -> Bytes32 {
         let mut leaves = Vec::new();
         for validator in state.validators.all_validators() {
             leaves.push((
@@ -632,7 +632,7 @@ mod tests {
         }
         Bytes32::from(
             CompressedAuthTree::from_pairs(leaves)
-                .expect("legacy oracle keys are domain-separated and unique")
+                .expect("reference oracle keys are domain-separated and unique")
                 .root(),
         )
     }
@@ -721,7 +721,7 @@ mod tests {
         );
         assert_eq!(
             incremental.root(),
-            legacy_state_commitment_v2_root(&state, height)
+            reference_state_commitment_v2_root(&state, height)
         );
     }
 

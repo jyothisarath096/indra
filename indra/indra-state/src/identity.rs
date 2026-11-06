@@ -104,7 +104,7 @@ pub fn resolve_and_check_identity(
 
 /// Resolve a delegator public key from state for governance redelegation.
 ///
-/// Registry entries are authoritative; no historical fallback is accepted.
+/// The registry is authoritative; no alternate identity source is accepted.
 pub fn resolve_delegator_identity_for_redelegation(
     validator_id: &Bytes32,
     delegator_id: &Bytes32,

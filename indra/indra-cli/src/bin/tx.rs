@@ -49,7 +49,7 @@ fn cmd_address(args: &[String]) {
 fn cmd_balance(args: &[String]) {
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| {
         eprintln!(
-            "Error: legacy balance scans now require ownership authorization. \
+            "Error: balance scans now require ownership authorization. \
              Re-run with --keys <keys.json> for the address owner."
         );
         std::process::exit(1);
@@ -73,7 +73,7 @@ fn cmd_balance(args: &[String]) {
     if address != derived_address {
         eprintln!(
             "Error: keys.json does not own requested address {}. \
-             Legacy UTXO/balance scans require the owner's keys.",
+             UTXO/balance scans require the owner's keys.",
             address
         );
         std::process::exit(1);

@@ -327,7 +327,7 @@ struct PersistentSparseNodeLoc {
     prefix: [u8; 32],
 }
 
-/// Persistent, path-copying version of the legacy 256-bit sparse Merkle tree.
+/// Persistent, path-copying version of the fixed-depth 256-bit sparse Merkle tree.
 ///
 /// This mirrors [`crate::smt::SparseMerkleTree`]'s fixed-depth tree, hash
 /// domains, empty-subtree defaults, and proof shape. It deliberately does not
@@ -349,7 +349,7 @@ impl Default for PersistentSparseMerkleTree {
 }
 
 impl PersistentSparseMerkleTree {
-    /// Create an empty legacy sparse Merkle tree.
+    /// Create an empty fixed-depth sparse Merkle tree.
     pub fn new() -> Self {
         let empty_hashes = sparse_empty_hashes();
         Self {
@@ -389,7 +389,7 @@ impl PersistentSparseMerkleTree {
         self.leaves.is_empty()
     }
 
-    /// Current legacy sparse Merkle root.
+    /// Current fixed-depth sparse Merkle root.
     pub fn root(&self) -> [u8; 32] {
         self.root
     }

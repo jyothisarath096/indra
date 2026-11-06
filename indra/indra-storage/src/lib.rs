@@ -35,7 +35,7 @@
 //! Storage has one canonical format and no migration ladder. Checkpoints made
 //! before the eventual pure-mainnet schema (including the future tranche staking
 //! model) are intentionally disposable; operators must replay from genesis or
-//! start with fresh storage after an incompatible pre-mainnet schema change.
+//! start with fresh storage after a schema change.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

@@ -16,9 +16,8 @@
 //!
 //! ## Storage model
 //!
-//! Canonical entries are kept in a persistent ordered map, with a frozen
-//! legacy sparse tree for pre-compressed-auth-tree compatibility and a
-//! persistent compressed authenticated tree for active roots/proofs.
+//! Canonical entries are kept in a persistent ordered map and a persistent
+//! compressed authenticated tree for active roots/proofs.
 
 use indra_core::{
     codec::{encode_list, list_encoded_len, ByteReader, Decode, Encode},

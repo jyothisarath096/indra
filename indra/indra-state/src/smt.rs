@@ -133,7 +133,7 @@ enum AuthTreeNode {
 /// This is a current-state, Jellyfish-style compressed sparse tree. It stores
 /// full keys at leaves, compressed nibble prefixes at branches, and never
 /// materializes empty subtrees or single-child branch chains. Internal node
-/// hashes are domain-separated from the legacy SMT so roots cannot be confused.
+/// hashes are domain-separated from the fixed-depth sparse tree so roots cannot be confused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedAuthTree {
     leaves: HashMap<[u8; 32], [u8; 32]>,

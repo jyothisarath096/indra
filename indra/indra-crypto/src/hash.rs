@@ -3,7 +3,7 @@
 //! Per spec Section B: SHA-256 is the v1 consensus hash.
 //! BLAKE3 is governance-upgradeable for v2, but v1 uses SHA-256 exclusively.
 //! The module registry (spec Section B3) makes future upgrades possible
-//! without a hard fork.
+//! without a protocol-version transition.
 
 use sha2::{Digest, Sha256};
 

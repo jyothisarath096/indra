@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn epoch_store_old_headerless_file_rejected_gracefully() {
-        let path = temp_path("legacy_headerless");
+        let path = temp_path("headerless");
         let record = record(0);
         let record_bytes = record.encode_to_vec();
         {

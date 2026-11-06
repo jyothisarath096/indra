@@ -2587,8 +2587,8 @@ mod tests {
     }
 
     #[test]
-    fn staking_nonce_persistent_encoding_matches_legacy_btree_encoding() {
-        let legacy = BTreeMap::from([
+    fn staking_nonce_persistent_encoding_matches_reference_btree_encoding() {
+        let reference = BTreeMap::from([
             (Bytes32::from([0xD1; 32]), 11),
             (Bytes32::from([0xA1; 32]), 7),
             (Bytes32::from([0xB1; 32]), 9),
@@ -2602,11 +2602,11 @@ mod tests {
             persistent.insert(key, value);
         }
 
-        let mut legacy_bytes = Vec::new();
-        encode_nonce_map_btree(&legacy, &mut legacy_bytes);
+        let mut reference_bytes = Vec::new();
+        encode_nonce_map_btree(&reference, &mut reference_bytes);
         let mut persistent_bytes = Vec::new();
         encode_nonce_map(&persistent, &mut persistent_bytes);
-        assert_eq!(persistent_bytes, legacy_bytes);
+        assert_eq!(persistent_bytes, reference_bytes);
     }
 
     #[test]
