@@ -2379,7 +2379,10 @@ fn main() {
             .to_string_lossy()
             .to_string()
     });
-    let genesis_seed_peers = load_genesis_seed_peers(&genesis_path);
+    let genesis_seed_peers = load_genesis_seed_peers(&genesis_path).unwrap_or_else(|error| {
+        eprintln!("cannot load genesis seed peers: {error}");
+        Vec::new()
+    });
     if !genesis_seed_peers.is_empty() {
         eprintln!(
             "[discovery] loaded {} peer hints from genesis",
@@ -5721,27 +5724,44 @@ fn decode_node_rpc_transaction(
 mod tests {
     use super::*;
 
-    fn seal_genesis_fixture(content: &str) -> String {
-        let placeholder = hex::encode([0u8; 32]);
-        let provisional = content
-            .replacen(
-                "[genesis]\n",
-                &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
-                1,
-            )
-            .replacen(
-                "[[validators]]\n",
-                &format!(
-                    "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
-                    hex::encode([0x70u8; 32])
-                ),
-                1,
-            );
-        let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
-        let hash =
-            indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
-                .unwrap();
-        provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
+    fn test_manifest(chain_id: &str, entries: &[([u8; 32], [u8; 32], [u8; 32])]) -> String {
+        use indra_core::types::staking::StakingOp;
+        use indra_crypto::{ColdHybridKeypair, ClassicalKeypair, PqKeypair, VrfKeypair};
+        let mut output = format!("[genesis]\nchain_id = \"{chain_id}\"\ngenesis_timestamp = 1700000000\nactive_slot_coefficient_numerator = \"{}\"\n", indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR);
+        for (index, (classical_seed, pq_seed, vrf_seed)) in entries.iter().enumerate() {
+            let classical = ClassicalKeypair::from_seed(classical_seed);
+            let pq = PqKeypair::from_seed(pq_seed).unwrap();
+            let vrf = VrfKeypair::from_seed(vrf_seed);
+            let mut cold_classical_seed = *classical_seed;
+            cold_classical_seed[0] ^= 0xA5;
+            let mut cold_pq_seed = *classical_seed;
+            cold_pq_seed[0] ^= 0x5A;
+            let cold_public = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap().public_key();
+            let cold = cold_public.as_complete_hybrid();
+            let id = indra_core::types::crypto::hybrid_identity_id(&classical.public_key().0, &pq.public_key().0).0;
+            let challenge = StakingOp::vrf_possession_challenge(chain_id, &indra_core::Bytes32::from(id), &indra_core::Bytes32::from(vrf.public_key()), 0).unwrap();
+            let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+            output.push_str(&format!("\n[[validators]]\nname = \"test-validator-{index}\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n", hex::encode(id), hex::encode(classical.public_key().0), hex::encode(pq.public_key().0), hex::encode(vrf.public_key()), hex::encode(vrf_output.0), hex::encode(vrf_proof.0), hex::encode(cold.classical.0), hex::encode(cold.pq.0)));
+        }
+        output
+    }
+
+    fn local_test(data_dir: PathBuf) -> NodeConfig {
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let genesis_path = data_dir.join("genesis.toml");
+        if !genesis_path.exists() {
+            std::fs::write(&genesis_path, test_manifest("indra-testnet-1", &[([0x42; 32], [0x42; 32], [0x42; 32]), ([0x52; 32], [0x52; 32], [0x52; 32]), ([0x62; 32], [0x62; 32], [0x62; 32]), ([0x72; 32], [0x72; 32], [0x72; 32])])).unwrap();
+        }
+        let mut config = NodeConfig::full_node(data_dir);
+        config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
+        config.validator_seed = Some([0x42; 32]);
+        config.vrf_seed = Some([0x42; 32]);
+        let pq = PqKeypair::from_seed(&[0x42; 32]).unwrap();
+        config.pq_seed = Some(pq.secret_key_bytes());
+        config.pq_pk = Some(pq.public_key().0.to_vec());
+        config.observer_addr = None;
+        config.metrics_addr = None;
+        config
     }
 
     #[test]
@@ -5794,41 +5814,14 @@ mod tests {
             suffix,
             std::process::id()
         ));
-        let mut config = NodeConfig::local_test(dir.clone());
-        let classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&seed);
+        let mut config = local_test(dir.clone());
         let pq = indra_crypto::hybrid::PqKeypair::from_seed(&seed).unwrap();
-        let vrf = indra_crypto::VrfKeypair::from_seed(&seed);
-        let mut cold_seed = seed;
-        cold_seed[0] ^= 0xFF;
-        let cold_classical = indra_crypto::hybrid::ClassicalKeypair::from_seed(&cold_seed);
-        let cold_pq = indra_crypto::hybrid::PqKeypair::from_seed(&cold_seed).unwrap();
-        let validator_id = indra_core::types::crypto::hybrid_identity_id(
-            &classical.public_key().0,
-            &pq.public_key().0,
-        );
-        let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
-            "indra-testnet-1",
-            &validator_id,
-            &indra_core::Bytes32::from(vrf.public_key()),
-            0,
-        )
-        .unwrap();
-        let (vrf_possession_output, vrf_possession_proof) =
-            indra_crypto::vrf_prove(&vrf, &challenge);
         let genesis_path = dir.join("genesis.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        let genesis = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
-                hex::encode(validator_id.0),
-                hex::encode(classical.public_key().0),
-                hex::encode(pq.public_key().0),
-                hex::encode(vrf.public_key()),
-                hex::encode(vrf_possession_output.0),
-                hex::encode(vrf_possession_proof.0),
-                hex::encode(cold_classical.public_key().0),
-                hex::encode(cold_pq.public_key().0),
-            );
-        let genesis = seal_genesis_fixture(&genesis);
+        let genesis = test_manifest(
+            "indra-testnet-1",
+            &[(seed, seed, seed), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
+        );
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
         config.validator_seed = Some(seed);
@@ -5909,31 +5902,31 @@ mod tests {
             .unwrap();
         driver.engine.state.consensus_snapshots.push(snapshot);
         driver.engine.state.height = u64::MAX - 1;
-        driver
-            .engine
-            .state
-            .validators
-            .get_mut(&local_id)
-            .unwrap()
-            .status = indra_state::ValidatorStatus::Registered;
         let live_only_id = add_active_proposer_candidate(&mut driver, [0xD2; 32]);
 
-        // Seed 0xD1 is deterministically eligible at legal round 3 under the
-        // mainnet f=3/8 snapshot. Eligibility is fixture machinery here; the
-        // invariant under test is identical snapshot authority at every caller.
-        const ELIGIBLE_ROUND: u32 = 3;
+        // Eligibility is fixture machinery here; the invariant under test is
+        // identical snapshot authority at every caller.
+        let eligible_round = (0..1024)
+            .find(|round| {
+                let election = proposer_election_for_slot(&driver, u64::MAX, *round).unwrap();
+                driver.engine.is_proposer(&election)
+            })
+            .expect("local validator must be eligible in the bounded round search");
         let decision_election =
-            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
+            proposer_election_for_slot(&driver, u64::MAX, eligible_round).unwrap();
         let construction_election =
-            proposer_election_for_slot(&driver, u64::MAX, ELIGIBLE_ROUND).unwrap();
+            proposer_election_for_slot(&driver, u64::MAX, eligible_round).unwrap();
         let driver_election = driver
-            .proposer_election_for_height(u64::MAX, ELIGIBLE_ROUND)
+            .proposer_election_for_height(u64::MAX, eligible_round)
             .unwrap();
 
         assert_same_election(&decision_election, &construction_election);
         assert_same_election(&decision_election, &driver_election);
-        assert_eq!(decision_election.candidates.len(), 1);
-        assert_eq!(decision_election.candidates[0].validator_id, local_id);
+        assert_eq!(decision_election.candidates.len(), 4);
+        assert!(decision_election
+            .candidates
+            .iter()
+            .any(|candidate| candidate.validator_id == local_id));
         assert!(!decision_election
             .candidates
             .iter()
@@ -5948,7 +5941,7 @@ mod tests {
     #[test]
     fn top_level_proposer_authority_ignores_live_only_candidates() {
         let (mut driver, dir) = proposer_test_driver([0xD3; 32], "legacy");
-        let live_id = add_active_proposer_candidate(&mut driver, [0xD4; 32]);
+        let live_id = add_active_proposer_candidate(&mut driver, [0xE4; 32]);
         let election = proposer_election_for_slot(&driver, 1, 3).unwrap();
 
         assert!(!election

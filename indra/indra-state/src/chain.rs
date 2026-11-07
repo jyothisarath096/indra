@@ -65,6 +65,8 @@ pub const MAX_RETIRED_COLD_PQ_COMPONENTS_DECODE: usize =
 pub struct ChainState {
     /// Chain identifier loaded from genesis and included in consensus-visible state.
     pub chain_id: String,
+    /// Fixed timestamp committed by the founder genesis manifest.
+    pub genesis_timestamp: u64,
     /// Immutable fingerprint of the finalized genesis manifest and state.
     /// Excluded from its own state-root preimage to avoid circular hashing.
     pub genesis_fingerprint: Bytes32,
@@ -110,9 +112,6 @@ pub struct ChainState {
     pub active_slot_coefficient_numerator: u64,
     /// Current QC-certified election seed.
     pub election_seed: Bytes64,
-    /// SHA-256 commitment to the canonical external-entropy descriptor and
-    /// source header used to construct genesis.
-    pub genesis_entropy_record_hash: Bytes32,
     /// Seed format version.
     pub election_seed_version: u8,
     /// First height to which `election_seed` applies.
@@ -180,6 +179,7 @@ impl ChainState {
         use crate::effects::CanonicalStateField as F;
         let ChainState {
             chain_id: _,
+            genesis_timestamp: _,
             height: _,
             tip_hash: _,
             base_fee: _,
@@ -250,6 +250,7 @@ impl Encode for ChainState {
         VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
             .unwrap_or_default()
             .encode(buf);
+        self.genesis_timestamp.encode(buf);
         self.genesis_fingerprint.encode(buf);
         // Included: the applied height determines the next valid block height.
         self.height.encode(buf);
@@ -278,7 +279,6 @@ impl Encode for ChainState {
         encode_list(&self.consensus_snapshots, buf);
         self.active_slot_coefficient_numerator.encode(buf);
         self.election_seed.encode(buf);
-        self.genesis_entropy_record_hash.encode(buf);
         self.election_seed_version.encode(buf);
         self.election_seed_height.encode(buf);
         self.reward_economic_snapshot.is_some().encode(buf);
@@ -297,6 +297,7 @@ impl Encode for ChainState {
         VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(self.chain_id.as_bytes())
             .unwrap_or_default()
             .encoded_len()
+            + self.genesis_timestamp.encoded_len()
             + self.genesis_fingerprint.encoded_len()
             + self.height.encoded_len()
             + self.tip_hash.encoded_len()
@@ -317,7 +318,6 @@ impl Encode for ChainState {
             + list_encoded_len(&self.consensus_snapshots)
             + 8
             + 64
-            + 32
             + 1
             + 8
             + 1
@@ -341,6 +341,7 @@ impl Decode for ChainState {
                 "persisted chain_id is not valid UTF-8".into(),
             )
         })?;
+        let genesis_timestamp = u64::decode(r)?;
         let genesis_fingerprint = Bytes32::decode(r)?;
         let height = u64::decode(r)?;
         let tip_hash = Bytes32::decode(r)?;
@@ -364,7 +365,6 @@ impl Decode for ChainState {
         let active_slot_coefficient_numerator = u64::decode(r)?;
         indra_core::sortition::validate_mainnet_f(active_slot_coefficient_numerator)?;
         let election_seed = Bytes64::decode(r)?;
-        let genesis_entropy_record_hash = Bytes32::decode(r)?;
         let election_seed_version = u8::decode(r)?;
         let election_seed_height = u64::decode(r)?;
         if election_seed_version != 1 {
@@ -415,6 +415,7 @@ impl Decode for ChainState {
         )?;
         let state = Self {
             chain_id,
+            genesis_timestamp,
             genesis_fingerprint,
             height,
             tip_hash,
@@ -428,7 +429,6 @@ impl Decode for ChainState {
             consensus_snapshots,
             active_slot_coefficient_numerator,
             election_seed,
-            genesis_entropy_record_hash,
             election_seed_version,
             election_seed_height,
             reward_economic_snapshot,
@@ -539,6 +539,7 @@ impl ChainState {
     pub fn new_genesis() -> Self {
         Self {
             chain_id: DEFAULT_CHAIN_ID.to_string(),
+            genesis_timestamp: 1_700_000_000,
             genesis_fingerprint: Bytes32::ZERO,
             height: 0,
             tip_hash: Bytes32::ZERO,
@@ -552,7 +553,6 @@ impl ChainState {
             consensus_snapshots: Vec::new(),
             active_slot_coefficient_numerator: MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
             election_seed: Bytes64::ZERO,
-            genesis_entropy_record_hash: Bytes32::ZERO,
             election_seed_version: 1,
             election_seed_height: 1,
             reward_economic_snapshot: None,

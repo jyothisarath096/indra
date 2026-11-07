@@ -28,7 +28,7 @@ use indra_network::{
 };
 use indra_node::{
     driver::{ConsensusDriver, DriverAction, DriverEvent},
-    genesis::{build_genesis_state, genesis_block_hash},
+    genesis::{build_finalized_genesis_state, genesis_block_hash, parse_genesis_manifest_str},
     sync::{import_unfinalized_block_for_test, SyncState},
     NodeConfig, NodeEngine,
 };
@@ -63,8 +63,94 @@ fn temp_dir(suffix: &str) -> PathBuf {
     p
 }
 
+fn test_genesis_toml(
+    chain_id: &str,
+    entries: &[([u8; 32], [u8; 32], [u8; 32])],
+) -> String {
+    use indra_core::types::staking::StakingOp;
+    use indra_crypto::{ColdHybridKeypair, ClassicalKeypair, PqKeypair, VrfKeypair};
+    let mut output = format!(
+        "[genesis]\nchain_id = \"{chain_id}\"\ngenesis_timestamp = 1700000000\nactive_slot_coefficient_numerator = \"{}\"\n",
+        indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+    );
+    for (index, (classical_seed, pq_seed, vrf_seed)) in entries.iter().enumerate() {
+        let classical = ClassicalKeypair::from_seed(classical_seed);
+        let pq = PqKeypair::from_seed(pq_seed).unwrap();
+        let vrf = VrfKeypair::from_seed(vrf_seed);
+        let mut cold_classical_seed = *classical_seed;
+        cold_classical_seed[0] ^= 0xA5;
+        let mut cold_pq_seed = *classical_seed;
+        cold_pq_seed[0] ^= 0x5A;
+        let cold_public = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap().public_key();
+        let cold = cold_public.as_complete_hybrid();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(&classical.public_key().0, &pq.public_key().0).0;
+        let challenge = StakingOp::vrf_possession_challenge(chain_id, &indra_core::Bytes32::from(validator_id), &indra_core::Bytes32::from(vrf.public_key()), 0).unwrap();
+        let (output_bytes, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
+        output.push_str(&format!(
+            "\n[[validators]]\nname = \"test-validator-{index}\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
+            hex::encode(validator_id), hex::encode(classical.public_key().0), hex::encode(pq.public_key().0), hex::encode(vrf.public_key()), hex::encode(output_bytes.0), hex::encode(proof.0), hex::encode(cold.classical.0), hex::encode(cold.pq.0),
+        ));
+    }
+    output
+}
+
+fn test_genesis_toml_single_authority(
+    chain_id: &str,
+    entries: &[([u8; 32], [u8; 32], [u8; 32])],
+) -> String {
+    test_genesis_toml(chain_id, entries)
+}
+
+fn local_test(data_dir: PathBuf) -> NodeConfig {
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let genesis_path = data_dir.join("genesis.toml");
+    if !genesis_path.exists() {
+        std::fs::write(
+            &genesis_path,
+            test_genesis_toml_single_authority(
+                "indra-testnet-1",
+                &[
+                    ([0x42; 32], [0x42; 32], [0x42; 32]),
+                    ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+                    ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+                    ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+                ],
+            ),
+        )
+        .unwrap();
+    }
+    let mut config = NodeConfig::full_node(data_dir);
+    config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
+    config.validator_seed = Some([0x42; 32]);
+    config.vrf_seed = Some([0x42; 32]);
+    let pq = PqKeypair::from_seed(&[0x42; 32]).unwrap();
+    config.pq_seed = Some(pq.secret_key_bytes());
+    config.pq_pk = Some(pq.public_key().0.to_vec());
+    config.observer_addr = None;
+    config.metrics_addr = None;
+    config
+}
+
+fn four_validator_state() -> ChainState {
+    let manifest = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        manifest.path(),
+        test_genesis_toml(
+            "indra-node-test",
+            &[
+                ([0x42; 32], [0x42; 32], [0x42; 32]),
+                ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+                ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+                ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+            ],
+        ),
+    )
+    .unwrap();
+    build_finalized_genesis_state(manifest.path().to_str()).unwrap()
+}
+
 fn anchored_genesis_state() -> ChainState {
-    let mut state = build_genesis_state();
+    let mut state = four_validator_state();
     state.active_slot_coefficient_numerator =
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state.consensus_snapshots.clear();
@@ -194,7 +280,7 @@ fn install_active_validator(
             vrf_key_activation_epoch: 0,
             pending_vrf_pk: None,
             pending_vrf_activation_epoch: None,
-            stake_spark: 1_000_000,
+            stake_spark: 1_000_000_000_000,
             status: indra_state::ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
@@ -232,7 +318,6 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
         indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
 
     if state.height == 0 {
-        state.validators = Default::default();
         state.consensus_snapshots.clear();
         state.reward_economic_snapshot = None;
         state.slash_membership_roots.clear();
@@ -249,7 +334,7 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
             vrf_key_activation_epoch: 0,
             pending_vrf_pk: None,
             pending_vrf_activation_epoch: None,
-            stake_spark: 1_000_000,
+            stake_spark: 1_000_000_000_000,
             status: indra_state::ValidatorStatus::Active,
             registered_epoch: 0,
             last_active_epoch: 0,
@@ -274,64 +359,15 @@ fn install_state_validator(state: &mut ChainState, seed: [u8; 32], name: &str) -
     hybrid
 }
 
-fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], name: &str) -> String {
+fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], _name: &str) -> String {
     std::fs::create_dir_all(dir).unwrap();
-    let classical = ClassicalKeypair::from_seed(&seed);
-    let pq = PqKeypair::from_seed(&seed).unwrap();
-    let vrf = VrfKeypair::from_seed(&seed);
-    let cold = indra_crypto::ColdHybridKeypair::from_independent_seeds(
-        [seed[0] ^ 0xA5; 32],
-        [seed[0] ^ 0x5A; 32],
-    )
-    .unwrap();
-    let cold_public = cold.public_key();
-    let cold_public = cold_public.as_complete_hybrid();
-    let validator_id = indra_core::types::crypto::hybrid_identity_id(
-        &classical.public_key().0,
-        &pq.public_key().0,
+    let path = dir.join("genesis.toml");
+    let genesis = test_genesis_toml_single_authority(
+        "indra-testnet-1",
+        &[(seed, seed, seed), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
     );
-    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
-        DEFAULT_CHAIN_ID,
-        &validator_id,
-        &Bytes32::from(vrf.public_key()),
-        0,
-    )
-    .unwrap();
-    let (vrf_possession_output, vrf_possession_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
-    let genesis_path = dir.join("genesis.toml");
-    let genesis = format!(
-        "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"{}\"\nvalidator_id = \"{}\"\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\nstake = 1000000\n",
-        name,
-        hex::encode(validator_id.0),
-        hex::encode(classical.public_key().0),
-        hex::encode(pq.public_key().0),
-        hex::encode(vrf.public_key()),
-        hex::encode(vrf_possession_output.0),
-        hex::encode(vrf_possession_proof.0),
-        hex::encode(cold_public.classical.0),
-        hex::encode(cold_public.pq.0),
-    );
-    let placeholder = hex::encode([0u8; 32]);
-    let provisional = genesis
-        .replacen(
-            "[genesis]\n",
-            &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
-            1,
-        )
-        .replacen(
-            "[[validators]]\n",
-            &format!(
-                "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
-                hex::encode([0x70u8; 32])
-            ),
-            1,
-        );
-    let manifest: indra_node::GenesisManifest = toml::from_str(&provisional).unwrap();
-    let hash = indra_node::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
-        .unwrap();
-    let genesis = provisional.replacen(&placeholder, &hex::encode(hash.0), 1);
-    std::fs::write(&genesis_path, genesis).unwrap();
-    genesis_path.to_string_lossy().to_string()
+    std::fs::write(&path, genesis).unwrap();
+    path.to_string_lossy().to_string()
 }
 
 fn build_single_validator_qc_bytes(
@@ -339,51 +375,43 @@ fn build_single_validator_qc_bytes(
     height: u64,
     round: u32,
     block_hash: Bytes32,
-    seed: [u8; 32],
+    _seed: [u8; 32],
 ) -> Vec<u8> {
-    let snapshot_root = state
+    let snapshot = state
         .snapshot_for_consensus_height(height)
-        .expect("QC fixture must use the governing snapshot")
-        .snapshot_root;
-    let classical = ClassicalKeypair::from_seed(&seed);
-    let pq = PqKeypair::from_seed(&seed).unwrap();
-    let hybrid = HybridKeypair::new(classical, pq);
-    let public = hybrid.public_key();
-    let validator_id =
-        indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
-    let vote = produce_vote(
-        height,
-        round,
-        VoteStep::Precommit,
-        block_hash,
-        validator_id,
-        snapshot_root,
-        DEFAULT_CHAIN_ID,
-        &hybrid,
-    )
-    .unwrap();
-    let qc = build_qc(
-        height,
-        round,
-        block_hash,
-        DEFAULT_CHAIN_ID,
-        snapshot_root,
-        &[QcValidator {
-            validator_id,
-            position: 0,
-            pq_pk: public.pq.0.to_vec(),
-            classical_pk: public.classical.0,
-            stake: 1_000_000,
-        }],
-        vec![&vote],
-    )
-    .unwrap();
+        .expect("QC fixture must use the governing snapshot");
+    let seeds = [[0x42; 32], [0xB2; 32], [0xC3; 32], [0xD4; 32]];
+    let signers: Vec<_> = seeds
+        .iter()
+        .map(|seed| HybridKeypair::new(ClassicalKeypair::from_seed(seed), PqKeypair::from_seed(seed).unwrap()))
+        .collect();
+    let votes: Vec<_> = signers
+        .iter()
+        .map(|signer| {
+            let public = signer.public_key();
+            let validator_id = indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
+            produce_vote(height, round, VoteStep::Precommit, block_hash, validator_id, snapshot.snapshot_root, &state.chain_id, signer).unwrap()
+        })
+        .collect();
+    let validators: Vec<_> = snapshot
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| QcValidator {
+            validator_id: entry.validator_id,
+            position,
+            pq_pk: entry.pq_vote_pk.to_vec(),
+            classical_pk: entry.classical_vote_pk,
+            stake: entry.consensus_weight_spark,
+        })
+        .collect();
+    let qc = build_qc(height, round, block_hash, &state.chain_id, snapshot.snapshot_root, &validators, votes.iter().collect()).unwrap();
     qc.encode_to_vec()
 }
 
 fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     let dir = temp_dir(suffix);
-    let mut config = NodeConfig::local_test(dir.clone());
+    let mut config = local_test(dir.clone());
     let pq = PqKeypair::from_seed(&seed).unwrap();
     config.validator_seed = Some(seed);
     config.vrf_seed = Some(seed);
@@ -419,8 +447,22 @@ fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
 }
 
 #[test]
+fn genesis_rejects_3_validators() {
+    let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32])];
+    let error = parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap_err();
+    assert!(error.contains("at least 4 validators"), "unexpected error: {error}");
+}
+
+#[test]
+fn genesis_with_4_validators() {
+    let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
+    let manifest = parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap();
+    assert_eq!(manifest.validators.len(), 4);
+}
+
+#[test]
 fn genesis_is_deterministic() {
-    let state = build_genesis_state();
+    let state = four_validator_state();
     let h1 = genesis_block_hash(&state).unwrap();
     let h2 = genesis_block_hash(&state).unwrap();
     assert_eq!(h1, h2);
@@ -429,7 +471,7 @@ fn genesis_is_deterministic() {
 #[test]
 fn node_engine_init_and_commit() {
     let dir = temp_dir("engine");
-    let config = NodeConfig::local_test(dir.clone());
+    let config = local_test(dir.clone());
     let mut engine = NodeEngine::init(config).unwrap();
     install_state_validator(&mut engine.state, [0x42u8; 32], "local");
 
@@ -468,7 +510,7 @@ fn state_root_changes_after_each_block() {
 
     let root0 = compute_state_root(&state);
 
-    let b1 = make_strict_block(&state, [0x11u8; 32], vec![]);
+    let b1 = make_strict_block(&state, [0x42u8; 32], vec![]);
     import_unfinalized_block_for_test(
         &b1,
         &mut state,
@@ -487,7 +529,7 @@ fn state_root_changes_after_each_block() {
         b1.header.block_hash(),
         [0x11u8; 32],
     );
-    let b2 = make_strict_block(&state, [0x11u8; 32], qc1);
+    let b2 = make_strict_block(&state, [0x42u8; 32], qc1);
     import_unfinalized_block_for_test(
         &b2,
         &mut state,
@@ -519,7 +561,7 @@ fn block_store_survives_reopen() {
 
         let mut last_qc = Vec::new();
         for i in 1..=3u64 {
-            let b = make_strict_block(&state, [0x12u8; 32], last_qc.clone());
+            let b = make_strict_block(&state, [0x42u8; 32], last_qc.clone());
             import_unfinalized_block_for_test(
                 &b,
                 &mut state,
@@ -552,7 +594,7 @@ fn block_store_survives_reopen() {
 fn restarted_block_store_preserves_hash_chain() {
     let dir = temp_dir("restart_chain");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut config = NodeConfig::local_test(dir.clone());
+    let mut config = local_test(dir.clone());
     let seed = [0x42u8; 32];
     let pq = PqKeypair::from_seed(&seed).unwrap();
     config.genesis_path = Some(write_single_validator_genesis(&dir, seed, "local"));
@@ -605,7 +647,7 @@ fn sync_state_downloads_full_chain_from_genesis() {
     let mut source_last_qc = Vec::new();
     for _ in 0..6u64 {
         let height = source_state.height + 1;
-        let block = make_strict_block(&source_state, [0x13u8; 32], source_last_qc.clone());
+        let block = make_strict_block(&source_state, [0x42u8; 32], source_last_qc.clone());
         import_unfinalized_block_for_test(
             &block,
             &mut source_state,
@@ -670,7 +712,7 @@ fn current_binary_hashes_workspace_block_log_consistently() {
     let dir = temp_dir("generated_hash_chain");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let config = NodeConfig::local_test(dir.clone());
+    let config = local_test(dir.clone());
     {
         let mut engine = NodeEngine::init(config.clone()).unwrap();
         install_state_validator(&mut engine.state, [0x42u8; 32], "local");
@@ -718,7 +760,7 @@ fn snapshot_and_restore() {
 
     let state_store = StateStore::open(dir.join("state")).unwrap();
 
-    let mut state = build_genesis_state();
+    let mut state = four_validator_state();
     state.height = 300;
     state.base_fee = 999;
 
@@ -745,7 +787,7 @@ fn full_node_pipeline() {
     let mut last_qc = Vec::new();
     let roots: Vec<Bytes32> = (1..=10u64)
         .map(|i| {
-            let b = make_strict_block(&state, [0x14u8; 32], last_qc.clone());
+            let b = make_strict_block(&state, [0x42u8; 32], last_qc.clone());
             import_unfinalized_block_for_test(
                 &b,
                 &mut state,

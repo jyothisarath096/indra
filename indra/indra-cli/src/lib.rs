@@ -50,7 +50,7 @@ pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{
     build_genesis_config, entry_from_keys, entry_from_public_keys, with_cold_file,
-    with_cold_manifest, GenesisConfig, GenesisEntry,
+    holds_at_least_one_third, stake_share_bps, with_cold_manifest, GenesisConfig, GenesisEntry,
 };
 pub use keygen::{
     encrypt_cold_keys, encrypt_keys, generate_cold_keys_file, generate_cold_share_ceremony,

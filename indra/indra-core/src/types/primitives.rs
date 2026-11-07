@@ -77,12 +77,6 @@ pub fn validate_consensus_round(round: u32) -> IndraResult<u32> {
 /// governance-configurable parameter.
 pub const MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR: u64 = 6_917_529_027_641_081_856;
 
-/// Sole declared Bitcoin confirmation depth for mainnet genesis entropy.
-pub const BITCOIN_GENESIS_CONFIRMATIONS: u32 = 100;
-
-/// Minimum inclusive distance between Bitcoin tip and the precommitted target.
-pub const MIN_GENESIS_PRECOMMIT_BLOCK_LEAD: u64 = 144;
-
 // ── Slashing ──────────────────────────────────────────────────────────────────
 
 /// Double precommit slash: 5% of stake.

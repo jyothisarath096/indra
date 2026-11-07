@@ -24,10 +24,6 @@ pub struct NodeConfig {
     /// into an already-populated state.
     pub genesis_path: Option<String>,
 
-    /// Minimum genesis validator count. Production configurations must use 4;
-    /// `local_test` uses 1 solely for focused single-validator unit fixtures.
-    pub(crate) genesis_validator_minimum: usize,
-
     /// The node's validator identity (32-byte Ed25519 seed).
     /// If None, this node is a full node (validates but does not propose).
     pub validator_seed: Option<[u8; 32]>,
@@ -159,79 +155,31 @@ pub fn validate_pool_capacities(
 
 impl NodeConfig {
     /// Create a default configuration for local testing.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn local_test(data_dir: PathBuf) -> Self {
         let genesis_path = data_dir.join("genesis.toml");
         std::fs::create_dir_all(&data_dir).expect("create local-test data directory");
         if !genesis_path.exists() {
-            let hot = indra_crypto::HybridKeypair::new(
-                indra_crypto::ClassicalKeypair::from_seed(&[0x42; 32]),
-                indra_crypto::PqKeypair::from_seed(&[0x43; 32]).unwrap(),
-            );
-            let cold =
-                indra_crypto::ColdHybridKeypair::from_independent_seeds([0x44; 32], [0x45; 32])
-                    .unwrap();
-            let hot_public = hot.public_key();
-            let cold_public = cold.public_key();
-            let cold_public = cold_public.as_complete_hybrid();
-            let vrf = indra_crypto::VrfKeypair::from_seed(&[0x42; 32]);
-            let vrf_public = vrf.public_key();
-            let validator_id = indra_core::types::crypto::HybridPubKey {
-                classical_pk: indra_core::Bytes32::from(hot_public.classical.0),
-                pq_pk: indra_core::VariableBytes::from_slice(&hot_public.pq.0)
-                    .expect("fixed-size ML-DSA-87 public key fits protocol maximum"),
-            }
-            .identity_id()
-            .0;
-            let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+            let contents = crate::genesis::test_genesis_toml_single_authority(
                 "indra-testnet-1",
-                &indra_core::Bytes32::from(validator_id),
-                &indra_core::Bytes32::from(vrf_public),
-                0,
-            )
-            .expect("local test VRF challenge");
-            let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
-            let contents = format!(
-                "[genesis]\nchain_id = \"indra-testnet-1\"\nactive_slot_coefficient_numerator = \"6917529027641081856\"\nbitcoin_pow_entropy_header = \"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"\n\n[genesis.bitcoin_pow_entropy_source]\nscheme = 1\nnetwork_genesis_hash = \"0000000000000000000000000000000000000000000000000000000000000000\"\nannounced_height = 1\nheader_codec = 1\nextraction_algorithm = 1\nminimum_confirmations = 100\nreorg_policy = 1\n\n[[validators]]\nname = \"local-test-validator\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
-                hex::encode(validator_id), hex::encode(hot_public.classical.0),
-                hex::encode(hot_public.pq.0), hex::encode(vrf_public),
-                hex::encode(vrf_output.0), hex::encode(vrf_proof.0),
-                hex::encode(cold_public.classical.0), hex::encode(cold_public.pq.0),
+                &[
+                    ([0x42; 32], [0x42; 32], [0x42; 32]),
+                    ([0x52; 32], [0x52; 32], [0x52; 32]),
+                    ([0x62; 32], [0x62; 32], [0x62; 32]),
+                    ([0x72; 32], [0x72; 32], [0x72; 32]),
+                ],
             );
-            let contents = {
-                let placeholder = hex::encode([0u8; 32]);
-                let provisional = contents
-                    .replacen(
-                        "[genesis]\n",
-                        &format!("[genesis]\ngenesis_precommit_hash = \"{placeholder}\"\n"),
-                        1,
-                    )
-                    .replacen(
-                        "[[validators]]\n",
-                        &format!(
-                            "[[validators]]\ngenesis_commitment_nonce = \"{}\"\n",
-                            hex::encode([0x70u8; 32])
-                        ),
-                        1,
-                    );
-                let manifest: crate::genesis::GenesisManifest = toml::from_str(&provisional)
-                    .expect("generated local-test genesis has the current schema");
-                let hash =
-                    crate::genesis::genesis_precommit_hash(&manifest.genesis, &manifest.validators)
-                        .expect("generated local-test genesis precommit is canonical");
-                provisional.replacen(&placeholder, &hex::encode(hash.0), 1)
-            };
             std::fs::write(&genesis_path, contents).expect("write local-test genesis");
         }
         let peers_file = data_dir.join("peers.json").to_string_lossy().to_string();
         Self {
             data_dir,
             genesis_path: Some(genesis_path.to_string_lossy().to_string()),
-            genesis_validator_minimum: 1,
             validator_seed: Some([0x42u8; 32]),
             vrf_seed: Some([0x42u8; 32]),
-            pq_seed: Some(vec![0x43; indra_crypto::PQ_SK_BYTES]),
+            pq_seed: Some(vec![0x42; indra_crypto::PQ_SK_BYTES]),
             pq_pk: Some(
-                indra_crypto::PqKeypair::from_seed(&[0x43; 32])
+                indra_crypto::PqKeypair::from_seed(&[0x42; 32])
                     .expect("fixed local-test ML-DSA seed is valid")
                     .public_key()
                     .0
@@ -261,7 +209,6 @@ impl NodeConfig {
         Self {
             data_dir,
             genesis_path: None,
-            genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
             pq_seed: None,
@@ -293,7 +240,6 @@ impl NodeConfig {
         Self {
             data_dir,
             genesis_path: None,
-            genesis_validator_minimum: 4,
             validator_seed: None,
             vrf_seed: None,
             pq_seed: None,

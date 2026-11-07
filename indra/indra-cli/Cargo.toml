@@ -24,7 +24,7 @@ zeroize.workspace = true
 [dev-dependencies]
 indra-core      = { path = "../indra-core" }
 indra-crypto    = { path = "../indra-crypto" }
-indra-node      = { path = "../indra-node" }
+indra-node      = { path = "../indra-node", features = ["test-support"] }
 indra-rpc       = { path = "../indra-rpc" }
 
 [[bin]]

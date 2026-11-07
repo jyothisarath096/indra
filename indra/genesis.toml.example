@@ -1,110 +1,20 @@
-# =============================================================================
-# INDRA v2 — Example Genesis Configuration
-# =============================================================================
-#
-# How to use this file:
-#
-# 1. Each validator creates their encrypted hot keystore and completes an
-#    offline cold-key Shamir ceremony. No private material is sent to the
-#    coordinator.
-#
-# 2. Each validator runs `indra-genesis commit-validator`. Only the resulting
-#    commitment artifact is published before the future Bitcoin target; the
-#    reveal artifact remains private until that target header is fixed.
-#
-# 3. The coordinator runs `indra-genesis precommit` at least 144 Bitcoin blocks
-#    before the target and publishes it through two independent witness channels.
-#    All validators reveal immediately; `indra-genesis freeze-authority` verifies
-#    the complete set while the target is still in the future. The opened artifact
-#    is also externally witnessed before the target. At 100 confirmations,
-#    `finalize` consumes that artifact and accepts no validator reveal input.
-#
-# 4. Each validator runs:
-#      indra-node --genesis genesis.toml --keys keys.json --data-dir ./data
-#
-# =============================================================================
-
 [genesis]
-chain_id     = "indra-testnet-1"
-# Initial mainnet protocol constant: f=3/8. Any other value is rejected.
+chain_id = "indra-mainnet"
+genesis_timestamp = 1700000000
 active_slot_coefficient_numerator = "6917529027641081856"
-bitcoin_pow_entropy_header = "<160 lowercase hex characters from the verified Bitcoin header>"
-genesis_precommit_hash = "<64 lowercase hex characters from the published precommit artifact>"
-
-[genesis.bitcoin_pow_entropy_source]
-scheme = 1
-network_genesis_hash = "<64 lowercase hex characters, raw byte order>"
-announced_height = 0 # replace with the publicly precommitted future height
-header_codec = 1
-extraction_algorithm = 1
-minimum_confirmations = 100
-reorg_policy = 1
-
-# Minimum 4 validators required (BFT safety: 3f+1, f=1 means tolerate 1 failure)
-# Recommended for testnet: 4–10 validators
 
 [[validators]]
-name                = "alice"
-validator_id        = "aabbcc..."   # 64 hex chars (32 bytes)
-hybrid_classical_pk = "aabbcc..."   # 64 hex chars (Ed25519 public key)
-hybrid_pq_pk        = "aabbcc..."   # exact ML-DSA-87 public-key length
-vrf_pk              = "aabbcc..."   # 64 hex chars (VRF public key)
-vrf_possession_output = "aabbcc..." # 128 hex chars (RFC 9381 output)
-vrf_possession_proof  = "aabbcc..." # 160 hex chars (RFC 9381 proof)
-cold_hybrid_classical_pk = "aabbcc..." # 64 hex chars
-cold_hybrid_pq_pk        = "aabbcc..." # exact ML-DSA-87 public-key length
-cold_key_version         = 1
-cold_nonce               = 0
-genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
-# Genesis validator stake in Spark (1 INDRA = 100,000,000 Spark)
-# Genesis validators are exempt from minimum stake requirements.
-# stake = 100000000000 -> 1,000 INDRA per genesis validator
-# All genesis validators enter the active set regardless of stake.
-# New validators joining after genesis compete for active set slots
-# by stake ranking — no hard minimum, market-driven admission.
-stake               = 100000000000
+name = "founder-1"
+validator_id = "<64 lowercase hex characters>"
+hybrid_classical_pk = "<64 lowercase hex characters>"
+hybrid_pq_pk = "<1952 lowercase hex characters>"
+vrf_pk = "<64 lowercase hex characters>"
+vrf_possession_output = "<64 lowercase hex characters>"
+vrf_possession_proof = "<variable-length lowercase hex characters>"
+cold_hybrid_classical_pk = "<64 lowercase hex characters>"
+cold_hybrid_pq_pk = "<1952 lowercase hex characters>"
+cold_key_version = 1
+cold_nonce = 0
+stake = 1000000000000
 
-[[validators]]
-name                = "bob"
-validator_id        = "112233..."
-hybrid_classical_pk = "112233..."
-hybrid_pq_pk        = "112233..."
-vrf_pk              = "112233..."
-vrf_possession_output = "112233..."
-vrf_possession_proof  = "112233..."
-cold_hybrid_classical_pk = "112233..."
-cold_hybrid_pq_pk        = "112233..."
-cold_key_version         = 1
-cold_nonce               = 0
-genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
-stake               = 100000000000
-
-[[validators]]
-name                = "carol"
-validator_id        = "334455..."
-hybrid_classical_pk = "334455..."
-hybrid_pq_pk        = "334455..."
-vrf_pk              = "334455..."
-vrf_possession_output = "334455..."
-vrf_possession_proof  = "334455..."
-cold_hybrid_classical_pk = "334455..."
-cold_hybrid_pq_pk        = "334455..."
-cold_key_version         = 1
-cold_nonce               = 0
-genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
-stake               = 100000000000
-
-[[validators]]
-name                = "dave"
-validator_id        = "556677..."
-hybrid_classical_pk = "556677..."
-hybrid_pq_pk        = "556677..."
-vrf_pk              = "556677..."
-vrf_possession_output = "556677..."
-vrf_possession_proof  = "556677..."
-cold_hybrid_classical_pk = "556677..."
-cold_hybrid_pq_pk        = "556677..."
-cold_key_version         = 1
-cold_nonce               = 0
-genesis_commitment_nonce = "<64 lowercase hex characters opened and witnessed before the target>"
-stake               = 100000000000
+# Repeat [[validators]] for at least four distinct validators.

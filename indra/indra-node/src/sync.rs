@@ -1486,20 +1486,10 @@ mod tests {
             .find(|seed| VrfKeypair::from_seed(&[*seed; 32]).public_key() == candidate.vrf_pubkey)
             .expect("test proposer VRF seed must be recoverable");
         let mut proposal = make_strict_block(state, proposer_seed, 0, vec![]);
-        // `canonical_test_genesis` deliberately uses independent hot and VRF
+        // The test genesis deliberately uses independent hot and VRF
         // seeds. Re-authorize the proposal with that fixture's registered hot
         // hybrid key; eligibility and authorization are independent proofs.
-        let signer = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0xD1; 32]),
-            PqKeypair::from_seed(&[0xD2; 32]).unwrap(),
-        );
-        let signature = signer
-            .sign(&proposal.signing_bytes(state.chain_id.as_bytes()).unwrap())
-            .unwrap();
-        proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
-            classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&signature.pq.0).unwrap(),
-        };
+        authorize_canonical_test_proposal(&mut proposal, state.chain_id.as_bytes());
         proposal
     }
 
@@ -1507,7 +1497,22 @@ mod tests {
         proposal: &mut indra_core::types::block::BlockProposalVNext,
         chain_id: &[u8],
     ) {
-        authorize_test_proposal(proposal, chain_id, [0xD1; 32], [0xD2; 32]);
+        let proposer_id = proposal.block.header.proposer_id;
+        let (classical_seed, pq_seed) = [
+            ([0xD1; 32], [0xD2; 32]),
+            ([0xB1; 32], [0xB2; 32]),
+            ([0xC1; 32], [0xC2; 32]),
+            ([0xE1; 32], [0xE2; 32]),
+        ]
+        .into_iter()
+        .find(|(classical, pq)| {
+            indra_core::types::crypto::hybrid_identity_id(
+                &ClassicalKeypair::from_seed(classical).public_key().0,
+                &PqKeypair::from_seed(pq).unwrap().public_key().0,
+            ) == proposer_id
+        })
+        .expect("test proposer identity must be recoverable");
+        authorize_test_proposal(proposal, chain_id, classical_seed, pq_seed);
     }
 
     fn authorize_test_proposal(
@@ -1643,7 +1648,7 @@ mod tests {
         let dir = temp_dir("a");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
@@ -1807,7 +1812,7 @@ mod tests {
         let dir = temp_dir("projection_root_rollback");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let original_state = state.clone();
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
@@ -1852,7 +1857,7 @@ mod tests {
         let dir = temp_dir("projection_apply_rollback");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let original_state = state.clone();
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
@@ -1896,7 +1901,7 @@ mod tests {
     fn durable_append_rejection_cannot_publish_projected_state_or_pool_effects() {
         let dir = temp_dir("durable_append_before_publish");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let original_state = state.clone();
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
@@ -1929,7 +1934,7 @@ mod tests {
 
     #[test]
     fn projected_verifier_preserves_root_error_strings() {
-        let state = crate::genesis::canonical_test_genesis();
+        let state = crate::genesis::test_genesis_state();
 
         let mut bad_state_root = make_block(&state);
         bad_state_root.header.state_root = Bytes32::from([0xE1; 32]);
@@ -1960,7 +1965,7 @@ mod tests {
 
     #[test]
     fn governed_sync_verification_fails_closed_without_snapshot() {
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let proposal = make_block(&state);
         state.consensus_snapshots.clear();
         let error = verify_block_state_root(&proposal, &state).unwrap_err();
@@ -1969,7 +1974,7 @@ mod tests {
 
     #[test]
     fn sync_import_guard_uses_snapshot_when_live_active_set_is_empty() {
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let proposal = make_block(&state);
         for validator_id in state
             .validators
@@ -2046,7 +2051,7 @@ mod tests {
         let dir = temp_dir("c");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut state = crate::genesis::canonical_test_genesis();
+        let mut state = crate::genesis::test_genesis_state();
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
             dir.join("blocks.log"),
@@ -2212,7 +2217,7 @@ mod tests {
             },
         );
 
-        let state = crate::genesis::canonical_test_genesis();
+        let state = crate::genesis::test_genesis_state();
         let block = make_block(&state);
         let provisional_height = block.header.height;
         let prepared = PreparedSyncBlock {
@@ -2265,7 +2270,7 @@ mod tests {
         sync.peer_connected(id);
         sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, Instant::now());
         assert!(sync.accept_response(wrong_id, wrong_peer, &[]).is_err());
-        let mut out_of_range = make_block(&crate::genesis::canonical_test_genesis());
+        let mut out_of_range = make_block(&crate::genesis::test_genesis_state());
         out_of_range.header.height = 99;
         assert!(sync.accept_response(id, peer, &[out_of_range]).is_err());
     }
@@ -2277,7 +2282,7 @@ mod tests {
         let id = Bytes32::from([0xA9; 32]);
         let wrong_id = Bytes32::from([0xAA; 32]);
         let now = Instant::now();
-        let state = crate::genesis::canonical_test_genesis();
+        let state = crate::genesis::test_genesis_state();
         let block = make_block(&state);
         let height = block.header.height;
         let prepared = PreparedSyncBlock {
@@ -2452,7 +2457,7 @@ mod tests {
         let mut source =
             crate::NodeEngine::init(crate::NodeConfig::local_test(source_dir.clone())).unwrap();
         let classical = ClassicalKeypair::from_seed(&[0x42; 32]);
-        let pq = PqKeypair::from_seed(&[0x43; 32]).unwrap();
+        let pq = PqKeypair::from_seed(&[0x42; 32]).unwrap();
         let hybrid = HybridKeypair::new(classical, pq);
         let validator_id = indra_core::types::crypto::hybrid_identity_id(
             &hybrid.public_key().classical.0,
@@ -2465,7 +2470,7 @@ mod tests {
             &mut block1,
             source.state.chain_id.as_bytes(),
             [0x42; 32],
-            [0x43; 32],
+            [0x42; 32],
         );
         source.commit_proposal(&block1).unwrap();
         let qc1 = build_qc_bytes(
@@ -2487,7 +2492,7 @@ mod tests {
             &mut block2,
             source.state.chain_id.as_bytes(),
             [0x42; 32],
-            [0x43; 32],
+            [0x42; 32],
         );
         source.commit_proposal(&block2).unwrap();
         let qc2 = build_qc_bytes(
@@ -2510,7 +2515,6 @@ mod tests {
 
         let mut destination_config = crate::NodeConfig::full_node(destination_dir.clone());
         destination_config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
-        destination_config.genesis_validator_minimum = 1;
         let report =
             crate::recovery::recover_finalized_prefix(&source_dir, destination_config).unwrap();
         assert_eq!(report.recovered_height, 2);
@@ -2519,7 +2523,6 @@ mod tests {
         let recovered = crate::NodeEngine::init({
             let mut config = crate::NodeConfig::full_node(destination_dir.clone());
             config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
-            config.genesis_validator_minimum = 1;
             config
         })
         .unwrap();
