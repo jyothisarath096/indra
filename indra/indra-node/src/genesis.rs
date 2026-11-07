@@ -757,6 +757,34 @@ mod tests {
     }
 
     #[test]
+    fn genesis_rejects_stake_below_dust_with_exact_error() {
+        let mut base = validators("dust");
+        base[0].stake = indra_core::types::primitives::DUST_LIMIT_SPARK - 1;
+        assert_validation_error(
+            &GenesisManifest { genesis: settings("dust"), validators: base, seeds: vec![] },
+            "genesis validator v0 stake is below dust",
+        );
+    }
+
+    #[test]
+    fn genesis_rejects_invalid_cold_classical_and_pq_keys_with_exact_errors() {
+        let baseline = validators("invalid-cold");
+        let mut invalid_classical = baseline.clone();
+        invalid_classical[0].cold_hybrid_classical_pk = "00".repeat(32);
+        assert_validation_error(
+            &GenesisManifest { genesis: settings("invalid-cold"), validators: invalid_classical, seeds: vec![] },
+            "genesis validator v0 has an invalid cold classical key",
+        );
+
+        let mut invalid_pq = baseline;
+        invalid_pq[0].cold_hybrid_pq_pk = "00".repeat(indra_crypto::PQ_PK_BYTES);
+        assert_validation_error(
+            &GenesisManifest { genesis: settings("invalid-cold"), validators: invalid_pq, seeds: vec![] },
+            "genesis validator v0 has an invalid cold PQ key",
+        );
+    }
+
+    #[test]
     fn empty_genesis_manifest_is_rejected() {
         assert_validation_error(&GenesisManifest {
             genesis: settings("empty"),
