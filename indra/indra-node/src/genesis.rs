@@ -419,7 +419,7 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut ChainState) -> Re
         }).map_err(|error| error.to_string())?;
         state.utxos.insert(OutputV1 {
             value_spark: GENESIS_VALIDATOR_UTXO_SPARK,
-            owner_pubkey: HybridPubKey { classical_pk: Bytes32::from(hot_classical), pq_pk: VariableBytes::from_slice(&hot_pq).map_err(|error| error.to_string())? },
+            owner_pubkey: HybridPubKey { classical_pk: Bytes32::from(cold_classical), pq_pk: VariableBytes::from_slice(&cold_pq).map_err(|error| error.to_string())? },
             lock_height: 0,
         }, 0, 0, state.utxos.len() as u32).map_err(|error| error.to_string())?;
     }
@@ -521,7 +521,8 @@ fn test_genesis_toml_with_stakes(
 mod tests {
     use super::*;
     use indra_core::codec::Encode;
-    use indra_core::types::primitives::MAX_CHAIN_ID_BYTES;
+    use indra_core::types::primitives::{MAX_CHAIN_ID_BYTES, TRANSACTION_PROTOCOL_VERSION};
+    use indra_core::types::transaction::{InputV1, TransactionV1};
     use indra_crypto::{ClassicalKeypair, ColdHybridKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 
     fn four_validator_test_state(chain_id: &str) -> ChainState {
@@ -633,13 +634,100 @@ mod tests {
     fn genesis_utxo_uses_authoritative_public_value() {
         let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
         let path = std::env::temp_dir().join(format!("indra-utxo-value-{}.toml", std::process::id()));
-        std::fs::write(&path, test_genesis_toml("utxo-value", &entries)).unwrap();
+        let manifest_text = test_genesis_toml("utxo-value", &entries);
+        let manifest = parse_genesis_manifest_str(&manifest_text).unwrap();
+        std::fs::write(&path, manifest_text).unwrap();
         let state = build_finalized_genesis_state(path.to_str()).unwrap();
         let rebuilt = build_finalized_genesis_state(path.to_str()).unwrap();
         assert_eq!(build_genesis_block(&state).unwrap().encode_to_vec(), build_genesis_block(&rebuilt).unwrap().encode_to_vec());
         assert_eq!(genesis_block_hash(&state).unwrap(), genesis_block_hash(&rebuilt).unwrap());
-        assert!(state.utxos.all_entries().all(|entry| entry.output.value_spark == GENESIS_VALIDATOR_UTXO_SPARK));
+        let mut cold_owners = Vec::new();
+        let mut hot_owners = Vec::new();
+        for validator in manifest.validators {
+            cold_owners.push(HybridPubKey {
+                classical_pk: Bytes32::from(decode_hex_exact::<32>(&validator.cold_hybrid_classical_pk, "cold").unwrap()),
+                pq_pk: VariableBytes::from_slice(&decode_hex_len(&validator.cold_hybrid_pq_pk, indra_crypto::PQ_PK_BYTES, "cold").unwrap()).unwrap(),
+            });
+            hot_owners.push(HybridPubKey {
+                classical_pk: Bytes32::from(decode_hex_exact::<32>(&validator.hybrid_classical_pk, "hot").unwrap()),
+                pq_pk: VariableBytes::from_slice(&decode_hex_len(&validator.hybrid_pq_pk, indra_crypto::PQ_PK_BYTES, "hot").unwrap()).unwrap(),
+            });
+        }
+        let genesis_entries: Vec<_> = state.utxos.all_entries().collect();
+        assert_eq!(genesis_entries.len(), cold_owners.len());
+        let mut actual_owners: Vec<Vec<u8>> = genesis_entries.iter().map(|entry| entry.output.owner_pubkey.encode_to_vec()).collect();
+        let mut expected_owners: Vec<Vec<u8>> = cold_owners.iter().map(Encode::encode_to_vec).collect();
+        actual_owners.sort();
+        expected_owners.sort();
+        assert_eq!(actual_owners, expected_owners);
+        for entry in genesis_entries {
+            assert_eq!(entry.output.value_spark, GENESIS_VALIDATOR_UTXO_SPARK);
+            assert!(!hot_owners.contains(&entry.output.owner_pubkey));
+        }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn genesis_utxo_spend_requires_the_cold_hybrid_key() {
+        let state = four_validator_test_state("cold-utxo-spend");
+        let hot = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[1; 32]),
+            PqKeypair::from_seed(&[1; 32]).unwrap(),
+        );
+        let mut cold_classical_seed = [1u8; 32];
+        cold_classical_seed[0] ^= 0xA5;
+        let mut cold_pq_seed = [1u8; 32];
+        cold_pq_seed[0] ^= 0x5A;
+        let cold = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap();
+        let cold_public = cold.public_key();
+        let cold_owner = HybridPubKey {
+            classical_pk: Bytes32::from(cold_public.as_complete_hybrid().classical.0),
+            pq_pk: VariableBytes::from_slice(&cold_public.as_complete_hybrid().pq.0).unwrap(),
+        };
+        let genesis_entry = state
+            .utxos
+            .all_entries()
+            .find(|entry| entry.output.owner_pubkey == cold_owner)
+            .unwrap();
+        let utxo_id = genesis_entry.utxo_id;
+        let value = genesis_entry.output.value_spark;
+        let fee = state.base_fee * 10;
+        let original_utxo_count = state.utxos.len();
+        let mut cold_tx = TransactionV1 {
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+            signature_module_id: 1,
+            inputs: vec![InputV1 { utxo_id }],
+            outputs: vec![OutputV1 { value_spark: value - fee, owner_pubkey: cold_owner.clone(), lock_height: 0 }],
+            fee_amount: fee,
+            signature: HybridSignature { classical_sig: VariableBytes::from_slice(&[0; MAX_CLASSICAL_SIG_BYTES]).unwrap(), pq_sig: VariableBytes::from_slice(&[0; MAX_PQ_SIG_BYTES]).unwrap() },
+        };
+        let cold_signature = cold.sign(&cold_tx.signing_bytes(&state.chain_id).unwrap()).unwrap();
+        cold_tx.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&cold_signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&cold_signature.pq.0).unwrap(),
+        };
+        let mut accepted = state.clone();
+        assert_eq!(indra_state::try_apply_transaction_candidate_with_dust(
+            &mut accepted, &cold_tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
+        ), Ok(()));
+        assert!(!accepted.utxos.contains(&utxo_id));
+        assert!(accepted.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == cold_owner && entry.output.value_spark == value - fee
+        }));
+
+        let mut hot_tx = cold_tx;
+        let hot_signature = hot.sign(&hot_tx.signing_bytes(&state.chain_id).unwrap()).unwrap();
+        hot_tx.signature = HybridSignature {
+            classical_sig: VariableBytes::from_slice(&hot_signature.classical.0).unwrap(),
+            pq_sig: VariableBytes::from_slice(&hot_signature.pq.0).unwrap(),
+        };
+        let mut rejected = state;
+        let error = indra_state::try_apply_transaction_candidate_with_dust(
+            &mut rejected, &hot_tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
+        ).unwrap_err();
+        assert_eq!(error.to_string(), "transaction signature invalid: Ed25519 signature verification failed");
+        assert!(rejected.utxos.contains(&utxo_id));
+        assert_eq!(rejected.utxos.len(), original_utxo_count);
     }
 
     #[test]
@@ -983,8 +1071,8 @@ mod tests {
         std::fs::write(&path, manifest).unwrap();
         let state = build_finalized_genesis_state(path.to_str()).unwrap();
         assert_eq!(hex::encode(state.election_seed.0), "f449538f3ffe86ac8fe27a2bea99714c8823140efdceda5144ac3f0143d58db0b3649bb84ddef0f63e2ebd3de8ecb1f09b46fc2d0b18fcf1feb3242ba477c039");
-        let fingerprint: [u8; 32] = hex::decode("3a5f1a3178613c686b686269a5aaf356459a5598f2a0bd3df5c8774402b1677c").unwrap().try_into().unwrap();
-        let block_hash: [u8; 32] = hex::decode("185dc492b2c637f7928da5e7f775c3bff2d43575a4e8a2a17ce62c3cced2f3cd").unwrap().try_into().unwrap();
+        let fingerprint: [u8; 32] = hex::decode("dc14cfe8a7d4b789554e442ad1bcd3cd4c26e782b6c5506b5e3e96b34e3f42dc").unwrap().try_into().unwrap();
+        let block_hash: [u8; 32] = hex::decode("13cf73518f8185c762b72e125043259e8c52465a9acc933be69049ade9ab5223").unwrap().try_into().unwrap();
         assert_eq!(state.genesis_fingerprint, Bytes32::from(fingerprint));
         assert_eq!(genesis_block_hash(&state).unwrap(), Bytes32::from(block_hash));
         std::fs::remove_file(path).unwrap();
