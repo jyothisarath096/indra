@@ -4131,6 +4131,7 @@ fn print_help() {
     println!();
     println!("All flags below override the corresponding config.toml field:");
     println!("  --keys <path>");
+    println!("  --keys-password-file <path>");
     println!("  --data-dir <path>");
     println!("  --genesis <path>");
     println!("  --p2p-addr <host:port>");
