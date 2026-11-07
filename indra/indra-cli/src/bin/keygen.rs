@@ -1,3 +1,7 @@
+use indra_core::codec::Encode;
+use indra_core::types::{crypto::HybridPubKey, primitives::{Bytes32, VariableBytes}};
+use indra_crypto::{ClassicalPublicKey, PaymentAddressV1, PqPublicKey};
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args
@@ -157,6 +161,8 @@ fn main() {
 
 fn cmd_inspect(args: &[String]) {
     let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
+    let chain_id = get(args, "--chain-id")
+        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
     let json = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
         eprintln!("Failed to read {}: {}", keys_path, e);
         std::process::exit(1);
@@ -175,6 +181,7 @@ fn cmd_inspect(args: &[String]) {
             );
             println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
             println!("VRF PK:         {}", hex::encode(public.vrf_pk));
+            print_owner_details(public.hybrid_classical_pk, public.hybrid_pq_pk.clone(), &chain_id);
         }
         indra_cli::KeyFilePublicMetadata::Cold {
             classical_pk,
@@ -184,6 +191,73 @@ fn cmd_inspect(args: &[String]) {
             println!("Classical PK:   {}", hex::encode(classical_pk));
             println!("PQ PK:          {}", hex::encode(&pq_pk));
             println!("PQ PK bytes:    {}", pq_pk.len());
+            print_owner_details(classical_pk, pq_pk, &chain_id);
+        }
+    }
+}
+
+fn print_owner_details(classical_pk: [u8; 32], pq_pk: Vec<u8>, chain_id: &str) {
+    let (owner_hex, address) = owner_details(classical_pk, pq_pk, chain_id).unwrap_or_else(|error| {
+        eprintln!("Failed to construct public owner details: {error}");
+        std::process::exit(1);
+    });
+    println!("chain_id={chain_id}");
+    println!("owner_pubkey_hex={owner_hex}");
+    println!("Payment Address:  {address}");
+}
+
+fn owner_details(
+    classical_pk: [u8; 32],
+    pq_pk: Vec<u8>,
+    chain_id: &str,
+) -> Result<(String, String), String> {
+    let owner = HybridPubKey {
+        classical_pk: Bytes32::from(classical_pk),
+        pq_pk: VariableBytes::from_slice(&pq_pk)
+            .map_err(|error| format!("invalid owner public key: {error}"))?,
+    };
+    let owner_hex = hex::encode(owner.encode_to_vec());
+    let pq_array: [u8; indra_crypto::PQ_PK_BYTES] = pq_pk
+        .try_into()
+        .map_err(|_| "invalid owner public key: invalid PQ key length".to_string())?;
+    let address = PaymentAddressV1::new(
+        chain_id.as_bytes(),
+        indra_crypto::HybridPublicKey {
+            classical: ClassicalPublicKey(classical_pk),
+            pq: PqPublicKey(pq_array),
+        },
+    )
+    .map_err(|error| format!("invalid payment address: {error}"))?;
+    Ok((owner_hex, address.to_text()))
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::*;
+    use indra_core::codec::Decode;
+
+    #[test]
+    fn inspect_owner_hex_and_payment_address_round_trip_for_hot_and_cold_keys() {
+        let chain_id = "inspect-test";
+        let hot = indra_cli::generate_from_master_seed("hot".to_string(), [7; 32]).unwrap();
+        let cold = indra_cli::ColdKeysFile::generate().unwrap();
+        for (classical, pq) in [
+            (hot.public.hybrid_classical_pk, hot.public.hybrid_pq_pk.clone()),
+            (cold.classical_pk, cold.pq_pk.clone()),
+        ] {
+            let (owner_hex, address_text) = owner_details(classical, pq.clone(), chain_id).unwrap();
+            let decoded = HybridPubKey::decode_exact(&hex::decode(owner_hex).unwrap()).unwrap();
+            assert_eq!(decoded.classical_pk, Bytes32::from(classical));
+            assert_eq!(decoded.pq_pk.as_slice(), pq.as_slice());
+            let address = PaymentAddressV1::from_text(&address_text, chain_id.as_bytes()).unwrap();
+            assert_eq!(address.owner_pubkey().classical.0, classical);
+            assert_eq!(address.owner_pubkey().pq.0.as_slice(), pq.as_slice());
+            if classical == hot.public.hybrid_classical_pk {
+                assert_eq!(
+                    hot.payment_address(chain_id.as_bytes()).unwrap().to_text(),
+                    address_text
+                );
+            }
         }
     }
 }

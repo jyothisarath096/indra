@@ -10,7 +10,7 @@ use indra_cli::{
     ColdAuthorizedStakingAction, PasswordSource, StakePositionExitSigner,
 };
 use indra_core::{
-    codec::Decode,
+    codec::{Decode, Encode},
     types::{
         crypto::HybridPubKey,
         primitives::{VariableBytes, DUST_LIMIT_SPARK},
@@ -121,6 +121,21 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         })
         .collect();
     let config = build_test_genesis("indra-cli-roundtrip", validators);
+    let mut expected_owner_hexes: Vec<String> = config
+        .validators
+        .iter()
+        .map(|validator| {
+            let classical = hex::decode(&validator.cold_hybrid_classical_pk).unwrap();
+            let pq = hex::decode(&validator.cold_hybrid_pq_pk).unwrap();
+            let classical: [u8; 32] = classical.try_into().unwrap();
+            hex::encode(HybridPubKey {
+                classical_pk: Bytes32::from(classical),
+                pq_pk: VariableBytes::from_slice(&pq).unwrap(),
+            }
+            .encode_to_vec())
+        })
+        .collect();
+    expected_owner_hexes.sort();
     let dir = temp_dir("genesis-roundtrip");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("genesis.toml");
@@ -143,6 +158,20 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         assert!(output.contains(field), "inspect output missing {field}: {output}");
     }
     assert_eq!(output.matches("share_bps=2500").count(), 4);
+    assert_eq!(output.matches("owner_pubkey_hex=").count(), 4);
+    let mut actual_owner_hexes: Vec<String> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("owner_pubkey_hex="))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(actual_owner_hexes.len(), 4);
+    assert_eq!(actual_owner_hexes.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    for line in output.lines().filter(|line| line.starts_with("owner_pubkey_hex=")) {
+        let encoded = line.strip_prefix("owner_pubkey_hex=").unwrap();
+        assert!(HybridPubKey::decode_exact(&hex::decode(encoded).unwrap()).is_ok());
+    }
+    actual_owner_hexes.sort();
+    assert_eq!(actual_owner_hexes, expected_owner_hexes);
     assert!(!output.contains("WARNING: validator"));
     std::fs::remove_dir_all(dir).unwrap();
 }

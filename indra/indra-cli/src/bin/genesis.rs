@@ -9,6 +9,8 @@ use indra_cli::{
     with_cold_file, GenesisEntry,
 };
 use indra_state::compute_state_root;
+use indra_core::codec::Encode;
+use indra_core::types::{crypto::HybridPubKey, primitives::{Bytes32, VariableBytes}};
 
 fn required(args: &[String], flag: &str) -> Result<String, String> {
     args.iter()
@@ -201,6 +203,21 @@ fn inspect_path(path: &str) -> Result<(), String> {
             "validator name={} id_prefix={} stake_spark={} share_bps={}",
             validator.name, id_prefix, validator.stake_spark, share
         );
+        // Manifest validation makes these branches unreachable; return errors instead of panicking.
+        let classical_pk = validator.cold_hybrid_classical_pk.ok_or_else(|| {
+            format!(
+                "internal error: validator {} has no cold classical key",
+                validator.name
+            )
+        })?;
+        let pq_pk = validator.cold_hybrid_pq_pk.clone().ok_or_else(|| {
+            format!("internal error: validator {} has no cold PQ key", validator.name)
+        })?;
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from(classical_pk),
+            pq_pk: VariableBytes::from_slice(&pq_pk).map_err(|error| error.to_string())?,
+        };
+        println!("owner_pubkey_hex={}", hex::encode(owner.encode_to_vec()));
         if holds_at_least_one_third(validator.stake_spark, total) {
             println!("WARNING: validator {} holds >= 1/3 of genesis stake", validator.name);
         }
