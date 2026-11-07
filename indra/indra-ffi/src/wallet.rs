@@ -22,6 +22,18 @@ pub fn build_wallet_context(
     sender_pq_pk: &[u8],
     utxos: &[IndraUtxoEntry],
 ) -> Result<WalletContext, IndraError> {
+    let classical = ClassicalKeypair::from_seed(&sender_classical_seed);
+    let pq_pk = match VariableBytes::<MAX_PQ_PK_BYTES>::from_slice(sender_pq_pk) {
+        Ok(pq_pk) => pq_pk,
+        Err(_) => {
+            sender_classical_seed.fill(0);
+            return Err(IndraError::InvalidParam);
+        }
+    };
+    let sender_pubkey = HybridPubKey {
+        classical_pk: Bytes32::from(classical.public_key().0),
+        pq_pk,
+    };
     let mut wallet = Wallet::new();
     let mut spent_indices_by_utxo = HashMap::with_capacity(utxos.len());
 
@@ -33,6 +45,7 @@ pub fn build_wallet_context(
             utxo.created_height,
             utxo.tx_index,
             utxo.out_index,
+            sender_pubkey.clone(),
         );
         if utxo.spent != 0 {
             wallet.mark_spent(&utxo_id);
@@ -40,13 +53,6 @@ pub fn build_wallet_context(
         spent_indices_by_utxo.insert(utxo_id, index);
     }
 
-    let classical = ClassicalKeypair::from_seed(&sender_classical_seed);
-    let pq_pk = VariableBytes::<MAX_PQ_PK_BYTES>::from_slice(sender_pq_pk)
-        .map_err(|_| IndraError::InvalidParam)?;
-    let sender_pubkey = HybridPubKey {
-        classical_pk: Bytes32::from(classical.public_key().0),
-        pq_pk,
-    };
     sender_classical_seed.fill(0);
 
     Ok(WalletContext {

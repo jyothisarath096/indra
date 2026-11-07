@@ -95,6 +95,7 @@ fn scan_tranche_refund(
         entry.created_height,
         entry.tx_index,
         entry.output_index,
+        entry.output.owner_pubkey.clone(),
     );
     Ok(1)
 }
@@ -131,6 +132,7 @@ pub fn scan_canonical_block(
                     block.header.height,
                     transaction_index,
                     output_index,
+                    output.owner_pubkey.clone(),
                 );
                 discovered += 1;
             }
@@ -233,10 +235,10 @@ mod tests {
         };
         let mut wallet = Wallet::new();
         assert_eq!(
-            scan_tranche_refund(&mut wallet, &entry, &[owner_pubkey]).unwrap(),
+            scan_tranche_refund(&mut wallet, &entry, &[owner_pubkey.clone()]).unwrap(),
             1
         );
-        assert_eq!(wallet.balance(), principal_spark);
+        assert_eq!(wallet.balance_owned_by(&owner_pubkey), principal_spark);
         assert_eq!(scan_tranche_refund(&mut wallet, &entry, &[]).unwrap(), 0);
     }
 }

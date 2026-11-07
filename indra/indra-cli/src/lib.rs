@@ -56,7 +56,7 @@ pub use keygen::{
     encrypt_cold_keys, encrypt_keys, generate_cold_keys_file, generate_cold_share_ceremony,
     generate_from_master_seed, generate_from_new_mnemonic, generate_from_passphrase,
     has_secret_value_in_argv, inspect_key_file_public_metadata, inspect_public_metadata,
-    load_cold_keys, load_keys, load_keys_for_cli, password_source_from_args, read_cold_share,
+    cold_hybrid_pubkey, cold_password_source_from_args, load_cold_keys, load_keys, load_keys_for_cli, password_source_from_args, read_cold_share,
     reconstruct_cold_shares, recover_from_mnemonic, validate_cold_share_manifest,
     verify_cold_share, warn_if_key_file_permissive, write_cold_share_secure,
     write_keys_file_secure, ColdKeysFile, ColdShareCeremony, ColdShareFile, ColdShareManifest,
@@ -74,5 +74,5 @@ pub use staking::{
     fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
     ColdAuthorizedStakingAction, StakePositionExitSigner,
 };
-pub use tx_builder::{build_transaction, BuiltStakingOp, BuiltTransaction, TxParams};
-pub use wallet::{PendingChange, Wallet, WalletEntry};
+pub use tx_builder::{build_cold_transaction, build_transaction, BuiltStakingOp, BuiltTransaction, ColdTxParams, TxParams};
+pub use wallet::{seed_wallet_from_genesis, PendingChange, Wallet, WalletEntry};

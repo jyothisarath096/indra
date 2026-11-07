@@ -18,12 +18,45 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use indra_core::{
     codec::{Decode, Encode},
-    types::primitives::Bytes32,
+    types::{crypto::HybridPubKey, primitives::Bytes32},
     types::transaction::OutputV1,
 };
 use indra_state::UtxoSet;
 
 use crate::error::{CliError, CliResult};
+
+/// Add the genesis UTXOs owned by `owner_pubkey` to a wallet as unspent.
+///
+/// This does not check whether an entry was later spent on-chain; use a
+/// canonical scan to learn spent state.
+pub fn seed_wallet_from_genesis(
+    wallet: &mut Wallet,
+    genesis_path: &str,
+    owner_pubkey: &HybridPubKey,
+) -> CliResult<usize> {
+    let genesis_state = indra_node::build_finalized_genesis_state(Some(genesis_path))
+        .map_err(CliError::Genesis)?;
+    let mut added = 0;
+    for entry in genesis_state
+        .utxos
+        .all_entries()
+        .filter(|entry| &entry.output.owner_pubkey == owner_pubkey)
+    {
+        if wallet.contains(&entry.utxo_id) {
+            continue;
+        }
+        wallet.add_utxo(
+            entry.utxo_id,
+            entry.output.value_spark,
+            entry.created_height,
+            entry.tx_index,
+            entry.output_index,
+            entry.output.owner_pubkey.clone(),
+        );
+        added += 1;
+    }
+    Ok(added)
+}
 
 const WALLET_FILE_MODE: u32 = 0o600;
 
@@ -44,6 +77,8 @@ pub struct WalletEntry {
     pub spent: bool,
     /// Confirmed block height that spent this entry, if discovered by scanning.
     pub spent_height: Option<u64>,
+    /// Canonical owner key for this UTXO.
+    pub owner_pubkey: HybridPubKey,
 }
 
 /// A locally tracked change output waiting to be confirmed on-chain.
@@ -79,6 +114,7 @@ impl Wallet {
         created_height: u64,
         tx_index: u32,
         out_index: u32,
+        owner_pubkey: HybridPubKey,
     ) {
         self.entries.insert(
             utxo_id,
@@ -90,9 +126,11 @@ impl Wallet {
                 out_index,
                 spent: false,
                 spent_height: None,
+                owner_pubkey,
             },
         );
     }
+
 
     /// Mark a UTXO as spent.
     pub fn mark_spent(&mut self, utxo_id: &Bytes32) {
@@ -198,16 +236,17 @@ impl Wallet {
             created_height,
             tx_index,
             out_index,
+            pending.output.owner_pubkey.clone(),
         );
         true
     }
 
-    /// Total spendable balance in Spark.
-    pub fn balance(&self) -> u64 {
+    /// Total spendable balance for exactly one owner key.
+    pub fn balance_owned_by(&self, owner_pubkey: &HybridPubKey) -> u64 {
         self.entries
             .values()
-            .filter(|e| !e.spent)
-            .fold(0u64, |acc, e| acc.saturating_add(e.value_spark))
+            .filter(|entry| !entry.spent && &entry.owner_pubkey == owner_pubkey)
+            .fold(0u64, |acc, entry| acc.saturating_add(entry.value_spark))
     }
 
     /// Select UTXOs to cover `target_spark` plus `fee_spark`.
@@ -216,9 +255,18 @@ impl Wallet {
     /// pick until we have enough.
     ///
     /// Returns selected entries or an error if balance is insufficient.
-    pub fn select_utxos(&self, target_spark: u64, fee_spark: u64) -> CliResult<Vec<&WalletEntry>> {
+    pub fn select_utxos(
+        &self,
+        owner_pubkey: &HybridPubKey,
+        target_spark: u64,
+        fee_spark: u64,
+    ) -> CliResult<Vec<&WalletEntry>> {
         let needed = target_spark.saturating_add(fee_spark);
-        let mut available: Vec<&WalletEntry> = self.entries.values().filter(|e| !e.spent).collect();
+        let mut available: Vec<&WalletEntry> = self
+            .entries
+            .values()
+            .filter(|e| !e.spent && &e.owner_pubkey == owner_pubkey)
+            .collect();
 
         // Sort by value descending (largest first — minimise inputs)
         available.sort_by(|a, b| b.value_spark.cmp(&a.value_spark));
@@ -235,7 +283,7 @@ impl Wallet {
         }
 
         Err(CliError::InsufficientBalance {
-            have: self.balance(),
+            have: self.balance_owned_by(owner_pubkey),
             need: needed,
         })
     }
@@ -244,7 +292,7 @@ impl Wallet {
     pub fn to_json(&self) -> String {
         let entries: Vec<String> = self.entries.values().map(|e| {
             format!(
-                r#"  {{"utxo_id":"{}","value_spark":{},"created_height":{},"tx_index":{},"out_index":{},"spent":{},"spent_height":{}}}"#,
+                r#"  {{"utxo_id":"{}","value_spark":{},"created_height":{},"tx_index":{},"out_index":{},"spent":{},"spent_height":{},"owner_pubkey":{}}}"#,
                 hex::encode(e.utxo_id.0),
                 e.value_spark,
                 e.created_height,
@@ -252,6 +300,7 @@ impl Wallet {
                 e.out_index,
                 e.spent,
                 e.spent_height.map_or_else(|| "null".to_string(), |height| height.to_string()),
+                format!("\"{}\"", hex::encode(e.owner_pubkey.encode_to_vec())),
             )
         }).collect();
         let pending: Vec<String> = self
@@ -315,6 +364,17 @@ impl Wallet {
             let out_idx = parse_u64_field(obj, "out_index")? as u32;
             let spent = obj.contains("\"spent\":true");
             let spent_height = parse_optional_u64_field(obj, "spent_height")?;
+            let owner_hex = match parse_str_field(obj, "owner_pubkey") {
+                Ok(owner_hex) => owner_hex,
+                Err(CliError::Parse(message)) if message == "missing field: owner_pubkey" => {
+                    return Err(CliError::Parse("missing required field: owner_pubkey".into()));
+                }
+                Err(error) => return Err(error),
+            };
+            let owner_bytes = hex::decode(owner_hex)
+                .map_err(|_| CliError::Parse("bad owner_pubkey hex".into()))?;
+            let owner_pubkey = HybridPubKey::decode_exact(&owner_bytes)
+                .map_err(|_| CliError::Parse("bad owner_pubkey encoding".into()))?;
 
             let id_bytes =
                 hex::decode(&utxo_id).map_err(|_| CliError::Parse("bad utxo_id hex".into()))?;
@@ -336,6 +396,7 @@ impl Wallet {
                     out_index: out_idx,
                     spent,
                     spent_height,
+                    owner_pubkey,
                 },
             );
         }
@@ -542,16 +603,39 @@ mod transparent_wallet_tests {
 
     #[test]
     fn wallet_json_rejects_negative_value_spark() {
-        let json = r#"{"entries":[{"utxo_id":"0000000000000000000000000000000000000000000000000000000000000000","value_spark":-1,"created_height":0,"tx_index":0,"out_index":0,"spent":false,"spent_height":null}],"pending_changes":[],"scan_blocks":[]}"#;
+        let json = r#"{"entries":[{"utxo_id":"0000000000000000000000000000000000000000000000000000000000000000","value_spark":-1,"created_height":0,"tx_index":0,"out_index":0,"spent":false,"spent_height":null,"owner_pubkey":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}],"pending_changes":[],"scan_blocks":[]}"#;
         assert!(Wallet::from_json(json).is_err());
+    }
+
+    #[test]
+    fn wallet_json_requires_owner_pubkey() {
+        let json = r#"{"entries":[{"utxo_id":"0000000000000000000000000000000000000000000000000000000000000000","value_spark":1,"created_height":0,"tx_index":0,"out_index":0,"spent":false,"spent_height":null}],"pending_changes":[],"scan_blocks":[]}"#;
+        assert_eq!(Wallet::from_json(json).unwrap_err().to_string(), "parse error: missing required field: owner_pubkey");
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indra_core::types::primitives::DEFAULT_CHAIN_ID;
+    use indra_crypto::ColdHybridKeypair;
 
     fn make_id(b: u8) -> Bytes32 {
         Bytes32::from([b; 32])
+    }
+
+    fn owner(b: u8) -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([b; 32]),
+            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[b; 32]).unwrap(),
+        }
+    }
+
+    fn test_cold_owner(seed: u8) -> HybridPubKey {
+        let mut classical = [seed; 32];
+        classical[0] ^= 0xA5;
+        let mut pq = [seed; 32];
+        pq[0] ^= 0x5A;
+        crate::cold_hybrid_pubkey(&ColdHybridKeypair::from_independent_seeds(classical, pq).unwrap()).unwrap()
     }
 
     fn temp_wallet_path(label: &str) -> PathBuf {
@@ -564,32 +648,32 @@ mod tests {
 
     #[test]
     fn empty_wallet_has_zero_balance() {
-        assert_eq!(Wallet::new().balance(), 0);
+        assert_eq!(Wallet::new().balance_owned_by(&owner(1)), 0);
     }
 
     #[test]
     fn add_and_balance() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 1_000_000, 1, 0, 0);
-        w.add_utxo(make_id(2), 2_000_000, 1, 0, 1);
-        assert_eq!(w.balance(), 3_000_000);
+        w.add_utxo(make_id(1), 1_000_000, 1, 0, 0, owner(1));
+        w.add_utxo(make_id(2), 2_000_000, 1, 0, 1, owner(1));
+        assert_eq!(w.balance_owned_by(&owner(1)), 3_000_000);
     }
 
     #[test]
     fn mark_spent_reduces_balance() {
         let mut w = Wallet::new();
         let id = make_id(1);
-        w.add_utxo(id, 1_000_000, 1, 0, 0);
+        w.add_utxo(id, 1_000_000, 1, 0, 0, owner(1));
         w.mark_spent(&id);
-        assert_eq!(w.balance(), 0);
+        assert_eq!(w.balance_owned_by(&owner(1)), 0);
     }
 
     #[test]
     fn coin_selection_sufficient() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 5_000_000, 1, 0, 0);
-        w.add_utxo(make_id(2), 3_000_000, 1, 0, 1);
-        let selected = w.select_utxos(4_000_000, 100_000).unwrap();
+        w.add_utxo(make_id(1), 5_000_000, 1, 0, 0, owner(1));
+        w.add_utxo(make_id(2), 3_000_000, 1, 0, 1, owner(1));
+        let selected = w.select_utxos(&owner(1), 4_000_000, 100_000).unwrap();
         let total: u64 = selected.iter().map(|e| e.value_spark).sum();
         assert!(total >= 4_100_000);
     }
@@ -597,17 +681,31 @@ mod tests {
     #[test]
     fn coin_selection_insufficient_errors() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(1), 100, 1, 0, 0);
-        assert!(w.select_utxos(1_000_000, 0).is_err());
+        w.add_utxo(make_id(1), 100, 1, 0, 0, owner(1));
+        assert!(w.select_utxos(&owner(1), 1_000_000, 0).is_err());
     }
 
     #[test]
     fn wallet_json_round_trip() {
         let mut w = Wallet::new();
-        w.add_utxo(make_id(0xAB), 999_000, 5, 1, 2);
+        w.add_utxo(make_id(0xAB), 999_000, 5, 1, 2, owner(1));
         let json = w.to_json();
         let w2 = Wallet::from_json(&json).unwrap();
-        assert_eq!(w2.balance(), 999_000);
+        assert_eq!(w2.balance_owned_by(&owner(1)), 999_000);
+    }
+
+    #[test]
+    fn wallet_json_round_trip_preserves_owner_for_cold_selection() {
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from([0xA1; 32]),
+            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&[0xB2; 32]).unwrap(),
+        };
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(make_id(0xAC), 999_000, 5, 1, 2, owner.clone());
+        let restored = Wallet::from_json(&wallet.to_json()).unwrap();
+        let selected = restored.select_utxos(&owner, 900_000, 50_000).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].owner_pubkey, owner);
     }
 
     #[cfg(unix)]
@@ -616,14 +714,14 @@ mod tests {
         let path = temp_wallet_path("mode");
         let path_str = path.to_string_lossy().to_string();
         let mut wallet = Wallet::new();
-        wallet.add_utxo(make_id(0xC1), 999_000, 5, 1, 2);
+        wallet.add_utxo(make_id(0xC1), 999_000, 5, 1, 2, owner(1));
 
         wallet.save(&path_str).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let restored = Wallet::load(&path_str).unwrap();
-        assert_eq!(restored.balance(), 999_000);
+        assert_eq!(restored.balance_owned_by(&owner(1)), 999_000);
         let _ = std::fs::remove_file(path);
     }
 
@@ -632,11 +730,11 @@ mod tests {
         let path = temp_wallet_path("atomic");
         let path_str = path.to_string_lossy().to_string();
         let mut original = Wallet::new();
-        original.add_utxo(make_id(0xD1), 1_000_000, 5, 1, 2);
+        original.add_utxo(make_id(0xD1), 1_000_000, 5, 1, 2, owner(1));
         original.save(&path_str).unwrap();
         let original_json = std::fs::read_to_string(&path).unwrap();
         let mut replacement = Wallet::new();
-        replacement.add_utxo(make_id(0xD2), 2_000_000, 6, 1, 2);
+        replacement.add_utxo(make_id(0xD2), 2_000_000, 6, 1, 2, owner(1));
 
         let err = write_wallet_file_atomic(&path, &replacement.to_json(), || {
             Err(CliError::Io("simulated interruption before rename".into()))
@@ -646,7 +744,7 @@ mod tests {
         assert!(err.to_string().contains("simulated interruption"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original_json);
         let restored = Wallet::load(&path_str).unwrap();
-        assert_eq!(restored.balance(), 1_000_000);
+        assert_eq!(restored.balance_owned_by(&owner(1)), 1_000_000);
         assert!(restored.contains(&make_id(0xD1)));
         assert!(!restored.contains(&make_id(0xD2)));
         let tmp_prefix = format!(".{}.tmp-", path.file_name().unwrap().to_string_lossy());
@@ -680,8 +778,8 @@ mod tests {
         let spent_id = make_id(0xA1);
         let other_id = make_id(0xA2);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(spent_id, 700_000, 4, 0, 0);
-        wallet.add_utxo(other_id, 900_000, 4, 0, 1);
+        wallet.add_utxo(spent_id, 700_000, 4, 0, 0, owner(1));
+        wallet.add_utxo(other_id, 900_000, 4, 0, 1, owner(1));
         let change = PendingChange {
             output: sample_output(550_000),
         };
@@ -691,9 +789,53 @@ mod tests {
         assert!(wallet.get(&spent_id).unwrap().spent);
         assert!(!wallet.get(&other_id).unwrap().spent);
         assert_eq!(wallet.pending_change_count(), 1);
-        assert_eq!(wallet.balance(), 900_000);
-        assert!(wallet.select_utxos(900_000, 1).is_err());
-        assert!(wallet.select_utxos(800_000, 50_000).is_ok());
+        assert_eq!(wallet.balance_owned_by(&owner(1)), 900_000);
+        assert!(wallet.select_utxos(&owner(1), 900_000, 1).is_err());
+        assert!(wallet.select_utxos(&owner(1), 800_000, 50_000).is_ok());
+    }
+
+    #[test]
+    fn select_utxos_ignores_other_owner_with_exact_error() {
+        let mine = owner(1);
+        let other = owner(2);
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(make_id(1), 90_000, 1, 0, 0, mine.clone());
+        wallet.add_utxo(make_id(2), 9_000_000, 1, 0, 1, other);
+        let error = wallet.select_utxos(&mine, 100_000, 50_000).unwrap_err();
+        assert_eq!(error.to_string(), "insufficient balance: have 90000 Spark, need 150000 Spark");
+    }
+
+    #[test]
+    fn seed_wallet_from_genesis_matches_owned_entries_and_is_idempotent() {
+        let manifest = indra_node::genesis::test_genesis_toml(
+            DEFAULT_CHAIN_ID,
+            &[
+                ([1; 32], [1; 32], [1; 32]),
+                ([2; 32], [2; 32], [2; 32]),
+                ([3; 32], [3; 32], [3; 32]),
+                ([4; 32], [4; 32], [4; 32]),
+            ],
+        );
+        let path = std::env::temp_dir().join(format!("indra-seed-genesis-{}", rand::random::<u64>()));
+        std::fs::write(&path, manifest).unwrap();
+        let state = indra_node::build_finalized_genesis_state(path.to_str()).unwrap();
+        let cold_owner = test_cold_owner(1);
+        let expected: Vec<_> = state
+            .utxos
+            .all_entries()
+            .filter(|entry| entry.output.owner_pubkey == cold_owner)
+            .map(|entry| (entry.utxo_id, entry.output.value_spark, entry.created_height, entry.tx_index, entry.output_index, entry.output.owner_pubkey.clone()))
+            .collect();
+        assert_eq!(expected.len(), 1);
+        let mut wallet = Wallet::new();
+        assert_eq!(seed_wallet_from_genesis(&mut wallet, path.to_str().unwrap(), &cold_owner).unwrap(), expected.len());
+        for (id, value, height, tx_index, output_index, owner) in &expected {
+            let entry = wallet.get(id).unwrap();
+            assert_eq!((entry.value_spark, entry.created_height, entry.tx_index, entry.out_index, &entry.owner_pubkey), (*value, *height, *tx_index, *output_index, owner));
+        }
+        assert_eq!(seed_wallet_from_genesis(&mut wallet, path.to_str().unwrap(), &cold_owner).unwrap(), 0);
+        assert_eq!(seed_wallet_from_genesis(&mut wallet, path.to_str().unwrap(), &owner(99)).unwrap(), 0);
+        let _ = std::fs::remove_file(path);
     }
 
     fn sample_output(value_spark: u64) -> OutputV1 {

@@ -79,7 +79,14 @@ fn cmd_balance(args: &[String]) {
         std::process::exit(1);
     }
     let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
-    let balance = wallet.balance();
+    let sender_pubkey = HybridPubKey {
+        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
+        pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
+            eprintln!("Error: invalid sender pq key length");
+            std::process::exit(1);
+        }),
+    };
+    let balance = wallet.balance_owned_by(&sender_pubkey);
     println!(
         "Address: {}\nBalance: {} Spark ({:.8} INDRA)",
         address,
@@ -245,6 +252,13 @@ mod tests {
     use indra_core::types::{primitives::VariableBytes, transaction::OutputV1};
     use indra_crypto::{hybrid::ClassicalKeypair, PqKeypair};
 
+    fn test_owner() -> HybridPubKey {
+        HybridPubKey {
+            classical_pk: Bytes32::from([0x11; 32]),
+            pq_pk: VariableBytes::from_slice(&[0x22; 32]).unwrap(),
+        }
+    }
+
     #[test]
     fn indra_tx_send_uses_shared_exact_indra_amount_parser() {
         assert_eq!(parse_send_amount_spark("0.00000003").unwrap(), 3);
@@ -265,8 +279,8 @@ mod tests {
         let spent_id = Bytes32::from([0xC1; 32]);
         let other_id = Bytes32::from([0xC2; 32]);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(spent_id, 1_000_000, 9, 0, 0);
-        wallet.add_utxo(other_id, 2_000_000, 9, 0, 1);
+        wallet.add_utxo(spent_id, 1_000_000, 9, 0, 0, test_owner());
+        wallet.add_utxo(other_id, 2_000_000, 9, 0, 1, test_owner());
         wallet.save(&wallet_path_str).unwrap();
         let built = indra_cli::BuiltTransaction {
             tx_hex: "00".to_string(),
@@ -284,9 +298,9 @@ mod tests {
         assert!(updated.get(&spent_id).unwrap().spent);
         assert!(!updated.get(&other_id).unwrap().spent);
         assert_eq!(updated.pending_change_count(), 1);
-        assert_eq!(updated.balance(), 2_000_000);
-        assert!(updated.select_utxos(2_000_000, 1).is_err());
-        assert!(updated.select_utxos(1_900_000, MIN_FEE_SPARK).is_ok());
+        assert_eq!(updated.balance_owned_by(&test_owner()), 2_000_000);
+        assert!(updated.select_utxos(&test_owner(), 2_000_000, 1).is_err());
+        assert!(updated.select_utxos(&test_owner(), 1_900_000, MIN_FEE_SPARK).is_ok());
 
         let _ = std::fs::remove_file(wallet_path);
     }

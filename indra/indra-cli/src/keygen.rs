@@ -4,6 +4,7 @@
 //! the CLI and node binary use one encrypted format.
 
 use crate::{CliError, CliResult};
+use indra_core::types::{crypto::HybridPubKey, primitives::{Bytes32, VariableBytes}};
 
 pub use indra_keystore::{
     check_password_file_permissions, encrypt_cold_keys, encrypt_keys, generate_cold_keys_file,
@@ -29,6 +30,35 @@ pub fn password_source_from_args<'a>(args: &'a [String]) -> PasswordSource<'a> {
     } else {
         PasswordSource::Prompt
     }
+}
+
+/// Resolve the password source for the encrypted cold-key file.
+///
+/// Cold password files are required to have restrictive permissions even when
+/// the ordinary hot-key path only warns about them.
+pub fn cold_password_source_from_args<'a>(args: &'a [String]) -> PasswordSource<'a> {
+    if let Some(path) = arg_value(args, "--cold-keys-password-file") {
+        PasswordSource::File {
+            path: std::path::Path::new(path),
+            reject_permissive: true,
+        }
+    } else if let Some(var) = arg_value(args, "--cold-keys-password-env") {
+        PasswordSource::Env(var)
+    } else {
+        PasswordSource::Prompt
+    }
+}
+
+/// Convert a reconstructed cold keypair to the owner-key representation used
+/// by ordinary transaction outputs and wallet entries.
+pub fn cold_hybrid_pubkey(keypair: &indra_crypto::ColdHybridKeypair) -> CliResult<HybridPubKey> {
+    let public_key = keypair.public_key();
+    let public = public_key.as_complete_hybrid();
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(public.classical.0),
+        pq_pk: VariableBytes::from_slice(&public.pq.0)
+            .map_err(|_| CliError::Crypto("invalid cold public key".into()))?,
+    })
 }
 
 /// Load keys for one-off CLI tools. Encrypted keys prompt by default; password
@@ -117,6 +147,66 @@ mod tests {
                 !source.contains("extract_hex32") && !source.contains("extract_hex_field"),
                 "CLI key consumer contains stale direct keys.json scraping helper"
             );
+        }
+    }
+
+    #[test]
+    fn cold_cli_loader_reports_exact_wrong_passphrase_error() {
+        let keys = ColdKeysFile::generate().unwrap();
+        let encrypted = encrypt_cold_keys(&keys, b"correct").unwrap();
+        let dir = std::env::temp_dir().join(format!("indra-cold-wrong-pass-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cold_path = dir.join("cold.json");
+        let pass_path = dir.join("wrong.pass");
+        write_keys_file_secure(cold_path.to_str().unwrap(), &encrypted).unwrap();
+        write_keys_file_secure(pass_path.to_str().unwrap(), "wrong\n").unwrap();
+        let args = vec![
+            "tool".to_string(),
+            "--cold-keys-password-file".to_string(),
+            pass_path.to_string_lossy().to_string(),
+        ];
+        let error = load_cold_keys(
+            cold_path.to_str().unwrap(),
+            cold_password_source_from_args(&args),
+        ).unwrap_err();
+        assert_eq!(error.to_string(), "keystore crypto error: authentication failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_password_file_rejects_permissive_permissions() {
+        let keys = ColdKeysFile::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("indra-cold-perms-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cold_path = dir.join("cold.json");
+        let pass_path = dir.join("cold.pass");
+        write_keys_file_secure(cold_path.to_str().unwrap(), &encrypt_cold_keys(&keys, b"pw").unwrap()).unwrap();
+        write_keys_file_secure(pass_path.to_str().unwrap(), "pw\n").unwrap();
+        std::fs::set_permissions(&pass_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let args = vec![
+            "tool".to_string(),
+            "--cold-keys-password-file".to_string(),
+            pass_path.to_string_lossy().to_string(),
+        ];
+        let error = load_cold_keys(cold_path.to_str().unwrap(), cold_password_source_from_args(&args)).unwrap_err();
+        assert_eq!(error.to_string(), format!("password file {} has permissive permissions (644); expected 600", pass_path.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_cli_argument_selects_cold_password_source() {
+        let args = vec![
+            "tool".to_string(),
+            "--cold-keys-password-file".to_string(),
+            "/tmp/cold.pass".to_string(),
+        ];
+        match cold_password_source_from_args(&args) {
+            PasswordSource::File { path, reject_permissive } => {
+                assert_eq!(path.to_str(), Some("/tmp/cold.pass"));
+                assert!(reject_permissive);
+            }
+            _ => panic!("expected cold password file source"),
         }
     }
 }

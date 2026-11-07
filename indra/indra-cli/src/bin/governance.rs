@@ -948,8 +948,12 @@ mod tests {
         let deposit_utxo_id = Bytes32::from([0xD1; 32]);
         let other_utxo_id = Bytes32::from([0xD2; 32]);
         let mut wallet = Wallet::new();
-        wallet.add_utxo(deposit_utxo_id, 1_000_000, 12, 0, 0);
-        wallet.add_utxo(other_utxo_id, 2_000_000, 12, 0, 1);
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from([0x11; 32]),
+            pq_pk: VariableBytes::from_slice(&[0x22; 32]).unwrap(),
+        };
+        wallet.add_utxo(deposit_utxo_id, 1_000_000, 12, 0, 0, owner.clone());
+        wallet.add_utxo(other_utxo_id, 2_000_000, 12, 0, 1, owner.clone());
         wallet.save(&wallet_path_str).unwrap();
 
         assert!(mark_governance_deposit_spent(&wallet_path_str, deposit_utxo_id).unwrap());
@@ -957,8 +961,8 @@ mod tests {
         let updated = Wallet::load(&wallet_path_str).unwrap();
         assert!(updated.get(&deposit_utxo_id).unwrap().spent);
         assert!(!updated.get(&other_utxo_id).unwrap().spent);
-        assert_eq!(updated.balance(), 2_000_000);
-        assert!(updated.select_utxos(2_000_000, 1).is_err());
+        assert_eq!(updated.balance_owned_by(&owner), 2_000_000);
+        assert!(updated.select_utxos(&owner, 2_000_000, 1).is_err());
 
         let _ = std::fs::remove_file(wallet_path);
     }

@@ -58,6 +58,24 @@ pub struct TxParams<'a> {
     pub sender_pubkey: HybridPubKey,
 }
 
+/// Parameters for an ordinary transfer signed by a validator cold key.
+pub struct ColdTxParams<'a> {
+    /// Chain identifier used in transaction signing.
+    pub chain_id: &'a str,
+    /// Recipient's complete canonical payment address.
+    pub recipient_address: &'a str,
+    /// Amount to send in Spark.
+    pub amount_spark: u64,
+    /// Transaction fee in Spark.
+    pub fee_spark: u64,
+    /// Wallet containing owner-tagged scanned UTXOs.
+    pub wallet: &'a Wallet,
+    /// Cold key used both for ownership selection and signing.
+    pub keypair: &'a ColdHybridKeypair,
+    /// Cold public key used for change.
+    pub owner_pubkey: HybridPubKey,
+}
+
 impl Drop for TxParams<'_> {
     fn drop(&mut self) {
         self.ed25519_seed.zeroize();
@@ -107,6 +125,82 @@ pub enum StakePositionExitSigner<'a> {
     },
 }
 
+fn assemble_transfer(
+    owner_pubkey: &HybridPubKey,
+    recipient_pubkey: HybridPubKey,
+    amount_spark: u64,
+    fee_spark: u64,
+    selected: &[&crate::wallet::WalletEntry],
+) -> CliResult<(Vec<InputV1>, Vec<OutputV1>, u64, Option<PendingChange>)> {
+    let total_in = selected.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.value_spark)
+            .ok_or_else(|| CliError::Transaction("input value overflow".into()))
+    })?;
+    let change_spark = total_in
+        .checked_sub(amount_spark)
+        .and_then(|value| value.checked_sub(fee_spark))
+        .ok_or_else(|| CliError::Transaction("inputs do not cover outputs and fee".into()))?;
+    let inputs = selected
+        .iter()
+        .map(|entry| InputV1 { utxo_id: entry.utxo_id })
+        .collect();
+    let mut outputs = vec![OutputV1 {
+        value_spark: amount_spark,
+        owner_pubkey: recipient_pubkey,
+        lock_height: 0,
+    }];
+    let mut pending_change = None;
+    let mut effective_fee_spark = fee_spark;
+    if change_spark > DUST_LIMIT_SPARK {
+        let change_output = OutputV1 {
+            value_spark: change_spark,
+            owner_pubkey: owner_pubkey.clone(),
+            lock_height: 0,
+        };
+        pending_change = Some(PendingChange { output: change_output.clone() });
+        outputs.push(change_output);
+    } else if change_spark > 0 {
+        effective_fee_spark = effective_fee_spark
+            .checked_add(change_spark)
+            .ok_or_else(|| CliError::Transaction("fee overflow while folding dust change".into()))?;
+    }
+    Ok((inputs, outputs, effective_fee_spark, pending_change))
+}
+
+fn sign_transfer<'a, Sign>(
+    chain_id: &str,
+    mut tx: TransactionV1,
+    selected: &[&'a crate::wallet::WalletEntry],
+    pending_change: Option<PendingChange>,
+    sign: Sign,
+) -> CliResult<BuiltTransaction>
+where
+    Sign: FnOnce(&[u8]) -> Result<indra_crypto::hybrid::HybridSignature, String>,
+{
+    let signing_bytes = tx
+        .signing_bytes(chain_id)
+        .map_err(|error| CliError::Transaction(error.to_string()))?;
+    let sig = sign(&signing_bytes).map_err(CliError::Crypto)?;
+    tx.signature = HybridSignature {
+        classical_sig: VariableBytes::from_slice(&sig.classical.0)
+            .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
+        pq_sig: VariableBytes::from_slice(&sig.pq.0)
+            .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
+    };
+    let tx_bytes = tx.encode_to_vec();
+    let tx_id = hex::encode(sha256(&tx_bytes));
+    Ok(BuiltTransaction {
+        tx_hex: hex::encode(tx_bytes),
+        tx_id,
+        change_spark: pending_change
+            .as_ref()
+            .map(|change| change.output.value_spark)
+            .unwrap_or(0),
+        spent_utxo_ids: selected.iter().map(|entry| entry.utxo_id).collect(),
+        pending_change,
+    })
+}
+
 /// Build and sign a transaction.
 pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     // 1. Validate amount and fee
@@ -131,60 +225,21 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
 
     // 3. Coin selection
-    let selected = params
-        .wallet
-        .select_utxos(params.amount_spark, params.fee_spark)?;
-    let total_in = selected.iter().try_fold(0u64, |sum, entry| {
-        sum.checked_add(entry.value_spark)
-            .ok_or_else(|| CliError::Transaction("input value overflow".into()))
-    })?;
-    let change_spark = total_in
-        .checked_sub(params.amount_spark)
-        .and_then(|value| value.checked_sub(params.fee_spark))
-        .ok_or_else(|| CliError::Transaction("inputs do not cover outputs and fee".into()))?;
-
-    // 4. Build inputs
-    let inputs: Vec<InputV1> = selected
-        .iter()
-        .map(|entry| InputV1 {
-            utxo_id: entry.utxo_id,
-        })
-        .collect();
-
-    // 5. Build transparent-value outputs.
-    let mut outputs = Vec::new();
-
-    // Recipient output
-    outputs.push(OutputV1 {
-        value_spark: params.amount_spark,
-        owner_pubkey: recipient_pubkey,
-        lock_height: 0,
-    });
-
-    // Change output (if above dust). A non-zero sub-dust remainder is paid as
-    // additional fee so the transaction still satisfies exact conservation.
-    let mut pending_change = None;
-    let mut effective_fee_spark = params.fee_spark;
-    if change_spark > DUST_LIMIT_SPARK {
-        let change_output = OutputV1 {
-            value_spark: change_spark,
-            owner_pubkey: params.sender_pubkey.clone(),
-            lock_height: 0,
-        };
-        pending_change = Some(PendingChange {
-            output: change_output.clone(),
-        });
-        outputs.push(change_output);
-    } else if change_spark > 0 {
-        effective_fee_spark = effective_fee_spark
-            .checked_add(change_spark)
-            .ok_or_else(|| {
-                CliError::Transaction("fee overflow while folding dust change".into())
-            })?;
-    }
+    let selected = params.wallet.select_utxos(
+        &params.sender_pubkey,
+        params.amount_spark,
+        params.fee_spark,
+    )?;
+    let (inputs, outputs, effective_fee_spark, pending_change) = assemble_transfer(
+        &params.sender_pubkey,
+        recipient_pubkey,
+        params.amount_spark,
+        params.fee_spark,
+        &selected,
+    )?;
 
     // 6. Build unsigned transaction.
-    let mut tx = TransactionV1 {
+    let tx = TransactionV1 {
         version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
         signature_module_id: 1,
         inputs,
@@ -192,11 +247,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         fee_amount: effective_fee_spark,
         signature: dummy_signature()?,
     };
-
-    // 9. Sign: compute tx hash (all fields except signature), then sign
-    let tx_bytes_unsigned = tx
-        .signing_bytes(params.chain_id)
-        .map_err(|error| CliError::Transaction(error.to_string()))?;
 
     let classical = ClassicalKeypair::from_seed(&params.ed25519_seed);
     let pq = PqKeypair::from_bytes(
@@ -206,36 +256,62 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     )
     .map_err(|e| CliError::Crypto(e.to_string()))?;
     let keypair = HybridKeypair::new(classical, pq);
-    let sig = keypair
-        .sign(&tx_bytes_unsigned)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
-
-    let classical_sig_bytes = sig.classical.0.to_vec();
-    let pq_sig_bytes = sig.pq.0.to_vec();
-
-    tx.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&classical_sig_bytes)
-            .map_err(|_| CliError::Transaction("classical sig too large".into()))?,
-        pq_sig: VariableBytes::from_slice(&pq_sig_bytes)
-            .map_err(|_| CliError::Transaction("pq sig too large".into()))?,
-    };
-
-    // 10. Serialise
-    let tx_bytes = tx.encode_to_vec();
-    let tx_id = hex::encode(sha256(&tx_bytes));
-    let tx_hex = hex::encode(&tx_bytes);
-    let spent_ids: Vec<Bytes32> = selected.iter().map(|e| e.utxo_id).collect();
-
-    Ok(BuiltTransaction {
-        tx_hex,
-        tx_id,
-        change_spark: pending_change
-            .as_ref()
-            .map(|change| change.output.value_spark)
-            .unwrap_or(0),
-        spent_utxo_ids: spent_ids,
+    sign_transfer(
+        params.chain_id,
+        tx,
+        &selected,
         pending_change,
-    })
+        move |bytes| keypair.sign(bytes).map_err(|e| e.to_string()),
+    )
+}
+
+/// Build and sign an ordinary transfer with a cold hybrid key.
+pub fn build_cold_transaction(params: &ColdTxParams<'_>) -> CliResult<BuiltTransaction> {
+    if params.amount_spark < DUST_LIMIT_SPARK {
+        return Err(CliError::Transaction(format!(
+            "amount {} Spark is below dust limit {}",
+            params.amount_spark, DUST_LIMIT_SPARK
+        )));
+    }
+    if params.fee_spark < MIN_FEE_SPARK {
+        return Err(CliError::Transaction(format!(
+            "fee {} Spark is below minimum {}",
+            params.fee_spark, MIN_FEE_SPARK
+        )));
+    }
+    let recipient_address = PaymentAddressV1::from_text(
+        params.recipient_address,
+        params.chain_id.as_bytes(),
+    )
+    .map_err(|e| CliError::Transaction(format!("invalid recipient payment address: {e}")))?;
+    let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
+    let selected = params.wallet.select_utxos(
+        &params.owner_pubkey,
+        params.amount_spark,
+        params.fee_spark,
+    )?;
+    let (inputs, outputs, effective_fee_spark, pending_change) = assemble_transfer(
+        &params.owner_pubkey,
+        recipient_pubkey,
+        params.amount_spark,
+        params.fee_spark,
+        &selected,
+    )?;
+    let tx = TransactionV1 {
+        version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+        signature_module_id: 1,
+        inputs,
+        outputs,
+        fee_amount: effective_fee_spark,
+        signature: dummy_signature()?,
+    };
+    sign_transfer(
+        params.chain_id,
+        tx,
+        &selected,
+        pending_change,
+        |bytes| params.keypair.sign(bytes).map_err(|e| e.to_string()),
+    )
 }
 
 /// Payload fields for an active-validator cold-authorized staking operation.
@@ -607,8 +683,6 @@ mod tests {
         let mut w = Wallet::new();
 
         let utxo_id = Bytes32::from([0xAAu8; 32]);
-        w.add_utxo(utxo_id, 10_000_000, 1, 0, 0);
-
         let pq = PqKeypair::generate();
         let pq_seed = pq.secret_key_bytes();
         let pq_pk = pq.public_key().0;
@@ -617,6 +691,7 @@ mod tests {
             classical_pk: Bytes32::from(classical.public_key().0),
             pq_pk: VariableBytes::from_slice(&pq_pk).unwrap(),
         };
+        w.add_utxo(utxo_id, 10_000_000, 1, 0, 0, spk.clone());
         (w, seed, pq_seed, spk)
     }
 
@@ -629,6 +704,109 @@ mod tests {
 
     fn test_cold_keypair(seed: u8) -> ColdHybridKeypair {
         ColdHybridKeypair::from_independent_seeds([seed; 32], [seed.wrapping_add(1); 32]).unwrap()
+    }
+
+    #[test]
+    fn cold_cli_transfer_is_accepted_hot_signature_rejected_and_change_returns_to_cold_owner() {
+        let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
+        let manifest = indra_node::genesis::test_genesis_toml(DEFAULT_CHAIN_ID, &entries);
+        let path = std::env::temp_dir().join(format!("indra-cli-cold-transfer-{}.toml", std::process::id()));
+        std::fs::write(&path, manifest).unwrap();
+        let state = indra_node::build_finalized_genesis_state(path.to_str()).unwrap();
+        let mut cold_classical_seed = [1u8; 32];
+        cold_classical_seed[0] ^= 0xA5;
+        let mut cold_pq_seed = [1u8; 32];
+        cold_pq_seed[0] ^= 0x5A;
+        let cold = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap();
+        let cold_public = cold.public_key();
+        let complete = cold_public.as_complete_hybrid();
+        let cold_owner = HybridPubKey {
+            classical_pk: Bytes32::from(complete.classical.0),
+            pq_pk: VariableBytes::from_slice(&complete.pq.0).unwrap(),
+        };
+        let entry = state.utxos.all_entries().find(|entry| entry.output.owner_pubkey == cold_owner).unwrap();
+        let genesis_utxo_id = entry.utxo_id;
+        let genesis_value = entry.output.value_spark;
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(genesis_utxo_id, genesis_value, entry.created_height, entry.tx_index, entry.output_index, cold_owner.clone());
+        let recipient = test_keypair(0x77);
+        let recipient_owner = hybrid_pubkey_from_keypair(&recipient).unwrap();
+        let recipient_address = PaymentAddressV1::new(DEFAULT_CHAIN_ID.as_bytes(), recipient.public_key()).unwrap().to_text();
+        let built = build_cold_transaction(&ColdTxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_address: &recipient_address,
+            amount_spark: 1_000_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            keypair: &cold,
+            owner_pubkey: cold_owner.clone(),
+        }).unwrap();
+        let tx = decode_built_tx(&built);
+        assert_eq!(tx.outputs[0].value_spark, 1_000_000);
+        assert_eq!(tx.outputs[0].owner_pubkey, recipient_owner);
+        assert_eq!(tx.outputs[1].owner_pubkey, cold_owner);
+        let mut accepted = state.clone();
+        assert_eq!(indra_state::try_apply_transaction_candidate_with_dust(
+            &mut accepted, &tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
+        ), Ok(()));
+        assert!(!accepted.utxos.contains(&genesis_utxo_id));
+        assert!(accepted.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == cold_owner
+                && entry.output.value_spark == genesis_value - 1_000_000 - MIN_FEE_SPARK
+        }));
+        assert!(accepted.utxos.all_entries().any(|entry| {
+            entry.output.owner_pubkey == recipient_owner && entry.output.value_spark == 1_000_000
+        }));
+        let mut hot_tx = tx.clone();
+        let hot = test_keypair(1);
+        let signature = hot.sign(&hot_tx.signing_bytes(DEFAULT_CHAIN_ID).unwrap()).unwrap();
+        hot_tx.signature = wire_hybrid_signature(&signature).unwrap();
+        let mut rejected = state;
+        let error = indra_state::try_apply_transaction_candidate_with_dust(
+            &mut rejected, &hot_tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
+        ).unwrap_err();
+        assert_eq!(error.to_string(), "transaction signature invalid: Ed25519 signature verification failed");
+        assert!(rejected.utxos.contains(&genesis_utxo_id));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn hot_and_cold_builders_select_only_their_owner_utxos() {
+        let hot = test_keypair(0x31);
+        let hot_owner = hybrid_pubkey_from_keypair(&hot).unwrap();
+        let cold = test_cold_keypair(0x41);
+        let cold_owner = crate::cold_hybrid_pubkey(&cold).unwrap();
+        let recipient = test_keypair(0x51);
+        let recipient_address = PaymentAddressV1::new(
+            DEFAULT_CHAIN_ID.as_bytes(),
+            recipient.public_key(),
+        ).unwrap().to_text();
+        let hot_id = Bytes32::from([0xA1; 32]);
+        let cold_id = Bytes32::from([0xB2; 32]);
+        let mut wallet = Wallet::new();
+        wallet.add_utxo(hot_id, 200_000, 1, 0, 0, hot_owner.clone());
+        wallet.add_utxo(cold_id, 2_000_000, 1, 0, 1, cold_owner.clone());
+        let hot_built = build_transaction(&TxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_address: &recipient_address,
+            amount_spark: 100_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            ed25519_seed: [0x31; 32],
+            ml_dsa_seed_bytes: PqKeypair::from_seed(&[0x31; 32]).unwrap().secret_key_bytes().to_vec(),
+            sender_pubkey: hot_owner,
+        }).unwrap();
+        assert_eq!(hot_built.spent_utxo_ids, vec![hot_id]);
+        let cold_built = build_cold_transaction(&ColdTxParams {
+            chain_id: DEFAULT_CHAIN_ID,
+            recipient_address: &recipient_address,
+            amount_spark: 100_000,
+            fee_spark: MIN_FEE_SPARK,
+            wallet: &wallet,
+            keypair: &cold,
+            owner_pubkey: cold_owner,
+        }).unwrap();
+        assert_eq!(cold_built.spent_utxo_ids, vec![cold_id]);
     }
 
     fn build_self_stake_op(

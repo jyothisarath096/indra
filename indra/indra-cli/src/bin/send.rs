@@ -7,6 +7,10 @@
 //!              --amount <INDRA> \
 //!              --fee <INDRA> \
 //!              --node http://127.0.0.1:8545
+//!
+//! Cold mode replaces `--keys` with `--cold-keys` and accepts
+//! `--cold-keys-password-file` or `--cold-keys-password-env`; `--genesis`
+//! may be supplied to discover cold-owned genesis UTXOs from the manifest.
 
 use std::io::Write;
 
@@ -34,6 +38,7 @@ fn main() {
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let chain_id = get("--chain-id")
         .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
+    let genesis_path = get("--genesis");
 
     let amount_spark = parse_amount_or_exit(&amount_str, "--amount");
     let fee_spark =
@@ -49,60 +54,94 @@ fn main() {
     println!("Node:    {}", node_url);
     println!("──────────────────────────────────────");
 
-    // Load keys through the shared canonical encrypted-keystore loader.
-    let keys = indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
-        eprintln!("Error loading keys: {}", e);
-        std::process::exit(1);
+    let cold_keys_path = get("--cold-keys");
+    let cold_keys = cold_keys_path.as_ref().map(|path| {
+        let source = indra_cli::cold_password_source_from_args(&args);
+        indra_cli::load_cold_keys(path, source).unwrap_or_else(|e| {
+            eprintln!("Error loading cold keys: {}", e);
+            std::process::exit(1);
+        })
     });
-    let ed25519_seed = keys.ed25519_seed;
-    let ml_dsa_seed_bytes = keys.ml_dsa_seed.to_vec();
-    let pq_pk_bytes = keys.public.hybrid_pq_pk.clone();
-
-    // Derive sender pubkey from seed
-    use indra_core::types::{
-        crypto::HybridPubKey,
-        primitives::{Bytes32, VariableBytes},
-    };
-    let sender_pubkey = HybridPubKey {
-        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
-        pq_pk: VariableBytes::from_slice(&pq_pk_bytes)
-            .unwrap_or_else(|_| VariableBytes::from_slice(&[0u8; 2592]).unwrap()),
+    let hot_keys = if cold_keys.is_none() {
+        Some(indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
+            eprintln!("Error loading keys: {}", e);
+            std::process::exit(1);
+        }))
+    } else {
+        None
     };
 
     // Load wallet
-    let wallet = indra_cli::Wallet::load(&wallet_path).unwrap_or_else(|e| {
+    let mut wallet = indra_cli::Wallet::load(&wallet_path).unwrap_or_else(|e| {
         eprintln!("Error loading wallet: {}", e);
+        std::process::exit(1);
+    });
+
+    let cold_keypair = cold_keys.as_ref().map(|cold_keys| {
+        cold_keys.reconstruct().unwrap_or_else(|e| {
+            eprintln!("Error reconstructing cold keys: {}", e);
+            std::process::exit(1);
+        })
+    });
+    let signer_owner = if let Some(cold_keypair) = cold_keypair.as_ref() {
+        indra_cli::cold_hybrid_pubkey(cold_keypair).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        let keys = hot_keys.as_ref().expect("hot keys loaded when cold mode is off");
+        indra_core::types::crypto::HybridPubKey {
+            classical_pk: indra_core::types::primitives::Bytes32::from(keys.public.hybrid_classical_pk),
+            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&keys.public.hybrid_pq_pk)
+                .unwrap_or_else(|_| {
+                    eprintln!("Error: invalid hot public key");
+                    std::process::exit(1);
+                }),
+        }
+    };
+
+    // Build transaction. Cold mode requires owner-tagged wallet entries, which
+    // are produced by `indra-wallet-scan --cold-owner`.
+    let built = if let Some(cold_keypair) = cold_keypair.as_ref() {
+        if let Some(genesis_path) = genesis_path.as_deref() {
+            indra_cli::seed_wallet_from_genesis(&mut wallet, genesis_path, &signer_owner)
+                .unwrap_or_else(|error| {
+                    eprintln!("Error loading genesis manifest: {error}");
+                    std::process::exit(1);
+                });
+        }
+        indra_cli::build_cold_transaction(&indra_cli::ColdTxParams {
+            chain_id: &chain_id,
+            recipient_address: &to,
+            amount_spark,
+            fee_spark,
+            wallet: &wallet,
+            keypair: cold_keypair,
+            owner_pubkey: signer_owner.clone(),
+        })
+    } else {
+        let keys = hot_keys.as_ref().expect("hot keys loaded when cold mode is off");
+        let sender_pubkey = signer_owner.clone();
+        indra_cli::build_transaction(&indra_cli::tx_builder::TxParams {
+            chain_id: &chain_id,
+            recipient_address: &to,
+            amount_spark,
+            fee_spark,
+            wallet: &wallet,
+            ed25519_seed: keys.ed25519_seed,
+            ml_dsa_seed_bytes: keys.ml_dsa_seed.to_vec(),
+            sender_pubkey,
+        })
+    }.unwrap_or_else(|e| {
+        eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
 
     println!(
         "Wallet balance: {} Spark ({:.8} INDRA)",
-        wallet.balance(),
-        wallet.balance() as f64 / (indra_cli::SPARK_PER_INDRA as f64)
+        wallet.balance_owned_by(&signer_owner),
+        wallet.balance_owned_by(&signer_owner) as f64 / (indra_cli::SPARK_PER_INDRA as f64)
     );
-
-    if wallet.balance() == 0 {
-        eprintln!("Error: wallet is empty. Add UTXOs first with 'indra-wallet scan'.");
-        std::process::exit(1);
-    }
-
-    // Build transaction
-    let params = indra_cli::tx_builder::TxParams {
-        chain_id: &chain_id,
-        recipient_address: &to,
-        amount_spark,
-        fee_spark,
-        wallet: &wallet,
-        ed25519_seed,
-        ml_dsa_seed_bytes,
-        sender_pubkey,
-    };
-
-    let built = indra_cli::build_transaction(&params).unwrap_or_else(|e| {
-        eprintln!("Error building transaction: {}", e);
-        std::process::exit(1);
-    });
-    drop(params);
 
     println!("\nTransaction built:");
     println!("  TX ID:    {}", built.tx_id);
