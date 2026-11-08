@@ -17,5 +17,5 @@ serde_json.workspace = true
 rand_core.workspace = true
 
 [dev-dependencies]
-indra-core      = { path = "../indra-core" }
+indra-core      = { path = "../indra-core", features = ["test-support"] }
 indra-state     = { path = "../indra-state" }

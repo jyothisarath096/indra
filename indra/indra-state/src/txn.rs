@@ -939,6 +939,7 @@ pub(crate) fn mutation_count() -> usize {
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::types::{
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
@@ -966,7 +967,7 @@ mod tests {
             activation_height: height,
             membership_root: Bytes32::from([0xA1; 32]),
         };
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.slash_membership_roots = vec![original_record];
         state.rebuild_state_commitment_v2(height);
         let root_before = state.state_commitment_v2_root(height);
@@ -1009,7 +1010,7 @@ mod tests {
             )
             .unwrap()
         };
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = u64::MAX;
         state.consensus_snapshots = vec![
             snapshot(601, 600, 2_000_000_000),
@@ -1053,7 +1054,7 @@ mod tests {
 
     #[test]
     fn committed_effect_journal_covers_each_mutated_dependency_scope() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let signer = Bytes32::from([0x31; 32]);
         let validator = Bytes32::from([0x32; 32]);
         let governance_signer = Bytes32::from([0x33; 32]);

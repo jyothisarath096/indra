@@ -9,7 +9,7 @@ use crate::{fixtures::dummy_block, timer::bench};
 /// Benchmark applying an empty block.
 pub fn bench_block_apply_empty(iterations: u64) {
     let r = bench("block_apply_empty", iterations, || {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis("indra-testnet-1");
         let block = dummy_block(1, state.tip_hash, 0);
         let _ = project_block_for_roots(&mut state, &block, 0);
     });
@@ -22,7 +22,7 @@ pub fn bench_block_apply_empty(iterations: u64) {
 /// verification is not included here — see crypto benchmarks for that.
 pub fn bench_block_apply_full(iterations: u64) {
     let r = bench("block_apply_200tx", iterations, || {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis("indra-testnet-1");
         let block = dummy_block(1, state.tip_hash, 200);
         let _ = project_block_for_roots(&mut state, &block, 0);
     });
@@ -33,7 +33,7 @@ pub fn bench_block_apply_full(iterations: u64) {
 /// Benchmark a chain of N sequential block applications.
 pub fn bench_chain_of_blocks(n: u64, iterations: u64) {
     let r = bench(&format!("chain_{n}_blocks"), iterations, || {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis("indra-testnet-1");
         for i in 1..=n {
             let block = dummy_block(i, state.tip_hash, 10);
             let _ = project_block_for_roots(&mut state, &block, 0);
@@ -45,7 +45,7 @@ pub fn bench_chain_of_blocks(n: u64, iterations: u64) {
 
 /// Benchmark state root computation.
 pub fn bench_state_root(iterations: u64) {
-    let state = ChainState::new_genesis();
+    let state = ChainState::new_genesis("indra-testnet-1");
 
     let r = bench("state_root_genesis", iterations, || {
         let _ = compute_state_root(&state);

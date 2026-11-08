@@ -672,7 +672,7 @@ mod handle_tests {
             crypto::HybridPubKey,
             governance::{governance_vote_commit_hash, GovernanceOpV2, GovernancePayload},
             primitives::{
-                Bytes32, VariableBytes, DEFAULT_CHAIN_ID, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                Bytes32, VariableBytes, TEST_CHAIN_ID, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
             },
             staking::{StakingOp, StakingOpBody},
             transaction::{OutputV1, TransactionV1},
@@ -998,12 +998,12 @@ mod handle_tests {
             handles::acquire_hot_signing_lease(session, recipient_handle).unwrap();
         let recipient_keypair = recipient_lease.material().keypair().unwrap();
         let recipient_address = indra_crypto::PaymentAddressV1::new(
-            DEFAULT_CHAIN_ID.as_bytes(),
+            TEST_CHAIN_ID.as_bytes(),
             recipient_keypair.public_key(),
         )
         .unwrap()
         .to_text();
-        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let chain = CString::new(TEST_CHAIN_ID).unwrap();
         let utxo = funded_utxo();
         let amount = 1_000_000;
         let params = IndraTxParams {
@@ -1025,7 +1025,7 @@ mod handle_tests {
         );
         let tx = unsafe { decode_tx_result(session, result, &metadata) };
         let direct = direct_keypair_from_master_seed([0x76; 32])
-            .sign(&tx.signing_bytes(DEFAULT_CHAIN_ID).unwrap())
+            .sign(&tx.signing_bytes(TEST_CHAIN_ID).unwrap())
             .unwrap();
         assert_wire_signature_matches_direct(&tx.signature, &direct);
         assert_eq!(tx.outputs[0].value_spark, amount);
@@ -1043,7 +1043,7 @@ mod handle_tests {
     fn transaction_builder_rejects_oversized_address_before_dereferencing_slice() {
         let _guard = test_lock();
         let session = create_session();
-        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
+        let chain = CString::new(TEST_CHAIN_ID).unwrap();
         let params = IndraTxParams {
             recipient_address: std::ptr::dangling(),
             recipient_address_len: indra_crypto::payment_address::MAX_PAYMENT_ADDRESS_TEXT_BYTES
@@ -1110,8 +1110,8 @@ mod handle_tests {
         let session = create_session();
         let (hot, hot_public) = handle_from_seed(session, [0x81; 32]);
         let (cold, cold_public) = cold_handle_from_seeds(session, [0x82; 32], [0x83; 32]);
-        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
-        let mut state = indra_state::ChainState::new_genesis();
+        let chain = CString::new(TEST_CHAIN_ID).unwrap();
+        let mut state = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         let deposit_id = state
             .utxos
             .insert(
@@ -1144,7 +1144,7 @@ mod handle_tests {
             OK
         );
         let registration = unsafe { decode_staking(&output) };
-        indra_state::delegation::apply_staking_op(&mut state, &registration, DEFAULT_CHAIN_ID, 1)
+        indra_state::delegation::apply_staking_op(&mut state, &registration, TEST_CHAIN_ID, 1)
             .unwrap();
         let validator_id = Bytes32::from(hot_public.validator_id);
         state.validators.get_mut(&validator_id).unwrap().status =
@@ -1184,7 +1184,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             2,
         )
         .unwrap();
@@ -1210,7 +1210,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             3,
         )
         .unwrap();
@@ -1237,7 +1237,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             4,
         )
         .unwrap();
@@ -1262,7 +1262,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             5,
         )
         .unwrap();
@@ -1302,7 +1302,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             6,
         )
         .unwrap();
@@ -1336,7 +1336,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             7,
         )
         .unwrap();
@@ -1394,8 +1394,8 @@ mod handle_tests {
         let session = create_session();
         let (hot, hot_public) = handle_from_seed(session, [0x91; 32]);
         let (cold, cold_public) = cold_handle_from_seeds(session, [0x92; 32], [0x93; 32]);
-        let chain = CString::new(DEFAULT_CHAIN_ID).unwrap();
-        let mut state = indra_state::ChainState::new_genesis();
+        let chain = CString::new(TEST_CHAIN_ID).unwrap();
+        let mut state = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         let registration_deposit = state
             .utxos
             .insert(
@@ -1431,7 +1431,7 @@ mod handle_tests {
         indra_state::delegation::apply_staking_op(
             &mut state,
             &unsafe { decode_staking(&output) },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             1,
         )
         .unwrap();
@@ -1489,10 +1489,10 @@ mod handle_tests {
             &propose,
             0,
             2,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
-        let proposal_id = compute_proposal_id(validator_id, &action, 0, DEFAULT_CHAIN_ID);
+        let proposal_id = compute_proposal_id(validator_id, &action, 0, TEST_CHAIN_ID);
 
         let mut cancel_state = state.clone();
         output.fill(0);
@@ -1518,7 +1518,7 @@ mod handle_tests {
             &unsafe { decode_governance(&output) },
             0,
             3,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
 
@@ -1587,7 +1587,7 @@ mod handle_tests {
             &unsafe { decode_governance(&output) },
             1,
             3,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         state
@@ -1621,7 +1621,7 @@ mod handle_tests {
             &unsafe { decode_governance(&output) },
             2,
             4,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 3);

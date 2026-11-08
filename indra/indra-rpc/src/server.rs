@@ -19,7 +19,7 @@
 //! use indra_state::ChainState;
 //! use std::sync::{Arc, Mutex};
 //!
-//! let engine = ChainState::new_genesis();
+//! let engine = ChainState::new_genesis("indra-testnet-1");
 //! let server = RpcServer::new("127.0.0.1:8545", Arc::new(Mutex::new(engine)));
 //! // server.run(); // blocks forever
 //! ```
@@ -616,6 +616,7 @@ fn dispatch_to_response<E: RpcEngineMut>(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{
         codec::Encode,
@@ -655,7 +656,7 @@ mod tests {
             Ok(request) => request,
             Err(response) => return response.to_json(),
         };
-        let mut engine = ChainState::new_genesis();
+        let mut engine = ChainState::new_genesis(TEST_CHAIN_ID);
         dispatch_to_response(
             &request.method,
             &request.params,
@@ -676,7 +677,7 @@ mod tests {
 
     #[test]
     fn call_rpc_get_height() {
-        let engine = ChainState::new_genesis();
+        let engine = ChainState::new_genesis(TEST_CHAIN_ID);
         let resp = call_rpc("indra_getHeight", &[], &engine);
         assert!(resp.contains("\"height\":0"));
         assert!(resp.contains("\"result\""));
@@ -684,7 +685,7 @@ mod tests {
 
     #[test]
     fn call_rpc_unknown_method() {
-        let engine = ChainState::new_genesis();
+        let engine = ChainState::new_genesis(TEST_CHAIN_ID);
         let resp = call_rpc("indra_fake", &[], &engine);
         assert!(resp.contains("\"error\""));
         assert!(resp.contains("-32601"));
@@ -698,7 +699,7 @@ mod tests {
     fn generic_rpc_rejects_transaction_with_trailing_bytes() {
         let mut encoded = test_transaction().encode_to_vec();
         encoded.push(0xAA);
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let response = dispatch_to_response(
             "indra_sendTransaction",
             &[hex::encode(encoded)],
@@ -712,7 +713,7 @@ mod tests {
 
     #[test]
     fn call_rpc_chain_info() {
-        let engine = ChainState::new_genesis();
+        let engine = ChainState::new_genesis(TEST_CHAIN_ID);
         let resp = call_rpc("indra_getChainInfo", &[], &engine);
         assert!(resp.contains("\"result\""));
         assert!(resp.contains("\"height\""));
@@ -721,14 +722,14 @@ mod tests {
 
     #[test]
     fn call_rpc_validator_set() {
-        let engine = ChainState::new_genesis();
+        let engine = ChainState::new_genesis(TEST_CHAIN_ID);
         let resp = call_rpc("indra_getValidatorSet", &[], &engine);
         assert!(resp.contains("\"validators\""));
     }
 
     #[test]
     fn rpc_scan_challenge_returns_error_for_invalid_payment_address() {
-        let engine = ChainState::new_genesis();
+        let engine = ChainState::new_genesis(TEST_CHAIN_ID);
         let resp = call_rpc("indra_getScanChallenge", &["not-hex".to_string()], &engine);
         assert!(resp.contains("\"error\""));
         assert!(resp.contains("invalid payment address"));

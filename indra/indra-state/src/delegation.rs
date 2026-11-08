@@ -1591,6 +1591,7 @@ fn apply_update_network_address(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::{
         chain::ChainState,
@@ -2039,7 +2040,7 @@ mod tests {
 
     #[test]
     fn vrf_rotation_is_snapshot_delayed_and_public_key_squatting_is_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.active_slot_coefficient_numerator =
             indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         let (validator_id, signer) = make_active_validator(&mut state, 31);
@@ -2094,7 +2095,7 @@ mod tests {
     #[test]
     fn vrf_registration_rejects_slashed_and_exited_validators() {
         for status in [ValidatorStatus::Slashed, ValidatorStatus::Exited] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             let (validator_id, signer) = make_active_validator(&mut state, 0x6A);
             state.validators.get_mut(&validator_id).unwrap().status = status;
             let vrf = indra_crypto::VrfKeypair::from_seed(&[0x6B; 32]);
@@ -2116,7 +2117,7 @@ mod tests {
 
     #[test]
     fn hot_staking_nonce_exhaustion_fails_closed() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let signer = keypair(0x6C);
         let signer_id = pubkey_from_keypair(&signer).identity_id();
         state.staking_nonces.insert(signer_id, u64::MAX);
@@ -2130,7 +2131,7 @@ mod tests {
 
     #[test]
     fn self_stake_cache_overflow_fails_before_consuming_utxo() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hot) = make_active_validator(&mut state, 0x6E);
         state.validators.get_mut(&validator_id).unwrap().stake_spark = u64::MAX;
         let cold_owner = resolve_active_validator_cold_pubkey(&state, &validator_id).unwrap();
@@ -2238,7 +2239,7 @@ mod tests {
 
     #[test]
     fn commission_change_is_not_immediate() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x41);
         let original_commission = state.validators.get(&validator_id).unwrap().commission_bps;
 
@@ -2260,7 +2261,7 @@ mod tests {
 
     #[test]
     fn delegate_rejects_unknown_utxo() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
 
@@ -2280,7 +2281,7 @@ mod tests {
 
     #[test]
     fn delegate_rejects_wrong_owner() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let wrong_owner = pubkey_from_keypair(&keypair(0x03));
@@ -2296,7 +2297,7 @@ mod tests {
 
     #[test]
     fn delegate_rejects_same_classical_key_with_substituted_pq_key() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x21);
         let legitimate_keypair = mixed_keypair(0x22, 0x23);
         let attacker_keypair = mixed_keypair(0x22, 0x24);
@@ -2318,7 +2319,7 @@ mod tests {
 
     #[test]
     fn delegate_rejects_below_minimum() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         state
             .validators
@@ -2339,7 +2340,7 @@ mod tests {
 
     #[test]
     fn substituted_pq_key_cannot_resolve_victim_validator_identity() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let legitimate_keypair = mixed_keypair(0x54, 0x55);
         let attacker_keypair = mixed_keypair(0x54, 0x56);
         let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
@@ -2379,7 +2380,7 @@ mod tests {
 
     #[test]
     fn first_registration_with_compromised_classical_key_cannot_squat_victim_identity_id() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let victim_keypair = mixed_keypair(0x5B, 0x5C);
         let attacker_keypair = mixed_keypair(0x5B, 0x5D);
         let victim_pubkey = pubkey_from_keypair(&victim_keypair);
@@ -2416,7 +2417,7 @@ mod tests {
 
     #[test]
     fn validator_self_stake_post_identity_gate_rejects_registry_mismatch() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let legitimate_keypair = mixed_keypair(0x58, 0x59);
         let conflicting_keypair = mixed_keypair(0x58, 0x5A);
         let legitimate_pubkey = pubkey_from_keypair(&legitimate_keypair);
@@ -2444,7 +2445,7 @@ mod tests {
 
     #[test]
     fn self_stake_rejects_unknown_utxo() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
         let op = self_stake_op(&state, Bytes32::from([0x31; 32]), &validator_keypair, 1);
         let chain_id = state.chain_id.clone();
@@ -2456,7 +2457,7 @@ mod tests {
 
     #[test]
     fn self_stake_rejects_wrong_utxo_owner() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
         let wrong_owner = pubkey_from_keypair(&keypair(0x02));
         let deposit_utxo_id = insert_delegator_utxo(&mut state, wrong_owner, 2_000_000, 0x32);
@@ -2471,7 +2472,7 @@ mod tests {
 
     #[test]
     fn self_stake_rejects_unregistered_validator() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let validator_keypair = keypair(0x01);
         let pubkey = pubkey_from_keypair(&validator_keypair);
         let deposit_utxo_id = insert_delegator_utxo(&mut state, pubkey, 2_000_000, 0x33);
@@ -2487,7 +2488,7 @@ mod tests {
 
     #[test]
     fn self_stake_rejects_slashed_validator() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0x01);
         state.validators.get_mut(&validator_id).unwrap().status = ValidatorStatus::Slashed;
         let pubkey = pubkey_from_keypair(&validator_keypair);
@@ -2503,7 +2504,7 @@ mod tests {
 
     #[test]
     fn self_stake_rejects_invalid_signature() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (_, validator_keypair) = make_active_validator(&mut state, 0x01);
         let wrong_keypair = keypair(0x02);
         let pubkey = pubkey_from_keypair(&validator_keypair);
@@ -2530,7 +2531,7 @@ mod tests {
 
     #[test]
     fn apply_staking_op_rejects_wrong_nonce() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let op = signed_op(
@@ -2555,7 +2556,7 @@ mod tests {
 
     #[test]
     fn apply_staking_op_rejects_replay() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let chain_id = state.chain_id.clone();
@@ -2574,7 +2575,7 @@ mod tests {
 
     #[test]
     fn apply_staking_op_rejects_bad_signature() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0x01);
         let delegator_keypair = keypair(0x02);
         let wrong_keypair = keypair(0x03);
@@ -2597,7 +2598,7 @@ mod tests {
 
     #[test]
     fn register_validator_post_identity_gate_rejects_preexisting_registry_mismatch() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let validator_keypair = mixed_keypair(0xB2, 0xB3);
         let conflicting_keypair = mixed_keypair(0xB2, 0xB4);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
@@ -2659,7 +2660,7 @@ mod tests {
 
     #[test]
     fn update_network_address_requires_validator_signature() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let chain_id = state.chain_id.clone();
         let (validator_id, _keypair) = make_active_validator(&mut state, 0xA2);
         let attacker = keypair(0xA3);
@@ -2681,7 +2682,7 @@ mod tests {
 
     #[test]
     fn update_network_address_rejects_invalid_syntax_at_apply() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let chain_id = state.chain_id.clone();
         let (validator_id, keypair) = make_active_validator(&mut state, 0xA4);
 
@@ -2730,7 +2731,7 @@ mod tests {
 
     #[test]
     fn update_network_address_cooldown_enforced() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let chain_id = state.chain_id.clone();
         let (validator_id, keypair) = make_active_validator(&mut state, 0xA5);
         let first = signed_op(
@@ -2762,7 +2763,7 @@ mod tests {
 
     #[test]
     fn update_network_address_later_epoch_succeeds_and_clearing_counts_as_update() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let chain_id = state.chain_id.clone();
         let (validator_id, keypair) = make_active_validator(&mut state, 0xA6);
         let active_epoch = epoch_for_height(u64::MAX);
@@ -2803,7 +2804,7 @@ mod tests {
     fn update_network_address_rejects_slashed_or_exited_validator() {
         let chain_id = "indra-testnet-1".to_string();
         for status in [ValidatorStatus::Slashed, ValidatorStatus::Exited] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             state.chain_id = chain_id.clone();
             let (validator_id, keypair) = make_active_validator(&mut state, 0xA7);
             state.validators.get_mut(&validator_id).unwrap().status = status.clone();
@@ -2826,7 +2827,7 @@ mod tests {
 
     #[test]
     fn registration_without_bond_is_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let validator_keypair = keypair(0x44);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
         let (vrf_pk, vrf_possession_output, vrf_possession_proof) =
@@ -2857,7 +2858,7 @@ mod tests {
 
     #[test]
     fn registration_with_bond_below_minimum_is_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let validator_keypair = keypair(0x45);
         let validator_pubkey = pubkey_from_keypair(&validator_keypair);
         let deposit_utxo_id = insert_registration_utxo(
@@ -2894,7 +2895,7 @@ mod tests {
 
     #[test]
     fn set_auto_delegate_stores_target() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB1);
         let (target_id, _) = make_active_validator(&mut state, 0xB2);
         let op = set_auto_delegate_op(&state, validator_id, target_id, &validator_keypair, 1);
@@ -2911,7 +2912,7 @@ mod tests {
 
     #[test]
     fn set_auto_delegate_clears_with_zero() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB3);
         let (target_id, _) = make_active_validator(&mut state, 0xB4);
         let chain_id = state.chain_id.clone();
@@ -2931,7 +2932,7 @@ mod tests {
 
     #[test]
     fn set_auto_delegate_rejects_self() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB5);
         let op = set_auto_delegate_op(&state, validator_id, validator_id, &validator_keypair, 1);
         let chain_id = state.chain_id.clone();
@@ -2943,7 +2944,7 @@ mod tests {
 
     #[test]
     fn set_auto_delegate_rejects_nonexistent_target() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB6);
         let op = set_auto_delegate_op(
             &state,
@@ -2961,7 +2962,7 @@ mod tests {
 
     #[test]
     fn set_auto_delegate_rejects_slashed_validator() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, validator_keypair) = make_active_validator(&mut state, 0xB7);
         let (target_id, _) = make_active_validator(&mut state, 0xB8);
         if let Some(v) = state.validators.get_mut(&validator_id) {
@@ -3033,7 +3034,7 @@ mod tests {
 
     #[test]
     fn register_validator_accepts_distinct_hot_and_cold_custody() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (op, deposit_id, validator_id) =
             registration_op_with_cold_deposit(&mut state, 0x81, 0x82, 0x83, 0x84);
         let chain_id = state.chain_id.clone();
@@ -3058,7 +3059,7 @@ mod tests {
 
     #[test]
     fn self_stake_accepts_distinct_hot_and_current_cold_custody() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hot) = make_active_validator(&mut state, 0x85);
         let cold = mixed_keypair(0x86, 0x87);
         activate_cold_for_test(&mut state, validator_id, &cold);
@@ -3157,7 +3158,7 @@ mod tests {
     #[test]
     fn validator_position_deposits_reject_hot_or_foreign_cold_custody() {
         for (label, owner_kind) in [("hot", 0_u8), ("foreign-cold", 1_u8)] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             let hot = keypair(0x89);
             let cold = mixed_keypair(0x8A, 0x8B);
             let foreign_cold = mixed_keypair(0x8C, 0x8D);
@@ -3194,7 +3195,7 @@ mod tests {
         }
 
         for (label, owner_kind) in [("hot", 0_u8), ("foreign-cold", 1_u8)] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             let (validator_id, hot) = make_active_validator(&mut state, 0x90);
             let cold = mixed_keypair(0x91, 0x92);
             let foreign_cold = mixed_keypair(0x93, 0x94);
@@ -3219,7 +3220,7 @@ mod tests {
 
     #[test]
     fn self_stake_uses_rotated_current_cold_key() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hot) = make_active_validator(&mut state, 0x96);
         let old_cold = mixed_keypair(0x97, 0x98);
         let new_cold = mixed_keypair(0x99, 0x9A);
@@ -3244,7 +3245,7 @@ mod tests {
 
     #[test]
     fn live_delegate_exit_and_maturity_use_positions_end_to_end() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, _) = make_active_validator(&mut state, 0xD1);
         let delegator_keypair = keypair(0xD2);
         let delegator_pubkey = pubkey_from_keypair(&delegator_keypair);
@@ -3307,7 +3308,7 @@ mod tests {
 
     #[test]
     fn register_validator_with_malformed_vrf_key_poisoning_snapshot_regression() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
 
         // Existing test helpers: create a legitimate hot/cold validator identity.
         let hot = mixed_keypair(0xA1, 0xA2);
@@ -3360,7 +3361,7 @@ mod tests {
 
     #[test]
     fn register_validator_rejects_foreign_vrf_key_without_secret_possession() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
 
         // Attacker controls these legitimate validator hot/cold identities.
         let attacker_hot = mixed_keypair(0xC1, 0xC2);
@@ -3410,7 +3411,7 @@ mod tests {
 
     #[test]
     fn register_validator_accepts_correct_vrf_possession_proof() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let hot = mixed_keypair(0xD2, 0xD3);
         let cold = mixed_keypair(0xD4, 0xD5);
         let deposit_utxo_id = insert_delegator_utxo(
@@ -3445,7 +3446,7 @@ mod tests {
 
     #[test]
     fn register_validator_rejects_vrf_proof_after_public_key_is_altered() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let hot = mixed_keypair(0xD8, 0xD9);
         let cold = mixed_keypair(0xDA, 0xDB);
         let deposit_utxo_id = insert_delegator_utxo(
@@ -3484,7 +3485,7 @@ mod tests {
     #[test]
     fn register_validator_vrf_proof_binds_chain_and_validator_identity_context() {
         for wrong_identity in [false, true] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             let hot = mixed_keypair(0xE0, 0xE1);
             let cold = mixed_keypair(0xE2, 0xE3);
             let validator_pubkey = pubkey_from_keypair(&hot);

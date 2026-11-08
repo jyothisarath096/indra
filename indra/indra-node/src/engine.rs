@@ -1854,6 +1854,7 @@ fn validate_manifest_if_present(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
 
     fn account_fixture_claims(state: &mut ChainState) {
@@ -1880,7 +1881,7 @@ mod tests {
         GovernanceActionType, GovernanceOpV2, GovernancePayload,
     };
     use indra_core::types::primitives::{
-        DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
+        DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
         TRANSACTION_PROTOCOL_VERSION,
     };
     use indra_core::types::slashing::SlashEvidenceV1;
@@ -2220,7 +2221,7 @@ mod tests {
             op.signer_id,
             op.nonce,
             &op.payload,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         );
         let msg_hash = indra_crypto::sha256(&domain);
         let sig = keypair.sign(&msg_hash).unwrap();
@@ -2232,7 +2233,7 @@ mod tests {
 
     fn sign_cold_governance_op(op: &mut GovernanceOpV2, keypair: &HybridKeypair) {
         let bytes = op
-            .cold_authorization_signing_bytes(DEFAULT_CHAIN_ID)
+            .cold_authorization_signing_bytes(TEST_CHAIN_ID)
             .unwrap()
             .unwrap();
         let sig = keypair.sign(&bytes).unwrap();
@@ -2584,7 +2585,7 @@ mod tests {
                     value_hash,
                     *validator_id,
                     snapshot_root,
-                    &DEFAULT_CHAIN_ID,
+                    &TEST_CHAIN_ID,
                     signer,
                 )
                 .unwrap()
@@ -2605,7 +2606,7 @@ mod tests {
             height,
             round,
             value_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot_root,
             &qc_validators,
             votes.iter().collect(),
@@ -2728,7 +2729,7 @@ mod tests {
                         Bytes32::from([height as u8; 32]),
                         validator_id,
                         snapshot.snapshot_root,
-                        DEFAULT_CHAIN_ID,
+                        TEST_CHAIN_ID,
                         &signer,
                     )
                     .unwrap();
@@ -2736,7 +2737,7 @@ mod tests {
                         height,
                         0,
                         VoteStep::Prevote,
-                        DEFAULT_CHAIN_ID.to_string(),
+                        TEST_CHAIN_ID.to_string(),
                         snapshot.snapshot_root,
                         voters,
                     );
@@ -2775,7 +2776,7 @@ mod tests {
                     block_hash,
                     validator_id,
                     snapshot.snapshot_root,
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                     signer,
                 )
                 .unwrap()
@@ -2785,7 +2786,7 @@ mod tests {
             height,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot.snapshot_root,
             &validators,
             votes.iter().collect(),
@@ -2829,10 +2830,10 @@ mod tests {
             &qc,
             &engine.qc_validators(),
             engine.state.validators.total_active_stake(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
-        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_ok());
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, TEST_CHAIN_ID).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2870,10 +2871,10 @@ mod tests {
             &qc,
             &engine.qc_validators(),
             engine.state.validators.total_active_stake(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_ok());
-        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_err());
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, TEST_CHAIN_ID).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2901,7 +2902,7 @@ mod tests {
             snapshot.total_weight_spark
         );
         let qc = qc_from_test_signers(1, Bytes32::from([0xA3; 32]), &snapshot, &[&a, &b, &c]);
-        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).is_ok());
+        assert!(NodeEngine::verify_qc_with_snapshot(&qc, &snapshot, TEST_CHAIN_ID).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2959,8 +2960,8 @@ mod tests {
                 qc_from_test_signers(300, Bytes32::from([0x30; 32]), &old_snapshot, &[&a, &b, &c]);
             let qc301 =
                 qc_from_test_signers(301, Bytes32::from([0x31; 32]), &new_snapshot, &[&a, &b, &c]);
-            NodeEngine::verify_qc_with_snapshot(&qc300, &old_snapshot, DEFAULT_CHAIN_ID).unwrap();
-            NodeEngine::verify_qc_with_snapshot(&qc301, &new_snapshot, DEFAULT_CHAIN_ID).unwrap();
+            NodeEngine::verify_qc_with_snapshot(&qc300, &old_snapshot, TEST_CHAIN_ID).unwrap();
+            NodeEngine::verify_qc_with_snapshot(&qc301, &new_snapshot, TEST_CHAIN_ID).unwrap();
             (qc300.encode_to_vec(), qc301.encode_to_vec())
         };
         assert_eq!(replay(), replay());
@@ -4054,7 +4055,7 @@ mod tests {
                 block_log_next_height: 100,
                 last_qc_height: 99,
                 epoch_log_latest_epoch: None,
-                chain_id: indra_core::types::primitives::DEFAULT_CHAIN_ID.into(),
+                chain_id: indra_core::types::primitives::TEST_CHAIN_ID.into(),
             },
         )
         .unwrap();

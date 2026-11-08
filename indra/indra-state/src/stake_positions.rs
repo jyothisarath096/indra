@@ -561,6 +561,7 @@ fn invalid_position(error: indra_core::error::IndraError) -> StateError {
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{
         codec::{Decode, Encode},
@@ -661,7 +662,7 @@ mod tests {
         let owner_pubkey = wire_pubkey(&owner_keys);
         let owner_id = owner_pubkey.identity_id();
         let validator_id = id(7);
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state
             .validators
             .upsert(validator(validator_id, &owner_keys))

@@ -554,6 +554,7 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{
         types::{
@@ -628,7 +629,7 @@ mod tests {
     }
 
     fn valid_state_and_tx() -> (ChainState, TransactionV1) {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (owner_pubkey, owner_keypair) = keypair([0x42; 32]);
         let input_value = 10_000_000_000u64;
         let input_fixture_tag = [0x11; 32];
@@ -904,7 +905,7 @@ mod tests {
 
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(spent.inputs[0].utxo_id);
-        mempool.apply_canonical_effects(&ChainState::new_genesis(), &effects);
+        mempool.apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects);
         assert_eq!(mempool.len(), 1);
         assert_byte_accounting(&mempool);
     }
@@ -921,7 +922,7 @@ mod tests {
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(first.inputs[0].utxo_id);
         effects.spent_utxos.insert(second.inputs[0].utxo_id);
-        mempool.apply_canonical_effects(&ChainState::new_genesis(), &effects);
+        mempool.apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects);
         assert!(mempool.is_empty());
         assert_byte_accounting(&mempool);
 
@@ -1039,7 +1040,7 @@ mod tests {
         let tx_id = mp.submit(tx, 100, 1).unwrap();
         assert!(mp.contains(&tx_id));
 
-        let state = indra_state::ChainState::new_genesis();
+        let state = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects
             .spent_utxos

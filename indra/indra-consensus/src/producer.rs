@@ -199,6 +199,7 @@ pub fn produce_block(
 /// This binds the header hash to the exact transaction set included in the block.
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::mempool::Mempool;
     use indra_crypto::VrfKeypair;
@@ -208,7 +209,7 @@ mod tests {
     };
 
     fn finalized_state(vrf_seed: &[u8; 32]) -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.active_slot_coefficient_numerator =
             indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
@@ -418,7 +419,7 @@ mod tests {
 
     #[test]
     fn wrong_proposer_rejected() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let mempool = Mempool::default_config();
         let seed = [0x42u8; 32];
         let wrong_seed = [0x99u8; 32];

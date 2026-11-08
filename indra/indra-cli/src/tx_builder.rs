@@ -672,10 +672,11 @@ fn dummy_signature() -> CliResult<HybridSignature> {
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::wallet::Wallet;
     use indra_core::codec::Decode;
-    use indra_core::types::primitives::{Bytes32, DEFAULT_CHAIN_ID};
+    use indra_core::types::primitives::Bytes32;
     use indra_core::types::transaction::TransactionV1;
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
@@ -709,7 +710,7 @@ mod tests {
     #[test]
     fn cold_cli_transfer_is_accepted_hot_signature_rejected_and_change_returns_to_cold_owner() {
         let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
-        let manifest = indra_node::genesis::test_genesis_toml(DEFAULT_CHAIN_ID, &entries);
+        let manifest = indra_node::genesis::test_genesis_toml(TEST_CHAIN_ID, &entries);
         let path = std::env::temp_dir().join(format!("indra-cli-cold-transfer-{}.toml", std::process::id()));
         std::fs::write(&path, manifest).unwrap();
         let state = indra_node::build_finalized_genesis_state(path.to_str()).unwrap();
@@ -731,9 +732,9 @@ mod tests {
         wallet.add_utxo(genesis_utxo_id, genesis_value, entry.created_height, entry.tx_index, entry.output_index, cold_owner.clone());
         let recipient = test_keypair(0x77);
         let recipient_owner = hybrid_pubkey_from_keypair(&recipient).unwrap();
-        let recipient_address = PaymentAddressV1::new(DEFAULT_CHAIN_ID.as_bytes(), recipient.public_key()).unwrap().to_text();
+        let recipient_address = PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), recipient.public_key()).unwrap().to_text();
         let built = build_cold_transaction(&ColdTxParams {
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
@@ -759,7 +760,7 @@ mod tests {
         }));
         let mut hot_tx = tx.clone();
         let hot = test_keypair(1);
-        let signature = hot.sign(&hot_tx.signing_bytes(DEFAULT_CHAIN_ID).unwrap()).unwrap();
+        let signature = hot.sign(&hot_tx.signing_bytes(TEST_CHAIN_ID).unwrap()).unwrap();
         hot_tx.signature = wire_hybrid_signature(&signature).unwrap();
         let mut rejected = state;
         let error = indra_state::try_apply_transaction_candidate_with_dust(
@@ -778,7 +779,7 @@ mod tests {
         let cold_owner = crate::cold_hybrid_pubkey(&cold).unwrap();
         let recipient = test_keypair(0x51);
         let recipient_address = PaymentAddressV1::new(
-            DEFAULT_CHAIN_ID.as_bytes(),
+            TEST_CHAIN_ID.as_bytes(),
             recipient.public_key(),
         ).unwrap().to_text();
         let hot_id = Bytes32::from([0xA1; 32]);
@@ -787,7 +788,7 @@ mod tests {
         wallet.add_utxo(hot_id, 200_000, 1, 0, 0, hot_owner.clone());
         wallet.add_utxo(cold_id, 2_000_000, 1, 0, 1, cold_owner.clone());
         let hot_built = build_transaction(&TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 100_000,
             fee_spark: MIN_FEE_SPARK,
@@ -798,7 +799,7 @@ mod tests {
         }).unwrap();
         assert_eq!(hot_built.spent_utxo_ids, vec![hot_id]);
         let cold_built = build_cold_transaction(&ColdTxParams {
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 100_000,
             fee_spark: MIN_FEE_SPARK,
@@ -876,7 +877,7 @@ mod tests {
     }
 
     fn payment_address(keypair: &HybridKeypair) -> String {
-        PaymentAddressV1::new(DEFAULT_CHAIN_ID.as_bytes(), keypair.public_key())
+        PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), keypair.public_key())
             .unwrap()
             .to_text()
     }
@@ -887,7 +888,7 @@ mod tests {
         let recipient_keypair = test_keypair(0x61);
         let recipient_address = payment_address(&recipient_keypair);
         let built = build_transaction(&TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
@@ -911,7 +912,7 @@ mod tests {
         let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
         let recipient_address = payment_address(&test_keypair(0x62));
         let built = build_transaction(&TxParams {
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
             fee_spark: MIN_FEE_SPARK,
@@ -934,7 +935,7 @@ mod tests {
             let recipient_address = payment_address(&test_keypair(0x6A));
             let amount = 10_000_000 - MIN_FEE_SPARK - remainder;
             let built = build_transaction(&TxParams {
-                chain_id: DEFAULT_CHAIN_ID,
+                chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark: amount,
                 fee_spark: MIN_FEE_SPARK,
@@ -961,7 +962,7 @@ mod tests {
             payment_address(&test_keypair(0x63)).replace("indra:", "bad:"),
         ] {
             assert!(build_transaction(&TxParams {
-                chain_id: DEFAULT_CHAIN_ID,
+                chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark: 1_000_000,
                 fee_spark: MIN_FEE_SPARK,
@@ -980,7 +981,7 @@ mod tests {
         let recipient_address = payment_address(&test_keypair(0x64));
         for amount_spark in [1, 100_000_000] {
             assert!(build_transaction(&TxParams {
-                chain_id: DEFAULT_CHAIN_ID,
+                chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark,
                 fee_spark: MIN_FEE_SPARK,
@@ -999,7 +1000,7 @@ mod tests {
         let pq = PqKeypair::from_seed(&seed).unwrap();
         let keypair = HybridKeypair::new(ClassicalKeypair::from_seed(&seed), pq);
         let deposit_utxo_id = Bytes32::from([0xA5; 32]);
-        let built = build_self_stake_op(deposit_utxo_id, &keypair, 7, DEFAULT_CHAIN_ID).unwrap();
+        let built = build_self_stake_op(deposit_utxo_id, &keypair, 7, TEST_CHAIN_ID).unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
         let op = StakingOp::decode_exact(&bytes).unwrap();
 
@@ -1030,7 +1031,7 @@ mod tests {
                 cold_key_version: 2,
                 cold_nonce: 8,
             },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let bytes = hex::decode(&built.op_hex).unwrap();
@@ -1060,7 +1061,7 @@ mod tests {
             &test_cold_keypair(0x91),
             &VrfKeypair::from_seed(&[0xAA; 32]),
             9,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let op = decode_built(&built);
@@ -1087,7 +1088,7 @@ mod tests {
             deposit_utxo_id,
             &keypair,
             10,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let op = decode_built(&built);
@@ -1114,7 +1115,7 @@ mod tests {
                 keypair: &keypair,
                 nonce: 11,
             },
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let op = decode_built(&built);
@@ -1133,7 +1134,7 @@ mod tests {
     fn build_claim_rewards_op_serialises_and_decodes() {
         let keypair = test_keypair(0x74);
         let validator_id = Bytes32::from([0x05; 32]);
-        let built = build_claim_rewards_op(validator_id, &keypair, 12, DEFAULT_CHAIN_ID).unwrap();
+        let built = build_claim_rewards_op(validator_id, &keypair, 12, TEST_CHAIN_ID).unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
@@ -1149,7 +1150,7 @@ mod tests {
         let keypair = test_keypair(0x75);
         let validator_id = Bytes32::from([0x06; 32]);
         let built =
-            build_set_commission_op(validator_id, 1_500, &keypair, 13, DEFAULT_CHAIN_ID).unwrap();
+            build_set_commission_op(validator_id, 1_500, &keypair, 13, TEST_CHAIN_ID).unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
@@ -1171,7 +1172,7 @@ mod tests {
             target_validator_id,
             &keypair,
             14,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let op = decode_built(&built);
@@ -1192,7 +1193,7 @@ mod tests {
         let keypair = test_keypair(0x79);
         let validator_id = Bytes32::from([0x18; 32]);
         let built =
-            build_set_auto_delegate_op(validator_id, Bytes32::ZERO, &keypair, 15, DEFAULT_CHAIN_ID)
+            build_set_auto_delegate_op(validator_id, Bytes32::ZERO, &keypair, 15, TEST_CHAIN_ID)
                 .unwrap();
         let op = decode_built(&built);
         assert!(matches!(
@@ -1214,7 +1215,7 @@ mod tests {
             Some("203.0.113.20:30303".to_string()),
             &keypair,
             16,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .unwrap();
         let op = decode_built(&built);
@@ -1233,7 +1234,7 @@ mod tests {
         let keypair = test_keypair(0x7B);
         let validator_id = Bytes32::from([0x1C; 32]);
         let built =
-            build_update_network_address_op(validator_id, None, &keypair, 17, DEFAULT_CHAIN_ID)
+            build_update_network_address_op(validator_id, None, &keypair, 17, TEST_CHAIN_ID)
                 .unwrap();
         let op = decode_built(&built);
         assert!(matches!(
@@ -1254,7 +1255,7 @@ mod tests {
             Some("validator.example.com:30303".to_string()),
             &keypair,
             18,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
     }
@@ -1272,16 +1273,16 @@ mod tests {
                 &test_cold_keypair(0x92),
                 &VrfKeypair::from_seed(&[0x11; 32]),
                 42,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(deposit_utxo_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_self_stake_op(deposit_utxo_id, &keypair, 42, TEST_CHAIN_ID).unwrap(),
             build_delegate_op(
                 validator_id,
                 deposit_utxo_id,
                 &keypair,
                 42,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
             build_exit_stake_position_op(
@@ -1294,17 +1295,17 @@ mod tests {
                     keypair: &keypair,
                     nonce: 42,
                 },
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
-            build_claim_rewards_op(validator_id, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
-            build_set_commission_op(validator_id, 1_100, &keypair, 42, DEFAULT_CHAIN_ID).unwrap(),
+            build_claim_rewards_op(validator_id, &keypair, 42, TEST_CHAIN_ID).unwrap(),
+            build_set_commission_op(validator_id, 1_100, &keypair, 42, TEST_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(
                 validator_id,
                 Bytes32::from([0x19; 32]),
                 &keypair,
                 42,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
             build_update_network_address_op(
@@ -1312,7 +1313,7 @@ mod tests {
                 Some("203.0.113.20:30303".to_string()),
                 &keypair,
                 42,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
         ];
@@ -1340,11 +1341,11 @@ mod tests {
                 &test_cold_keypair(0x93),
                 &VrfKeypair::from_seed(&[0x12; 32]),
                 1,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
-            build_self_stake_op(deposit_utxo_id, &keypair, 2, DEFAULT_CHAIN_ID).unwrap(),
-            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, DEFAULT_CHAIN_ID)
+            build_self_stake_op(deposit_utxo_id, &keypair, 2, TEST_CHAIN_ID).unwrap(),
+            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, TEST_CHAIN_ID)
                 .unwrap(),
             build_exit_stake_position_op(
                 Bytes32::from([0x32; 32]),
@@ -1356,17 +1357,17 @@ mod tests {
                     keypair: &keypair,
                     nonce: 5,
                 },
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
-            build_claim_rewards_op(validator_id, &keypair, 6, DEFAULT_CHAIN_ID).unwrap(),
-            build_set_commission_op(validator_id, 1_200, &keypair, 7, DEFAULT_CHAIN_ID).unwrap(),
+            build_claim_rewards_op(validator_id, &keypair, 6, TEST_CHAIN_ID).unwrap(),
+            build_set_commission_op(validator_id, 1_200, &keypair, 7, TEST_CHAIN_ID).unwrap(),
             build_set_auto_delegate_op(
                 validator_id,
                 Bytes32::from([0x1A; 32]),
                 &keypair,
                 8,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
             build_update_network_address_op(
@@ -1374,7 +1375,7 @@ mod tests {
                 Some("203.0.113.21:30303".to_string()),
                 &keypair,
                 9,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap(),
         ];

@@ -900,6 +900,7 @@ fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{
         codec::Encode,
@@ -907,7 +908,7 @@ mod tests {
             crypto::{ColdHybridPubKey, HybridSignature},
             governance::{ColdGovernanceAuthorization, GovernableAction, GovernanceActionType},
             primitives::{
-                VariableBytes, DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
+                VariableBytes, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK,
                 MINIMUM_ACTIVE_SELF_STAKE_SPARK,
             },
             staking::{ColdStakingAuthorization, StakingOp, StakingOpBody},
@@ -1092,7 +1093,7 @@ mod tests {
             signature: dummy_sig(),
         };
         let message = op
-            .rotate_validator_cold_key_dual_signing_bytes(DEFAULT_CHAIN_ID)
+            .rotate_validator_cold_key_dual_signing_bytes(TEST_CHAIN_ID)
             .unwrap()
             .unwrap();
         let current_signature = current.sign(&message).unwrap();
@@ -1180,7 +1181,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -1226,7 +1227,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -1323,7 +1324,7 @@ mod tests {
 
     #[test]
     fn active_validator_cold_governance_authorizes_all_discretionary_actions() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (hot_pubkey, hot_keypair) = keypair(0xD1);
         let validator_id = install_governance_validator(&mut state, &hot_pubkey);
@@ -1337,15 +1338,15 @@ mod tests {
         state.finalize_genesis().unwrap();
         let mut propose = propose_op(validator_id, &hot_keypair, cold_pubkey.clone(), deposit, 1);
         set_cold_authorization(&mut propose, 1);
-        sign_cold_governance_op(&mut propose, &cold_keypair, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_cold_governance_op(&mut propose, &cold_keypair, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &propose, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
         let proposal_id = compute_proposal_id(
             validator_id,
             &GovernableAction::SetMinDelegationSpark {
                 value: DUST_LIMIT_SPARK,
             },
             0,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         );
 
         let mut cancel = GovernanceOpV2 {
@@ -1361,9 +1362,9 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut cancel, &cold_keypair, DEFAULT_CHAIN_ID);
+        sign_cold_governance_op(&mut cancel, &cold_keypair, TEST_CHAIN_ID);
         let supply_before_cancel = state.total_supply;
-        apply_governance_op(&mut state, &cancel, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &cancel, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
         let cancelled = state.governance.proposals.get(&proposal_id).unwrap();
         assert_eq!(state.total_supply, supply_before_cancel - 1_000);
         assert_eq!(state.monetary_ledger.epoch_governance_burned_spark, 1_000);
@@ -1406,8 +1407,8 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut commit, &cold_keypair, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_cold_governance_op(&mut commit, &cold_keypair, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &commit, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
 
         state
             .governance
@@ -1430,8 +1431,8 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut reveal, &cold_keypair, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_cold_governance_op(&mut reveal, &cold_keypair, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &reveal, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
 
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 4);
         assert!(state.governance.gov_nonces.get(&validator_id).is_none());
@@ -1446,7 +1447,7 @@ mod tests {
 
     #[test]
     fn hot_governance_nonce_exhaustion_fails_closed() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let signer_id = Bytes32::from([0xEF; 32]);
         state.governance.gov_nonces.insert(signer_id, u64::MAX);
         let op = GovernanceOpV2 {
@@ -1470,7 +1471,7 @@ mod tests {
 
     #[test]
     fn governance_burn_overflow_is_atomic() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let proposal_id = Bytes32::from([0xED; 32]);
         let (proposer_pubkey, _) = keypair(0xED);
         state.governance.proposals.insert(
@@ -1509,7 +1510,7 @@ mod tests {
 
     #[test]
     fn governance_commit_before_rotation_reveals_under_new_cold_version() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (hot_pubkey, _) = keypair(0x70);
         let validator_id = install_governance_validator(&mut state, &hot_pubkey);
         let (_, cold_v1) = mixed_keypair(0x71, 0x72);
@@ -1549,12 +1550,12 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut commit, &cold_v1, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_cold_governance_op(&mut commit, &cold_v1, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &commit, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
 
         let (_, cold_v2) = mixed_keypair(0x75, 0x76);
         let rotation = rotate_cold_key_op(validator_id, &cold_v1, &cold_v2, 1, 2);
-        apply_staking_op(&mut state, &rotation, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+        apply_staking_op(&mut state, &rotation, TEST_CHAIN_ID, u64::MAX).unwrap();
         state
             .governance
             .proposals
@@ -1577,8 +1578,8 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut reveal, &cold_v2, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_cold_governance_op(&mut reveal, &cold_v2, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &reveal, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
 
         assert!(state.governance.proposals[&proposal_id]
             .reveals
@@ -1590,7 +1591,7 @@ mod tests {
 
     #[test]
     fn rotation_with_cold_staking_and_governance_replays_deterministically() {
-        let mut base = ChainState::new_genesis();
+        let mut base = ChainState::new_genesis(TEST_CHAIN_ID);
         let (hot_pubkey, _) = keypair(0x40);
         let validator_id = install_governance_validator(&mut base, &hot_pubkey);
         let (_, cold_v1) = mixed_keypair(0x41, 0x42);
@@ -1626,7 +1627,7 @@ mod tests {
             nonce: 0,
             signature: dummy_sig(),
         };
-        sign_cold_staking_op(&mut commission_v1, &cold_v1, DEFAULT_CHAIN_ID);
+        sign_cold_staking_op(&mut commission_v1, &cold_v1, TEST_CHAIN_ID);
 
         let mut commit = GovernanceOpV2 {
             action_type: GovernanceActionType::CommitVote,
@@ -1647,7 +1648,7 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut commit, &cold_v1, DEFAULT_CHAIN_ID);
+        sign_cold_governance_op(&mut commit, &cold_v1, TEST_CHAIN_ID);
 
         let (_, cold_v2) = mixed_keypair(0x45, 0x46);
         let rotation = rotate_cold_key_op(validator_id, &cold_v1, &cold_v2, 1, 3);
@@ -1666,7 +1667,7 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_cold_governance_op(&mut reveal, &cold_v2, DEFAULT_CHAIN_ID);
+        sign_cold_governance_op(&mut reveal, &cold_v2, TEST_CHAIN_ID);
         let mut commission_v2 = StakingOp {
             body: StakingOpBody::SetCommission {
                 validator_id,
@@ -1679,20 +1680,20 @@ mod tests {
             nonce: 0,
             signature: dummy_sig(),
         };
-        sign_cold_staking_op(&mut commission_v2, &cold_v2, DEFAULT_CHAIN_ID);
+        sign_cold_staking_op(&mut commission_v2, &cold_v2, TEST_CHAIN_ID);
 
         let replay = |state: &mut ChainState| {
-            apply_staking_op(state, &commission_v1, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            apply_governance_op(state, &commit, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-            apply_staking_op(state, &rotation, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+            apply_staking_op(state, &commission_v1, TEST_CHAIN_ID, u64::MAX).unwrap();
+            apply_governance_op(state, &commit, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
+            apply_staking_op(state, &rotation, TEST_CHAIN_ID, u64::MAX).unwrap();
             state
                 .governance
                 .proposals
                 .get_mut(&proposal_id)
                 .unwrap()
                 .phase = ProposalPhase::Reveal;
-            apply_governance_op(state, &reveal, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-            apply_staking_op(state, &commission_v2, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
+            apply_governance_op(state, &reveal, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
+            apply_staking_op(state, &commission_v2, TEST_CHAIN_ID, u64::MAX).unwrap();
         };
         let mut first = base.clone();
         let mut second = base;
@@ -1720,7 +1721,7 @@ mod tests {
 
     #[test]
     fn active_validator_governance_rejects_both_hot_bypass_shapes() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (hot_pubkey, hot_keypair) = keypair(0xD5);
         let validator_id = install_governance_validator(&mut state, &hot_pubkey);
         let (_, cold_keypair) = keypair(0xD6);
@@ -1736,23 +1737,23 @@ mod tests {
             },
             signature: dummy_sig(),
         };
-        sign_hot_governance_op(&mut hot_signed, &hot_keypair, DEFAULT_CHAIN_ID);
+        sign_hot_governance_op(&mut hot_signed, &hot_keypair, TEST_CHAIN_ID);
         assert!(matches!(
-            apply_governance_op(&mut state, &hot_signed, 0, u64::MAX, DEFAULT_CHAIN_ID),
+            apply_governance_op(&mut state, &hot_signed, 0, u64::MAX, TEST_CHAIN_ID),
             Err(StateError::InvalidGovernanceOp { reason })
                 if reason.contains("hot fallback is prohibited")
         ));
 
         let mut cold_form_signed_hot = hot_signed;
         set_cold_authorization(&mut cold_form_signed_hot, 1);
-        sign_cold_governance_op(&mut cold_form_signed_hot, &hot_keypair, DEFAULT_CHAIN_ID);
+        sign_cold_governance_op(&mut cold_form_signed_hot, &hot_keypair, TEST_CHAIN_ID);
         assert!(matches!(
             apply_governance_op(
                 &mut state,
                 &cold_form_signed_hot,
                 0,
                 u64::MAX,
-                DEFAULT_CHAIN_ID
+                TEST_CHAIN_ID
             ),
             Err(StateError::GovernanceSignatureInvalid { .. })
         ));
@@ -1761,7 +1762,7 @@ mod tests {
 
     #[test]
     fn execute_remains_hot_for_active_cold_validator() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (hot_pubkey, hot_keypair) = keypair(0xD9);
         let validator_id = install_governance_validator(&mut state, &hot_pubkey);
         let (_, cold_keypair) = keypair(0xDA);
@@ -1785,8 +1786,8 @@ mod tests {
             payload: GovernancePayload::Execute { proposal_id },
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut execute, &hot_keypair, DEFAULT_CHAIN_ID);
-        apply_governance_op(&mut state, &execute, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
+        sign_governance_op(&mut execute, &hot_keypair, TEST_CHAIN_ID);
+        apply_governance_op(&mut state, &execute, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
         assert!(state.governance.queued_executions[0].executed);
         assert_eq!(state.governance.gov_nonces.get(&validator_id), Some(&1));
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 0);
@@ -1794,7 +1795,7 @@ mod tests {
 
     #[test]
     fn mixed_hot_cold_governance_and_staking_replay_is_deterministic() {
-        let mut base = ChainState::new_genesis();
+        let mut base = ChainState::new_genesis(TEST_CHAIN_ID);
         base.governance.params.proposal_deposit_spark = 1_000;
 
         let (active_hot_pubkey, active_hot_keypair) = keypair(0xE3);
@@ -1813,7 +1814,7 @@ mod tests {
             1,
         );
         set_cold_authorization(&mut cold_propose, 1);
-        sign_cold_governance_op(&mut cold_propose, &active_cold_keypair, DEFAULT_CHAIN_ID);
+        sign_cold_governance_op(&mut cold_propose, &active_cold_keypair, TEST_CHAIN_ID);
 
         let mut cold_commission = StakingOp {
             body: StakingOpBody::SetCommission {
@@ -1827,7 +1828,7 @@ mod tests {
             nonce: 0,
             signature: dummy_sig(),
         };
-        sign_cold_staking_op(&mut cold_commission, &active_cold_keypair, DEFAULT_CHAIN_ID);
+        sign_cold_staking_op(&mut cold_commission, &active_cold_keypair, TEST_CHAIN_ID);
 
         let (hot_pubkey, hot_keypair) = keypair(0xE5);
         let hot_id = install_governance_validator(&mut base, &hot_pubkey);
@@ -1850,12 +1851,12 @@ mod tests {
             *cold_authorization = None;
         }
         hot_propose.nonce = 1;
-        sign_hot_governance_op(&mut hot_propose, &hot_keypair, DEFAULT_CHAIN_ID);
+        sign_hot_governance_op(&mut hot_propose, &hot_keypair, TEST_CHAIN_ID);
 
         let replay = |state: &mut ChainState| {
-            apply_governance_op(state, &cold_propose, 0, u64::MAX, DEFAULT_CHAIN_ID).unwrap();
-            apply_staking_op(state, &cold_commission, DEFAULT_CHAIN_ID, u64::MAX).unwrap();
-            let error = apply_governance_op(state, &hot_propose, 0, u64::MAX, DEFAULT_CHAIN_ID)
+            apply_governance_op(state, &cold_propose, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
+            apply_staking_op(state, &cold_commission, TEST_CHAIN_ID, u64::MAX).unwrap();
+            let error = apply_governance_op(state, &hot_propose, 0, u64::MAX, TEST_CHAIN_ID)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -1876,7 +1877,7 @@ mod tests {
 
     #[test]
     fn governance_proposal_rejects_deposit_utxo_not_owned_by_proposer() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (attacker_pubkey, attacker_keypair) = keypair(0x11);
         let (victim_pubkey, _) = keypair(0x22);
@@ -1893,7 +1894,7 @@ mod tests {
             victim_deposit,
             1,
         );
-        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -1908,7 +1909,7 @@ mod tests {
 
     #[test]
     fn governance_proposal_rejects_victim_classical_key_with_attacker_pq_key() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (victim_pubkey, _) = keypair(0x31);
         let victim_id = install_governance_validator(&mut state, &victim_pubkey);
@@ -1921,7 +1922,7 @@ mod tests {
             .unwrap();
         let op = propose_op(victim_id, &mixed_keypair, mixed_pubkey, attacker_deposit, 1);
 
-        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -1934,7 +1935,7 @@ mod tests {
 
     #[test]
     fn apply_propose_independently_rechecks_complete_registered_key() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (victim_pubkey, _) = keypair(0x32);
         let victim_id = install_governance_validator(&mut state, &victim_pubkey);
@@ -1958,7 +1959,7 @@ mod tests {
             &mut state,
             &op,
             0,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &action,
             &attacker_deposit,
             &mixed_pubkey,
@@ -1978,7 +1979,7 @@ mod tests {
 
     #[test]
     fn governance_proposal_accepts_deposit_utxo_owned_by_proposer() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x33);
         let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
@@ -1994,7 +1995,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(state.governance.proposals.len(), 1);
@@ -2004,7 +2005,7 @@ mod tests {
 
     #[test]
     fn proposal_submission_with_overfunded_utxo_returns_change() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x35);
         let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
@@ -2021,7 +2022,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(
@@ -2041,7 +2042,7 @@ mod tests {
 
     #[test]
     fn governance_admission_uses_next_block_height_exactly_like_selection() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = 10;
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x36);
@@ -2057,7 +2058,7 @@ mod tests {
         let op = propose_op(proposer_id, &proposer_keypair, proposer_pubkey, deposit, 1);
 
         let mut next_projection = state.clone();
-        apply_governance_op(&mut next_projection, &op, 0, 11, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut next_projection, &op, 0, 11, TEST_CHAIN_ID).unwrap();
         let change = next_projection
             .utxos
             .all_entries()
@@ -2074,24 +2075,24 @@ mod tests {
             &op,
             0,
             state.height,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_ok());
-        assert!(validate_governance_op(&state, &op, 0, DEFAULT_CHAIN_ID).is_err());
+        assert!(validate_governance_op(&state, &op, 0, TEST_CHAIN_ID).is_err());
         let mut selection_projection = state.clone();
         assert!(apply_governance_op(
             &mut selection_projection,
             &op,
             0,
             state.height.saturating_add(1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
     }
 
     #[test]
     fn proposal_submission_with_exact_utxo_creates_no_change() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x36);
         let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
@@ -2108,7 +2109,7 @@ mod tests {
             1,
         );
 
-        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID).unwrap();
 
         assert!(state.utxos.get(&deposit).is_none());
         assert_eq!(
@@ -2123,7 +2124,7 @@ mod tests {
 
     #[test]
     fn proposal_submission_rejects_underfunded_utxo_without_spending_it() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x37);
         let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
@@ -2133,7 +2134,7 @@ mod tests {
             .unwrap();
         let op = propose_op(proposer_id, &proposer_keypair, proposer_pubkey, deposit, 1);
 
-        let result = apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -2149,7 +2150,7 @@ mod tests {
 
     #[test]
     fn proposal_submission_rejects_conflicting_active_parameter_target() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (first_pubkey, first_keypair, first_id, first_deposit) =
             install_proposer_with_deposit(&mut state, 0x38, 1_000, 0);
@@ -2166,7 +2167,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK,
             },
         );
-        apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &first, 0, 0, TEST_CHAIN_ID).unwrap();
 
         let second = propose_op_with_action(
             second_id,
@@ -2178,7 +2179,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK + 1,
             },
         );
-        let result = apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID);
+        let result = apply_governance_op(&mut state, &second, 0, 0, TEST_CHAIN_ID);
 
         assert!(matches!(
             result,
@@ -2195,7 +2196,7 @@ mod tests {
             ProposalPhase::Cancelled,
             ProposalPhase::Executed,
         ] {
-            let mut state = ChainState::new_genesis();
+            let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             state.governance.params.proposal_deposit_spark = 1_000;
             let (first_pubkey, first_keypair, first_id, first_deposit) =
                 install_proposer_with_deposit(&mut state, 0x3a, 1_000, 0);
@@ -2212,7 +2213,7 @@ mod tests {
                     value: DUST_LIMIT_SPARK,
                 },
             );
-            apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+            apply_governance_op(&mut state, &first, 0, 0, TEST_CHAIN_ID).unwrap();
             let first_proposal_id = *state.governance.proposals.keys().next().unwrap();
             state
                 .governance
@@ -2232,7 +2233,7 @@ mod tests {
                 },
             );
 
-            apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID)
+            apply_governance_op(&mut state, &second, 0, 0, TEST_CHAIN_ID)
                 .unwrap_or_else(|err| panic!("terminal phase {terminal_phase:?} blocked: {err}"));
             assert_eq!(state.governance.proposals.len(), 2);
         }
@@ -2240,7 +2241,7 @@ mod tests {
 
     #[test]
     fn proposal_submission_allows_different_parameters_concurrently() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (first_pubkey, first_keypair, first_id, first_deposit) =
             install_proposer_with_deposit(&mut state, 0x3c, 1_000, 0);
@@ -2257,7 +2258,7 @@ mod tests {
                 value: DUST_LIMIT_SPARK,
             },
         );
-        apply_governance_op(&mut state, &first, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &first, 0, 0, TEST_CHAIN_ID).unwrap();
 
         let second = propose_op_with_action(
             second_id,
@@ -2267,14 +2268,14 @@ mod tests {
             1,
             GovernableAction::SetSlashLivenessThresholdEpochs { value: 4 },
         );
-        apply_governance_op(&mut state, &second, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &second, 0, 0, TEST_CHAIN_ID).unwrap();
 
         assert_eq!(state.governance.proposals.len(), 2);
     }
 
     #[test]
     fn governance_deposit_refund_goes_to_proposer() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         let (proposer_pubkey, proposer_keypair) = keypair(0x44);
         let proposer_id = install_governance_validator(&mut state, &proposer_pubkey);
@@ -2289,7 +2290,7 @@ mod tests {
             deposit,
             1,
         );
-        apply_governance_op(&mut state, &op, 0, 0, DEFAULT_CHAIN_ID).unwrap();
+        apply_governance_op(&mut state, &op, 0, 0, TEST_CHAIN_ID).unwrap();
         let proposal_id = *state.governance.proposals.keys().next().unwrap();
 
         return_governance_deposit(&mut state, proposal_id, 0).unwrap();
@@ -2310,7 +2311,7 @@ mod tests {
 
     #[test]
     fn queued_governance_action_revalidated_before_execution() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (proposer_pubkey, _) = keypair(0x55);
         state.governance.params.governance_quorum_bps = 7_000;
         let proposal_id = Bytes32::from([0x55; 32]);
@@ -2346,7 +2347,7 @@ mod tests {
 
     #[test]
     fn valid_queued_governance_action_still_executes() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (proposer_pubkey, _) = keypair(0x66);
         state.governance.params.governance_quorum_bps = 5_000;
         let proposal_id = Bytes32::from([0x66; 32]);
@@ -2382,7 +2383,7 @@ mod tests {
 
     #[test]
     fn auto_execute_revalidates_stale_proposals() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (proposer_pubkey, _) = keypair(0x77);
         state.governance.params.governance_quorum_bps = 7_000;
         let proposal_id = Bytes32::from([0x77; 32]);
@@ -2418,7 +2419,7 @@ mod tests {
 
     #[test]
     fn failed_execution_time_revalidation_marks_proposal_failed() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (proposer_pubkey, _) = keypair(0x88);
         state.governance.params.governance_quorum_bps = 7_000;
         let proposal_id = Bytes32::from([0x88; 32]);
@@ -2454,7 +2455,7 @@ mod tests {
 
     #[test]
     fn state_rejects_invalid_reveal_value() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let proposal_id = Bytes32::from([0x99; 32]);
         let validator_id = Bytes32::from([0xAA; 32]);
         let nonce = Bytes32::from([0xBB; 32]);
@@ -2504,7 +2505,7 @@ mod tests {
 
     #[test]
     fn reveal_verification_uses_domain_separated_hash() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let proposal_id = Bytes32::from([0xAB; 32]);
         let validator_id = Bytes32::from([0xCD; 32]);
         let nonce = Bytes32::from([0xEF; 32]);
@@ -2551,7 +2552,7 @@ mod tests {
 
     #[test]
     fn governance_redelegation_uses_only_active_remainder_mid_unbonding() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (delegator_pubkey, delegator_keys) = keypair(0xD8);
         let delegator_id = delegator_pubkey.identity_id();
         let from_validator = Bytes32::from([0xD9; 32]);

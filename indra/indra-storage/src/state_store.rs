@@ -526,6 +526,7 @@ fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<Ch
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
 
     #[test]
@@ -602,7 +603,7 @@ mod tests {
     }
 
     fn finalized_test_state() -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.active_slot_coefficient_numerator =
             indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state.validators.upsert(test_validator()).unwrap();
@@ -734,7 +735,7 @@ mod tests {
     fn snapshot_with_future_schema_version_rejected() {
         let dir = temp_dir("future_schema");
         let store = StateStore::open(&dir).unwrap();
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = 7;
         let mut payload = Vec::new();
         payload.push(SNAPSHOT_FORMAT_VERSION);

@@ -11,26 +11,6 @@ pub struct BuiltTxOwned {
     pub spent_indices: Box<[usize]>,
 }
 
-/// Build and sign an INDRA transaction from safe Rust inputs.
-pub fn build(
-    recipient_address: &str,
-    amount_spark: u64,
-    fee_spark: u64,
-    sender_classical_seed: [u8; 32],
-    sender_pq_sk: &[u8],
-    wallet_context: WalletContext,
-) -> Result<BuiltTxOwned, IndraError> {
-    build_with_address(
-        recipient_address,
-        amount_spark,
-        fee_spark,
-        sender_classical_seed,
-        sender_pq_sk,
-        indra_core::types::primitives::DEFAULT_CHAIN_ID,
-        wallet_context,
-    )
-}
-
 /// Build and sign an INDRA transaction for a canonical payment address.
 pub fn build_with_address(
     recipient_address: &str,

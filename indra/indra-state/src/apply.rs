@@ -548,6 +548,7 @@ pub fn verify_slash_candidate(
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
 
     fn apply_block(
@@ -581,7 +582,7 @@ mod tests {
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
-                BLOCK_FORMAT_VERSION, DEFAULT_CHAIN_ID, DUST_LIMIT_SPARK,
+                BLOCK_FORMAT_VERSION, DUST_LIMIT_SPARK,
                 INITIAL_BASE_FEE_SPARK_PER_KB, MAX_STAKING_OPS_PER_BLOCK,
                 MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION,
             },
@@ -748,7 +749,7 @@ mod tests {
     }
 
     fn canonical_test_genesis() -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         install_governance_validator(&mut state, [0xF0; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         state.finalize_genesis().unwrap();
         state
@@ -781,7 +782,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -804,7 +805,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -829,7 +830,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -855,7 +856,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -873,7 +874,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -894,7 +895,7 @@ mod tests {
             payload,
             signature: dummy_sig(),
         };
-        sign_governance_op(&mut op, keypair, DEFAULT_CHAIN_ID);
+        sign_governance_op(&mut op, keypair, TEST_CHAIN_ID);
         op
     }
 
@@ -1069,7 +1070,7 @@ mod tests {
         let public = keypair.public_key();
         let validator_id =
             indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state
             .validators
             .upsert(ValidatorEntry {
@@ -1646,7 +1647,7 @@ mod tests {
             &block_hash,
             &validator_id,
             &snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         );
         let sig = keypair.sign(&signing_bytes).unwrap();
         VoteV1 {
@@ -1678,7 +1679,7 @@ mod tests {
 
     /// Build a state that has one pre-existing UTXO ready to be spent.
     fn state_with_utxo() -> (ChainState, Bytes32, HybridKeypair, [u8; 32], u64) {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
         let output = dummy_output(0x01, owner_pubkey);
@@ -1735,7 +1736,7 @@ mod tests {
     #[test]
     #[ignore = "real-hardware release benchmark; run explicitly with --release --ignored --nocapture"]
     fn max_transaction_block_validation_real_hardware_benchmark() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         install_governance_validator(&mut state, [0xF1; 32], MINIMUM_VALIDATOR_SELF_STAKE_SPARK);
         let (owner_pubkey, keypair) = make_test_keypair([0x11; 32]);
         let mut inputs = Vec::with_capacity(MAX_TX_PER_BLOCK);
@@ -1945,7 +1946,7 @@ mod tests {
         state.finalize_genesis().unwrap();
         state.rebuild_state_commitment_v2(0);
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
-        let proposal_id = compute_proposal_id(proposer_id, &action, 0, DEFAULT_CHAIN_ID);
+        let proposal_id = compute_proposal_id(proposer_id, &action, 0, TEST_CHAIN_ID);
         let mut proposal = test_proposal_record(
             proposal_id,
             proposer_id,
@@ -3813,7 +3814,7 @@ mod tests {
 
     #[test]
     fn concurrent_identical_synthetic_rewards_have_distinct_utxo_coordinates() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (owner, _) = make_test_keypair([0xD8; 32]);
         let amount = indra_core::types::primitives::DUST_LIMIT_SPARK;
         let height = 77;

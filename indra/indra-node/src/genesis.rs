@@ -428,8 +428,9 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut ChainState) -> Re
 
 /// Build and finalize state from a manifest path.
 pub fn build_finalized_genesis_state(genesis_path: Option<&str>) -> Result<ChainState, String> {
-    let mut state = ChainState::new_genesis();
     let path = genesis_path.ok_or("canonical genesis construction requires a manifest")?;
+    let chain_id = parse_genesis_manifest(path)?.genesis.chain_id;
+    let mut state = ChainState::new_genesis(&chain_id);
     load_genesis_validators(path, &mut state)?;
     state.finalize_genesis().map_err(|error| error.to_string())?;
     state.genesis_fingerprint = genesis_fingerprint(&state)?;

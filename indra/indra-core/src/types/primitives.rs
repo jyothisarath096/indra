@@ -162,8 +162,9 @@ pub const MAX_STANDARD_VRF_PROOF_BYTES: usize = 80;
 
 // ── Economics ─────────────────────────────────────────────────────────────────
 
-/// Default testnet chain ID — matches genesis.toml.example.
-pub const DEFAULT_CHAIN_ID: &str = "indra-testnet-1";
+/// Test chain ID used only by test-support builds and unit tests.
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_CHAIN_ID: &str = "indra-testnet-1";
 
 /// Spark per INDRA — 8 decimal places (matches Bitcoin's satoshi model).
 pub const SPARK_PER_INDRA: u64 = 100_000_000;

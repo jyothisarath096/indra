@@ -385,6 +385,7 @@ pub(crate) fn delegator_identity_value_hash(
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::smt::CompressedAuthTree;
     use indra_core::{
@@ -465,7 +466,7 @@ mod tests {
     #[test]
     fn consensus_snapshot_leaf_is_content_sensitive_and_domain_separated() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = height;
         state.consensus_snapshots = vec![
             consensus_snapshot(1, 0, 1_000_000_000),
@@ -505,7 +506,7 @@ mod tests {
     #[test]
     fn reward_economic_snapshot_leaf_is_content_sensitive_and_domain_separated() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = height;
         state.reward_economic_snapshot = Some(
             RewardEconomicSnapshot::new(
@@ -548,7 +549,7 @@ mod tests {
     #[test]
     fn slash_membership_root_leaf_is_content_sensitive_and_domain_separated() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = height;
         state.slash_membership_roots = vec![SlashMembershipRootRecord {
             activation_height: height,
@@ -703,7 +704,7 @@ mod tests {
     #[test]
     fn delegator_identity_incremental_updates_match_full_rebuild() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut incremental = StateCommitmentV2::from_state(&state, height);
 
         for index in 0..64u8 {
@@ -728,7 +729,7 @@ mod tests {
     #[test]
     fn delegator_identity_leaves_are_root_sensitive_and_domain_separated() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.rebuild_state_commitment_v2(height);
         let empty_root = state.state_commitment_v2_root(height);
 
@@ -764,7 +765,7 @@ mod tests {
     #[test]
     fn state_txn_rollback_rebuilds_identity_commitment_from_canonical_registry() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let existing_id = id(0x50);
         let existing_identity = pubkey(0x51);
         state
@@ -889,7 +890,7 @@ mod tests {
     #[test]
     fn evicted_validator_tombstone_incremental_commitment_matches_rebuild() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = height;
         let baseline = StateCommitmentV2::from_state(&state, height).root();
         let validator_id = id(0xED);
@@ -911,7 +912,7 @@ mod tests {
         let rebuilt = StateCommitmentV2::from_state(&state, height).root();
         assert_ne!(rebuilt, baseline);
 
-        let mut incremental = StateCommitmentV2::from_state(&ChainState::new_genesis(), height);
+        let mut incremental = StateCommitmentV2::from_state(&ChainState::new_genesis(TEST_CHAIN_ID), height);
         incremental.put_evicted_validator_tombstone(&tombstone);
         assert_eq!(incremental.root(), rebuilt);
         incremental.delete_evicted_validator_tombstone(&validator_id);
@@ -921,7 +922,7 @@ mod tests {
     #[test]
     fn state_commitment_v2_rebuild_after_decode_is_deterministic() {
         let height = u64::MAX;
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let validator = validator(0x77);
         state.validators.upsert(validator).unwrap();
         state.finalize_genesis().unwrap();

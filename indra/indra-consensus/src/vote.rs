@@ -352,8 +352,9 @@ pub fn vote_signing_bytes(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
-    use indra_core::types::{primitives::DEFAULT_CHAIN_ID, vote::VoteStep};
+    use indra_core::types::vote::VoteStep;
     use indra_crypto::hybrid::HybridKeypair;
 
     const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
@@ -381,7 +382,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
@@ -393,7 +394,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -417,7 +418,7 @@ mod tests {
                 TEST_SNAPSHOT_ROOT,
                 voter.validator_id,
                 TEST_SNAPSHOT_ROOT,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &keypair,
             )
             .is_err());
@@ -432,7 +433,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
@@ -445,7 +446,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -463,7 +464,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
@@ -475,7 +476,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -493,7 +494,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v],
         );
@@ -505,7 +506,7 @@ mod tests {
             block_hash,
             stranger.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &stranger_kp,
         )
         .unwrap();
@@ -520,7 +521,7 @@ mod tests {
             1,
             0,
             VoteStep::Prevote,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v.clone()],
         );
@@ -532,7 +533,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -586,7 +587,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
@@ -599,7 +600,7 @@ mod tests {
             block_hash,
             v1.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp1,
         )
         .unwrap();
@@ -610,7 +611,7 @@ mod tests {
             block_hash,
             v2.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp2,
         )
         .unwrap();
@@ -633,7 +634,7 @@ mod tests {
             1,
             0,
             VoteStep::Precommit,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             TEST_SNAPSHOT_ROOT,
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
@@ -645,7 +646,7 @@ mod tests {
             block_hash,
             v1.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp1,
         )
         .unwrap();
@@ -656,7 +657,7 @@ mod tests {
             block_hash,
             v2.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp2,
         )
         .unwrap();
@@ -667,7 +668,7 @@ mod tests {
             block_hash,
             v3.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp3,
         )
         .unwrap();

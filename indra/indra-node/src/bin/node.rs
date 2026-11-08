@@ -5722,6 +5722,7 @@ fn decode_node_rpc_transaction(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
 
     fn test_manifest(chain_id: &str, entries: &[([u8; 32], [u8; 32], [u8; 32])]) -> String {
@@ -7484,7 +7485,7 @@ mod tests {
 
     #[test]
     fn rpc_read_state_is_consistent_snapshot() {
-        let mut chain = indra_state::ChainState::new_genesis();
+        let mut chain = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         chain.height = 42;
         let snapshot = RpcSnapshot {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 3, false, 0, 43)
@@ -7517,7 +7518,7 @@ mod tests {
 
     #[test]
     fn provenance_rpc_prefetches_utxo_creation_block() {
-        let mut chain = indra_state::ChainState::new_genesis();
+        let mut chain = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         let created_height = 174_599;
         let utxo_id = chain
             .utxos
@@ -7554,7 +7555,7 @@ mod tests {
 
     #[test]
     fn get_transaction_rpc_prefetches_requested_block_height() {
-        let chain = indra_state::ChainState::new_genesis();
+        let chain = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         let req = indra_rpc::types::RpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "indra_getTransaction".to_string(),
@@ -7602,7 +7603,7 @@ mod tests {
     #[test]
     fn rpc_snapshot_serves_get_transaction_from_requested_block() {
         let height = 176_677;
-        let mut chain = indra_state::ChainState::new_genesis();
+        let mut chain = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         chain.height = height + 2;
         let tx = snapshot_test_transaction(0xA7);
         let expected_tx_hex = hex::encode(tx.encode_to_vec());
@@ -7635,7 +7636,7 @@ mod tests {
 
     #[test]
     fn rpc_snapshot_serves_requested_block_without_tip_stub() {
-        let mut chain = indra_state::ChainState::new_genesis();
+        let mut chain = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         chain.height = 2;
         let unsigned = indra_core::types::block::BlockVNext {
             header: indra_core::types::block::BlockHeaderVNext {

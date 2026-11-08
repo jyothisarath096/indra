@@ -1179,6 +1179,7 @@ pub(crate) fn verify_block_state_root(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_consensus::qc::{verify_qc_strict, QcValidator};
     use indra_consensus::{
@@ -1191,7 +1192,7 @@ mod tests {
         codec::Encode,
         types::{
             block::BlockVNext,
-            primitives::{DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS},
+            primitives::EPOCH_DURATION_BLOCKS,
             vote::VoteStep,
         },
         Bytes32, QuorumCertificateV1, VariableBytes,
@@ -1414,7 +1415,7 @@ mod tests {
             value_hash,
             validator_id,
             snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             hybrid,
         )
         .unwrap();
@@ -1422,7 +1423,7 @@ mod tests {
             height,
             round,
             value_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot_root,
             &[QcValidator {
                 validator_id,
@@ -1458,7 +1459,7 @@ mod tests {
                     block_hash,
                     validator_id,
                     snapshot.snapshot_root,
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                     signer,
                 )
                 .unwrap()
@@ -1468,7 +1469,7 @@ mod tests {
             height,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot.snapshot_root,
             &validators,
             votes.iter().collect(),
@@ -1676,7 +1677,7 @@ mod tests {
 
     #[test]
     fn imported_projection_commit_matches_reference_two_step_sequence() {
-        let mut reference_state = ChainState::new_genesis();
+        let mut reference_state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) =
             install_active_validator(&mut reference_state, 0x61, 10_000, true, true);
         let mut actual_state = reference_state.clone();
@@ -1721,7 +1722,7 @@ mod tests {
 
     #[test]
     fn optimized_import_projection_roots_match_old_two_call_reference() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x71, 10_000, true, true);
         let mut prev_qc = Vec::new();
 
@@ -1768,7 +1769,7 @@ mod tests {
 
     #[test]
     fn live_import_projection_commit_preserves_epoch_record_timestamp() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x62, 10_000, true, true);
         advance_fixture_height_with_issuance(&mut state, EPOCH_DURATION_BLOCKS - 1);
         state.tip_hash = Bytes32::from([0xA5; 32]);
@@ -1994,7 +1995,7 @@ mod tests {
         let dir = temp_dir("b");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let _ = install_active_validator(&mut state, 0x41, 10_000, true, true);
         let mut mempool = Mempool::default_config();
         let mut block_store = BlockStore::open(
@@ -2354,7 +2355,7 @@ mod tests {
 
     #[test]
     fn valid_qc_for_other_hash_proves_provisional_block_is_wrong() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0xB1, 10_000, true, true);
         let real = make_strict_block(&state, 0xB1, 0, vec![]);
         let mut unfinalized_fork = real.clone();
@@ -2408,7 +2409,7 @@ mod tests {
 
     #[test]
     fn invalid_later_certificate_is_attributed_to_carrier() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0xB2, 10_000, true, true);
         let block = make_strict_block(&state, 0xB2, 0, vec![]);
         let mut qc = build_qc_bytes(
@@ -2537,7 +2538,7 @@ mod tests {
     #[ignore = "real-hardware release benchmark; run explicitly with --release --ignored --nocapture"]
     fn buffered_sync_real_hardware_benchmark() {
         const FINALIZED_BLOCKS: usize = 50;
-        let mut builder = ChainState::new_genesis();
+        let mut builder = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) =
             install_active_validator(&mut builder, 0xC1, 10_000, true, true);
         let initial = builder.clone();
@@ -2606,7 +2607,7 @@ mod tests {
         const SIGNERS: usize = 134;
         const BYZANTINE_SOURCES: usize = 67;
 
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut keypairs = Vec::with_capacity(VALIDATORS);
         for seed in 1..=VALIDATORS {
             let (_, keypair) =
@@ -2744,7 +2745,7 @@ mod tests {
 
     #[test]
     fn strict_block_one_accepts_empty_qc() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (_validator_id, _hybrid) =
             install_active_validator(&mut state, 0x11, 10_000, true, true);
         let block = make_strict_block(&state, 0x11, 0, vec![]);
@@ -2756,7 +2757,7 @@ mod tests {
 
     #[test]
     fn strict_block_two_rejects_empty_qc() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x12, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x12, 0, vec![]);
         apply_verified_test(&mut state, &block1, 0).unwrap();
@@ -2787,7 +2788,7 @@ mod tests {
 
     #[test]
     fn verify_block_qc_rejects_wrong_height_qc() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x14, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x14, 0, vec![]);
@@ -2836,7 +2837,7 @@ mod tests {
 
     #[test]
     fn verify_block_qc_rejects_qc_certifying_wrong_parent_hash() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x15, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x15, 0, vec![]);
@@ -2892,7 +2893,7 @@ mod tests {
 
     #[test]
     fn verify_block_qc_accepts_qc_certifying_correct_parent_hash() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x16, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x16, 0, vec![]);
@@ -2918,7 +2919,7 @@ mod tests {
 
     #[test]
     fn all_sync_qc_surfaces_reject_trailing_bytes() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x17, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x17, 0, vec![]);
         let valid_qc = build_qc_bytes(
@@ -2958,7 +2959,7 @@ mod tests {
 
     #[test]
     fn bounded_network_qc_queue_returns_every_admitted_outcome() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x18, 10_000, true, true);
         install_test_snapshot_at_inert_gate(&mut state);
         let snapshot = state
@@ -3006,7 +3007,7 @@ mod tests {
 
     #[test]
     fn syncing_node_rejects_post_block_weight_inflation_qc_attack() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (a_id, a) = install_active_validator(&mut state, 0xB1, 20, true, true);
         install_active_validator(&mut state, 0xB2, 40, true, true);
         install_active_validator(&mut state, 0xB3, 40, true, true);
@@ -3033,7 +3034,7 @@ mod tests {
                     .collect::<Vec<_>>()
             },
             state.validators.total_active_stake(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_ok());
         assert!(verify_sync_qc(&qc, &state, u64::MAX).is_err());
@@ -3043,7 +3044,7 @@ mod tests {
     fn consensus_snapshot_capstone_blocks_both_original_qc_attacks_end_to_end() {
         use indra_consensus::vote::{VoteCollector, VoteDecision};
 
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (a_id, a) = install_active_validator(&mut state, 0xC1, 40, true, true);
         let (_, b) = install_active_validator(&mut state, 0xC2, 30, true, true);
         let (c_id, _) = install_active_validator(&mut state, 0xC3, 30, true, true);
@@ -3061,7 +3062,7 @@ mod tests {
             u64::MAX,
             0,
             VoteStep::Precommit,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             snapshot.snapshot_root,
             voters,
         );
@@ -3072,7 +3073,7 @@ mod tests {
             block_h_hash,
             a_id,
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &a,
         )
         .unwrap();
@@ -3087,7 +3088,7 @@ mod tests {
             block_h_hash,
             b_id,
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &b,
         )
         .unwrap();
@@ -3103,7 +3104,7 @@ mod tests {
             u64::MAX,
             0,
             block_h_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot.snapshot_root,
             &crate::engine::NodeEngine::qc_validators_for_height(u64::MAX, &snapshot),
             vec![&a_vote, &b_vote],
@@ -3131,13 +3132,13 @@ mod tests {
             &qc_h,
             &live_qc_validators,
             state.validators.total_active_stake(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
         assert!(crate::engine::NodeEngine::verify_qc_with_snapshot(
             &qc_h,
             &snapshot,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_ok());
         assert!(verify_sync_qc(&qc_h, &state, u64::MAX).is_ok());
@@ -3165,13 +3166,13 @@ mod tests {
             &forged,
             &inflated_qc_validators,
             state.validators.total_active_stake(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_ok());
         assert!(crate::engine::NodeEngine::verify_qc_with_snapshot(
             &forged,
             &snapshot,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
         assert!(verify_sync_qc(&forged, &state, u64::MAX).is_err());
@@ -3188,7 +3189,7 @@ mod tests {
 
     #[test]
     fn strict_valid_block_with_vrf_qc_and_state_root_passes() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x31, 10_000, true, true);
 
         let block1 = make_strict_block(&state, 0x31, 0, vec![]);

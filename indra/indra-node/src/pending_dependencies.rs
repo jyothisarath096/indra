@@ -446,6 +446,7 @@ pub(crate) fn slash_footprint(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::types::{
         crypto::{ColdHybridPubKey, HybridSignature},
@@ -524,7 +525,7 @@ mod tests {
 
     #[test]
     fn every_staking_and_governance_variant_has_its_required_dependency_families() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let signer = Bytes32::from([0x11; 32]);
         let validator = Bytes32::from([0x22; 32]);
         let position = StakePositionV1::new(

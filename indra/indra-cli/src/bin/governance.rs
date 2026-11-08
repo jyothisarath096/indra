@@ -718,6 +718,7 @@ Vote flags:\n\
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use std::sync::Mutex;
 
@@ -733,7 +734,7 @@ mod tests {
 
     #[test]
     fn cli_cold_proposal_is_accepted_by_consensus() {
-        use indra_core::types::{primitives::DEFAULT_CHAIN_ID, transaction::OutputV1};
+        use indra_core::types::transaction::OutputV1;
         use indra_crypto::hybrid::{ClassicalKeypair, ColdHybridKeypair, PqKeypair};
         use indra_state::validator::{ValidatorEntry, ValidatorStatus};
 
@@ -749,7 +750,7 @@ mod tests {
         let validator_id = hot_pubkey.identity_id();
         let cold = ColdHybridKeypair::from_independent_seeds([0x93; 32], [0x94; 32]).unwrap();
         let cold_pubkey = cold_hybrid_pubkey(&cold).unwrap();
-        let mut state = indra_state::ChainState::new_genesis();
+        let mut state = indra_state::ChainState::new_genesis(TEST_CHAIN_ID);
         state.governance.params.proposal_deposit_spark = 1_000;
         state
             .validators
@@ -806,9 +807,9 @@ mod tests {
                 cold_nonce: 1,
             }),
         };
-        let op = build_cold_governance_op(validator_id, payload, &cold, DEFAULT_CHAIN_ID).unwrap();
+        let op = build_cold_governance_op(validator_id, payload, &cold, TEST_CHAIN_ID).unwrap();
 
-        indra_state::governance_apply::apply_governance_op(&mut state, &op, 0, 1, DEFAULT_CHAIN_ID)
+        indra_state::governance_apply::apply_governance_op(&mut state, &op, 0, 1, TEST_CHAIN_ID)
             .unwrap();
         assert_eq!(state.governance.proposals.len(), 1);
         assert!(state.utxos.get(&deposit).is_none());

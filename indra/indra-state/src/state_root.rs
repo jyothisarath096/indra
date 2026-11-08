@@ -81,12 +81,13 @@ pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> 
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::types::{crypto::HybridPubKey, transaction::OutputV1};
 
     #[test]
     fn state_root_is_deterministic_and_changes_with_canonical_state() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         assert_eq!(
             compute_state_root(&state),
             compute_state_root(&state.clone())
@@ -119,7 +120,7 @@ mod tests {
 
     #[test]
     fn chain_id_is_committed() {
-        let first = ChainState::new_genesis();
+        let first = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut second = first.clone();
         second.chain_id = "other-chain".to_string();
         second.rebuild_state_commitment_v2(second.height);
@@ -128,7 +129,7 @@ mod tests {
 
     #[test]
     fn election_seed_is_committed() {
-        let first = ChainState::new_genesis();
+        let first = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut changed_seed = first.clone();
         changed_seed.election_seed = indra_core::Bytes64([0xA5; 64]);
         assert_ne!(
@@ -139,7 +140,7 @@ mod tests {
 
     #[test]
     fn genesis_timestamp_is_committed() {
-        let first = ChainState::new_genesis();
+        let first = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut changed = first.clone();
         changed.genesis_timestamp += 1;
         assert_ne!(compute_state_root(&first), compute_state_root(&changed));

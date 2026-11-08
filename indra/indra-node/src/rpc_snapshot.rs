@@ -435,6 +435,7 @@ fn index_tranche(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::types::stake_position::{PositionCustodyV1, UnbondingTimingV1};
     use std::{
@@ -453,7 +454,7 @@ mod tests {
     }
 
     fn populated_state_with_distribution(count: usize, dominant_validator: bool) -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         for number in 0..count as u64 {
             let validator_id = if dominant_validator {
                 numbered_id(1)
@@ -575,7 +576,7 @@ mod tests {
 
     #[test]
     fn publication_is_prior_or_new_and_never_torn() {
-        let old = ChainState::new_genesis();
+        let old = ChainState::new_genesis(TEST_CHAIN_ID);
         let publisher = RpcSnapshotPublisher::new(&old, 0, false, 0, 0);
         let held_old = publisher.load();
         let mut new = old.clone();

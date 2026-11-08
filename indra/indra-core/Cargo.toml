@@ -6,6 +6,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 indra-crypto       = { path = "../indra-crypto" }
 sha2.workspace     = true

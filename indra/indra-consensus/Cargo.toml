@@ -16,7 +16,7 @@ indra-state  = { path = "../indra-state" }
 thiserror.workspace = true
 
 [dev-dependencies]
-indra-core   = { path = "../indra-core" }
+indra-core   = { path = "../indra-core", features = ["test-support"] }
 indra-crypto = { path = "../indra-crypto" }
 indra-state  = { path = "../indra-state", features = ["test-support"] }
 rand.workspace = true

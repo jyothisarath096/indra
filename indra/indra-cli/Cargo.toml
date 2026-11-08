@@ -22,7 +22,7 @@ libc.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-indra-core      = { path = "../indra-core" }
+indra-core      = { path = "../indra-core", features = ["test-support"] }
 indra-crypto    = { path = "../indra-crypto" }
 indra-node      = { path = "../indra-node", features = ["test-support"] }
 indra-rpc       = { path = "../indra-rpc" }

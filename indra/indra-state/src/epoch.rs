@@ -1193,6 +1193,7 @@ pub fn epoch_for_height(height: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::{
         compute_state_root,
@@ -1213,7 +1214,7 @@ mod tests {
     };
 
     fn new_test_state() -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.active_slot_coefficient_numerator =
             indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         state

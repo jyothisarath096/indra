@@ -2866,6 +2866,7 @@ fn send_transaction(params: &[String]) -> DispatchResult {
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{
         types::{
@@ -2892,7 +2893,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn make_state(_suffix: &str) -> ChainState {
-        ChainState::new_genesis()
+        ChainState::new_genesis(TEST_CHAIN_ID)
     }
 
     struct BlockBackedEngine {
@@ -3060,7 +3061,7 @@ mod tests {
     }
 
     fn block_backed_engine() -> BlockBackedEngine {
-        let mut chain = ChainState::new_genesis();
+        let mut chain = ChainState::new_genesis(TEST_CHAIN_ID);
         chain.height = 2;
         let block1 = dummy_block(1, 0x11);
         let block2 = dummy_block(2, 0x22);

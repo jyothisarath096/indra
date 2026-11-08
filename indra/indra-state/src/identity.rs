@@ -122,6 +122,7 @@ pub fn resolve_delegator_identity_for_redelegation(
 
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_core::{types::crypto::HybridPubKey, VariableBytes};
 
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn resolve_registered_identity_accepts_matching_submitted_pubkey() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let delegator_id = id(0x10);
         let registered = pubkey(0x10, 0xA0);
         state
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn resolve_registered_identity_rejects_different_submitted_pubkey() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let delegator_id = id(0x11);
         state
             .delegator_identities
@@ -167,7 +168,7 @@ mod tests {
 
     #[test]
     fn resolve_new_identity_without_registry_reports_no_prior_record() {
-        let state = ChainState::new_genesis();
+        let state = ChainState::new_genesis(TEST_CHAIN_ID);
         let delegator_id = id(0x12);
 
         assert_eq!(

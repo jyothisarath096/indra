@@ -1,5 +1,7 @@
 //! Integration tests for the full node pipeline.
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_consensus::mempool::Mempool;
 use indra_consensus::{
     build_qc,
@@ -12,7 +14,7 @@ use indra_core::{
     codec::{Decode, Encode},
     types::{
         crypto::HybridSignature,
-        primitives::{VariableBytes, DEFAULT_CHAIN_ID},
+        primitives::VariableBytes,
         vote::{VoteStep, VoteV1},
     },
     Bytes32,
@@ -999,7 +1001,7 @@ fn node_syncs_before_joining_consensus() {
             .snapshot_for_consensus_height(1)
             .unwrap()
             .snapshot_root,
-        DEFAULT_CHAIN_ID,
+        TEST_CHAIN_ID,
         &remote,
     )
     .unwrap();

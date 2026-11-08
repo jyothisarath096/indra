@@ -6,11 +6,13 @@
 //!
 //!   cargo test -p indra-state --test audit_phase2 -- --ignored
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_core::types::{
     block::{BlockHeaderVNext, BlockVNext},
     crypto::{HybridPubKey, HybridSignature},
     primitives::{
-        Bytes32, ProtocolVersion, VariableBytes, DEFAULT_CHAIN_ID, INITIAL_BASE_FEE_SPARK_PER_KB,
+        Bytes32, ProtocolVersion, VariableBytes, INITIAL_BASE_FEE_SPARK_PER_KB,
         LIFETIME_SUPPLY_CAP_SPARK, MAX_QC_SIZE_BYTES, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
         TRANSACTION_PROTOCOL_VERSION,
     },
@@ -36,7 +38,7 @@ fn keypair(seed: [u8; 32]) -> (HybridPubKey, HybridKeypair) {
 }
 
 fn finalized_genesis() -> ChainState {
-    let mut state = ChainState::new_genesis();
+    let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
     state.active_slot_coefficient_numerator =
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     let seed = [0xF0; 32];
@@ -139,7 +141,7 @@ fn tx_spending(
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         },
     };
-    tx.signature = sign_tx(&tx, keypair, DEFAULT_CHAIN_ID);
+    tx.signature = sign_tx(&tx, keypair, TEST_CHAIN_ID);
     tx
 }
 
@@ -173,7 +175,7 @@ fn tx_spending_same_utxo_twice(
             pq_sig: VariableBytes::from_slice(&[0u8; 4627]).unwrap(),
         },
     };
-    tx.signature = sign_tx(&tx, keypair, DEFAULT_CHAIN_ID);
+    tx.signature = sign_tx(&tx, keypair, TEST_CHAIN_ID);
     tx
 }
 
@@ -290,7 +292,7 @@ fn t02_duplicate_utxo_spend_across_two_transactions_in_one_block_is_rejected() {
         [0x62; 32],
     );
     tx_b.outputs[0].lock_height = 1;
-    tx_b.signature = sign_tx(&tx_b, &owner_keypair, DEFAULT_CHAIN_ID);
+    tx_b.signature = sign_tx(&tx_b, &owner_keypair, TEST_CHAIN_ID);
 
     let block = block_with_transactions(&state, vec![tx_a, tx_b]);
 

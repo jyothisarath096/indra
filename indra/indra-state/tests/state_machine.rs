@@ -3,6 +3,8 @@
 //! These tests verify multi-block scenarios, epoch transitions,
 //! and fee evolution over sequences of blocks.
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_core::{
     codec::{Decode, Encode},
     types::{
@@ -30,7 +32,7 @@ use indra_state::{
 const TEST_INPUT_VALUE: u64 = 1_000_000;
 
 fn new_test_state() -> ChainState {
-    let mut state = ChainState::new_genesis();
+    let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
     state.active_slot_coefficient_numerator =
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state

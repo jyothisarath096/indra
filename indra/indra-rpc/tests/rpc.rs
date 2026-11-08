@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_core::types::{
     crypto::HybridPubKey,
     governance::{GovernableAction, ProposalTier},
@@ -23,7 +25,7 @@ use indra_state::governance::{
 use indra_state::ChainState;
 
 fn engine(_suffix: &str) -> ChainState {
-    ChainState::new_genesis()
+    ChainState::new_genesis(TEST_CHAIN_ID)
 }
 
 fn dummy_output(byte: u8) -> OutputV1 {

@@ -422,7 +422,7 @@ pub fn verify_qc_strict(
 mod tests {
     use super::*;
     use crate::vote::produce_vote;
-    use indra_core::types::primitives::DEFAULT_CHAIN_ID;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::{
         block::VrfSuiteV1,
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
@@ -491,7 +491,7 @@ mod tests {
             block_hash,
             validator.validator_id,
             snapshot_a.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &signer,
         )
         .unwrap();
@@ -499,15 +499,15 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot_a.snapshot_root,
             &[validator],
             vec![&vote],
         )
         .unwrap();
 
-        assert!(verify_qc_against_snapshot(&qc, &snapshot_a, DEFAULT_CHAIN_ID).is_ok());
-        assert!(verify_qc_against_snapshot(&qc, &snapshot_b, DEFAULT_CHAIN_ID).is_err());
+        assert!(verify_qc_against_snapshot(&qc, &snapshot_a, TEST_CHAIN_ID).is_ok());
+        assert!(verify_qc_against_snapshot(&qc, &snapshot_b, TEST_CHAIN_ID).is_err());
     }
 
     #[test]
@@ -524,7 +524,7 @@ mod tests {
             block_hash,
             a.validator_id,
             root_a,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &a_key,
         )
         .unwrap();
@@ -535,7 +535,7 @@ mod tests {
             block_hash,
             b.validator_id,
             root_b,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &b_key,
         )
         .unwrap();
@@ -543,7 +543,7 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             root_a,
             &[a, b],
             vec![&vote_a, &vote_b],
@@ -562,7 +562,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -570,7 +570,7 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
@@ -591,7 +591,7 @@ mod tests {
             TEST_SNAPSHOT_ROOT,
             validator.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &keypair,
         )
         .unwrap();
@@ -604,7 +604,7 @@ mod tests {
                 1,
                 round,
                 TEST_SNAPSHOT_ROOT,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 TEST_SNAPSHOT_ROOT,
                 std::slice::from_ref(&validator),
                 vec![&vote],
@@ -624,7 +624,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -632,7 +632,7 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
@@ -653,7 +653,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -675,8 +675,8 @@ mod tests {
                     .unwrap(),
             }],
         };
-        assert!(verify_qc(&qc, &[v.clone()], 10_000, DEFAULT_CHAIN_ID).is_ok());
-        assert!(verify_qc_strict(&qc, &[v], 10_000, DEFAULT_CHAIN_ID).is_ok());
+        assert!(verify_qc(&qc, &[v.clone()], 10_000, TEST_CHAIN_ID).is_ok());
+        assert!(verify_qc_strict(&qc, &[v], 10_000, TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -690,7 +690,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -698,7 +698,7 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
@@ -707,7 +707,7 @@ mod tests {
         qc.classical_signatures.clear();
 
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::SignatureCountMismatch {
                 expected: 1,
                 got: 0,
@@ -726,7 +726,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -734,14 +734,14 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
         )
         .unwrap();
 
-        assert!(verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID).is_ok());
+        assert!(verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -755,7 +755,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -763,7 +763,7 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v.clone()],
             vec![&vote],
@@ -773,7 +773,7 @@ mod tests {
             VariableBytes::from_slice(&[0x42u8; 64]).unwrap();
 
         assert!(matches!(
-            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::CryptoError { .. })
         ));
     }
@@ -790,7 +790,7 @@ mod tests {
             block_hash,
             v1.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp1,
         )
         .unwrap();
@@ -798,14 +798,14 @@ mod tests {
             1,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &[v1.clone(), v2.clone()],
             vec![&vote],
         )
         .unwrap();
         assert!(matches!(
-            verify_qc(&qc, &[v1, v2], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v1, v2], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::InsufficientStake { .. })
         ));
     }
@@ -832,7 +832,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::InvalidPQSignature { .. })
         ));
     }
@@ -852,7 +852,7 @@ mod tests {
             classical_signatures: vec![],
         };
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::SignatureCountMismatch {
                 expected: 1,
                 got: 0
@@ -871,7 +871,7 @@ mod tests {
             block_hash,
             v.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &kp,
         )
         .unwrap();
@@ -912,7 +912,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            verify_qc(&qc, &[v], 10_000, DEFAULT_CHAIN_ID),
+            verify_qc(&qc, &[v], 10_000, TEST_CHAIN_ID),
             Err(ConsensusError::DuplicateSignature)
         );
     }
@@ -942,7 +942,7 @@ mod tests {
             hash_a,
             byzantine.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_key,
         )
         .unwrap();
@@ -953,7 +953,7 @@ mod tests {
             hash_a,
             honest_a.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &honest_a_key,
         )
         .unwrap();
@@ -964,7 +964,7 @@ mod tests {
             hash_b,
             byzantine.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_key,
         )
         .unwrap();
@@ -975,7 +975,7 @@ mod tests {
             hash_b,
             honest_b.validator_id,
             TEST_SNAPSHOT_ROOT,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &honest_b_key,
         )
         .unwrap();
@@ -984,7 +984,7 @@ mod tests {
             height,
             round,
             hash_a,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &validators,
             vec![&byzantine_a, &honest_a_vote],
@@ -994,7 +994,7 @@ mod tests {
             height,
             round,
             hash_b,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
             &validators,
             vec![&byzantine_b, &honest_b_vote],
@@ -1004,11 +1004,11 @@ mod tests {
         assert!(3_333u128 * 3 < total_stake as u128);
         assert!(!has_strict_two_thirds_quorum(6_667, total_stake));
         assert!(matches!(
-            verify_qc(&qc_a, &validators, total_stake, DEFAULT_CHAIN_ID),
+            verify_qc(&qc_a, &validators, total_stake, TEST_CHAIN_ID),
             Err(ConsensusError::InsufficientStake { .. })
         ));
         assert!(matches!(
-            verify_qc(&qc_b, &validators, total_stake, DEFAULT_CHAIN_ID),
+            verify_qc(&qc_b, &validators, total_stake, TEST_CHAIN_ID),
             Err(ConsensusError::InsufficientStake { .. })
         ));
     }

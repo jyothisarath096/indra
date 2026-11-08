@@ -1,3 +1,4 @@
+use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::NodeConfig;
     use indra_consensus::{
@@ -6,7 +7,7 @@
     };
     use indra_core::{
         types::block::{BlockHeaderVNext, BlockVNext},
-        types::primitives::{DEFAULT_CHAIN_ID, DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK},
+        types::primitives::{DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK},
         Bytes32, Bytes64, ProtocolVersion, VariableBytes,
     };
     use indra_crypto::{
@@ -134,7 +135,7 @@
             block_hash,
             validator_id,
             snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             signer,
         )
         .unwrap();
@@ -142,7 +143,7 @@
             height,
             0,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot_root,
             &driver.engine.qc_validators(),
             vec![&vote],
@@ -178,7 +179,7 @@
                     block_hash,
                     validator_id,
                     snapshot_root,
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                     signer,
                 )
                 .unwrap()
@@ -189,7 +190,7 @@
             height,
             round,
             block_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot_root,
             &driver.engine.qc_validators(),
             vote_refs,
@@ -412,7 +413,7 @@
             block,
             proposer_authorization: empty,
         };
-        let transcript = proposal.signing_bytes(DEFAULT_CHAIN_ID.as_bytes()).unwrap();
+        let transcript = proposal.signing_bytes(TEST_CHAIN_ID.as_bytes()).unwrap();
         let signature = signer.sign(&transcript).unwrap();
         proposal.proposer_authorization = indra_core::types::crypto::HybridSignature {
             classical_sig: VariableBytes::from_slice(&signature.classical.0).unwrap(),
@@ -961,7 +962,7 @@
         let qc = QuorumCertificateV1::decode_exact(&fixture.drivers[0].last_qc_bytes()).unwrap();
         assert_eq!((qc.height,qc.round,qc.block_hash),(1,0,hash));
         let snapshot = fixture.drivers[0].engine.state.snapshot_for_consensus_height(1).unwrap().clone();
-        indra_core::types::qc::verify_qc_against_snapshot(&qc, &snapshot, DEFAULT_CHAIN_ID).unwrap();
+        indra_core::types::qc::verify_qc_against_snapshot(&qc, &snapshot, TEST_CHAIN_ID).unwrap();
         let qc_signers: Vec<_> = snapshot.entries().iter().enumerate()
             .filter(|(i, _)| (qc.signer_bitfield[*i / 8] & (1u8 << (*i % 8))) != 0)
             .map(|(_, entry)| entry.validator_id)
@@ -1029,7 +1030,7 @@
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15000".parse().unwrap(), vote: prevotes[0].clone() });
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15002".parse().unwrap(), vote: precommits[2].1.clone() });
         let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&fixture.materials[3].seed), fixture.materials[3].pq.clone());
-        let conflicting = indra_consensus::vote::produce_vote(1, 0, VoteStep::Precommit, Bytes32([9u8;32]), ids[3], governing_snapshot_root(&fixture.drivers[0], 1), DEFAULT_CHAIN_ID, &signer).unwrap();
+        let conflicting = indra_consensus::vote::produce_vote(1, 0, VoteStep::Precommit, Bytes32([9u8;32]), ids[3], governing_snapshot_root(&fixture.drivers[0], 1), TEST_CHAIN_ID, &signer).unwrap();
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15003".parse().unwrap(), vote: conflicting });
         let after = (fixture.drivers[0].engine.state.height, fixture.drivers[0].engine.state.tip_hash, fixture.drivers[0].last_qc_bytes(), fixture.drivers[0].last_qc_height(), fixture.drivers[0].current_round(), fixture.drivers[0].current_phase(), fixture.drivers[0].vote_admission_metrics.qc_formations);
         assert_eq!(after, baseline);
@@ -1085,7 +1086,7 @@
                 let qc = QuorumCertificateV1::decode_exact(proposal.block.header.quorum_certificate.as_slice()).unwrap();
                 assert_eq!((qc.height, qc.block_hash), (1, height1_hash));
                 let snap = fixture.drivers[0].engine.state.snapshot_for_consensus_height(1).unwrap().clone();
-                indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, DEFAULT_CHAIN_ID).unwrap();
+                indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, TEST_CHAIN_ID).unwrap();
             }
             for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
             let mut prevotes = Vec::new();
@@ -1114,7 +1115,7 @@
             let qc = QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap();
             assert_eq!((qc.height, qc.round, qc.block_hash), (2, height2_round, height2_hash));
             let snap = d.engine.state.snapshot_for_consensus_height(2).unwrap().clone();
-            indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, DEFAULT_CHAIN_ID).unwrap();
+            indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, TEST_CHAIN_ID).unwrap();
         }
         let d0 = &mut fixture.drivers[0];
         let before_roots = indra_state::compute_state_roots(&d0.engine.state);
@@ -1181,7 +1182,7 @@
         pcs.sort_by_key(|(i,_)|*i);
         for i in 0..4 { for (j,v) in &pcs { if *j != i { fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",21000+j).parse().unwrap(), vote: v.clone() }); } } }
         let roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
-        for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,recovered_hash); assert_eq!(d.current_round(), 0); assert_eq!(d.current_phase(), RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.block_hash),(1,recovered_hash)); let snap=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&snap,DEFAULT_CHAIN_ID).unwrap(); }
+        for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,recovered_hash); assert_eq!(d.current_round(), 0); assert_eq!(d.current_phase(), RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.block_hash),(1,recovered_hash)); let snap=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&snap,TEST_CHAIN_ID).unwrap(); }
         let a = &mut fixture.drivers[0]; let before_roots=indra_state::compute_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,before_roots.state_root,before_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19000".parse().unwrap(),vote:votes[0].clone()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19001".parse().unwrap(),vote:partition_nil_precommit.clone().unwrap()}); let after_roots=indra_state::compute_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,after_roots.state_root,after_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after);
         let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
         let _ = (hash, partition, partition_nil_precommit.clone());
@@ -1227,7 +1228,7 @@
         let mut votes=Vec::new(); for i in 0..4 { let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}).unwrap(); post_gst_emitted_messages+=1; votes.push((i,v,delivery_step)); }
         let mut pcs=Vec::new(); let delivered_step=delivery_step+1; for (j,v,emitted) in &votes { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if i!=*j { let acts=fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",22000+j).parse().unwrap(),vote:v.clone()}); if let Some(pc)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)}else{None}){post_gst_emitted_messages+=1; pcs.push((i,pc,delivered_step));} } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step;
         pcs.sort_by_key(|(i,_,_)|*i); let delivered_step=delivery_step+1; for (j,v,emitted) in &pcs { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if *j!=i { fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",23000+j).parse().unwrap(),vote:v.clone()}); } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step; assert!(delivery_step > 0); assert_eq!(post_gst_emitted_messages,post_gst_delivered_broadcasts);
-        let roots=indra_state::compute_state_roots(&fixture.drivers[0].engine.state); for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,hash); assert_eq!(d.current_round(),0); assert_eq!(d.current_phase(),RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.round,qc.block_hash),(1,round,hash)); let s=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&s,DEFAULT_CHAIN_ID).unwrap(); }
+        let roots=indra_state::compute_state_roots(&fixture.drivers[0].engine.state); for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,hash); assert_eq!(d.current_round(),0); assert_eq!(d.current_phase(),RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.round,qc.block_hash),(1,round,hash)); let s=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&s,TEST_CHAIN_ID).unwrap(); }
         let a=&mut fixture.drivers[0]; let rb=indra_state::compute_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,rb.state_root,rb.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundBlock{from:None,proposal:delayed_proposal}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24000".parse().unwrap(),vote:old_prevote.unwrap()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24001".parse().unwrap(),vote:old_precommit.unwrap()}); let ra=indra_state::compute_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,ra.state_root,ra.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after); assert!(a.pending_proposal(&_initial_hash).is_none()); assert!(a.locked_round.is_none()&&a.locked_value.is_none()&&a.valid_round.is_none()&&a.valid_value.is_none());
         let dirs=fixture.dirs; drop(fixture.drivers); for dir in dirs { let _=std::fs::remove_dir_all(dir); }
     }
@@ -1683,7 +1684,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 &snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
         }
@@ -1712,7 +1713,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 &snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
             assert!(no_broadcast_vote(&driver.sign_and_record_local_vote(
@@ -1862,7 +1863,7 @@
             proposal_hash,
             ids[3],
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_signer,
         )
         .unwrap();
@@ -1873,7 +1874,7 @@
             conflicting_hash,
             ids[3],
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_signer,
         )
         .unwrap();
@@ -2011,7 +2012,7 @@
             conflicting_hash,
             ids[3],
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_signer,
         )
         .unwrap();
@@ -2042,7 +2043,7 @@
             proposal_hash,
             ids[3],
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_signer,
         )
         .unwrap();
@@ -2053,7 +2054,7 @@
             conflicting_hash,
             ids[3],
             snapshot.snapshot_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &byzantine_signer,
         )
         .unwrap();
@@ -2093,7 +2094,7 @@
             1,
             round,
             conflicting_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             snapshot.snapshot_root,
             &qc_validators,
             vec![
@@ -2106,7 +2107,7 @@
         assert!(indra_core::types::qc::verify_qc_against_snapshot(
             &conflicting_qc,
             &snapshot,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
         )
         .is_err());
 
@@ -2152,7 +2153,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 &snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
         }
@@ -2586,7 +2587,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 &snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
         }
@@ -3176,7 +3177,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 &snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
         }
@@ -3828,7 +3829,7 @@
                 indra_core::types::qc::verify_qc_against_snapshot(
                     &parent_qc,
                     parent_snapshot,
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                 )
                 .unwrap();
             }
@@ -4068,7 +4069,7 @@
                 indra_core::types::qc::verify_qc_against_snapshot(
                     &qc,
                     &snapshot,
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                 )
                 .unwrap();
                 assert!(matches!(driver.vote_safety.load(), VoteSafetyLoadResult::NoRecord));
@@ -4128,7 +4129,7 @@
             indra_core::types::qc::verify_qc_against_snapshot(
                 &qc,
                 snapshot,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
             )
             .unwrap();
         }
@@ -4458,7 +4459,7 @@
         assert!(fixture.driver_a.collector_has_vote_from(h, r, VoteStep::Prevote, b_id));
         let c = test_validator_material([0xC3; 32]);
         let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&c.seed), c.pq);
-        let vc = indra_consensus::vote::produce_vote(h, r, VoteStep::Prevote, Bytes32::ZERO, Bytes32::from(c.validator_id), governing_snapshot_root(&fixture.driver_a, h), DEFAULT_CHAIN_ID, &signer).unwrap();
+        let vc = indra_consensus::vote::produce_vote(h, r, VoteStep::Prevote, Bytes32::ZERO, Bytes32::from(c.validator_id), governing_snapshot_root(&fixture.driver_a, h), TEST_CHAIN_ID, &signer).unwrap();
         queue.push_back(vc);
         let vc = queue.pop_front().unwrap();
         let c_actions = fixture.driver_a.process(DriverEvent::InboundVote { from: "127.0.0.1:11003".parse().unwrap(), vote: vc });
@@ -4516,7 +4517,7 @@
             .build_genesis_consensus_snapshot()
             .unwrap();
         let vrf = vrf_authority_from_snapshot(
-            DEFAULT_CHAIN_ID.as_bytes(),
+            TEST_CHAIN_ID.as_bytes(),
             301,
             2,
             indra_core::types::primitives::Bytes64([0x55; 64]),
@@ -4646,7 +4647,7 @@
                     let voters = NodeEngine::registered_voters_for_height(*height, snapshot);
                     let validators = NodeEngine::qc_validators_for_height(*height, snapshot);
                     let authority = vrf_authority_from_snapshot(
-                        DEFAULT_CHAIN_ID.as_bytes(),
+                        TEST_CHAIN_ID.as_bytes(),
                         *height,
                         0,
                         Bytes64([(*height % 251) as u8; 64]),
@@ -4677,7 +4678,7 @@
                                 block_hash,
                                 *id,
                                 snapshot.snapshot_root,
-                                DEFAULT_CHAIN_ID,
+                                TEST_CHAIN_ID,
                                 signer,
                             )
                             .unwrap()
@@ -4687,13 +4688,13 @@
                         *height,
                         0,
                         block_hash,
-                        DEFAULT_CHAIN_ID,
+                        TEST_CHAIN_ID,
                         snapshot.snapshot_root,
                         &validators,
                         votes.iter().collect(),
                     )
                     .unwrap();
-                    NodeEngine::verify_qc_with_snapshot(&qc, snapshot, DEFAULT_CHAIN_ID).unwrap();
+                    NodeEngine::verify_qc_with_snapshot(&qc, snapshot, TEST_CHAIN_ID).unwrap();
                     let sortition = signers
                         .iter()
                         .filter(|(id, _, _)| snapshot.entry_with_position(id).is_some())
@@ -4775,7 +4776,7 @@
             1,
             0,
             VoteStep::Prevote,
-            DEFAULT_CHAIN_ID.to_string(),
+            TEST_CHAIN_ID.to_string(),
             governing_snapshot_root(&driver, 1),
             voters,
         );
@@ -4807,7 +4808,7 @@
                 hash_a,
                 signer_ids[idx],
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signers[idx],
             )
             .unwrap();
@@ -4824,7 +4825,7 @@
                 hash_b,
                 signer_ids[idx],
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signers[idx],
             )
             .unwrap();
@@ -4841,7 +4842,7 @@
             hash_a,
             signer_ids[2],
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             signers[2],
         )
         .unwrap();
@@ -4882,7 +4883,7 @@
             block_hash,
             remote_a_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -4893,7 +4894,7 @@
             block_hash,
             remote_b_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -4904,7 +4905,7 @@
             block_hash,
             remote_a_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -4915,7 +4916,7 @@
             block_hash,
             remote_b_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -5235,7 +5236,7 @@
             block_hash,
             validator_id_for(&signer),
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &signer,
         )
         .unwrap();
@@ -5368,7 +5369,7 @@
             Bytes32::ZERO,
             validator_id_for(&signer),
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &signer,
         )
         .unwrap();
@@ -5455,7 +5456,7 @@
                 Bytes32::ZERO,
                 validator_id_for(signer),
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -5604,7 +5605,7 @@
                     1,
                     i as u32,
                     VoteStep::Prevote,
-                    DEFAULT_CHAIN_ID.to_string(),
+                    TEST_CHAIN_ID.to_string(),
                     governing_snapshot_root(&driver, 1),
                     driver.registered_voters.clone(),
                 ),
@@ -5835,7 +5836,7 @@
                 block_hash,
                 validator_id_for(signer),
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             ).unwrap();
             actions.extend(driver.process(DriverEvent::InboundVote {
@@ -5851,7 +5852,7 @@
                 block_hash,
                 validator_id_for(signer),
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             ).unwrap();
             actions.extend(driver.process(DriverEvent::InboundVote {
@@ -5996,7 +5997,7 @@
             hash_a,
             validator_id_for(&local),
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -6068,7 +6069,7 @@
             block_hash,
             validator_id_for(&local),
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -6118,7 +6119,7 @@
             block_hash,
             validator_id_for(&local),
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -6162,7 +6163,7 @@
                 hash,
                 validator_id_for(signer),
                 governing_snapshot_root(&driver, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -6206,7 +6207,7 @@
             Bytes32::ZERO,
             validator_id_for(&remote),
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6259,7 +6260,7 @@
             Bytes32::ZERO,
             validator_id_for(&remote),
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6320,7 +6321,7 @@
             Bytes32::ZERO,
             remote_id,
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6337,7 +6338,7 @@
             Bytes32::ZERO,
             remote_id,
             wrong_root,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6384,7 +6385,7 @@
                 Bytes32::ZERO,
                 remote_id,
                 root,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &remote,
             )
             .unwrap(),
@@ -6395,7 +6396,7 @@
                 Bytes32::ZERO,
                 remote_id,
                 root,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &remote,
             )
             .unwrap(),
@@ -6406,7 +6407,7 @@
                 Bytes32::ZERO,
                 remote_id,
                 root,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &remote,
             )
             .unwrap(),
@@ -6455,7 +6456,7 @@
             Bytes32::ZERO,
             validator_id_for(&signer),
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &signer,
         )
         .unwrap();
@@ -6499,7 +6500,7 @@
             Bytes32::from([0xAAu8; 32]),
             remote_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6510,7 +6511,7 @@
             Bytes32::from([0xBBu8; 32]),
             remote_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6550,7 +6551,7 @@
                     hash,
                     remote_id,
                     governing_snapshot_root(&driver, driver.next_height()),
-                    DEFAULT_CHAIN_ID,
+                    TEST_CHAIN_ID,
                     &remote,
                 )
                 .unwrap()
@@ -6606,7 +6607,7 @@
             Bytes32::ZERO,
             real_id,
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &attacker,
         )
         .unwrap();
@@ -6626,7 +6627,7 @@
             Bytes32::ZERO,
             real_id,
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &real,
         )
         .unwrap();
@@ -6665,7 +6666,7 @@
             Bytes32::ZERO,
             remote_id,
             governing_snapshot_root(&driver, driver.next_height()),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();
@@ -6695,7 +6696,7 @@
                 hash,
                 real_id,
                 governing_snapshot_root(&driver, driver.next_height()),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &attacker,
             )
             .unwrap();
@@ -6843,7 +6844,7 @@
             block2.header.block_hash(),
             source_validator_id,
             governing_snapshot_root(&driver, 2),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &source_local,
         )
         .unwrap();
@@ -6851,7 +6852,7 @@
             2,
             block2.header.proposer_round,
             block2.header.block_hash(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             governing_snapshot_root(&driver, 2),
             &driver.engine.qc_validators(),
             vec![&qc_vote],
@@ -6932,7 +6933,7 @@
             block2.header.block_hash(),
             validator_id,
             governing_snapshot_root(&driver, 2),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -6940,7 +6941,7 @@
             2,
             block2.header.proposer_round,
             block2.header.block_hash(),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             governing_snapshot_root(&driver, 2),
             &driver.engine.qc_validators(),
             vec![&qc_vote],
@@ -7017,7 +7018,7 @@
         let qc_for_height_2 = source.last_qc_bytes();
         let mut bad_block3 = make_strict_block(&source, [0xB6u8; 32], 0, qc_for_height_2);
         bad_block3.header.prev_hash = Bytes32::from([0xEEu8; 32]);
-        reauthorize_test_proposal(&mut bad_block3, [0xB6u8; 32], DEFAULT_CHAIN_ID.as_bytes());
+        reauthorize_test_proposal(&mut bad_block3, [0xB6u8; 32], TEST_CHAIN_ID.as_bytes());
 
         let (mut driver, dir) = local_driver([0xB6u8; 32], "sync_partial_importer");
         install_active_validator(&mut driver, [0xB6u8; 32], "local");
@@ -7353,7 +7354,7 @@
             value_hash,
             validator_id,
             governing_snapshot_root(&driver, 7),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -7362,7 +7363,7 @@
             7,
             0,
             value_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             governing_snapshot_root(&driver, 7),
             &validators,
             vec![&vote],
@@ -7406,7 +7407,7 @@
             value_hash,
             validator_id,
             governing_snapshot_root(&driver, 7),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -7415,7 +7416,7 @@
             7,
             0,
             value_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             governing_snapshot_root(&driver, 7),
             &validators,
             vec![&vote],
@@ -7461,7 +7462,7 @@
             value_hash,
             validator_id,
             governing_snapshot_root(&driver, 7),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &local,
         )
         .unwrap();
@@ -7470,7 +7471,7 @@
             7,
             0,
             value_hash,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             governing_snapshot_root(&driver, 7),
             &validators,
             vec![&vote],
@@ -7609,7 +7610,7 @@
             original_hash,
             remote_a_id,
             governing_snapshot_root(&driver, height),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_a,
         )
         .unwrap();
@@ -7620,7 +7621,7 @@
             original_hash,
             remote_b_id,
             governing_snapshot_root(&driver, height),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote_b,
         )
         .unwrap();
@@ -7986,7 +7987,7 @@
                 block_x_hash,
                 validator_id,
                 governing_snapshot_root(&driver_b, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -8061,7 +8062,7 @@
                 block_y_hash,
                 validator_id,
                 governing_snapshot_root(&driver_b, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -8083,7 +8084,7 @@
                 block_y_hash,
                 validator_id,
                 governing_snapshot_root(&driver_b, 1),
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 signer,
             )
             .unwrap();
@@ -8167,7 +8168,7 @@
             Bytes32::from([0xABu8; 32]),
             remote_id,
             governing_snapshot_root(&driver, 1),
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &remote,
         )
         .unwrap();

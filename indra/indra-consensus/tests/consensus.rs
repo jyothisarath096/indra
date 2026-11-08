@@ -2,6 +2,8 @@
 //!
 //! Tests the complete path: mempool → block production → voting → QC.
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_consensus::{
     mempool::Mempool,
     producer::{produce_block, BlockTemplate},
@@ -12,7 +14,7 @@ use indra_consensus::{
 use indra_core::{
     types::{
         crypto::HybridSignature,
-        primitives::{DEFAULT_CHAIN_ID, LIFETIME_SUPPLY_CAP_SPARK, TRANSACTION_PROTOCOL_VERSION},
+        primitives::{LIFETIME_SUPPLY_CAP_SPARK, TRANSACTION_PROTOCOL_VERSION},
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
@@ -120,7 +122,7 @@ impl TestValidator {
 
 #[test]
 fn mempool_to_block_pipeline() {
-    let mut state = ChainState::new_genesis();
+    let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
     state.active_slot_coefficient_numerator =
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state.election_seed = indra_core::types::primitives::Bytes64([0x42; 64]);
@@ -273,7 +275,7 @@ fn full_consensus_round() {
         height,
         round,
         VoteStep::Precommit,
-        DEFAULT_CHAIN_ID.to_string(),
+        TEST_CHAIN_ID.to_string(),
         Bytes32::ZERO,
         voters,
     );
@@ -286,7 +288,7 @@ fn full_consensus_round() {
             block_hash,
             v.id,
             Bytes32::ZERO,
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &v.hybrid_kp,
         )
         .unwrap();
@@ -309,7 +311,7 @@ fn full_consensus_round() {
         height,
         round,
         block_hash,
-        DEFAULT_CHAIN_ID.to_string(),
+        TEST_CHAIN_ID.to_string(),
         Bytes32::ZERO,
         qc_validators.clone(),
     );
@@ -320,13 +322,13 @@ fn full_consensus_round() {
     let qc = builder.build().unwrap();
     assert_eq!(qc.signer_count(), 3);
 
-    assert!(verify_qc(&qc, &qc_validators, total_stake, DEFAULT_CHAIN_ID).is_ok());
-    assert!(verify_qc_strict(&qc, &qc_validators, total_stake, DEFAULT_CHAIN_ID).is_ok());
+    assert!(verify_qc(&qc, &qc_validators, total_stake, TEST_CHAIN_ID).is_ok());
+    assert!(verify_qc_strict(&qc, &qc_validators, total_stake, TEST_CHAIN_ID).is_ok());
 }
 
 #[test]
 fn age_eligible_txs_included_first() {
-    let state = ChainState::new_genesis();
+    let state = ChainState::new_genesis(TEST_CHAIN_ID);
     let mut mempool = Mempool::default_config();
     let (owner_pubkey, owner_keypair) = make_user_keypair(0x66);
 
@@ -380,7 +382,7 @@ fn qc_builder_quorum_detection() {
         1,
         0,
         block_hash,
-        DEFAULT_CHAIN_ID.to_string(),
+        TEST_CHAIN_ID.to_string(),
         Bytes32::ZERO,
         qc_validators.clone(),
     );
@@ -396,7 +398,7 @@ fn qc_builder_quorum_detection() {
         block_hash,
         v1.id,
         Bytes32::ZERO,
-        DEFAULT_CHAIN_ID,
+        TEST_CHAIN_ID,
         &v1.hybrid_kp,
     )
     .unwrap();
@@ -441,7 +443,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
                 block_hash,
                 validator.id,
                 snapshot_root,
-                DEFAULT_CHAIN_ID,
+                TEST_CHAIN_ID,
                 &validator.hybrid_kp,
             )
             .unwrap();
@@ -470,5 +472,5 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         classical_signatures,
     };
 
-    assert!(verify_qc_strict(&qc, &qc_validators, 10_000, DEFAULT_CHAIN_ID).is_ok());
+    assert!(verify_qc_strict(&qc, &qc_validators, 10_000, TEST_CHAIN_ID).is_ok());
 }

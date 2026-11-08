@@ -616,7 +616,7 @@ mod transparent_wallet_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_core::types::primitives::DEFAULT_CHAIN_ID;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_crypto::ColdHybridKeypair;
 
     fn make_id(b: u8) -> Bytes32 {
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn seed_wallet_from_genesis_matches_owned_entries_and_is_idempotent() {
         let manifest = indra_node::genesis::test_genesis_toml(
-            DEFAULT_CHAIN_ID,
+            TEST_CHAIN_ID,
             &[
                 ([1; 32], [1; 32], [1; 32]),
                 ([2; 32], [2; 32], [2; 32]),

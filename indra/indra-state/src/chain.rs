@@ -18,7 +18,7 @@ use indra_core::types::{
 };
 
 use indra_core::types::primitives::{
-    Bytes32, Bytes64, VariableBytes, DEFAULT_CHAIN_ID, EPOCH_DURATION_BLOCKS,
+    Bytes32, Bytes64, VariableBytes, EPOCH_DURATION_BLOCKS,
     INITIAL_BASE_FEE_SPARK_PER_KB, MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, MAX_CHAIN_ID_BYTES,
     MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
     MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
@@ -536,9 +536,9 @@ impl ChainState {
     /// Create the genesis state (before any block has been applied).
     ///
     /// This is the canonical starting point for every INDRA node.
-    pub fn new_genesis() -> Self {
+    pub fn new_genesis(chain_id: &str) -> Self {
         Self {
-            chain_id: DEFAULT_CHAIN_ID.to_string(),
+            chain_id: chain_id.to_string(),
             genesis_timestamp: 1_700_000_000,
             genesis_fingerprint: Bytes32::ZERO,
             height: 0,
@@ -1809,6 +1809,7 @@ fn decode_retired_cold_components(
 }
 #[cfg(test)]
 mod tests {
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
 
     #[test]
@@ -1880,7 +1881,7 @@ mod tests {
     }
 
     fn snapshot_state() -> ChainState {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state
             .validators
             .upsert(snapshot_validator(1, 11, 2_000_000_000))
@@ -1895,9 +1896,9 @@ mod tests {
 
     #[test]
     fn genesis_state_is_correct() {
-        let state = ChainState::new_genesis();
+        let state = ChainState::new_genesis(TEST_CHAIN_ID);
         assert_eq!(state.height, 0);
-        assert_eq!(state.chain_id, DEFAULT_CHAIN_ID);
+        assert_eq!(state.chain_id, TEST_CHAIN_ID);
         assert_eq!(state.tip_hash, Bytes32::ZERO);
         assert_eq!(state.base_fee, INITIAL_BASE_FEE_SPARK_PER_KB);
         assert_eq!(state.total_supply, 0);
@@ -1915,7 +1916,7 @@ mod tests {
     fn persisted_state_rejects_every_non_mainnet_f() {
         let preferred = MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
         for invalid_f in [preferred - 1, preferred + 1, 1, 1u64 << 63] {
-            let mut invalid = ChainState::new_genesis();
+            let mut invalid = ChainState::new_genesis(TEST_CHAIN_ID);
             invalid.active_slot_coefficient_numerator = invalid_f;
             assert!(
                 ChainState::decode_exact(&invalid.encode_to_vec()).is_err(),
@@ -1943,13 +1944,13 @@ mod tests {
             classical_pk: Bytes32::from(validator.hybrid_classical_pk.unwrap()),
             pq_pk: VariableBytes::from_slice(validator.hybrid_pq_pk.as_ref().unwrap()).unwrap(),
         };
-        let mut exact = ChainState::new_genesis();
+        let mut exact = ChainState::new_genesis(TEST_CHAIN_ID);
         exact.validators.upsert(validator.clone()).unwrap();
         exact.finalize_genesis().unwrap();
         assert_eq!(exact.total_supply, LIFETIME_SUPPLY_CAP_SPARK);
         assert_eq!(exact.monetary_ledger.reward_budget_spark, 0);
 
-        let mut over = ChainState::new_genesis();
+        let mut over = ChainState::new_genesis(TEST_CHAIN_ID);
         over.validators.upsert(validator).unwrap();
         over.utxos
             .insert(
@@ -1995,7 +1996,7 @@ mod tests {
 
     #[test]
     fn finalized_slash_revokes_frozen_qc_and_vrf_authority_at_next_height() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state
             .validators
             .upsert(snapshot_validator(1, 11, 4_000_000_000))
@@ -2220,7 +2221,7 @@ mod tests {
 
     #[test]
     fn slash_membership_history_keeps_502_until_last_governed_window_expires() {
-        let mut state = ChainState::new_genesis();
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.slash_membership_roots = (0u64..502)
             .map(|index| SlashMembershipRootRecord {
                 activation_height: 301 + index * EPOCH_DURATION_BLOCKS,
@@ -2506,12 +2507,12 @@ mod tests {
 
     #[test]
     fn genesis_has_no_blocks() {
-        assert!(!ChainState::new_genesis().has_blocks());
+        assert!(!ChainState::new_genesis(TEST_CHAIN_ID).has_blocks());
     }
 
     #[test]
     fn genesis_epoch_is_zero() {
-        assert_eq!(ChainState::new_genesis().current_epoch(), 0);
+        assert_eq!(ChainState::new_genesis(TEST_CHAIN_ID).current_epoch(), 0);
     }
 
     fn test_hybrid_pubkey(byte: u8) -> HybridPubKey {
@@ -2716,7 +2717,7 @@ mod tests {
 
     #[test]
     fn snapshot_decode_rejects_non_utf8_chain_id_without_default_substitution() {
-        let state = ChainState::new_genesis();
+        let state = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut bytes = state.encode_to_vec();
         // VariableBytes encodes its u32 length before the chain-id bytes.
         bytes[4] = 0xff;

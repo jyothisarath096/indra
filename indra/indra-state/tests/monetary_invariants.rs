@@ -1,5 +1,7 @@
 //! Consensus monetary invariants for the transparent-value transaction format.
 
+use indra_core::types::primitives::TEST_CHAIN_ID;
+
 use indra_core::types::{
     block::{BlockHeaderVNext, BlockVNext},
     crypto::{HybridPubKey, HybridSignature},
@@ -76,7 +78,7 @@ fn validator(owner: &HybridPubKey) -> ValidatorEntry {
 
 fn state() -> (ChainState, HybridPubKey, HybridKeypair) {
     let (owner, pair) = keypair([9; 32]);
-    let mut state = ChainState::new_genesis();
+    let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
     state.active_slot_coefficient_numerator =
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR;
     state.validators.upsert(validator(&owner)).unwrap();
