@@ -63,6 +63,21 @@ fn temp_dir(suffix: &str) -> PathBuf {
     p
 }
 
+fn write_valid_cli_inputs(dir: &PathBuf) -> (PathBuf, PathBuf, PathBuf, String) {
+    let keys = generate_from_master_seed("chain-id-test".to_string(), [0xA1; 32]).unwrap();
+    let keys_path = dir.join("keys.json");
+    let password_path = dir.join("keys.password");
+    let wallet_path = dir.join("wallet.json");
+    std::fs::write(&keys_path, indra_cli::encrypt_keys(&keys, b"test-password").unwrap()).unwrap();
+    std::fs::write(&password_path, b"test-password\n").unwrap();
+    indra_cli::Wallet::new().save(wallet_path.to_str().unwrap()).unwrap();
+    let address = keys
+        .payment_address("indra-testnet-1".as_bytes())
+        .unwrap()
+        .to_text();
+    (keys_path, password_path, wallet_path, address)
+}
+
 fn engine(suffix: &str) -> (NodeEngine, PathBuf) {
     let dir = temp_dir(suffix);
     let config = NodeConfig::local_test(dir.clone());
@@ -212,6 +227,159 @@ fn keygen_all_keys_present() {
 }
 
 #[test]
+fn keygen_generate_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-keygen-generate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let output_path = dir.join("generated-keys.json");
+    let password_path = dir.join("password");
+    std::fs::write(&password_path, b"test-password\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .current_dir(&dir)
+        .args([
+            "--output", output_path.to_str().unwrap(),
+            "--name", "valid-validator",
+            "--keys-password-file", password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn keygen_inspect_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-keygen-inspect");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (keys_path, _, _, _) = write_valid_cli_inputs(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .current_dir(&dir)
+        .args(["inspect", "--keys", keys_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn indra_tx_address_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-tx-address");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (keys_path, password_path, _, _) = write_valid_cli_inputs(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
+        .current_dir(&dir)
+        .args([
+            "address", "--keys", keys_path.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn indra_tx_balance_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-tx-balance");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (keys_path, password_path, wallet_path, _) = write_valid_cli_inputs(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
+        .current_dir(&dir)
+        .args([
+            "balance", "--keys", keys_path.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(),
+            "--wallet", wallet_path.to_str().unwrap(),
+            "--rpc", "http://127.0.0.1:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn indra_tx_send_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-tx-send");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (keys_path, password_path, wallet_path, address) = write_valid_cli_inputs(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
+        .current_dir(&dir)
+        .args([
+            "send", "--keys", keys_path.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(),
+            "--wallet", wallet_path.to_str().unwrap(),
+            "--to", &address, "--amount", "0.0001", "--rpc", "http://127.0.0.1:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn indra_send_requires_chain_id_at_binary_boundary() {
+    let dir = temp_dir("missing-chain-indra-send");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (keys_path, password_path, wallet_path, address) = write_valid_cli_inputs(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-send"))
+        .current_dir(&dir)
+        .args([
+            "--keys", keys_path.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(),
+            "--wallet", wallet_path.to_str().unwrap(),
+            "--to", &address, "--amount", "0.0001", "--node", "http://127.0.0.1:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "missing required flag --chain-id"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn keygen_cold_succeeds_without_chain_id() {
+    let dir = temp_dir("cold-without-chain-id");
+    std::fs::create_dir_all(&dir).unwrap();
+    let output_path = dir.join("cold-keys.json");
+    let password_path = dir.join("cold-password");
+    std::fs::write(&password_path, b"cold-password\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .current_dir(&dir)
+        .args([
+            "cold",
+            "--output", output_path.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output_path.is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn keygen_deterministic_from_seed() {
     let k1 = generate_from_master_seed("Deterministic".to_string(), [0xAAu8; 32]).unwrap();
     let k2 = generate_from_master_seed("Deterministic".to_string(), [0xAAu8; 32]).unwrap();
@@ -286,7 +454,13 @@ fn keygen_cold_cli_encrypts_preserves_hot_file_and_requires_force_to_overwrite()
     .unwrap();
 
     let inspect = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
-        .args(["inspect", "--keys", cold_path.to_str().unwrap()])
+        .args([
+            "inspect",
+            "--keys",
+            cold_path.to_str().unwrap(),
+            "--chain-id",
+            "indra-testnet-1",
+        ])
         .output()
         .unwrap();
     assert!(

@@ -76,3 +76,15 @@ pub use staking::{
 };
 pub use tx_builder::{build_cold_transaction, build_transaction, BuiltStakingOp, BuiltTransaction, ColdTxParams, TxParams};
 pub use wallet::{seed_wallet_from_genesis, PendingChange, Wallet, WalletEntry};
+
+/// Exact error emitted when a command requires an explicit chain ID.
+pub const MISSING_CHAIN_ID_ERROR: &str = "missing required flag --chain-id";
+
+/// Return the explicit `--chain-id` argument required by chain-bound commands.
+pub fn required_chain_id(args: &[String]) -> Result<String, &'static str> {
+    args.iter()
+        .position(|arg| arg == "--chain-id")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .ok_or(MISSING_CHAIN_ID_ERROR)
+}

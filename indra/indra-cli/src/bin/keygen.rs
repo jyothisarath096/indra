@@ -25,14 +25,10 @@ fn main() {
         .position(|a| a == "--output")
         .and_then(|i| args.get(i + 1))
         .map_or("keys.json", String::as_str);
-    let chain_id = args
-        .iter()
-        .position(|a| a == "--chain-id")
-        .and_then(|i| args.get(i + 1))
-        .map_or(
-            indra_core::types::primitives::DEFAULT_CHAIN_ID,
-            String::as_str,
-        );
+    let chain_id = indra_cli::required_chain_id(&args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     if indra_cli::has_secret_value_in_argv(&args, "--recover") {
         eprintln!("Error: do not pass a mnemonic in argv. Use '--recover' and enter it at the secure prompt.");
         std::process::exit(1);
@@ -161,8 +157,10 @@ fn main() {
 
 fn cmd_inspect(args: &[String]) {
     let keys_path = get(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
-    let chain_id = get(args, "--chain-id")
-        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
+    let chain_id = indra_cli::required_chain_id(args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     let json = std::fs::read_to_string(&keys_path).unwrap_or_else(|e| {
         eprintln!("Failed to read {}: {}", keys_path, e);
         std::process::exit(1);
@@ -259,6 +257,18 @@ mod inspect_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chain_id_is_required_for_generation_and_inspection() {
+        assert_eq!(
+            indra_cli::required_chain_id(&[]),
+            Err(indra_cli::MISSING_CHAIN_ID_ERROR)
+        );
+        assert_eq!(
+            indra_cli::required_chain_id(&["--chain-id".into(), "indra-mainnet".into()]),
+            Ok("indra-mainnet".into())
+        );
     }
 }
 

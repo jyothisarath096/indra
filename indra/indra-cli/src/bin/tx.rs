@@ -23,20 +23,22 @@ fn main() {
 
 fn usage_and_exit() -> ! {
     eprintln!("Usage:");
-    eprintln!("  indra-tx address --keys <keys.json> [--keys-password-file <path>]");
-    eprintln!("  indra-tx balance --keys <keys.json> [--keys-password-file <path>] [--address <hex>] [--wallet <wallet.json>] --rpc <url>");
-    eprintln!("  indra-tx send --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --rpc <url>");
+    eprintln!("  indra-tx address --chain-id <id> --keys <keys.json> [--keys-password-file <path>]");
+    eprintln!("  indra-tx balance --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--address <hex>] [--wallet <wallet.json>] --rpc <url>");
+    eprintln!("  indra-tx send --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --rpc <url>");
     std::process::exit(1);
 }
 
 fn cmd_address(args: &[String]) {
+    let chain_id = indra_cli::required_chain_id(args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
     let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let chain_id = get_arg(args, "--chain-id")
-        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
     let address = keys
         .payment_address(chain_id.as_bytes())
         .unwrap_or_else(|e| {
@@ -47,6 +49,10 @@ fn cmd_address(args: &[String]) {
 }
 
 fn cmd_balance(args: &[String]) {
+    let chain_id = indra_cli::required_chain_id(args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| {
         eprintln!(
             "Error: balance scans now require ownership authorization. \
@@ -60,8 +66,6 @@ fn cmd_balance(args: &[String]) {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
     });
-    let chain_id = get_arg(args, "--chain-id")
-        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
     let derived_address = keys
         .payment_address(chain_id.as_bytes())
         .unwrap_or_else(|e| {
@@ -96,6 +100,10 @@ fn cmd_balance(args: &[String]) {
 }
 
 fn cmd_send(args: &[String]) {
+    let chain_id = indra_cli::required_chain_id(args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     let keys_path = get_arg(args, "--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get_arg(args, "--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let recipient_address = required_arg(args, "--to");
@@ -105,9 +113,6 @@ fn cmd_send(args: &[String]) {
             std::process::exit(1);
         });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let chain_id = get_arg(args, "--chain-id")
-        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
-
     let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
@@ -326,5 +331,18 @@ mod tests {
             owner_pubkey: key_material(0x91).2,
             lock_height: 0,
         }
+    }
+
+    #[test]
+    fn explicit_chain_id_is_accepted_for_all_commands() {
+        let args = vec!["--chain-id".to_string(), "indra-mainnet".to_string()];
+        assert_eq!(
+            indra_cli::required_chain_id(&args),
+            Ok("indra-mainnet".to_string())
+        );
+        assert_eq!(
+            indra_cli::required_chain_id(&[]),
+            Err(indra_cli::MISSING_CHAIN_ID_ERROR)
+        );
     }
 }

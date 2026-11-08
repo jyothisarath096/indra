@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   indra-send --keys keys.json --wallet wallet.json \
+//!              --chain-id <id> \
 //!              [--keys-password-file keys.pass] \
 //!              --to <canonical_payment_address> \
 //!              --amount <INDRA> \
@@ -24,6 +25,11 @@ fn main() {
             .cloned()
     };
 
+    let chain_id = indra_cli::required_chain_id(&args).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
+
     let keys_path = get("--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let to = get("--to").unwrap_or_else(|| {
@@ -36,8 +42,6 @@ fn main() {
     });
     let fee_str = get("--fee").unwrap_or_else(|| "0.0001".to_string());
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
-    let chain_id = get("--chain-id")
-        .unwrap_or_else(|| indra_core::types::primitives::DEFAULT_CHAIN_ID.to_string());
     let genesis_path = get("--genesis");
 
     let amount_spark = parse_amount_or_exit(&amount_str, "--amount");
@@ -269,6 +273,19 @@ mod tests {
         assert_eq!(
             parse_cli_indra_amount("10.5", "--amount").unwrap(),
             indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_chain_id_is_accepted_and_missing_chain_id_has_exact_error() {
+        let args = vec!["--chain-id".to_string(), "indra-mainnet".to_string()];
+        assert_eq!(
+            indra_cli::required_chain_id(&args),
+            Ok("indra-mainnet".to_string())
+        );
+        assert_eq!(
+            indra_cli::required_chain_id(&[]),
+            Err(indra_cli::MISSING_CHAIN_ID_ERROR)
         );
     }
 }
