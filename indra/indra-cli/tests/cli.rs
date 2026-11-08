@@ -247,6 +247,7 @@ fn keygen_generate_requires_chain_id_at_binary_boundary() {
         String::from_utf8_lossy(&output.stderr).trim_end(),
         "missing required flag --chain-id"
     );
+    assert!(!output_path.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -317,6 +318,7 @@ fn indra_tx_send_requires_chain_id_at_binary_boundary() {
     let dir = temp_dir("missing-chain-tx-send");
     std::fs::create_dir_all(&dir).unwrap();
     let (keys_path, password_path, wallet_path, address) = write_valid_cli_inputs(&dir);
+    let wallet_before = std::fs::read(&wallet_path).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
         .current_dir(&dir)
         .args([
@@ -332,6 +334,7 @@ fn indra_tx_send_requires_chain_id_at_binary_boundary() {
         String::from_utf8_lossy(&output.stderr).trim_end(),
         "missing required flag --chain-id"
     );
+    assert_eq!(std::fs::read(&wallet_path).unwrap(), wallet_before);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -340,6 +343,7 @@ fn indra_send_requires_chain_id_at_binary_boundary() {
     let dir = temp_dir("missing-chain-indra-send");
     std::fs::create_dir_all(&dir).unwrap();
     let (keys_path, password_path, wallet_path, address) = write_valid_cli_inputs(&dir);
+    let wallet_before = std::fs::read(&wallet_path).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_indra-send"))
         .current_dir(&dir)
         .args([
@@ -355,6 +359,7 @@ fn indra_send_requires_chain_id_at_binary_boundary() {
         String::from_utf8_lossy(&output.stderr).trim_end(),
         "missing required flag --chain-id"
     );
+    assert_eq!(std::fs::read(&wallet_path).unwrap(), wallet_before);
     let _ = std::fs::remove_dir_all(dir);
 }
 

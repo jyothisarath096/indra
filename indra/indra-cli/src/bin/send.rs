@@ -276,16 +276,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_chain_id_is_accepted_and_missing_chain_id_has_exact_error() {
-        let args = vec!["--chain-id".to_string(), "indra-mainnet".to_string()];
-        assert_eq!(
-            indra_cli::required_chain_id(&args),
-            Ok("indra-mainnet".to_string())
-        );
-        assert_eq!(
-            indra_cli::required_chain_id(&[]),
-            Err(indra_cli::MISSING_CHAIN_ID_ERROR)
-        );
-    }
 }

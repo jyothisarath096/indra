@@ -82,9 +82,56 @@ pub const MISSING_CHAIN_ID_ERROR: &str = "missing required flag --chain-id";
 
 /// Return the explicit `--chain-id` argument required by chain-bound commands.
 pub fn required_chain_id(args: &[String]) -> Result<String, &'static str> {
-    args.iter()
-        .position(|arg| arg == "--chain-id")
-        .and_then(|index| args.get(index + 1))
-        .cloned()
-        .ok_or(MISSING_CHAIN_ID_ERROR)
+    let Some(index) = args.iter().position(|arg| arg == "--chain-id") else {
+        return Err(MISSING_CHAIN_ID_ERROR);
+    };
+    let Some(value) = args.get(index + 1) else {
+        return Err(MISSING_CHAIN_ID_ERROR);
+    };
+    if value.is_empty() || value.starts_with("--") {
+        return Err("invalid --chain-id value");
+    }
+    Ok(value.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{required_chain_id, MISSING_CHAIN_ID_ERROR};
+
+    #[test]
+    fn required_chain_id_reports_missing_flag() {
+        assert_eq!(required_chain_id(&[]), Err(MISSING_CHAIN_ID_ERROR));
+    }
+
+    #[test]
+    fn required_chain_id_reports_flag_without_value() {
+        assert_eq!(
+            required_chain_id(&["--chain-id".into()]),
+            Err(MISSING_CHAIN_ID_ERROR)
+        );
+    }
+
+    #[test]
+    fn required_chain_id_rejects_empty_value() {
+        assert_eq!(
+            required_chain_id(&["--chain-id".into(), "".into()]),
+            Err("invalid --chain-id value")
+        );
+    }
+
+    #[test]
+    fn required_chain_id_rejects_flag_as_value() {
+        assert_eq!(
+            required_chain_id(&["--chain-id".into(), "--keys".into()]),
+            Err("invalid --chain-id value")
+        );
+    }
+
+    #[test]
+    fn required_chain_id_accepts_explicit_value() {
+        assert_eq!(
+            required_chain_id(&["--chain-id".into(), "indra-mainnet".into()]),
+            Ok("indra-mainnet".into())
+        );
+    }
 }

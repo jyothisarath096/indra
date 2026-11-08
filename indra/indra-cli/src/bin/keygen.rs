@@ -259,17 +259,6 @@ mod inspect_tests {
         }
     }
 
-    #[test]
-    fn chain_id_is_required_for_generation_and_inspection() {
-        assert_eq!(
-            indra_cli::required_chain_id(&[]),
-            Err(indra_cli::MISSING_CHAIN_ID_ERROR)
-        );
-        assert_eq!(
-            indra_cli::required_chain_id(&["--chain-id".into(), "indra-mainnet".into()]),
-            Ok("indra-mainnet".into())
-        );
-    }
 }
 
 fn cmd_cold(args: &[String]) {
