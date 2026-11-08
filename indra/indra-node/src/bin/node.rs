@@ -4240,7 +4240,6 @@ fn run_init() {
 
 [node]
 mode     = "validator"
-chain_id = "indra-testnet-1"
 data_dir = "{}"
 genesis  = "{}"
 

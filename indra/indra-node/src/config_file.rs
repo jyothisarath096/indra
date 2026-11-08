@@ -36,8 +36,6 @@ pub struct KeysData {
 pub struct NodeConfigFile {
     /// `[node].mode`.
     pub mode: Option<String>,
-    /// `[node].chain_id`.
-    pub chain_id: Option<String>,
     /// `[node].data_dir`.
     pub data_dir: Option<String>,
     /// `[node].genesis`.
@@ -126,7 +124,6 @@ impl NodeConfigFile {
         validate_known_config_keys(&table)?;
         Ok(Self {
             mode: get_str(&table, "node", "mode"),
-            chain_id: get_str(&table, "node", "chain_id"),
             data_dir: get_str(&table, "node", "data_dir"),
             genesis: get_str(&table, "node", "genesis"),
             keys_path: get_str(&table, "keys", "path"),
@@ -503,7 +500,7 @@ fn validate_known_config_keys(table: &Value) -> Result<(), String> {
 
 fn allowed_config_keys(section: &str) -> Option<&'static [&'static str]> {
     match section {
-        "node" => Some(&["mode", "chain_id", "data_dir", "genesis"]),
+        "node" => Some(&["mode", "data_dir", "genesis"]),
         "keys" => Some(&["path", "password_file"]),
         "network" => Some(&[
             "p2p_addr",
@@ -682,7 +679,6 @@ password_file = "/tmp/indra/keys.pass"
             r#"
 [node]
 mode = "validator"
-chain_id = "indra-testnet-1"
 data_dir = "/root/.indra/data"
 genesis = "/root/.indra/data/genesis.toml"
 
@@ -882,6 +878,25 @@ extra_security_mode = "warn"
         );
         let err = NodeConfigFile::load(&path).err().unwrap_or_default();
         assert!(err.contains("unrecognized config key node.extra_security_mode"));
+    }
+
+    #[test]
+    fn node_chain_id_is_rejected_as_unknown_config_key() {
+        let path = temp_file(
+            "node-chain-id",
+            r#"
+[node]
+mode = "observer"
+chain_id = "indra-testnet-1"
+data_dir = "/tmp/indra"
+genesis = "/tmp/indra/genesis.toml"
+"#,
+        );
+        let err = NodeConfigFile::load(&path).err().unwrap_or_default();
+        assert_eq!(
+            err,
+            "unrecognized config key node.chain_id; if this was intended for a different section, move it there instead of leaving it silently ignored"
+        );
     }
 
     #[test]

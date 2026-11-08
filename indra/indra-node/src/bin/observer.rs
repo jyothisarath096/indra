@@ -493,7 +493,6 @@ fn run_observer_init() {
 
 [node]
 mode     = "observer"
-chain_id = "indra-testnet-1"
 data_dir = "{}"
 genesis  = "{}"
 
