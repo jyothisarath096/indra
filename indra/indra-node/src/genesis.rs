@@ -388,15 +388,12 @@ pub(crate) fn test_genesis_state() -> ChainState {
 }
 
 /// Load validator entries from a manifest into chain state.
-pub fn load_genesis_validators(genesis_path: &str, state: &mut ChainState) -> Result<(), String> {
-    let content = std::fs::read_to_string(genesis_path).map_err(|error| error.to_string())?;
-    let manifest = parse_genesis_manifest_str(&content)?;
-    state.chain_id = manifest.genesis.chain_id.clone();
+pub fn load_genesis_validators(manifest: &GenesisManifest, state: &mut ChainState) -> Result<(), String> {
     state.genesis_timestamp = manifest.genesis.genesis_timestamp;
     state.active_slot_coefficient_numerator = manifest.genesis.active_slot_coefficient_numerator;
     state.election_seed = derive_genesis_election_seed(&manifest.genesis, &manifest.validators)?;
     state.election_seed_height = 1;
-    let mut validators = manifest.validators;
+    let mut validators = manifest.validators.clone();
     validators.sort_by_key(|validator| validator.validator_id.clone());
     for validator in validators {
         let id = decode_hex_exact::<32>(&validator.validator_id, "validator_id")?;
@@ -429,9 +426,9 @@ pub fn load_genesis_validators(genesis_path: &str, state: &mut ChainState) -> Re
 /// Build and finalize state from a manifest path.
 pub fn build_finalized_genesis_state(genesis_path: Option<&str>) -> Result<ChainState, String> {
     let path = genesis_path.ok_or("canonical genesis construction requires a manifest")?;
-    let chain_id = parse_genesis_manifest(path)?.genesis.chain_id;
-    let mut state = ChainState::new_genesis(&chain_id);
-    load_genesis_validators(path, &mut state)?;
+    let manifest = parse_genesis_manifest(path)?;
+    let mut state = ChainState::new_genesis(&manifest.genesis.chain_id);
+    load_genesis_validators(&manifest, &mut state)?;
     state.finalize_genesis().map_err(|error| error.to_string())?;
     state.genesis_fingerprint = genesis_fingerprint(&state)?;
     Ok(state)
@@ -542,6 +539,28 @@ mod tests {
         )
         .unwrap();
         build_finalized_genesis_state(manifest.path().to_str()) .unwrap()
+    }
+
+    #[test]
+    fn build_finalized_genesis_state_uses_manifest_chain_id() {
+        let manifest = tempfile::NamedTempFile::new().unwrap();
+        let chain_id = "chain-id-from-manifest";
+        std::fs::write(
+            manifest.path(),
+            test_genesis_toml(
+                chain_id,
+                &[
+                    ([1; 32], [1; 32], [1; 32]),
+                    ([2; 32], [2; 32], [2; 32]),
+                    ([3; 32], [3; 32], [3; 32]),
+                    ([4; 32], [4; 32], [4; 32]),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let state = build_finalized_genesis_state(manifest.path().to_str()).unwrap();
+        assert_eq!(state.chain_id, chain_id);
     }
 
     fn validators(chain: &str) -> Vec<GenesisValidator> {
