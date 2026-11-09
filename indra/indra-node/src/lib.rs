@@ -55,7 +55,7 @@ pub use engine::NodeEngine;
 pub use error::{NodeError, NodeResult};
 pub use genesis::{
     build_finalized_genesis_state, build_genesis_block,
-    load_genesis_validators, parse_genesis_manifest, parse_genesis_manifest_str,
+    parse_genesis_manifest, parse_genesis_manifest_str,
     validate_genesis_manifest, GenesisManifest, GenesisSeed, GenesisSettings, GenesisValidator,
 };
 pub use metrics::{

@@ -388,7 +388,7 @@ pub(crate) fn test_genesis_state() -> ChainState {
 }
 
 /// Load validator entries from a manifest into chain state.
-pub fn load_genesis_validators(manifest: &GenesisManifest, state: &mut ChainState) -> Result<(), String> {
+fn load_genesis_validators(manifest: &GenesisManifest, state: &mut ChainState) -> Result<(), String> {
     state.genesis_timestamp = manifest.genesis.genesis_timestamp;
     state.active_slot_coefficient_numerator = manifest.genesis.active_slot_coefficient_numerator;
     state.election_seed = derive_genesis_election_seed(&manifest.genesis, &manifest.validators)?;
