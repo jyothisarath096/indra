@@ -889,15 +889,28 @@ fn lowest_representable_registry_validator(
         })
         .map(|validator| (validator.validator_id, validator.stake_spark))
         .collect();
-    candidates.sort_by(|(id_a, stake_a), (id_b, stake_b)| {
-        stake_a.cmp(stake_b).then_with(|| id_b.0.cmp(&id_a.0))
-    });
+    candidates.sort_by(|a, b| registry_eviction_order(state, a, b));
     for candidate in candidates {
         if build_evicted_validator_tombstone(state, candidate.0, current_height).is_ok() {
             return Ok(candidate);
         }
     }
     Err(StateError::TombstoneCapacityExceeded)
+}
+
+fn registry_eviction_order(
+    state: &ChainState,
+    (id_a, stake_a): &(Bytes32, u64),
+    (id_b, stake_b): &(Bytes32, u64),
+) -> std::cmp::Ordering {
+    stake_a
+        .cmp(stake_b)
+        .then_with(|| {
+            let epoch_a = state.validators.get(id_a).map_or(u64::MAX, |v| v.registered_epoch);
+            let epoch_b = state.validators.get(id_b).map_or(u64::MAX, |v| v.registered_epoch);
+            epoch_b.cmp(&epoch_a)
+        })
+        .then_with(|| id_b.0.cmp(&id_a.0))
 }
 
 fn build_evicted_validator_tombstone(
@@ -3544,5 +3557,26 @@ mod tests {
             ));
             assert_eq!(state, before);
         }
+    }
+
+    #[test]
+    fn registry_eviction_ties_prefer_latest_registration_then_larger_id() {
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
+        let (first_id, _) = make_active_validator(&mut state, 0xA1);
+        let (second_id, _) = make_active_validator(&mut state, 0xB2);
+        state.validators.get_mut(&first_id).unwrap().registered_epoch = 4;
+        state.validators.get_mut(&second_id).unwrap().registered_epoch = 5;
+
+        let first = (first_id, 10_000_000_000);
+        let second = (second_id, 10_000_000_000);
+        assert_eq!(registry_eviction_order(&state, &first, &second), std::cmp::Ordering::Greater);
+
+        state.validators.get_mut(&second_id).unwrap().registered_epoch = 4;
+        let (low, high) = if first_id < second_id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(registry_eviction_order(&state, &low, &high), std::cmp::Ordering::Greater);
     }
 }

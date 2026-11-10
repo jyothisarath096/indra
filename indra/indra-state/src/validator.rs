@@ -787,7 +787,7 @@ impl ValidatorSet {
     pub fn select_active_set(&mut self, total_staked_spark: u64, height: u64) {
         let max_active = max_active_validators(total_staked_spark);
         let _ = height;
-        let mut candidates: Vec<(Bytes32, u64)> = self
+        let mut candidates: Vec<(Bytes32, u64, u64)> = self
             .validators
             .values()
             .filter(|v| {
@@ -796,14 +796,17 @@ impl ValidatorSet {
                     ValidatorStatus::Active | ValidatorStatus::Registered
                 ) && v.stake_spark >= MINIMUM_ACTIVE_SELF_STAKE_SPARK
             })
-            .map(|v| (v.validator_id, v.stake_spark))
+            .map(|v| (v.validator_id, v.stake_spark, v.registered_epoch))
             .collect();
 
-        candidates.sort_by(|(id_a, stake_a), (id_b, stake_b)| {
-            stake_b.cmp(stake_a).then_with(|| id_a.0.cmp(&id_b.0))
+        candidates.sort_by(|(id_a, stake_a, epoch_a), (id_b, stake_b, epoch_b)| {
+            stake_b
+                .cmp(stake_a)
+                .then_with(|| epoch_a.cmp(epoch_b))
+                .then_with(|| id_a.0.cmp(&id_b.0))
         });
 
-        for (index, (id, _)) in candidates.iter().enumerate() {
+        for (index, (id, _, _)) in candidates.iter().enumerate() {
             if let Some(validator) = self.validators.get_mut(id) {
                 if index < max_active {
                     validator.status = ValidatorStatus::Active;
@@ -1039,6 +1042,84 @@ mod tests {
         vs.upsert(make_validator(0x02, 2_000, 0)).unwrap();
         vs.upsert(make_validator(0x03, 3_000, 0)).unwrap();
         assert_eq!(vs.total_active_stake(), 6_000);
+    }
+
+    #[test]
+    fn active_set_ties_prefer_earliest_registration_then_lower_id() {
+        let mut set = ValidatorSet::new();
+        let stake = MINIMUM_ACTIVE_SELF_STAKE_SPARK;
+        let mut earlier = make_validator(0xF0, stake, 2);
+        let mut later = make_validator(0x01, stake, 4);
+        earlier.status = ValidatorStatus::Registered;
+        later.status = ValidatorStatus::Registered;
+        set.upsert(earlier).unwrap();
+        set.upsert(later).unwrap();
+        for id in 0x02u8..=0x14 {
+            let mut filler = make_validator(id, stake, 3);
+            filler.status = ValidatorStatus::Registered;
+            set.upsert(filler).unwrap();
+        }
+        set.select_active_set(0, 0);
+        assert_eq!(set.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Active);
+        assert_eq!(set.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Registered);
+
+        let mut same_epoch = ValidatorSet::new();
+        let mut higher_id = make_validator(0xF0, stake, 4);
+        let mut lower_id = make_validator(0x01, stake, 4);
+        higher_id.status = ValidatorStatus::Registered;
+        lower_id.status = ValidatorStatus::Registered;
+        same_epoch.upsert(higher_id).unwrap();
+        same_epoch.upsert(lower_id).unwrap();
+        for id in 0x02u8..=0x14 {
+            let mut filler = make_validator(id, stake, 0);
+            filler.status = ValidatorStatus::Registered;
+            same_epoch.upsert(filler).unwrap();
+        }
+        same_epoch.select_active_set(0, 0);
+        assert_eq!(same_epoch.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active);
+        assert_eq!(same_epoch.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Registered);
+    }
+
+    #[test]
+    fn active_set_higher_stake_beats_earlier_registration() {
+        let mut set = ValidatorSet::new();
+        let mut earlier = make_validator(0xF0, MINIMUM_ACTIVE_SELF_STAKE_SPARK, 1);
+        let mut higher = make_validator(0x01, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 1, 2);
+        earlier.status = ValidatorStatus::Registered;
+        higher.status = ValidatorStatus::Registered;
+        set.upsert(earlier).unwrap();
+        set.upsert(higher).unwrap();
+        for id in 0x02u8..=0x14 {
+            let mut filler = make_validator(id, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2, u64::from(id) + 10);
+            filler.status = ValidatorStatus::Registered;
+            set.upsert(filler).unwrap();
+        }
+        set.select_active_set(0, 0);
+        assert_eq!(set.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active);
+        assert_eq!(set.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Registered);
+    }
+
+    #[test]
+    fn active_set_selection_is_deterministic_and_respects_phase_one_cap() {
+        let mut set = ValidatorSet::new();
+        for id in 0u8..=20 {
+            let mut validator = make_validator(
+                id,
+                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
+                u64::from(20 - id),
+            );
+            validator.status = ValidatorStatus::Registered;
+            set.upsert(validator).unwrap();
+        }
+        let mut second = set.clone();
+        set.select_active_set(0, 0);
+        second.select_active_set(0, 0);
+        assert_eq!(set, second);
+        assert_eq!(set.active_count(), 20);
+        for id in 0u8..=20 {
+            let expected = if id >= 1 { ValidatorStatus::Active } else { ValidatorStatus::Registered };
+            assert_eq!(set.get(&Bytes32::from([id; 32])).unwrap().status, expected);
+        }
     }
 }
 
