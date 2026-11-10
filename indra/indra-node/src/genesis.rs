@@ -1091,8 +1091,8 @@ mod tests {
         std::fs::write(&path, manifest).unwrap();
         let state = build_finalized_genesis_state(path.to_str()).unwrap();
         assert_eq!(hex::encode(state.election_seed.0), "f449538f3ffe86ac8fe27a2bea99714c8823140efdceda5144ac3f0143d58db0b3649bb84ddef0f63e2ebd3de8ecb1f09b46fc2d0b18fcf1feb3242ba477c039");
-        let fingerprint: [u8; 32] = hex::decode("dc14cfe8a7d4b789554e442ad1bcd3cd4c26e782b6c5506b5e3e96b34e3f42dc").unwrap().try_into().unwrap();
-        let block_hash: [u8; 32] = hex::decode("13cf73518f8185c762b72e125043259e8c52465a9acc933be69049ade9ab5223").unwrap().try_into().unwrap();
+        let fingerprint: [u8; 32] = hex::decode("d6b42e43d60499eb98a970d19ac02ccc33eb978ae44d03ed81cfdf696d39cae6").unwrap().try_into().unwrap();
+        let block_hash: [u8; 32] = hex::decode("3d0cd6e747a50c4b7f0185b0aeb2db097f09954c0ded6e7627adc1c7a9fcf055").unwrap().try_into().unwrap();
         assert_eq!(state.genesis_fingerprint, Bytes32::from(fingerprint));
         assert_eq!(genesis_block_hash(&state).unwrap(), Bytes32::from(block_hash));
         std::fs::remove_file(path).unwrap();

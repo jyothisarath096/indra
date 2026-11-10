@@ -41,6 +41,10 @@ pub const GOVERNANCE_CRITICAL_COMMIT_EPOCHS: u64 = 30;
 pub const GOVERNANCE_REVEAL_EPOCHS: u64 = 10;
 /// Deposit return support threshold.
 pub const GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS: u32 = 1_000;
+/// Standard governance YES-stake threshold in basis points.
+pub const GOVERNANCE_STANDARD_QUORUM_BPS: u32 = 9_000;
+/// Critical governance YES-stake threshold in basis points.
+pub const GOVERNANCE_CRITICAL_QUORUM_BPS: u32 = 9_500;
 
 /// Runtime-governable protocol parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +84,8 @@ impl GovernableParams {
             slash_double_precommit_bps: SLASH_DOUBLE_PRECOMMIT_BPS,
             max_commission_bps: MAX_COMMISSION_BPS,
             governance_delay_epochs: GOVERNANCE_DELAY_EPOCHS,
-            governance_quorum_bps: 5_000,
-            governance_critical_quorum_bps: 6_700,
+            governance_quorum_bps: GOVERNANCE_STANDARD_QUORUM_BPS,
+            governance_critical_quorum_bps: GOVERNANCE_CRITICAL_QUORUM_BPS,
         }
     }
 
@@ -165,7 +169,7 @@ impl GovernableParams {
                 if *value < 4_000 {
                     return Err("floor is 4000 BPS (40%)".into());
                 }
-                if *value > 9_000 {
+                if *value > GOVERNANCE_STANDARD_QUORUM_BPS {
                     return Err("ceiling is 9000 BPS (90%)".into());
                 }
             }
@@ -179,7 +183,7 @@ impl GovernableParams {
                 if *value < 5_000 {
                     return Err("floor is 5000 BPS (50%)".into());
                 }
-                if *value > 9_500 {
+                if *value > GOVERNANCE_CRITICAL_QUORUM_BPS {
                     return Err("ceiling is 9500 BPS (95%)".into());
                 }
             }
@@ -1209,6 +1213,34 @@ mod tests {
             SLASH_LIVENESS_THRESHOLD_EPOCHS
         );
         assert_eq!(params.proposal_deposit_spark, 1_000 * SPARK_PER_INDRA);
+        assert_eq!(params.governance_quorum_bps, GOVERNANCE_STANDARD_QUORUM_BPS);
+        assert_eq!(
+            params.governance_critical_quorum_bps,
+            GOVERNANCE_CRITICAL_QUORUM_BPS
+        );
+    }
+
+    #[test]
+    fn governance_quorum_boundaries_are_strict_at_maximum_defaults() {
+        let standard = GovernanceSnapshot {
+            weights: [(Bytes32::from([1; 32]), 10_000)].into_iter().collect(),
+            total_stake: 10_000,
+        };
+        assert!(!standard.quorum_met_at_height(9_000, GOVERNANCE_STANDARD_QUORUM_BPS, 0));
+        assert!(standard.quorum_met_at_height(9_001, GOVERNANCE_STANDARD_QUORUM_BPS, 0));
+        assert!(!standard.quorum_met_at_height(9_500, GOVERNANCE_CRITICAL_QUORUM_BPS, 0));
+        assert!(standard.quorum_met_at_height(9_501, GOVERNANCE_CRITICAL_QUORUM_BPS, 0));
+
+        let founders = GovernanceSnapshot {
+            weights: [(Bytes32::from([2; 32]), 400_000_000_000)]
+                .into_iter()
+                .collect(),
+            total_stake: 400_000_000_000,
+        };
+        assert!(founders.quorum_met(400_000_000_000, GOVERNANCE_STANDARD_QUORUM_BPS));
+        assert!(founders.quorum_met(400_000_000_000, GOVERNANCE_CRITICAL_QUORUM_BPS));
+        assert!(!founders.quorum_met(360_000_000_000, GOVERNANCE_STANDARD_QUORUM_BPS));
+        assert!(!founders.quorum_met(360_000_000_000, GOVERNANCE_CRITICAL_QUORUM_BPS));
     }
 
     #[test]
@@ -1255,6 +1287,8 @@ mod tests {
     fn governance_actions_are_constitutionally_non_monetary() {
         let before = monetary_policy_snapshot();
         let mut params = GovernableParams::default_mainnet();
+        params.governance_quorum_bps = 5_000;
+        params.governance_critical_quorum_bps = 6_700;
         let actions = current_governable_action_samples();
 
         // There are exactly nine governable actions today. This count and the
