@@ -11,7 +11,7 @@ use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 use std::sync::LazyLock;
 
-static STATE: LazyLock<ChainState> = LazyLock::new(ChainState::new_genesis);
+static STATE: LazyLock<ChainState> = LazyLock::new(|| ChainState::new_genesis("indra-fuzz"));
 
 fuzz_target!(|data: &[u8]| {
     // Exercise the real JSON-RPC envelope parser whenever the bytes are UTF-8.
