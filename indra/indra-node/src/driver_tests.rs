@@ -739,11 +739,8 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         driver_b: ConsensusDriver,
         material_a: TestValidatorMaterial,
         material_b: TestValidatorMaterial,
-        sealed_genesis: Vec<u8>,
         dir_a: PathBuf,
         dir_b: PathBuf,
-        vote_safety_path_a: PathBuf,
-        vote_safety_path_b: PathBuf,
     }
 
     fn shared_two_validator_fixture() -> TwoValidatorFixture {
@@ -756,7 +753,6 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         let sealed = original + &render_test_validator_record("b", &b, 1_000_000)
             + &render_test_validator_record("c", &test_validator_material([0xC3; 32]), 1_000_000)
             + &render_test_validator_record("d", &test_validator_material([0xD4; 32]), 1_000_000);
-        let sealed_genesis = sealed.as_bytes().to_vec();
         std::fs::write(dir_a.join("genesis.toml"), &sealed).unwrap();
         let dir_b = temp_dir("shared_b_seed");
         std::fs::create_dir_all(&dir_b).unwrap();
@@ -772,7 +768,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         let ea = NodeEngine::init(ca).unwrap(); let eb = NodeEngine::init(cb).unwrap();
         let vote_safety_path_a = ea.config.vote_safety_path();
         let vote_safety_path_b = eb.config.vote_safety_path();
-        TwoValidatorFixture { driver_a: ConsensusDriver::new(ea, VoteSafetyStore::open(&vote_safety_path_a)), driver_b: ConsensusDriver::new(eb, VoteSafetyStore::open(&vote_safety_path_b)), material_a: a, material_b: b, sealed_genesis, dir_a, dir_b, vote_safety_path_a, vote_safety_path_b }
+        TwoValidatorFixture { driver_a: ConsensusDriver::new(ea, VoteSafetyStore::open(&vote_safety_path_a)), driver_b: ConsensusDriver::new(eb, VoteSafetyStore::open(&vote_safety_path_b)), material_a: a, material_b: b, dir_a, dir_b }
     }
 
     #[test]

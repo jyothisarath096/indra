@@ -4194,41 +4194,7 @@ mod tests {
         let dir = temp_dir("chain_id_snapshot");
         let config = NodeConfig::local_test(dir.clone());
         let genesis_path = config.genesis_path.as_ref().unwrap();
-        let mut genesis = std::fs::read_to_string(genesis_path).unwrap();
-        let hot = HybridKeypair::new(
-            ClassicalKeypair::from_seed(&[0x42; 32]),
-            PqKeypair::from_seed(&[0x43; 32]).unwrap(),
-        );
-        let hot_public = hot.public_key();
-        let validator_id = indra_core::types::crypto::hybrid_identity_id(
-            &hot_public.classical.0,
-            &hot_public.pq.0,
-        );
-        let vrf = VrfKeypair::from_seed(&[0x42; 32]);
-        let old_challenge = StakingOp::vrf_possession_challenge(
-            "indra-testnet-1",
-            &validator_id,
-            &Bytes32::from(vrf.public_key()),
-            0,
-        )
-        .unwrap();
-        let new_challenge = StakingOp::vrf_possession_challenge(
-            "indra-custom-testnet",
-            &validator_id,
-            &Bytes32::from(vrf.public_key()),
-            0,
-        )
-        .unwrap();
-        let (old_output, old_proof) = indra_crypto::vrf_prove(&vrf, &old_challenge);
-        let (new_output, new_proof) = indra_crypto::vrf_prove(&vrf, &new_challenge);
-        genesis = genesis
-            .replace(
-                "chain_id = \"indra-testnet-1\"",
-                "chain_id = \"indra-custom-testnet\"",
-            )
-            .replace(&hex::encode(old_output.0), &hex::encode(new_output.0))
-            .replace(&hex::encode(old_proof.0), &hex::encode(new_proof.0));
-        genesis = crate::genesis::test_genesis_toml_single_authority(
+        let genesis = crate::genesis::test_genesis_toml_single_authority(
             "indra-custom-testnet",
             &[([0x42; 32], [0x42; 32], [0x42; 32]), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
         );
