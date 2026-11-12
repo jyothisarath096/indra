@@ -530,6 +530,7 @@ dependencies = [
  "indra-core",
  "indra-crypto",
  "ml-kem",
+ "rand",
  "thiserror",
  "tokio",
  "x25519-dalek",
