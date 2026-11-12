@@ -316,7 +316,7 @@ operations, visibility, and next-snapshot eligibility.
 
 This delayed consensus removal remains economically backed because the
 withdrawn bond is locked through the unbonding period; the current constant is
-1,008 epochs (`indra-core/src/types/primitives.rs:39`).
+300 epochs (`indra-core/src/types/primitives.rs:40`).
 
 Software MUST NOT stop recognizing the validator's snapshot-valid votes merely
 because its live registry status became `Registered`. Whether the validator's

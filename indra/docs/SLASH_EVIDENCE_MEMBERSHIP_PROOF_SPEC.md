@@ -18,7 +18,7 @@ The repair adds:
 
 1. a versioned Merkle membership root derived from every authoritative
    `ConsensusSnapshot`;
-2. a bounded canonical history of those roots for the existing 500-epoch
+2. a bounded canonical history of those roots for the existing 150-epoch
    evidence window; and
 3. a proof-carrying slash-evidence format whose signatures are verified using
    the historical snapshot entry proven by the evidence; and
@@ -90,8 +90,8 @@ This specification treats these existing constants as fixed inputs:
 
 ```text
 EPOCH_DURATION_BLOCKS = 300
-SLASH_EVIDENCE_WINDOW_EPOCHS = 500
-UNBONDING_PERIOD_EPOCHS = 1008
+SLASH_EVIDENCE_WINDOW_EPOCHS = 150
+UNBONDING_PERIOD_EPOCHS = 300
 MAX_ACTIVE_VALIDATORS = 200
 ```
 
@@ -105,7 +105,7 @@ current_epoch <= infraction_epoch + SLASH_EVIDENCE_WINDOW_EPOCHS
 the evidence window not to exceed the unbonding period so slashable funds
 remain locked (`indra-core/src/types/primitives.rs:35-46`,
 `indra-core/src/types/primitives.rs:1335`). This specification does not shorten
-or otherwise revisit the 500-epoch policy.
+or otherwise revisit the 150-epoch policy.
 
 ### 1.3 Security objective
 
@@ -357,7 +357,7 @@ coexists with the oldest still-provable closed interval for one epoch,
 canonical state MUST permit up to:
 
 ```text
-SLASH_EVIDENCE_WINDOW_EPOCHS + 2 = 502 records
+SLASH_EVIDENCE_WINDOW_EPOCHS + 2 = 152 records
 ```
 
 under the ordinary one-snapshot-per-epoch schedule.
@@ -368,7 +368,7 @@ all slash evidence in that block has been validated and applied. At the end of
 the boundary transition, an older record MAY be removed exactly when:
 
 ```text
-current_epoch > I_last + 500
+current_epoch > I_last + 150
 ```
 
 This last-governed-height rule is required because a snapshot activated at
@@ -376,17 +376,17 @@ height 301 governs through boundary height 600: `epoch_for_height(600) == 2`
 even though `epoch_for_height(301) == 1`. Pruning from the activation epoch
 would remove the root one epoch too early for evidence about height 600.
 Implementations MUST not use collection length alone as the semantic pruning
-rule, although a 502-record cap MUST also be enforced as an invariant.
+rule, although a 152-record cap MUST also be enforced as an invariant.
 
 Replay, block projection, rollback, and checkpoint restore MUST perform
 identical creation and pruning.
 
 ### 3.4 Exact canonical cost
 
-At the 502-record inclusive maximum:
+At the 152-record inclusive maximum:
 
 ```text
-4-byte list prefix + 502 * 40-byte records = 20,084 bytes
+4-byte list prefix + 152 * 40-byte records = 6,084 bytes
 ```
 
 This is independent of active-validator count.
@@ -610,7 +610,7 @@ For `SlashEvidenceV2`, validation MUST proceed fail closed:
 2. require both votes' validator IDs to equal `evidence.validator_id`;
 3. require equal vote heights and rounds;
 4. compute `infraction_epoch = epoch_for_height(vote_1.height)`;
-5. enforce the existing 500-epoch evidence window;
+5. enforce the existing 150-epoch evidence window;
 6. require conflicting nonzero block hashes and the currently slashable vote
    step;
 7. resolve the one canonical root record for `vote_1.height`;
@@ -845,7 +845,7 @@ the post-gate path. A matured release continues to use
 
 **DESIGN JUDGMENT — REQUIRES ECONOMIC AND STATE-MACHINE REVIEW:** An active
 bond has no pre-existing maturity schedule. This specification treats eviction
-as the event that starts its ordinary 1,008-epoch unbonding period. An
+as the event that starts its ordinary 300-epoch unbonding period. An
 already-unbonding bond keeps its earlier schedule. Immediately releasing active
 bonds recreates the defect; restarting the clock for already-unbonding bonds
 would extend a lock that was already promised. External review MUST confirm
@@ -866,7 +866,7 @@ from the live registry, slash validation MUST require all of:
 3. the authoritative membership root record for `H`;
 4. a valid membership proof for the same validator ID in `S(H)`;
 5. both vote signatures valid under the keys in that proven entry;
-6. the ordinary equivocation, chain-ID, duplicate, and 500-epoch window rules;
+6. the ordinary equivocation, chain-ID, duplicate, and 150-epoch window rules;
    and
 7. at least one canonical self-custody position or tranche that remains
    slashable under the height-aware principal predicate.
@@ -930,8 +930,8 @@ while it still contains a position or tranche reference is forbidden. Removing
 a retained record without updating its reference, or removing a reference
 without the corresponding canonical transition, is an invariant error.
 
-Because `SLASH_EVIDENCE_WINDOW_EPOCHS = 500` is less than
-`UNBONDING_PERIOD_EPOCHS = 1008`, a tranche whose unbonding begins at eviction
+Because `SLASH_EVIDENCE_WINDOW_EPOCHS = 150` is less than
+`UNBONDING_PERIOD_EPOCHS = 300`, a tranche whose unbonding begins at eviction
 remains locked throughout every admissible evidence epoch. An already-unbonding
  self-custody tranche is slashable only when its recorded start is not earlier than the
 infraction under the existing legacy/height-precise predicate. This preserves
@@ -976,11 +976,11 @@ current_epoch > evidence_retention_end_epoch(T)
 and bonds_empty(T)
 ```
 
-In the ordinary case, newly unbonding bonds keep the tombstone alive for 1,008
-epochs, longer than the 502-record membership-root horizon. That is safe:
+In the ordinary case, newly unbonding bonds keep the tombstone alive for 300
+epochs, longer than the 152-record membership-root horizon. That is safe:
 membership roots are needed only while new evidence can be admitted; the
 tombstone remains afterward solely to release locked principal. Tombstones
-therefore do not piggyback on the 502-root collection and do not share its
+therefore do not piggyback on the 152-root collection and do not share its
 retention length.
 
 Prunable tombstones are removed in deterministic ascending order of:
@@ -1134,7 +1134,7 @@ cover:
    custody, and cap-pressure behavior.
 
 No real activation may proceed if review cannot establish that the
-500-versus-1,008 security relationship still holds through eviction.
+150-versus-300 security relationship still holds through eviction.
 
 ### 7.10 Honest limitations and unresolved decisions
 
@@ -1216,7 +1216,7 @@ single-gate bootstrap.
 
 ### 8.3 Pre-activation infractions
 
-There is no deterministic way for ordinary pruned nodes to backfill 500 prior
+There is no deterministic way for ordinary pruned nodes to backfill 150 prior
 membership roots from parent state at `G`. Archive replay could reconstruct
 them, but consensus cannot depend on optional archive availability.
 
@@ -1228,7 +1228,7 @@ Therefore:
 - no proof claim is made for pre-`G` membership; and
 - no pre-`G` root backfill occurs.
 
-This creates a transitional legacy tail of at most 500 epochs. It preserves
+This creates a transitional legacy tail of at most 150 epochs. It preserves
 historical evidence validity and avoids silently granting offenders amnesty at
 activation. After that tail expires, every admissible infraction is
 proof-governed.
@@ -1429,19 +1429,19 @@ testnet constant accidentally.
 - Tombstones with no remaining position or tranche references become prunable
   (7.64 MiB), including the four-byte outer count.
 
-These replace the roughly 257 MiB maximum-set canonical cost of retaining 500
+These replace the roughly 257 MiB maximum-set canonical cost of retaining 150
 full 200-validator snapshots.
 
-For an exact like-for-like 502-record inclusive history, a full snapshot's
+For an exact like-for-like 152-record inclusive history, a full snapshot's
 canonical size is `61 + 2,696 * member_count` bytes, plus one four-byte outer
 list prefix. The comparison is:
 
-| Members | One full snapshot | 502 full snapshots | Compact 502-root history |
+| Members | One full snapshot | 152 full snapshots | Compact 152-root history |
 |---:|---:|---:|---:|
-| 4 | 10,845 bytes | 5,444,194 bytes (5.19 MiB) | 20,084 bytes |
-| 200 | 539,261 bytes | 270,709,026 bytes (258.17 MiB) | 20,084 bytes |
+| 4 | 10,845 bytes | 1,648,444 bytes (1.57 MiB) | 6,084 bytes |
+| 200 | 539,261 bytes | 81,967,676 bytes (78.17 MiB) | 6,084 bytes |
 
-This refines “hundreds of MB” to 257.65 MiB at the active-set ceiling and
+This refines “hundreds of MB” to 78.17 MiB at the active-set ceiling and
 shows that even the current four-validator set would otherwise consume
 5.18 MiB canonically.
 
@@ -1525,7 +1525,7 @@ It does not solve:
    1 retains today's explicit double-precommit semantics.
 4. **Reporter identity and incentives.** No reporter-reward policy changes are
    made.
-5. **Evidence-window policy.** The value 500 is fixed input here, not newly
+5. **Evidence-window policy.** The value 150 is fixed input here, not newly
    justified or made governable.
 6. **Immediate versus epoch-frozen consensus removal.** This remains governed
    by the versioned consensus-snapshot design, not membership roots.

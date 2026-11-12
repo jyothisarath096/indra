@@ -504,7 +504,7 @@ REGISTERED ↔ ACTIVE
        SLASHED
 ```
 
-**Unbonding period:** 1,008 epochs (~21 days). Each exit becomes an immutable
+**Unbonding period:** 300 epochs (about 21 to 32 days at measured mean block times). Each exit becomes an immutable
 height-precise tranche; stake cannot be redirected during unbonding.
 
 ### 5.3 Auto-delegation for validators outside the active set
@@ -560,7 +560,7 @@ with no economic consequence.
 ```
 Minimum delegation:    Dust limit (0.001 INDRA protocol floor)
                        Each validator sets their own minimum above this
-Unbonding period:      1,008 epochs (~21 days)
+Unbonding period:      300 epochs (about 21 to 32 days at measured mean block times)
 Commission range:      0–20% (maximum governable, can only decrease)
 Reward frequency:      Each epoch (~30 minutes)
 Key custody:           Delegator retains full custody always
@@ -988,7 +988,7 @@ Blocks per year:             5,256,000
 Epoch duration:              300 blocks (~30 minutes)
 Consensus quorum:            66.67% of total stake
 BFT safety threshold:        <33.33% Byzantine stake
-Unbonding period:            1,008 epochs (~21 days)
+Unbonding period:            300 epochs (about 21 to 32 days at measured mean block times)
 Default prune window:        50,000 blocks
 Snapshot interval:           300 blocks (each epoch)
 
