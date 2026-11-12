@@ -973,6 +973,13 @@ mod tests {
         let end_epoch = match frozen.timing {
             UnbondingTimingV1::HeightPrecise { end_epoch, .. } => end_epoch,
         };
+        let one_epoch_early =
+            (end_epoch - 1) * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+        let mut early_release = state.clone();
+        assert!(release_matured_position_tranches(&mut early_release, one_epoch_early)
+            .unwrap()
+            .is_empty());
+        assert!(early_release.unbonding_tranches.contains_key(&first));
         let release_height = end_epoch * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
         let before_failed_release = state.clone();
         set_fail_after_mutation(None);

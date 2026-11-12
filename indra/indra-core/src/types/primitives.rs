@@ -36,17 +36,18 @@ pub const MAX_TRANCHES_PER_VALIDATOR: usize = 104_096;
 /// Binding network-wide maximum retained unbonding tranches.
 pub const MAX_TRANCHES_TOTAL: usize = 104_096;
 
-/// Epochs a validator's stake is locked after initiating exit.
-pub const UNBONDING_PERIOD_EPOCHS: u64 = 1008; // 21 days at 2 epochs/hour (48 epochs/day × 21 days = 1008)
+/// Measured in epochs. At the measured mean block time of about 20 to 31 seconds this is a real duration of about 21 to 32 days.
+pub const UNBONDING_PERIOD_EPOCHS: u64 = 300;
 
 /// Number of epochs after equivocation during which evidence is accepted
 /// and self-bonds that entered unbonding after the infraction remain slashable.
+/// Measured in epochs. At the measured mean block time of about 20 to 31 seconds this is a real duration of about 10 to 16 days.
 /// This must be <= UNBONDING_PERIOD_EPOCHS so slashable funds are still locked.
-pub const SLASH_EVIDENCE_WINDOW_EPOCHS: u64 = 500;
+pub const SLASH_EVIDENCE_WINDOW_EPOCHS: u64 = 150;
 
-/// Epochs after exit during which a validator's signatures remain valid.
+/// Measured in epochs. At the measured mean block time of about 20 to 31 seconds this is a real duration of about 28 to 43 days.
 /// AUTH_WINDOW = UNBONDING_PERIOD + 100
-pub const AUTH_WINDOW_EPOCHS: u64 = 1108; // unbonding(1008) + buffer(100)
+pub const AUTH_WINDOW_EPOCHS: u64 = 400; // unbonding(300) + buffer(100)
 
 /// Hard floor on total round time — immutable, not governable.
 pub const MIN_ROUND_TIME_MS: u64 = 3_000;
@@ -709,6 +710,7 @@ mod tests {
         assert!(VALIDATOR_SET_PHASE4_MAX <= MAX_QC_SIGNERS);
         assert!(AUTH_WINDOW_EPOCHS >= UNBONDING_PERIOD_EPOCHS);
         assert!(SLASH_EVIDENCE_WINDOW_EPOCHS <= UNBONDING_PERIOD_EPOCHS);
+        assert_eq!(AUTH_WINDOW_EPOCHS, UNBONDING_PERIOD_EPOCHS + 100);
     }
 
     #[test]

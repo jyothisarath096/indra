@@ -3488,6 +3488,74 @@ mod tests {
     }
 
     #[test]
+    fn double_precommit_evidence_window_is_inclusive_at_boundary() {
+        use indra_core::types::stake_position::{
+            ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1,
+        };
+
+        let (mut state, validator_id, keypair) = slash_validator_state([0xD5; 32], 1_000_000);
+        let custody = PositionCustodyV1::ValidatorColdIdentity { validator_id };
+        let position = StakePositionV1::new(
+            validator_id,
+            validator_id,
+            custody,
+            Some(ActiveStakeAggregateV1::new(1_000_000, 1, 1).unwrap()),
+            0,
+            0,
+        )
+        .unwrap();
+        state.stake_positions.insert(position.position_id, position);
+        state.rebuild_position_tranche_index().unwrap();
+        let snapshot = state.consensus_snapshots[0].clone();
+        let evidence = SlashEvidenceV2 {
+            validator_id,
+            vote_1: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xD5; 32]),
+            ),
+            vote_2: signed_vote(
+                &keypair,
+                validator_id,
+                1,
+                0,
+                VoteStep::Precommit,
+                Bytes32::from([0xD6; 32]),
+            ),
+            membership_proof: build_slash_membership_proof(&snapshot, 0).unwrap(),
+        };
+        let chain_id = state.chain_id.clone();
+        let boundary_height = indra_core::types::primitives::SLASH_EVIDENCE_WINDOW_EPOCHS
+            * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
+        let mut accepted = state.clone();
+        apply_slash_v2_at_height_with_accounting(
+            &mut accepted,
+            &evidence,
+            &chain_id,
+            boundary_height,
+            None,
+        )
+        .unwrap();
+
+        let mut rejected = state;
+        let error = apply_slash_v2_at_height_with_accounting(
+            &mut rejected,
+            &evidence,
+            &chain_id,
+            boundary_height + indra_core::types::primitives::EPOCH_DURATION_BLOCKS,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid slash evidence: slash evidence outside evidence window: infraction_epoch=0, current_epoch=151, window=150"
+        );
+    }
+
+    #[test]
     fn largest_remainder_two_ten_spark_records_at_five_percent_is_exact() {
         let targets = [
             (SlashTarget::Position(Bytes32::from([1; 32])), 10),

@@ -9,7 +9,7 @@ use indra_cli::{
 use indra_core::codec::Decode;
 use indra_core::types::{
     crypto::HybridPubKey,
-    primitives::{Bytes32, VariableBytes},
+    primitives::{Bytes32, VariableBytes, UNBONDING_PERIOD_EPOCHS},
     stake_position::PositionCustodyV1,
 };
 
@@ -187,7 +187,7 @@ fn run_self_unstake(args: &[String]) -> CliResult<()> {
         &node_url,
         &[(
             "Note",
-            "UTXO returns after 1,008 epochs (approximately 21 days)".to_string(),
+            format!("UTXO returns after {UNBONDING_PERIOD_EPOCHS} epochs"),
         )],
         None,
     )
@@ -265,7 +265,7 @@ fn run_undelegate(args: &[String]) -> CliResult<()> {
             ("Position", hex::encode(position_id.0)),
             (
                 "Note",
-                "UTXO returns after 1,008 epochs (approximately 21 days)".to_string(),
+                format!("UTXO returns after {UNBONDING_PERIOD_EPOCHS} epochs"),
             ),
         ],
         None,

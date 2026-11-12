@@ -694,8 +694,14 @@ mod tests {
             .unwrap();
         }
         assert!(plan.tombstone.retained_position_ids.is_empty());
-        assert!(!tombstone_is_prunable_v2(&plan.tombstone, 501));
-        assert!(tombstone_is_prunable_v2(&plan.tombstone, 502));
+        assert!(!tombstone_is_prunable_v2(
+            &plan.tombstone,
+            SLASH_EVIDENCE_WINDOW_EPOCHS + 1
+        ));
+        assert!(tombstone_is_prunable_v2(
+            &plan.tombstone,
+            SLASH_EVIDENCE_WINDOW_EPOCHS + 2
+        ));
     }
 
     #[test]

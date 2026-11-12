@@ -1809,7 +1809,7 @@ fn decode_retired_cold_components(
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
+    use indra_core::types::primitives::{SLASH_EVIDENCE_WINDOW_EPOCHS, TEST_CHAIN_ID};
     use super::*;
 
     #[test]
@@ -2220,23 +2220,39 @@ mod tests {
     }
 
     #[test]
-    fn slash_membership_history_keeps_502_until_last_governed_window_expires() {
+    fn slash_membership_history_keeps_window_plus_two_until_last_governed_window_expires() {
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
-        state.slash_membership_roots = (0u64..502)
+        state.slash_membership_roots = (0u64..(SLASH_EVIDENCE_WINDOW_EPOCHS + 2))
             .map(|index| SlashMembershipRootRecord {
                 activation_height: 301 + index * EPOCH_DURATION_BLOCKS,
                 membership_root: Bytes32::from([(index % 251) as u8; 32]),
             })
             .collect();
 
-        state.prune_slash_membership_roots(150_600).unwrap();
-        assert_eq!(crate::epoch::epoch_for_height(150_600), 502);
-        assert_eq!(state.slash_membership_roots.len(), 502);
+        let boundary_height = (SLASH_EVIDENCE_WINDOW_EPOCHS + 2) * EPOCH_DURATION_BLOCKS;
+        state.prune_slash_membership_roots(boundary_height).unwrap();
+        assert_eq!(
+            crate::epoch::epoch_for_height(boundary_height),
+            SLASH_EVIDENCE_WINDOW_EPOCHS + 2
+        );
+        assert_eq!(
+            state.slash_membership_roots.len(),
+            SLASH_EVIDENCE_WINDOW_EPOCHS as usize + 2
+        );
         assert_eq!(state.slash_membership_roots[0].activation_height, 301);
 
-        state.prune_slash_membership_roots(150_900).unwrap();
-        assert_eq!(crate::epoch::epoch_for_height(150_900), 503);
-        assert_eq!(state.slash_membership_roots.len(), 501);
+        let after_boundary_height = boundary_height + EPOCH_DURATION_BLOCKS;
+        state
+            .prune_slash_membership_roots(after_boundary_height)
+            .unwrap();
+        assert_eq!(
+            crate::epoch::epoch_for_height(after_boundary_height),
+            SLASH_EVIDENCE_WINDOW_EPOCHS + 3
+        );
+        assert_eq!(
+            state.slash_membership_roots.len(),
+            SLASH_EVIDENCE_WINDOW_EPOCHS as usize + 1
+        );
         assert_eq!(state.slash_membership_roots[0].activation_height, 601);
     }
 

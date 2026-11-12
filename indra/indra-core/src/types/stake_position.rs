@@ -774,6 +774,22 @@ mod tests {
     }
 
     #[test]
+    fn unbonding_end_epoch_uses_floor_height_plus_new_period() {
+        let first = UnbondingTimingV1::height_precise(1).unwrap();
+        let second = UnbondingTimingV1::height_precise(301).unwrap();
+        let UnbondingTimingV1::HeightPrecise {
+            end_epoch: first_end,
+            ..
+        } = first;
+        let UnbondingTimingV1::HeightPrecise {
+            end_epoch: second_end,
+            ..
+        } = second;
+        assert_eq!(first_end, 300);
+        assert_eq!(second_end, 301);
+    }
+
+    #[test]
     fn malformed_versions_tags_ids_timing_custody_and_principal_fail_closed() {
         let mut custody_version = position().custody.encode_to_vec();
         custody_version[0] = 2;
