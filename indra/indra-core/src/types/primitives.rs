@@ -54,8 +54,10 @@ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 /// Exclusive upper bound of the normative consensus-round domain.
 ///
 /// Every proposal, vote, QC, PoLC, live transition, and persisted safety
-/// record must satisfy `round < MAX_ROUNDS_PER_HEIGHT`.
-pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1_024;
+/// record must satisfy `round < MAX_ROUNDS_PER_HEIGHT`. The large finite
+/// domain prevents a prolonged, non-finalizing height from failing closed
+/// merely because a healthy node exhausted a small local round counter.
+pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1 << 24;
 
 /// Validate one consensus round against the authoritative protocol domain.
 pub fn validate_consensus_round(round: u32) -> IndraResult<u32> {

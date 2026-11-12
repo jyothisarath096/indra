@@ -140,7 +140,14 @@ mod tests {
         ] {
             let mut vote = dummy_vote();
             vote.round = round;
-            assert!(VoteV1::decode_exact(&vote.encode_to_vec()).is_err());
+            let error = VoteV1::decode_exact(&vote.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round {round}; maximum legal round is {}",
+                    crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
         }
     }
 

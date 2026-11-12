@@ -411,7 +411,7 @@ mod tests {
             indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
             u32::MAX,
         ] {
-            assert!(produce_vote(
+            let error = produce_vote(
                 1,
                 round,
                 VoteStep::Prevote,
@@ -421,7 +421,14 @@ mod tests {
                 TEST_CHAIN_ID,
                 &keypair,
             )
-            .is_err());
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round: invalid consensus round {round}; maximum legal round is {}",
+                    indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
         }
     }
 

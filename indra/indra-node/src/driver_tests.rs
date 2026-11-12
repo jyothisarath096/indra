@@ -5354,6 +5354,41 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
     }
 
     #[test]
+    fn certified_round_jump_accepts_new_bound_and_rejects_exclusive_bound() {
+        let mut fixture = shared_four_validator_fixture();
+        let driver = &mut fixture.drivers[0];
+        driver.sync.mark_caught_up(driver.height());
+        driver.refresh_registered_voters();
+        let target_round = MAX_ROUNDS_PER_HEIGHT - 1;
+        driver.current_round = target_round - MAX_ACCEPTED_ROUND_JUMP;
+        let snapshot_root = governing_snapshot_root(driver, 1);
+        for voter in driver.registered_voters.iter().take(3) {
+            driver
+                .round_advance_evidence
+                .entry((1, target_round))
+                .or_default()
+                .insert(
+                    voter.validator_id,
+                    dummy_vote(1, target_round, VoteStep::Prevote, Bytes32::ZERO, snapshot_root),
+                );
+        }
+
+        let _ = driver.maybe_advance_to_certified_round(1, target_round);
+        assert_eq!(driver.current_round(), target_round);
+
+        driver.current_round = target_round - 1;
+        let actions = driver.maybe_advance_to_certified_round(1, MAX_ROUNDS_PER_HEIGHT);
+        assert!(actions.is_empty());
+        assert_eq!(driver.current_round(), target_round - 1);
+
+        let dirs = fixture.dirs.clone();
+        drop(fixture.drivers);
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn invalid_high_round_vote_is_rejected_before_any_consensus_mutation() {
         let (mut driver, dir) = local_driver([0x49u8; 32], "high_round_vote");
         let signer = install_active_validator(&mut driver, [0x49u8; 32], "local");

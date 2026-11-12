@@ -600,7 +600,7 @@ mod tests {
             indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
             u32::MAX,
         ] {
-            assert!(build_qc(
+            let error = build_qc(
                 1,
                 round,
                 TEST_SNAPSHOT_ROOT,
@@ -609,7 +609,14 @@ mod tests {
                 std::slice::from_ref(&validator),
                 vec![&vote],
             )
-            .is_err());
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round: invalid consensus round {round}; maximum legal round is {}",
+                    indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
         }
     }
 

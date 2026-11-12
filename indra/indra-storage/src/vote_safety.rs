@@ -400,7 +400,14 @@ mod tests {
             indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
             u32::MAX,
         ] {
-            assert!(store.record(1, round, 0, None).is_err());
+            let error = store.record(1, round, 0, None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "I/O error: invalid consensus round {round}; maximum legal round is {}",
+                    indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
 
             // Recompute the CRC so this exercises semantic persisted-state
             // validation rather than corrupted-byte handling.

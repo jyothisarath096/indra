@@ -696,15 +696,36 @@ mod tests {
         ] {
             let mut header = dummy_header();
             header.proposer_round = round;
-            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+            let error = BlockHeaderVNext::decode_exact(&header.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round {round}; maximum legal round is {}",
+                    crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
 
             let mut header = dummy_header();
             header.value_entropy.origin_round = round;
-            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+            let error = BlockHeaderVNext::decode_exact(&header.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round {round}; maximum legal round is {}",
+                    crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
 
             let mut header = dummy_header();
             header.polc_round = Some(round);
-            assert!(BlockHeaderVNext::decode_exact(&header.encode_to_vec()).is_err());
+            let error = BlockHeaderVNext::decode_exact(&header.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid consensus round {round}; maximum legal round is {}",
+                    crate::types::primitives::MAX_ROUNDS_PER_HEIGHT - 1
+                )
+            );
         }
     }
 }
