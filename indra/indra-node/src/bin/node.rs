@@ -2357,6 +2357,10 @@ fn main() {
         eprintln!("Retain:    {} blocks", prune_keep);
     }
 
+    if let Err(error) = ensure_data_dir(Path::new(&data_dir)) {
+        eprintln!("ERROR: cannot create data directory {}: {error}", data_dir);
+        std::process::exit(1);
+    }
     check_disk_space(Path::new(&data_dir));
 
     // Load keys
@@ -4122,6 +4126,10 @@ fn check_disk_space(data_dir: &Path) -> u64 {
     available
 }
 
+fn ensure_data_dir(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)
+}
+
 fn print_help() {
     println!("Usage: indra-node [--config <path>] [flags]");
     println!();
@@ -5763,6 +5771,17 @@ mod tests {
         config.observer_addr = None;
         config.metrics_addr = None;
         config
+    }
+
+    #[test]
+    fn ensure_data_dir_creates_missing_directory_before_free_space_query() {
+        let parent = tempfile::tempdir().unwrap();
+        let data_dir = parent.path().join("nested").join("node-data");
+        assert!(!data_dir.exists());
+
+        ensure_data_dir(&data_dir).unwrap();
+        assert!(data_dir.is_dir());
+        assert!(check_disk_space(&data_dir) > 0);
     }
 
     #[test]
