@@ -106,6 +106,8 @@ impl EpochTransitionContext {
 }
 
 /// Apply the epoch transition to the chain state.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
 pub fn apply_epoch_transition(
     state: &mut ChainState,
     context: &EpochTransitionContext,
@@ -134,6 +136,8 @@ pub fn apply_epoch_transition(
 }
 
 /// Apply an epoch transition using an explicit, validated boundary context.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
 pub fn apply_epoch_transition_at_height(
     state: &mut ChainState,
     context: &EpochTransitionContext,
@@ -144,6 +148,7 @@ pub fn apply_epoch_transition_at_height(
     apply_epoch_transition_at_height_with_selector(state, context, timestamp_secs, &selector)
 }
 
+#[cfg(any(debug_assertions, feature = "test-support"))]
 fn reward_selector_from_signers(
     reward_signer_ids: Option<&BTreeSet<Bytes32>>,
 ) -> RewardRecipientSelector {
