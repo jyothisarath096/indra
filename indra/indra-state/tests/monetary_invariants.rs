@@ -250,6 +250,7 @@ fn epoch_reward_does_not_increase_total_supply() {
         &mut state,
         &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
+        None,
     )
     .unwrap();
     assert_eq!(state.total_supply, supply_before);
@@ -295,6 +296,7 @@ fn liveness_penalty_burn_reduces_total_supply_if_active() {
         &mut state,
         &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
+        None,
     )
     .unwrap();
     assert!(state.total_supply < supply_before);
@@ -332,6 +334,7 @@ fn total_supply_invariant_across_full_epoch_cycle() {
         &mut state,
         &EpochTransitionContext::new(height, height - 1).unwrap(),
         0,
+        None,
     )
     .unwrap();
     assert_eq!(after_block, supply_before + expected_reward - fee / 2);

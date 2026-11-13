@@ -389,6 +389,21 @@ fn make_block_with_qc(state: &ChainState, signer_ids: &[Bytes32]) -> BlockVNext 
     block
 }
 
+fn validator_pending_reward(state: &ChainState, validator_id: Bytes32) -> u64 {
+    let position_id = indra_core::types::stake_position::derive_position_id(
+        validator_id,
+        validator_id,
+        indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+            validator_id,
+        },
+    );
+    state
+        .stake_positions
+        .get(&position_id)
+        .unwrap()
+        .pending_rewards_spark
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -505,6 +520,114 @@ fn apply_block_updates_last_active_epoch_for_qc_signers() {
             .last_active_epoch,
         0
     );
+}
+
+#[test]
+fn applied_blocks_pay_only_embedded_qc_signers_exactly() {
+    let mut state = new_test_state();
+    let validator_ids = install_test_validators_for_qc(&mut state);
+
+    for height in 1..=12u64 {
+        let signers = match height {
+            1 => validator_ids.clone(),
+            2 => validator_ids[..3].to_vec(),
+            3 => vec![validator_ids[1], validator_ids[2], validator_ids[3]],
+            4 => vec![validator_ids[0], validator_ids[2], validator_ids[3]],
+            _ => validator_ids[..3].to_vec(),
+        };
+        let before = validator_ids
+            .iter()
+            .map(|id| validator_pending_reward(&state, *id))
+            .collect::<Vec<_>>();
+        let minted_before = state.monetary_ledger.cumulative_reward_minted_spark;
+        let block = if height == 1 {
+            make_block(&state, vec![])
+        } else {
+            make_block_with_qc(&state, &signers)
+        };
+        assert_eq!(block.header.height, height);
+        apply_block(&mut state, &block, 0).unwrap();
+        let minted = state
+            .monetary_ledger
+            .cumulative_reward_minted_spark
+            .checked_sub(minted_before)
+            .unwrap();
+        let increases = validator_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| validator_pending_reward(&state, *id) - before[index])
+            .collect::<Vec<_>>();
+        assert_eq!(increases.iter().sum::<u64>(), minted);
+        for (index, validator_id) in validator_ids.iter().enumerate() {
+            if signers.contains(validator_id) {
+                assert!(increases[index] > 0, "signer {validator_id:?} was not paid");
+            } else {
+                assert_eq!(increases[index], 0, "non-signer {validator_id:?} was paid");
+            }
+        }
+    }
+}
+
+#[test]
+fn boundary_block_fees_go_only_to_embedded_qc_signers() {
+    let mut state = new_test_state();
+    let validator_ids = install_test_validators_for_qc(&mut state);
+    advance_fixture_height_with_issuance(&mut state, EPOCH_DURATION_BLOCKS - 1);
+
+    let boundary_signers = vec![validator_ids[0], validator_ids[1], validator_ids[3]];
+    let before = validator_ids
+        .iter()
+        .map(|id| validator_pending_reward(&state, *id))
+        .collect::<Vec<_>>();
+    state.fee_reward_pool = 10_000;
+    state.total_supply = state.total_supply.checked_add(state.fee_reward_pool).unwrap();
+    state.monetary_ledger.genesis_issued_spark = state
+        .monetary_ledger
+        .genesis_issued_spark
+        .checked_add(state.fee_reward_pool)
+        .unwrap();
+    state.monetary_ledger.reward_budget_spark = state
+        .monetary_ledger
+        .reward_budget_spark
+        .checked_sub(state.fee_reward_pool)
+        .unwrap();
+    let block = make_block_with_qc(&state, &boundary_signers);
+    apply_block(&mut state, &block, 0).unwrap();
+    assert_eq!(state.fee_reward_pool, 0);
+    for (index, validator_id) in validator_ids.iter().enumerate() {
+        let increase = validator_pending_reward(&state, *validator_id) - before[index];
+        if boundary_signers.contains(validator_id) {
+            assert!(increase > 0, "boundary signer {validator_id:?} was not paid");
+        } else {
+            assert_eq!(increase, 0, "boundary non-signer {validator_id:?} was paid");
+        }
+    }
+}
+
+#[test]
+fn height_one_block_pays_all_snapshot_members() {
+    let mut state = new_test_state();
+    let validator_ids = install_test_validators_for_qc(&mut state);
+    let before = validator_ids
+        .iter()
+        .map(|id| validator_pending_reward(&state, *id))
+        .collect::<Vec<_>>();
+    let minted_before = state.monetary_ledger.cumulative_reward_minted_spark;
+    let block = make_block(&state, vec![]);
+    apply_block(&mut state, &block, 0).unwrap();
+    let minted = state
+        .monetary_ledger
+        .cumulative_reward_minted_spark
+        .checked_sub(minted_before)
+        .unwrap();
+    let increases = validator_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| validator_pending_reward(&state, *id) - before[index])
+        .collect::<Vec<_>>();
+    assert_eq!(increases.iter().sum::<u64>(), minted);
+    assert!(increases.iter().all(|increase| *increase > 0));
+    assert!(increases.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[test]
@@ -864,6 +987,7 @@ fn epoch_transition_produces_identical_state_on_replay() {
         )
         .unwrap(),
         0,
+        None,
     )
     .unwrap();
     apply_epoch_transition(
@@ -876,6 +1000,7 @@ fn epoch_transition_produces_identical_state_on_replay() {
         )
         .unwrap(),
         0,
+        None,
     )
     .unwrap();
     assert_eq!(original.encode_to_vec(), replay.encode_to_vec());

@@ -10,7 +10,7 @@
 //! Reward issuance is height-derived, checked, and capped by the immutable
 //! lifetime budget; epoch transitions report and reset only epoch-local counters.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use indra_core::{
     types::primitives::{
@@ -32,6 +32,21 @@ use crate::{
     },
     validator::ValidatorStatus,
 };
+
+/// Selects the frozen snapshot members eligible for one reward allocation.
+///
+/// `AllMembers` is used when the applied block has no embedded QC, or when the
+/// supplied signer set has no intersection with the paired reward snapshot.
+/// `Signers` pays only the intersection of the verified signer IDs and that
+/// snapshot; the existing commission, delegator, and largest-remainder logic
+/// remains unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewardRecipientSelector {
+    /// Pay every member of the paired frozen snapshot.
+    AllMembers,
+    /// Pay the snapshot members whose IDs are in this verified signer set.
+    Signers(BTreeSet<Bytes32>),
+}
 
 /// Immutable, derived facts for one epoch-boundary state transition.
 ///
@@ -95,6 +110,7 @@ pub fn apply_epoch_transition(
     state: &mut ChainState,
     context: &EpochTransitionContext,
     timestamp_secs: u64,
+    reward_signer_ids: Option<&BTreeSet<Bytes32>>,
 ) -> StateResult<EpochRecord> {
     let before = state.clone();
     #[cfg(test)]
@@ -102,7 +118,9 @@ pub fn apply_epoch_transition(
         *state = before;
         return Err(error);
     }
-    match apply_epoch_transition_at_height(state, context, timestamp_secs).and_then(|record| {
+    let selector = reward_selector_from_signers(reward_signer_ids);
+    match apply_epoch_transition_at_height_with_selector(state, context, timestamp_secs, &selector)
+    .and_then(|record| {
         state.refresh_and_reconcile_monetary_state()?;
         state.rebuild_state_commitment_v2(context.boundary_height);
         Ok(record)
@@ -120,12 +138,48 @@ pub fn apply_epoch_transition_at_height(
     state: &mut ChainState,
     context: &EpochTransitionContext,
     timestamp_secs: u64,
+    reward_signer_ids: Option<&BTreeSet<Bytes32>>,
 ) -> StateResult<EpochRecord> {
-    apply_epoch_transition_final(state, context, timestamp_secs)
+    let selector = reward_selector_from_signers(reward_signer_ids);
+    apply_epoch_transition_at_height_with_selector(state, context, timestamp_secs, &selector)
+}
+
+fn reward_selector_from_signers(
+    reward_signer_ids: Option<&BTreeSet<Bytes32>>,
+) -> RewardRecipientSelector {
+    reward_signer_ids.map_or(RewardRecipientSelector::AllMembers, |signers| {
+        RewardRecipientSelector::Signers(signers.clone())
+    })
+}
+
+/// Apply an epoch transition using an explicit reward signer selector.
+pub(crate) fn apply_epoch_transition_at_height_with_selector(
+    state: &mut ChainState,
+    context: &EpochTransitionContext,
+    timestamp_secs: u64,
+    reward_selector: &RewardRecipientSelector,
+) -> StateResult<EpochRecord> {
+    apply_epoch_transition_final(state, context, timestamp_secs, reward_selector)
 }
 
 /// Mint and allocate the unique reward authorized for `height`.
+#[cfg(test)]
 pub(crate) fn apply_block_reward_issuance(state: &mut ChainState, height: u64) -> StateResult<u64> {
+    apply_block_reward_issuance_with_selector(
+        state,
+        height,
+        &RewardRecipientSelector::AllMembers,
+    )
+}
+
+/// Mint and allocate the block reward to verified QC signers, falling back to
+/// all frozen snapshot members when the block has no QC or no signer intersects
+/// the paired reward snapshot.
+pub(crate) fn apply_block_reward_issuance_with_selector(
+    state: &mut ChainState,
+    height: u64,
+    reward_selector: &RewardRecipientSelector,
+) -> StateResult<u64> {
     use crate::error::StateError;
     use crate::monetary::cumulative_reward_target_at_height;
 
@@ -158,7 +212,13 @@ pub(crate) fn apply_block_reward_issuance(state: &mut ChainState, height: u64) -
                 message: "reward issuance exceeds reward budget or lifetime supply cap",
             });
         }
-        distribute_block_rewards(state, reward, epoch_for_height(height), height)?;
+        distribute_block_rewards_with_selector(
+            state,
+            reward,
+            epoch_for_height(height),
+            height,
+            reward_selector,
+        )?;
         state.total_supply = post_mint_supply;
         state.monetary_ledger.epoch_reward_minted_spark = state
             .monetary_ledger
@@ -174,6 +234,7 @@ fn apply_epoch_transition_final(
     state: &mut ChainState,
     context: &EpochTransitionContext,
     timestamp_secs: u64,
+    reward_selector: &RewardRecipientSelector,
 ) -> StateResult<EpochRecord> {
     let height = context.boundary_height;
     let current_epoch = context.opening_epoch;
@@ -230,7 +291,7 @@ fn apply_epoch_transition_final(
     )?;
 
     state.validators.select_active_set(total_staked, height);
-    distribute_fee_rewards(state, current_epoch, height)?;
+    distribute_fee_rewards_with_selector(state, current_epoch, height, reward_selector)?;
     let fee_rewards_distributed = fee_pool_before.checked_sub(state.fee_reward_pool).ok_or(
         crate::error::StateError::InvariantViolation {
             message: "fee reward pool increased during distribution",
@@ -644,11 +705,28 @@ pub fn tally_votes(proposal: &ProposalRecord) -> (u64, u64, u64) {
     (yes, no, abstain)
 }
 
+#[cfg(test)]
 fn distribute_block_rewards(
     state: &mut ChainState,
     epoch_block_reward: u64,
     current_epoch: u64,
     height: u64,
+) -> crate::error::StateResult<()> {
+    distribute_block_rewards_with_selector(
+        state,
+        epoch_block_reward,
+        current_epoch,
+        height,
+        &RewardRecipientSelector::AllMembers,
+    )
+}
+
+fn distribute_block_rewards_with_selector(
+    state: &mut ChainState,
+    epoch_block_reward: u64,
+    current_epoch: u64,
+    height: u64,
+    reward_selector: &RewardRecipientSelector,
 ) -> crate::error::StateResult<()> {
     #[cfg(test)]
     install_reward_basis_if_missing(state)?;
@@ -658,13 +736,29 @@ fn distribute_block_rewards(
         current_epoch,
         height,
         SnapshotRewardSource::Block,
+        reward_selector,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn distribute_fee_rewards(
     state: &mut ChainState,
     current_epoch: u64,
     height: u64,
+) -> crate::error::StateResult<()> {
+    distribute_fee_rewards_with_selector(
+        state,
+        current_epoch,
+        height,
+        &RewardRecipientSelector::AllMembers,
+    )
+}
+
+fn distribute_fee_rewards_with_selector(
+    state: &mut ChainState,
+    current_epoch: u64,
+    height: u64,
+    reward_selector: &RewardRecipientSelector,
 ) -> crate::error::StateResult<()> {
     #[cfg(test)]
     install_reward_basis_if_missing(state)?;
@@ -680,6 +774,7 @@ pub(crate) fn distribute_fee_rewards(
         current_epoch,
         height,
         SnapshotRewardSource::Fee,
+        reward_selector,
     );
     if result.is_err() {
         state.fee_reward_pool = fee_pool;
@@ -803,6 +898,7 @@ fn distribute_snapshot_rewards(
     current_epoch: u64,
     height: u64,
     _source: SnapshotRewardSource,
+    reward_selector: &RewardRecipientSelector,
 ) -> crate::error::StateResult<()> {
     use crate::error::StateError;
 
@@ -820,9 +916,22 @@ fn distribute_snapshot_rewards(
             "paired consensus snapshot has zero total weight".to_string(),
         ));
     }
+    let signer_members = match reward_selector {
+        RewardRecipientSelector::AllMembers => Vec::new(),
+        RewardRecipientSelector::Signers(signers) => consensus
+            .entries()
+            .iter()
+            .filter(|member| signers.contains(&member.validator_id))
+            .collect::<Vec<_>>(),
+    };
+    let eligible_members = if signer_members.is_empty() {
+        consensus.entries().iter().collect::<Vec<_>>()
+    } else {
+        signer_members
+    };
     let validator_allocations = largest_remainder_allocations(
         pool,
-        consensus.entries().iter().map(|member| {
+        eligible_members.iter().map(|member| {
             (
                 member.validator_id,
                 member.consensus_weight_spark,
@@ -1488,6 +1597,305 @@ mod tests {
             crate::monetary::MonetaryLedgerV1::genesis(state.total_supply).unwrap();
     }
 
+    fn reward_fixture(stakes: &[u64]) -> (ChainState, Vec<Bytes32>) {
+        let mut state = new_test_state();
+        let mut ids = Vec::with_capacity(stakes.len());
+        for (index, stake) in stakes.iter().copied().enumerate() {
+            let id_byte = u8::try_from(index + 1).unwrap();
+            let validator = make_validator(id_byte, stake);
+            let id = validator.validator_id;
+            state.validators.upsert(validator).unwrap();
+            install_self_position(&mut state, id, stake);
+            ids.push(id);
+        }
+        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
+        let economic = state.build_reward_economic_snapshot(&snapshot).unwrap();
+        state.consensus_snapshots = vec![snapshot];
+        state.reward_economic_snapshot = Some(economic);
+        (state, ids)
+    }
+
+    fn pending_reward(state: &ChainState, validator_id: Bytes32) -> u64 {
+        validator_position_rewards(state, validator_id)
+    }
+
+    fn signer_selector(ids: impl IntoIterator<Item = Bytes32>) -> RewardRecipientSelector {
+        RewardRecipientSelector::Signers(ids.into_iter().collect())
+    }
+
+    #[test]
+    fn block_reward_split_among_signers_only_by_self_stake() {
+        let (mut state, ids) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut state,
+            100,
+            0,
+            1,
+            &signer_selector([ids[0], ids[1], ids[3]]),
+        )
+        .unwrap();
+        assert_eq!(pending_reward(&state, ids[0]), 14);
+        assert_eq!(pending_reward(&state, ids[1]), 29);
+        assert_eq!(pending_reward(&state, ids[2]), 0);
+        assert_eq!(pending_reward(&state, ids[3]), 57);
+    }
+
+    #[test]
+    fn non_signer_delegators_receive_zero_block_reward() {
+        let (mut state, ids) = reward_fixture(&[1, 1, 1, 1]);
+        let delegator_id = Bytes32::from([0xD1; 32]);
+        let custody = indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+            delegator_id,
+        };
+        let position = indra_core::types::stake_position::StakePositionV1::new(
+            ids[2],
+            delegator_id,
+            custody,
+            Some(
+                indra_core::types::stake_position::ActiveStakeAggregateV1::new(100, 0, 0)
+                    .unwrap(),
+            ),
+            0,
+            0,
+        )
+        .unwrap();
+        state.stake_positions.insert(position.position_id, position);
+        state.rebuild_position_tranche_index().unwrap();
+        let snapshot = state.build_genesis_consensus_snapshot().unwrap();
+        state.reward_economic_snapshot = Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
+        state.consensus_snapshots = vec![snapshot];
+        distribute_block_rewards_with_selector(
+            &mut state,
+            100,
+            0,
+            1,
+            &signer_selector([ids[0], ids[1], ids[3]]),
+        )
+        .unwrap();
+        assert_eq!(pending_reward(&state, ids[2]), 0);
+        let delegator_position = state
+            .stake_positions
+            .get(&position_id_for_test(ids[2], delegator_id))
+            .unwrap();
+        assert_eq!(delegator_position.pending_rewards_spark, 0);
+        assert_eq!(pending_reward(&state, ids[0]), 34);
+    }
+
+    fn position_id_for_test(validator_id: Bytes32, delegator_id: Bytes32) -> Bytes32 {
+        indra_core::types::stake_position::derive_position_id(
+            validator_id,
+            delegator_id,
+            indra_core::types::stake_position::PositionCustodyV1::DelegatorIdentity {
+                delegator_id,
+            },
+        )
+    }
+
+    #[test]
+    fn block_without_embedded_qc_pays_all_members() {
+        let (mut state, ids) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut state,
+            100,
+            0,
+            1,
+            &RewardRecipientSelector::AllMembers,
+        )
+        .unwrap();
+        assert_eq!(
+            ids.iter().map(|id| pending_reward(&state, *id)).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn signers_outside_reward_snapshot_fall_back_to_all_members() {
+        let (mut state, ids) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut state,
+            100,
+            0,
+            1,
+            &signer_selector([Bytes32::from([0xFF; 32])]),
+        )
+        .unwrap();
+        assert_eq!(
+            ids.iter().map(|id| pending_reward(&state, *id)).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn signers_partially_outside_reward_snapshot_use_the_intersection() {
+        let (mut state, ids) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut state,
+            100,
+            0,
+            1,
+            &signer_selector([ids[1], Bytes32::from([0xFF; 32])]),
+        )
+        .unwrap();
+        assert_eq!(pending_reward(&state, ids[0]), 0);
+        assert_eq!(pending_reward(&state, ids[1]), 100);
+        assert_eq!(pending_reward(&state, ids[2]), 0);
+        assert_eq!(pending_reward(&state, ids[3]), 0);
+    }
+
+    #[test]
+    fn signer_order_does_not_change_reward_result() {
+        let (mut first, ids) = reward_fixture(&[1, 2, 3, 4]);
+        let (mut second, _) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut first,
+            100,
+            0,
+            1,
+            &signer_selector([ids[3], ids[0], ids[1]]),
+        )
+        .unwrap();
+        distribute_block_rewards_with_selector(
+            &mut second,
+            100,
+            0,
+            1,
+            &signer_selector([ids[1], ids[3], ids[0]]),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn signer_subset_reward_pool_is_exhausted_exactly() {
+        let (mut state, ids) = reward_fixture(&[1, 2, 3, 4]);
+        distribute_block_rewards_with_selector(
+            &mut state,
+            101,
+            0,
+            1,
+            &signer_selector([ids[0], ids[2]]),
+        )
+        .unwrap();
+        let total: u64 = ids.iter().map(|id| pending_reward(&state, *id)).sum();
+        assert_eq!(total, 101);
+        assert_eq!(pending_reward(&state, ids[0]), 25);
+        assert_eq!(pending_reward(&state, ids[2]), 76);
+    }
+
+    #[test]
+    fn boundary_fee_reward_uses_boundary_qc_signers() {
+        let (mut state, ids) = reward_fixture(&[1, 1, 1, 1]);
+        state.fee_reward_pool = 100;
+        distribute_fee_rewards_with_selector(
+            &mut state,
+            1,
+            300,
+            &signer_selector([ids[0], ids[2], ids[3]]),
+        )
+        .unwrap();
+        assert_eq!(pending_reward(&state, ids[0]), 34);
+        assert_eq!(pending_reward(&state, ids[1]), 0);
+        assert_eq!(pending_reward(&state, ids[2]), 33);
+        assert_eq!(pending_reward(&state, ids[3]), 33);
+        assert_eq!(state.fee_reward_pool, 0);
+    }
+
+    #[test]
+    fn rewards_over_twelve_blocks_with_rotating_omitted_signer() {
+        let (mut state, ids) = reward_fixture(&[1, 1, 1, 1]);
+        for index in 0..12usize {
+            let omitted = index % 4;
+            let signers = ids
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate, id)| (candidate != omitted).then_some(*id));
+            distribute_block_rewards_with_selector(
+                &mut state,
+                100,
+                0,
+                index as u64 + 1,
+                &signer_selector(signers),
+            )
+            .unwrap();
+        }
+        assert_eq!(pending_reward(&state, ids[0]), 306);
+        assert_eq!(pending_reward(&state, ids[1]), 300);
+        assert_eq!(pending_reward(&state, ids[2]), 297);
+        assert_eq!(pending_reward(&state, ids[3]), 297);
+        assert_eq!(
+            ids.iter().map(|id| pending_reward(&state, *id)).sum::<u64>(),
+            1_200
+        );
+    }
+
+    #[test]
+    fn reward_application_is_deterministic_on_replay() {
+        let (mut first, ids) = reward_fixture(&[1, 2, 3, 4]);
+        let mut second = first.clone();
+        let selector = signer_selector([ids[0], ids[2], ids[3]]);
+        for state in [&mut first, &mut second] {
+            distribute_block_rewards_with_selector(state, 101, 0, 1, &selector).unwrap();
+        }
+        assert_eq!(first, second);
+        assert_eq!(crate::compute_state_root(&first), crate::compute_state_root(&second));
+    }
+
+    #[test]
+    #[ignore = "release-mode reward selector timing; run explicitly with --release --ignored --nocapture"]
+    fn reward_selector_real_hardware_timing_200_snapshot_members() {
+        let stakes = vec![1u64; 200];
+        let (all_state, ids) = reward_fixture(&stakes);
+        assert_eq!(ids.len(), 200);
+        let signer_ids = ids.iter().copied().take(140).collect::<BTreeSet<_>>();
+
+        let mut all_state = all_state;
+        let mut all_samples = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let started = std::time::Instant::now();
+            distribute_block_rewards_with_selector(
+                &mut all_state,
+                1_000,
+                0,
+                1,
+                &RewardRecipientSelector::AllMembers,
+            )
+            .unwrap();
+            all_samples.push(started.elapsed().as_micros());
+        }
+
+        let (mut signer_state, _) = reward_fixture(&stakes);
+        let mut signer_samples = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let started = std::time::Instant::now();
+            distribute_block_rewards_with_selector(
+                &mut signer_state,
+                1_000,
+                0,
+                1,
+                &RewardRecipientSelector::Signers(signer_ids.clone()),
+            )
+            .unwrap();
+            signer_samples.push(started.elapsed().as_micros());
+        }
+
+        all_samples.sort_unstable();
+        signer_samples.sort_unstable();
+        let mean = |samples: &[u128]| {
+            samples.iter().sum::<u128>() as f64 / samples.len() as f64
+        };
+        let p99 = |samples: &[u128]| samples[(samples.len() * 99) / 100];
+        println!(
+            "QC_REWARD_TIMING all_members_mean_us={:.3} all_members_p99_us={}",
+            mean(&all_samples),
+            p99(&all_samples)
+        );
+        println!(
+            "QC_REWARD_TIMING signers_140_mean_us={:.3} signers_140_p99_us={}",
+            mean(&signer_samples),
+            p99(&signer_samples)
+        );
+    }
+
     #[test]
     fn epoch_transition_context_validates_and_derives_boundary_facts() {
         let context = EpochTransitionContext::new(300, 299).unwrap();
@@ -1668,8 +2076,8 @@ mod tests {
                 .unwrap();
         install_reward_basis_if_missing(&mut continuous).unwrap();
         install_reward_basis_if_missing(&mut replayed).unwrap();
-        apply_epoch_transition_at_height(&mut continuous, &context, 111).unwrap();
-        apply_epoch_transition_at_height(&mut replayed, &context, 999).unwrap();
+        apply_epoch_transition_at_height(&mut continuous, &context, 111, None).unwrap();
+        apply_epoch_transition_at_height(&mut replayed, &context, 999, None).unwrap();
 
         assert_eq!(
             continuous.governance.proposals.keys().collect::<Vec<_>>(),
@@ -2166,6 +2574,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         let before_effective = state.validators.get(&validator_id).unwrap();
@@ -2182,6 +2591,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         let after_effective = state.validators.get(&validator_id).unwrap();
@@ -2227,6 +2637,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(state.total_supply, supply_before);
@@ -2249,6 +2660,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
@@ -2279,6 +2691,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2307,6 +2720,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         let expected_penalty = initial_stake.saturating_mul(SLASH_LIVENESS_BPS as u64) / 10_000;
@@ -2331,6 +2745,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 
@@ -2367,6 +2782,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         apply_epoch_transition(
@@ -2379,6 +2795,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(s1.total_supply, s2.total_supply);
@@ -2416,6 +2833,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         apply_epoch_transition(
@@ -2428,6 +2846,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 
@@ -2479,6 +2898,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
         apply_epoch_transition(
@@ -2491,6 +2911,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 
@@ -2544,6 +2965,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 
@@ -2578,6 +3000,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 
@@ -2637,6 +3060,7 @@ mod tests {
             )
             .unwrap(),
             0,
+            None,
         )
         .unwrap();
 

@@ -1335,8 +1335,19 @@ impl NodeEngine {
                 height: proposal_height,
             });
         }
+        // A reproposal preserves the already validated stable value. With
+        // signer-scoped rewards, replacing the original parent QC with a
+        // different valid signer subset would change the projected reward
+        // state root and therefore the stable value hash. The original block
+        // QC is already parent-valid; retain it when present and use the
+        // supplied QC only for the height-one compatibility case.
+        let qc_source = if original_block.header.quorum_certificate.is_empty() {
+            last_qc.as_slice()
+        } else {
+            original_block.header.quorum_certificate.as_slice()
+        };
         let qc_bytes =
-            VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(&last_qc).map_err(|error| {
+            VariableBytes::<MAX_QC_SIZE_BYTES>::from_slice(qc_source).map_err(|error| {
                 NodeError::BlockInvalid {
                     height: proposal_height,
                     reason: error.to_string(),

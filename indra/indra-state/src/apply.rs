@@ -31,7 +31,7 @@
 //! State is only mutated after all validation passes.
 //! On any error, the original state is unchanged.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use indra_core::{
     codec::{Decode, Encode},
@@ -4852,7 +4852,19 @@ fn apply_block_inner(
     // accumulated into an epoch reserve. This transition also fails closed if
     // the persisted cumulative target is inconsistent with the prior height.
     txn.snapshot_epoch_scope();
-    crate::epoch::apply_block_reward_issuance(txn.state_mut(), block.header.height)?;
+    let reward_selector = verified_qc.map_or(
+        crate::epoch::RewardRecipientSelector::AllMembers,
+        |qc| {
+            crate::epoch::RewardRecipientSelector::Signers(
+                qc.signer_ids().iter().copied().collect::<BTreeSet<_>>(),
+            )
+        },
+    );
+    crate::epoch::apply_block_reward_issuance_with_selector(
+        txn.state_mut(),
+        block.header.height,
+        &reward_selector,
+    )?;
     txn.after_mutation()?;
 
     // A slash finalized at H revokes only the affected frozen authorities at
@@ -4885,10 +4897,11 @@ fn apply_block_inner(
     // Apply epoch transition if this is the last block of an epoch.
     let epoch_record = if let Some(context) = transition_context {
         txn.snapshot_epoch_scope();
-        Some(crate::epoch::apply_epoch_transition_at_height(
+        Some(crate::epoch::apply_epoch_transition_at_height_with_selector(
             txn.state_mut(),
             &context,
             timestamp_secs,
+            &reward_selector,
         )?)
     } else {
         None

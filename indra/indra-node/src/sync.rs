@@ -1721,6 +1721,59 @@ mod tests {
     }
 
     #[test]
+    fn sync_import_reproduces_signer_scoped_rewards() {
+        let mut live_state = ChainState::new_genesis(TEST_CHAIN_ID);
+        let (validator_id, hybrid) =
+            install_active_validator(&mut live_state, 0x6A, 10_000, true, true);
+        let mut imported_state = live_state.clone();
+        let mut previous_qc = Vec::new();
+
+        for _ in 0..6 {
+            let block = make_strict_block(&live_state, 0x6A, 0, previous_qc.clone());
+            let live_record = apply_verified_test(&mut live_state, &block, 0).unwrap();
+            let imported = validate_imported_block(&block, &imported_state, 0).unwrap();
+            assert_eq!(live_record, imported.epoch_record);
+            assert_eq!(compute_state_root(&live_state), compute_state_root(&imported.state));
+            assert_eq!(live_state.encode_to_vec(), imported.state.encode_to_vec());
+
+            let position_id = indra_core::types::stake_position::derive_position_id(
+                validator_id,
+                validator_id,
+                indra_core::types::stake_position::PositionCustodyV1::ValidatorColdIdentity {
+                    validator_id,
+                },
+            );
+            assert_eq!(
+                live_state
+                    .stake_positions
+                    .get(&position_id)
+                    .unwrap()
+                    .pending_rewards_spark,
+                imported
+                    .state
+                    .stake_positions
+                    .get(&position_id)
+                    .unwrap()
+                    .pending_rewards_spark
+            );
+            imported_state = imported.state;
+            previous_qc = build_qc_bytes(
+                block.header.height,
+                block.header.proposer_round,
+                block.header.block_hash(),
+                validator_id,
+                &hybrid,
+                hybrid.public_key().pq.0.to_vec(),
+                10_000,
+                imported_state
+                    .snapshot_for_consensus_height(block.header.height)
+                    .unwrap()
+                    .snapshot_root,
+            );
+        }
+    }
+
+    #[test]
     fn optimized_import_projection_roots_match_old_two_call_reference() {
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x71, 10_000, true, true);
