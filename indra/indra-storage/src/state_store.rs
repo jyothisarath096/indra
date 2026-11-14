@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION};
-use indra_state::{compute_state_roots, ChainState};
+use indra_state::{ChainState, compute_state_roots};
 
 static SNAPSHOT_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 
@@ -526,8 +526,8 @@ fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<Ch
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
 
     #[test]
     fn cleanup_failure_is_counted_and_not_silent() {
@@ -539,13 +539,13 @@ mod tests {
         assert_eq!(StateStore::cleanup_failure_count(), before + 1);
     }
     use indra_core::{
+        Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderVNext, BlockVNext},
         types::primitives::DUST_LIMIT_SPARK,
-        Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
-        apply_block_for_test as apply_block, compute_state_root, compute_validator_set_root,
-        ValidatorEntry, ValidatorStatus,
+        ValidatorEntry, ValidatorStatus, apply_block_for_test as apply_block, compute_state_root,
+        compute_validator_set_root,
     };
     use std::io::Write;
 
@@ -744,9 +744,10 @@ mod tests {
         write_snapshot(&dir, state.height, &payload);
 
         let err = store.load_latest().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not match node schema version"));
+        assert!(
+            err.to_string()
+                .contains("does not match node schema version")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -819,7 +820,8 @@ mod tests {
                 &entry.validator_id,
                 &snapshot.snapshot_root,
                 &state.chain_id,
-            );
+            )
+            .unwrap();
             let signature = keypair.sign(&bytes).unwrap();
             let qc = indra_core::types::qc::QuorumCertificateV1 {
                 height: state.height,
@@ -948,9 +950,10 @@ mod tests {
         drop(file);
 
         let err = store.load_latest().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported snapshot format version"));
+        assert!(
+            err.to_string()
+                .contains("unsupported snapshot format version")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

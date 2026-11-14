@@ -205,6 +205,7 @@ impl BlockHeaderVNext {
     }
 
     /// Compute the stable consensus value hash for a block.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_value_hash(
         height: u64,
         prev_hash: Bytes32,

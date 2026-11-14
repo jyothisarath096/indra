@@ -6,6 +6,7 @@
 use indra_core::types::primitives::TEST_CHAIN_ID;
 
 use indra_core::{
+    Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     codec::{Decode, Encode},
     types::{
         block::{BlockHeaderVNext, BlockVNext},
@@ -19,14 +20,13 @@ use indra_core::{
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
-    Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{
-    apply_block_for_test as apply_block, compute_state_root,
-    epoch::{apply_epoch_transition, EpochTransitionContext},
+    ChainState, ValidatorEntry, ValidatorStatus, apply_block_for_test as apply_block,
+    compute_state_root,
+    epoch::{EpochTransitionContext, apply_epoch_transition},
     utxo::UtxoSet,
-    ChainState, ValidatorEntry, ValidatorStatus,
 };
 
 const TEST_INPUT_VALUE: u64 = 1_000_000;
@@ -354,7 +354,8 @@ fn qc_bytes_for_signers(
                 validator_id,
                 &snapshot.snapshot_root,
                 &state.chain_id,
-            );
+            )
+            .unwrap();
             (*validator_id, keypair.sign(&bytes).unwrap())
         })
         .collect();
@@ -580,7 +581,10 @@ fn boundary_block_fees_go_only_to_embedded_qc_signers() {
         .map(|id| validator_pending_reward(&state, *id))
         .collect::<Vec<_>>();
     state.fee_reward_pool = 10_000;
-    state.total_supply = state.total_supply.checked_add(state.fee_reward_pool).unwrap();
+    state.total_supply = state
+        .total_supply
+        .checked_add(state.fee_reward_pool)
+        .unwrap();
     state.monetary_ledger.genesis_issued_spark = state
         .monetary_ledger
         .genesis_issued_spark
@@ -597,7 +601,10 @@ fn boundary_block_fees_go_only_to_embedded_qc_signers() {
     for (index, validator_id) in validator_ids.iter().enumerate() {
         let increase = validator_pending_reward(&state, *validator_id) - before[index];
         if boundary_signers.contains(validator_id) {
-            assert!(increase > 0, "boundary signer {validator_id:?} was not paid");
+            assert!(
+                increase > 0,
+                "boundary signer {validator_id:?} was not paid"
+            );
         } else {
             assert_eq!(increase, 0, "boundary non-signer {validator_id:?} was paid");
         }
@@ -962,10 +969,12 @@ fn test_auto_delegate_full_lifecycle() {
         "the claim must clear prior accrual even though its own block issues a fresh reward"
     );
     assert_eq!(state.utxos.len(), utxos_before + 1);
-    assert!(state
-        .utxos
-        .all_entries()
-        .any(|entry| entry.output.value_spark == claimed));
+    assert!(
+        state
+            .utxos
+            .all_entries()
+            .any(|entry| entry.output.value_spark == claimed)
+    );
 }
 
 #[test]

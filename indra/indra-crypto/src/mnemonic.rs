@@ -50,26 +50,31 @@ pub fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 32], CryptoError> {
 }
 
 /// Derive all INDRA keypair seeds from a 32-byte master seed.
-pub fn derive_all_seeds(master_seed: &[u8; 32]) -> DerivedSeeds {
-    let ed25519_seed = derive_seed(master_seed, b"indra-ed25519-v1");
-    let ml_dsa_seed = derive_seed(master_seed, b"indra-ml-dsa-v1");
-    let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1");
-    DerivedSeeds {
+pub fn derive_all_seeds(master_seed: &[u8; 32]) -> Result<DerivedSeeds, CryptoError> {
+    let ed25519_seed = derive_seed(master_seed, b"indra-ed25519-v1")?;
+    let ml_dsa_seed = derive_seed(master_seed, b"indra-ml-dsa-v1")?;
+    let vrf_seed = derive_seed(master_seed, b"indra-vrf-v1")?;
+    Ok(DerivedSeeds {
         ed25519_seed,
         ml_dsa_seed,
         vrf_seed,
-    }
+    })
 }
 
-fn derive_seed(master_seed: &[u8; 32], domain: &[u8]) -> [u8; 32] {
+fn derive_seed(master_seed: &[u8; 32], domain: &[u8]) -> Result<[u8; 32], CryptoError> {
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(master_seed).expect("HMAC accepts any key size");
+    let mut mac = HmacSha256::new_from_slice(master_seed).map_err(|_| {
+        CryptoError::MalformedEncoding {
+            scheme: "HMAC-SHA256 key",
+            actual: master_seed.len(),
+        }
+    })?;
     mac.update(domain);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
-    out
+    Ok(out)
 }
 
 /// Validate a mnemonic phrase without deriving keys.
@@ -105,8 +110,8 @@ mod tests {
     fn same_phrase_gives_same_seeds() {
         let phrase = generate_mnemonic();
         let seed = mnemonic_to_seed(&phrase).unwrap();
-        let derived1 = derive_all_seeds(&seed);
-        let derived2 = derive_all_seeds(&seed);
+        let derived1 = derive_all_seeds(&seed).unwrap();
+        let derived2 = derive_all_seeds(&seed).unwrap();
         assert_eq!(derived1.ed25519_seed, derived2.ed25519_seed);
         assert_eq!(derived1.ml_dsa_seed, derived2.ml_dsa_seed);
         assert_eq!(derived1.vrf_seed, derived2.vrf_seed);
@@ -148,7 +153,7 @@ mod tests {
     fn hybrid_and_vrf_seeds_are_different() {
         let phrase = generate_mnemonic();
         let seed = mnemonic_to_seed(&phrase).unwrap();
-        let derived = derive_all_seeds(&seed);
+        let derived = derive_all_seeds(&seed).unwrap();
         assert_ne!(derived.ed25519_seed, derived.ml_dsa_seed);
         assert_ne!(derived.ed25519_seed, derived.vrf_seed);
         assert_ne!(derived.ml_dsa_seed, derived.vrf_seed);
@@ -158,7 +163,7 @@ mod tests {
     fn known_vector() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
         let seed = mnemonic_to_seed(phrase).unwrap();
-        let derived = derive_all_seeds(&seed);
+        let derived = derive_all_seeds(&seed).unwrap();
         assert_eq!(
             hex::encode(derived.ed25519_seed),
             "47200e375715b909433a00a43e72958a32f04773fe8566b5cc9027e6f7ffef27"
@@ -176,15 +181,15 @@ mod tests {
     #[test]
     fn hmac_derive_seed_is_deterministic() {
         let master = [0x42u8; 32];
-        let s1 = derive_seed(&master, b"indra-ed25519-v1");
-        let s2 = derive_seed(&master, b"indra-ed25519-v1");
+        let s1 = derive_seed(&master, b"indra-ed25519-v1").unwrap();
+        let s2 = derive_seed(&master, b"indra-ed25519-v1").unwrap();
         assert_eq!(s1, s2);
     }
 
     #[test]
     fn boundary_master_seeds_derive_independent_nonzero_component_keys() {
         for master in [[0u8; 32], [0xffu8; 32]] {
-            let derived = derive_all_seeds(&master);
+            let derived = derive_all_seeds(&master).unwrap();
             assert_ne!(derived.ed25519_seed, [0u8; 32]);
             assert_ne!(derived.ml_dsa_seed, [0u8; 32]);
             assert_ne!(derived.ed25519_seed, derived.ml_dsa_seed);

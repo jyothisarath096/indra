@@ -7,7 +7,8 @@
 //!              --to <canonical_payment_address> \
 //!              --amount <INDRA> \
 //!              --fee <INDRA> \
-//!              --node http://127.0.0.1:8545
+//!              --node http://127.0.0.1:8545 \
+//!              [--rpc-token-file token.path]
 //!
 //! Cold mode replaces `--keys` with `--cold-keys` and accepts
 //! `--cold-keys-password-file` or `--cold-keys-password-env`; `--genesis`
@@ -17,6 +18,10 @@ use std::io::Write;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Err(error) = indra_cli::rpc_client::configure_from_args(&args) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
 
     let get = |flag: &str| -> Option<String> {
         args.iter()
@@ -67,10 +72,12 @@ fn main() {
         })
     });
     let hot_keys = if cold_keys.is_none() {
-        Some(indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
-            eprintln!("Error loading keys: {}", e);
-            std::process::exit(1);
-        }))
+        Some(
+            indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
+                eprintln!("Error loading keys: {}", e);
+                std::process::exit(1);
+            }),
+        )
     } else {
         None
     };
@@ -93,14 +100,20 @@ fn main() {
             std::process::exit(1);
         })
     } else {
-        let keys = hot_keys.as_ref().expect("hot keys loaded when cold mode is off");
+        let keys = hot_keys
+            .as_ref()
+            .expect("hot keys loaded when cold mode is off");
         indra_core::types::crypto::HybridPubKey {
-            classical_pk: indra_core::types::primitives::Bytes32::from(keys.public.hybrid_classical_pk),
-            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(&keys.public.hybrid_pq_pk)
-                .unwrap_or_else(|_| {
-                    eprintln!("Error: invalid hot public key");
-                    std::process::exit(1);
-                }),
+            classical_pk: indra_core::types::primitives::Bytes32::from(
+                keys.public.hybrid_classical_pk,
+            ),
+            pq_pk: indra_core::types::primitives::VariableBytes::from_slice(
+                &keys.public.hybrid_pq_pk,
+            )
+            .unwrap_or_else(|_| {
+                eprintln!("Error: invalid hot public key");
+                std::process::exit(1);
+            }),
         }
     };
 
@@ -124,7 +137,9 @@ fn main() {
             owner_pubkey: signer_owner.clone(),
         })
     } else {
-        let keys = hot_keys.as_ref().expect("hot keys loaded when cold mode is off");
+        let keys = hot_keys
+            .as_ref()
+            .expect("hot keys loaded when cold mode is off");
         let sender_pubkey = signer_owner.clone();
         indra_cli::build_transaction(&indra_cli::tx_builder::TxParams {
             chain_id: &chain_id,
@@ -136,7 +151,8 @@ fn main() {
             ml_dsa_seed_bytes: keys.ml_dsa_seed.to_vec(),
             sender_pubkey,
         })
-    }.unwrap_or_else(|e| {
+    }
+    .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
@@ -227,40 +243,7 @@ fn submit_transaction(node_url: &str, tx_hex: &str) -> Result<String, String> {
 }
 
 fn submit_raw_rpc(node_url: &str, body: &str) -> Result<String, String> {
-    // Use std::net for HTTP — no external HTTP crate needed
-    let url = node_url.trim_start_matches("http://");
-    let (host, path) = if let Some(pos) = url.find('/') {
-        (&url[..pos], &url[pos..])
-    } else {
-        (url, "/")
-    };
-
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    let mut stream =
-        TcpStream::connect(host).map_err(|e| format!("cannot connect to {}: {}", host, e))?;
-
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, body.len(), body
-    );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write error: {}", e))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("read error: {}", e))?;
-
-    // Extract body (after \r\n\r\n)
-    if let Some(pos) = response.find("\r\n\r\n") {
-        Ok(response[pos + 4..].to_string())
-    } else {
-        Ok(response)
-    }
+    indra_cli::rpc_client::post_json(node_url, body).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -275,5 +258,4 @@ mod tests {
             indra_cli::parse_indra_amount_to_spark("10.5", "--amount").unwrap()
         );
     }
-
 }

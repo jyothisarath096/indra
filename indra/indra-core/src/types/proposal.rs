@@ -116,7 +116,7 @@ pub fn verify_proposal<'a>(
     }
     let pk = HybridPublicKey {
         classical: ClassicalPublicKey(entry.classical_vote_pk),
-        pq: PqPublicKey(entry.pq_vote_pk.clone()),
+        pq: PqPublicKey(entry.pq_vote_pk),
     };
     let sig = proposal
         .proposer_authorization

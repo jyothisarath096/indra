@@ -1,10 +1,5 @@
 //! Staking CLI helpers: key reconstruction, HTTP RPC, nonce fetch, and submission.
 
-use std::{
-    io::{Read, Write},
-    net::TcpStream,
-};
-
 use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
 pub use crate::tx_builder::{
@@ -25,38 +20,9 @@ pub fn reconstruct_keypair(keys: &KeysFile) -> CliResult<HybridKeypair> {
     Ok(HybridKeypair::new(classical, pq))
 }
 
-/// Make a simple HTTP/1.1 JSON-RPC POST request.
+/// Make a bounded JSON-RPC POST request through the shared client.
 pub fn http_post(url: &str, body: &str) -> CliResult<String> {
-    let url = url.trim_start_matches("http://");
-    let (host, path) = if let Some(pos) = url.find('/') {
-        (&url[..pos], &url[pos..])
-    } else {
-        (url, "/")
-    };
-
-    let mut stream = TcpStream::connect(host)
-        .map_err(|e| CliError::Rpc(format!("cannot connect to node: {}", e)))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path,
-        host,
-        body.len(),
-        body
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| CliError::Rpc(format!("write error: {}", e)))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| CliError::Rpc(format!("read error: {}", e)))?;
-
-    if let Some(pos) = response.find("\r\n\r\n") {
-        Ok(response[pos + 4..].to_string())
-    } else {
-        Ok(response)
-    }
+    crate::rpc_client::post_json(url, body)
 }
 
 /// Fetch the current staking nonce for a signer. The caller adds one.

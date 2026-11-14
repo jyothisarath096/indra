@@ -3,14 +3,14 @@
 //! This is everything a node needs to validate the next block.
 //! It is the input and output of `apply_block`.
 
-use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
+use indra_core::codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len};
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::crypto::HybridPubKey;
 use indra_core::types::reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
 };
 use indra_core::types::slash_membership::{
-    compute_slash_membership_root, SlashMembershipRootRecord, MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
+    MAX_SLASH_MEMBERSHIP_ROOT_RECORDS, SlashMembershipRootRecord, compute_slash_membership_root,
 };
 use indra_core::types::{
     block::VrfSuiteV1,
@@ -18,10 +18,10 @@ use indra_core::types::{
 };
 
 use indra_core::types::primitives::{
-    Bytes32, Bytes64, VariableBytes, EPOCH_DURATION_BLOCKS,
-    INITIAL_BASE_FEE_SPARK_PER_KB, MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, MAX_CHAIN_ID_BYTES,
+    Bytes32, Bytes64, EPOCH_DURATION_BLOCKS, INITIAL_BASE_FEE_SPARK_PER_KB,
+    MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, MAX_CHAIN_ID_BYTES,
     MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
-    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
+    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL, VariableBytes,
 };
 use indra_core::types::stake_position::{
     ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTrancheV1,
@@ -1809,8 +1809,8 @@ fn decode_retired_cold_components(
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::{SLASH_EVIDENCE_WINDOW_EPOCHS, TEST_CHAIN_ID};
     use super::*;
+    use indra_core::types::primitives::{SLASH_EVIDENCE_WINDOW_EPOCHS, TEST_CHAIN_ID};
 
     #[test]
     fn retired_cold_component_decode_caps_fail_before_allocation() {
@@ -1843,7 +1843,7 @@ mod tests {
         error::IndraError,
         types::{
             crypto::HybridPubKey,
-            primitives::{VariableBytes, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS},
+            primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS, VariableBytes},
         },
     };
 
@@ -2020,7 +2020,8 @@ mod tests {
                 .unwrap()
                 .snapshot_root,
             &state.chain_id,
-        );
+        )
+        .unwrap();
         let revoked_keypair = indra_crypto::HybridKeypair::new(
             indra_crypto::ClassicalKeypair::from_seed(&[11; 32]),
             indra_crypto::PqKeypair::from_seed(&[12; 32]).unwrap(),
@@ -2047,12 +2048,14 @@ mod tests {
             }],
         };
         state.height = 10;
-        assert!(indra_core::types::qc::verify_qc_against_snapshot(
-            &qc,
-            state.snapshot_for_consensus_height(10).unwrap(),
-            &state.chain_id,
-        )
-        .is_ok());
+        assert!(
+            indra_core::types::qc::verify_qc_against_snapshot(
+                &qc,
+                state.snapshot_for_consensus_height(10).unwrap(),
+                &state.chain_id,
+            )
+            .is_ok()
+        );
         {
             let validator = state.validators.get_mut(&revoked).unwrap();
             validator.status = crate::validator::ValidatorStatus::Slashed;
@@ -2114,9 +2117,11 @@ mod tests {
         first.rotate_consensus_snapshot_after_boundary(300).unwrap();
         let regular = first.snapshot_for_consensus_height(301).unwrap();
         assert_eq!(regular.source_boundary_height, 300);
-        assert!(regular
-            .entry_with_position(&Bytes32::from([1; 32]))
-            .is_none());
+        assert!(
+            regular
+                .entry_with_position(&Bytes32::from([1; 32]))
+                .is_none()
+        );
         assert_eq!(first.consensus_snapshots.len(), 2);
         assert_eq!(
             first

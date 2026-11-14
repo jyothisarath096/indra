@@ -20,12 +20,12 @@ use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{has_strict_two_thirds_quorum, muldiv, validate_consensus_round, Bytes32},
+    primitives::{Bytes32, has_strict_two_thirds_quorum, muldiv, validate_consensus_round},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
-    verify_hybrid, ClassicalPublicKey, ClassicalSignature, HybridKeypair, HybridPublicKey,
-    HybridSignature, PqPublicKey, PqSignature,
+    ClassicalPublicKey, ClassicalSignature, HybridKeypair, HybridPublicKey, HybridSignature,
+    PqPublicKey, PqSignature, verify_hybrid,
 };
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -239,7 +239,7 @@ pub fn verify_vote_authority(
         &vote.validator_id,
         &vote.snapshot_root,
         chain_id,
-    );
+    )?;
     let sig_classical: [u8; 64] =
         vote.signature
             .classical_sig
@@ -289,7 +289,7 @@ pub fn produce_vote(
     keypair: &HybridKeypair,
 ) -> ConsensusResult<VoteV1> {
     validate_round(round)?;
-    use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
+    use indra_core::types::primitives::{MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, VariableBytes};
     let signing_bytes = vote_signing_bytes(
         height,
         round,
@@ -298,7 +298,7 @@ pub fn produce_vote(
         &validator_id,
         &snapshot_root,
         chain_id,
-    );
+    )?;
     let sig = keypair.sign(&signing_bytes)?;
     Ok(VoteV1 {
         height,
@@ -338,7 +338,7 @@ pub fn vote_signing_bytes(
     validator_id: &Bytes32,
     snapshot_root: &Bytes32,
     chain_id: &str,
-) -> Vec<u8> {
+) -> ConsensusResult<Vec<u8>> {
     indra_core::types::vote_signing::vote_signing_bytes(
         height,
         round,
@@ -348,12 +348,15 @@ pub fn vote_signing_bytes(
         snapshot_root,
         chain_id,
     )
+    .map_err(|error| ConsensusError::CryptoError {
+        detail: error.to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::vote::VoteStep;
     use indra_crypto::hybrid::HybridKeypair;
 
@@ -430,6 +433,50 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn oversized_chain_id_is_rejected_by_vote_sign_and_verify() {
+        let (voter, keypair) = voter(0x72, 10_000);
+        let oversized = "x".repeat(usize::from(u16::MAX) + 1);
+        let sign_error = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            TEST_SNAPSHOT_ROOT,
+            voter.validator_id,
+            TEST_SNAPSHOT_ROOT,
+            &oversized,
+            &keypair,
+        )
+        .unwrap_err();
+        assert_eq!(
+            sign_error.to_string(),
+            "crypto error: field 'chain_id' length 65536 exceeds maximum 65535"
+        );
+
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            TEST_SNAPSHOT_ROOT,
+            voter.validator_id,
+            TEST_SNAPSHOT_ROOT,
+            TEST_CHAIN_ID,
+            &keypair,
+        )
+        .unwrap();
+        let verify_error = verify_vote_authority(
+            &vote,
+            &oversized,
+            &TEST_SNAPSHOT_ROOT,
+            std::slice::from_ref(&voter),
+        )
+        .unwrap_err();
+        assert_eq!(
+            verify_error.to_string(),
+            "crypto error: field 'chain_id' length 65536 exceeds maximum 65535"
+        );
     }
 
     #[test]

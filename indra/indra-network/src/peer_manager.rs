@@ -5,14 +5,14 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 
@@ -21,11 +21,11 @@ use indra_core::types::{
     vote_signing::vote_signing_bytes,
 };
 use indra_core::{codec::Encode, ssz::sha256};
-use indra_crypto::{verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES};
+use indra_crypto::{ClassicalPublicKey, HybridPublicKey, PQ_PK_BYTES, PqPublicKey, verify_hybrid};
 
 use crate::{
     dandelion::{
-        Action as DandelionAction, FluffReason, RelayPeer, State as DandelionState, SWEEP_INTERVAL,
+        Action as DandelionAction, FluffReason, RelayPeer, SWEEP_INTERVAL, State as DandelionState,
     },
     error::NetworkError,
     frame::{FrameReader, FrameWriter},
@@ -33,8 +33,8 @@ use crate::{
     message::Message,
     net_types::{NetworkCommand, NetworkEvent, RelayValidatorKey},
     peer::{
-        PeerTable, ScoreEvent, BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE,
-        MAX_SCORE,
+        BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE, MAX_SCORE, PeerTable,
+        ScoreEvent,
     },
     policy::{BanStore, BoundedTtlSet},
     rate_limit::{
@@ -558,7 +558,7 @@ impl PeerManagerActor {
                 let Some(key) = self.relay_keys.get(&vote.validator_id) else {
                     return false;
                 };
-                let signing_bytes = vote_signing_bytes(
+                let Ok(signing_bytes) = vote_signing_bytes(
                     vote.height,
                     vote.round,
                     vote.step,
@@ -566,7 +566,9 @@ impl PeerManagerActor {
                     &vote.validator_id,
                     &vote.snapshot_root,
                     &self.relay_chain_id,
-                );
+                ) else {
+                    return false;
+                };
                 verify_relay_hybrid_signature(&signing_bytes, &vote.signature, key)
             }
             Message::Block(proposal) => {
@@ -949,7 +951,9 @@ impl PeerManagerActor {
                     if reason == FluffReason::NoRelay {
                         // Aggregate alert only: transaction IDs and peer addresses are
                         // deliberately excluded to avoid creating a correlation log.
-                        eprintln!("[p2p][alert] no eligible Dandelion transaction relay after bounded reconnect window; fluffing");
+                        eprintln!(
+                            "[p2p][alert] no eligible Dandelion transaction relay after bounded reconnect window; fluffing"
+                        );
                     }
                     let msg = Message::Tx(tx);
                     if let Some(except) = except {
@@ -1206,7 +1210,9 @@ impl PeerManagerActor {
         let mut is_outbound = false;
         if let Some(peer) = self.peers_by_validator.get(&validator_id) {
             if peer.addr == addr {
-                let peer = self.peers_by_validator.remove(&validator_id).unwrap();
+                let Some(peer) = self.peers_by_validator.remove(&validator_id) else {
+                    return;
+                };
                 is_outbound = peer.is_outbound;
                 peer.read_task.abort();
                 peer.write_task.abort();
@@ -1462,12 +1468,12 @@ mod tests {
         block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         crypto::HybridSignature,
         primitives::{
-            Bytes64, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES,
-            MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
+            Bytes64, MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES,
+            MAX_STANDARD_VRF_PROOF_BYTES, ProtocolVersion, VariableBytes,
         },
         vote::{VoteStep, VoteV1},
     };
-    use indra_crypto::{vrf_prove, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
+    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair, vrf_prove};
     use tokio::net::{TcpListener, TcpStream};
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
@@ -1738,7 +1744,8 @@ mod tests {
             &validator_id,
             &Bytes32::ZERO,
             "indra-testnet-1",
-        );
+        )
+        .unwrap();
         VoteV1 {
             height: 7,
             round: 2,
@@ -2720,11 +2727,13 @@ mod tests {
     #[test]
     fn relay_does_not_forward_request_or_response_messages() {
         assert!(relay_message_class(&Message::RequestQC { height: 7 }).is_none());
-        assert!(relay_message_class(&Message::QCResponse {
-            height: 7,
-            qc_bytes: vec![]
-        })
-        .is_none());
+        assert!(
+            relay_message_class(&Message::QCResponse {
+                height: 7,
+                qc_bytes: vec![]
+            })
+            .is_none()
+        );
     }
 
     const SIM_VALIDATORS_N200: usize = 200;

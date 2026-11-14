@@ -68,9 +68,15 @@ fn write_valid_cli_inputs(dir: &PathBuf) -> (PathBuf, PathBuf, PathBuf, String) 
     let keys_path = dir.join("keys.json");
     let password_path = dir.join("keys.password");
     let wallet_path = dir.join("wallet.json");
-    std::fs::write(&keys_path, indra_cli::encrypt_keys(&keys, b"test-password").unwrap()).unwrap();
+    std::fs::write(
+        &keys_path,
+        indra_cli::encrypt_keys(&keys, b"test-password").unwrap(),
+    )
+    .unwrap();
     std::fs::write(&password_path, b"test-password\n").unwrap();
-    indra_cli::Wallet::new().save(wallet_path.to_str().unwrap()).unwrap();
+    indra_cli::Wallet::new()
+        .save(wallet_path.to_str().unwrap())
+        .unwrap();
     let address = keys
         .payment_address("indra-testnet-1".as_bytes())
         .unwrap()
@@ -117,13 +123,21 @@ fn build_command_args(
 ) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
-        "--chain-id".to_string(), chain_id.to_string(),
-        "--genesis-timestamp".to_string(), timestamp.to_string(),
+        "--chain-id".to_string(),
+        chain_id.to_string(),
+        "--genesis-timestamp".to_string(),
+        timestamp.to_string(),
     ];
     for entry in entries {
-        args.extend(["--validator-entry".to_string(), entry.to_string_lossy().into_owned()]);
+        args.extend([
+            "--validator-entry".to_string(),
+            entry.to_string_lossy().into_owned(),
+        ]);
     }
-    args.extend(["--output".to_string(), output.to_string_lossy().into_owned()]);
+    args.extend([
+        "--output".to_string(),
+        output.to_string_lossy().into_owned(),
+    ]);
     args
 }
 
@@ -132,7 +146,13 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
     let validators = (0..4u8)
         .map(|i| {
             let keys = generate_from_master_seed(format!("genesis-{i}"), [i + 1; 32]).unwrap();
-            genesis_entry("indra-cli-roundtrip", &format!("v{i}"), &keys, DUST_LIMIT_SPARK * 10, i + 41)
+            genesis_entry(
+                "indra-cli-roundtrip",
+                &format!("v{i}"),
+                &keys,
+                DUST_LIMIT_SPARK * 10,
+                i + 41,
+            )
         })
         .collect();
     let config = build_test_genesis("indra-cli-roundtrip", validators);
@@ -143,11 +163,13 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
             let classical = hex::decode(&validator.cold_hybrid_classical_pk).unwrap();
             let pq = hex::decode(&validator.cold_hybrid_pq_pk).unwrap();
             let classical: [u8; 32] = classical.try_into().unwrap();
-            hex::encode(HybridPubKey {
-                classical_pk: Bytes32::from(classical),
-                pq_pk: VariableBytes::from_slice(&pq).unwrap(),
-            }
-            .encode_to_vec())
+            hex::encode(
+                HybridPubKey {
+                    classical_pk: Bytes32::from(classical),
+                    pq_pk: VariableBytes::from_slice(&pq).unwrap(),
+                }
+                .encode_to_vec(),
+            )
         })
         .collect();
     expected_owner_hexes.sort();
@@ -159,7 +181,11 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         .args(["validate", "--genesis", path.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(validate.status.success(), "{}", String::from_utf8_lossy(&validate.stderr));
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
     let validate_stdout = String::from_utf8_lossy(&validate.stdout);
     assert!(validate_stdout.contains("fingerprint="));
     assert!(validate_stdout.contains("genesis_block_hash="));
@@ -167,10 +193,26 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         .args(["inspect", "--genesis", path.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(inspect.status.success(), "{}", String::from_utf8_lossy(&inspect.stderr));
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
     let output = String::from_utf8_lossy(&inspect.stdout);
-    for field in ["chain_id", "validator_count", "seed", "state_root", "snapshot_root", "fingerprint", "genesis_block_hash", "file_sha256"] {
-        assert!(output.contains(field), "inspect output missing {field}: {output}");
+    for field in [
+        "chain_id",
+        "validator_count",
+        "seed",
+        "state_root",
+        "snapshot_root",
+        "fingerprint",
+        "genesis_block_hash",
+        "file_sha256",
+    ] {
+        assert!(
+            output.contains(field),
+            "inspect output missing {field}: {output}"
+        );
     }
     assert_eq!(output.matches("share_bps=2500").count(), 4);
     assert_eq!(output.matches("owner_pubkey_hex=").count(), 4);
@@ -180,8 +222,17 @@ fn genesis_cli_round_trips_and_inspects_all_canonical_roots() {
         .map(str::to_string)
         .collect();
     assert_eq!(actual_owner_hexes.len(), 4);
-    assert_eq!(actual_owner_hexes.iter().collect::<std::collections::HashSet<_>>().len(), 4);
-    for line in output.lines().filter(|line| line.starts_with("owner_pubkey_hex=")) {
+    assert_eq!(
+        actual_owner_hexes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("owner_pubkey_hex="))
+    {
         let encoded = line.strip_prefix("owner_pubkey_hex=").unwrap();
         assert!(HybridPubKey::decode_exact(&hex::decode(encoded).unwrap()).is_ok());
     }
@@ -199,18 +250,34 @@ fn genesis_cli_build_timestamp_warning_is_nonfatal_and_current_time_is_quiet() {
     let entries = write_build_entries(&dir, chain_id);
     let old_output = dir.join("old.toml");
     let old = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
-        .args(build_command_args(chain_id, 1_700_000_000, &entries, &old_output))
+        .args(build_command_args(
+            chain_id,
+            1_700_000_000,
+            &entries,
+            &old_output,
+        ))
         .output()
         .unwrap();
-    assert!(old.status.success(), "{}", String::from_utf8_lossy(&old.stderr));
+    assert!(
+        old.status.success(),
+        "{}",
+        String::from_utf8_lossy(&old.stderr)
+    );
     assert!(String::from_utf8_lossy(&old.stdout).contains("WARNING: genesis timestamp"));
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let current_output = dir.join("current.toml");
     let current = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args(build_command_args(chain_id, now, &entries, &current_output))
         .output()
         .unwrap();
-    assert!(current.status.success(), "{}", String::from_utf8_lossy(&current.stderr));
+    assert!(
+        current.status.success(),
+        "{}",
+        String::from_utf8_lossy(&current.stderr)
+    );
     assert!(!String::from_utf8_lossy(&current.stdout).contains("WARNING: genesis timestamp"));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -227,6 +294,76 @@ fn keygen_all_keys_present() {
 }
 
 #[test]
+fn keygen_export_public_round_trips_hot_and_cold_without_secrets() {
+    let dir = temp_dir("export-public");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hot = generate_from_master_seed("export-hot".into(), [0x61; 32]).unwrap();
+    let cold = indra_cli::ColdKeysFile::generate().unwrap();
+    let hot_path = dir.join("hot.json");
+    let cold_path = dir.join("cold.json");
+    let password_path = dir.join("password.txt");
+    std::fs::write(&hot_path, indra_cli::encrypt_keys(&hot, b"pw").unwrap()).unwrap();
+    indra_cli::write_keys_file_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
+    indra_cli::write_keys_file_secure(
+        cold_path.to_str().unwrap(),
+        &indra_cli::encrypt_cold_keys(&cold, b"pw").unwrap(),
+    )
+    .unwrap();
+    let hot_output = dir.join("hot-public.json");
+    let cold_output = dir.join("cold-public.json");
+    for (source, output, extra) in [
+        (&hot_path, &hot_output, vec![]),
+        (
+            &cold_path,
+            &cold_output,
+            vec![
+                "--hot-export",
+                hot_output.to_str().unwrap(),
+                "--keys-password-file",
+                password_path.to_str().unwrap(),
+            ],
+        ),
+    ] {
+        let mut args = vec![
+            "export-public",
+            "--keys",
+            source.to_str().unwrap(),
+            "--chain-id",
+            "export-chain",
+            "--output",
+            output.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        let result = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let json = std::fs::read_to_string(output).unwrap();
+        let parsed: indra_cli::PublicKeyExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, if output == &hot_output { "hot" } else { "cold" });
+        assert!(!json.contains(&hex::encode(hot.ed25519_seed)));
+        assert!(!json.contains(&hex::encode(hot.ml_dsa_seed)));
+        assert!(!json.contains(&hex::encode(hot.vrf_seed)));
+        assert!(!json.contains(&hex::encode(cold.classical_seed)));
+        assert!(!json.contains(&hex::encode(cold.pq_seed)));
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(output).unwrap().permissions()) & 0o777, 0o644);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn genesis_validator_entry_rejects_removed_keystore_flags_exactly() {
+    let result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args(["validator-entry", "--hot-keys", "hot.json"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(String::from_utf8_lossy(&result.stderr), "Error: unknown argument --hot-keys\n");
+}
+
+#[test]
 fn keygen_generate_requires_chain_id_at_binary_boundary() {
     let dir = temp_dir("missing-chain-keygen-generate");
     std::fs::create_dir_all(&dir).unwrap();
@@ -236,9 +373,12 @@ fn keygen_generate_requires_chain_id_at_binary_boundary() {
     let output = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .current_dir(&dir)
         .args([
-            "--output", output_path.to_str().unwrap(),
-            "--name", "valid-validator",
-            "--keys-password-file", password_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--name",
+            "valid-validator",
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -277,8 +417,11 @@ fn indra_tx_address_requires_chain_id_at_binary_boundary() {
     let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
         .current_dir(&dir)
         .args([
-            "address", "--keys", keys_path.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(),
+            "address",
+            "--keys",
+            keys_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -298,10 +441,15 @@ fn indra_tx_balance_requires_chain_id_at_binary_boundary() {
     let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
         .current_dir(&dir)
         .args([
-            "balance", "--keys", keys_path.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(),
-            "--wallet", wallet_path.to_str().unwrap(),
-            "--rpc", "http://127.0.0.1:1",
+            "balance",
+            "--keys",
+            keys_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--wallet",
+            wallet_path.to_str().unwrap(),
+            "--rpc",
+            "http://127.0.0.1:1",
         ])
         .output()
         .unwrap();
@@ -322,10 +470,19 @@ fn indra_tx_send_requires_chain_id_at_binary_boundary() {
     let output = Command::new(env!("CARGO_BIN_EXE_indra-tx"))
         .current_dir(&dir)
         .args([
-            "send", "--keys", keys_path.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(),
-            "--wallet", wallet_path.to_str().unwrap(),
-            "--to", &address, "--amount", "0.0001", "--rpc", "http://127.0.0.1:1",
+            "send",
+            "--keys",
+            keys_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--wallet",
+            wallet_path.to_str().unwrap(),
+            "--to",
+            &address,
+            "--amount",
+            "0.0001",
+            "--rpc",
+            "http://127.0.0.1:1",
         ])
         .output()
         .unwrap();
@@ -347,10 +504,18 @@ fn indra_send_requires_chain_id_at_binary_boundary() {
     let output = Command::new(env!("CARGO_BIN_EXE_indra-send"))
         .current_dir(&dir)
         .args([
-            "--keys", keys_path.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(),
-            "--wallet", wallet_path.to_str().unwrap(),
-            "--to", &address, "--amount", "0.0001", "--node", "http://127.0.0.1:1",
+            "--keys",
+            keys_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--wallet",
+            wallet_path.to_str().unwrap(),
+            "--to",
+            &address,
+            "--amount",
+            "0.0001",
+            "--node",
+            "http://127.0.0.1:1",
         ])
         .output()
         .unwrap();
@@ -374,12 +539,18 @@ fn keygen_cold_succeeds_without_chain_id() {
         .current_dir(&dir)
         .args([
             "cold",
-            "--output", output_path.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_path.is_file());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -512,11 +683,23 @@ fn genesis_cli_build_refuses_to_overwrite_existing_output() {
     let output = dir.join("genesis.toml");
     let entries = write_build_entries(&dir, chain_id);
     let args = build_command_args(chain_id, 1_700_000_000, &entries, &output);
-    let first = Command::new(env!("CARGO_BIN_EXE_indra-genesis")).args(&args).output().unwrap();
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
-    let second = Command::new(env!("CARGO_BIN_EXE_indra-genesis")).args(&args).output().unwrap();
+    let first = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args(&args)
+        .output()
+        .unwrap();
     assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("already exists; refusing to overwrite"));
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already exists; refusing to overwrite")
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -528,26 +711,168 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
     let hot_path = dir.join("hot.json");
     std::fs::write(&hot_path, indra_cli::encrypt_keys(&hot, b"pw").unwrap()).unwrap();
     let cold_path = dir.join("cold.json");
+    let password_path = dir.join("password.txt");
+    indra_cli::write_keys_file_secure(password_path.to_str().unwrap(), "pw\n").unwrap();
     indra_cli::generate_cold_keys_file(&cold_path, b"pw", false).unwrap();
+    let hot_export = dir.join("hot-export.json");
+    let cold_export = dir.join("cold-export.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "export-public", "--keys", hot_path.to_str().unwrap(), "--chain-id",
+            "validator-entry-chain", "--output", hot_export.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let result = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "export-public", "--keys", cold_path.to_str().unwrap(), "--chain-id",
+            "validator-entry-chain", "--hot-export", hot_export.to_str().unwrap(),
+            "--keys-password-file", password_path.to_str().unwrap(), "--output",
+            cold_export.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     let proof_path = dir.join("proof.json");
-    std::fs::write(
-        &proof_path,
-        r#"{"vrf_possession_output":"00","vrf_possession_proof":"00"}"#,
-    )
-    .unwrap();
+    let proof = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "create-vrf-proof",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-keys",
+            hot_path.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--output",
+            proof_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(proof.status.success(), "{}", String::from_utf8_lossy(&proof.stderr));
     let output = dir.join("entry.json");
     std::fs::write(&output, b"must remain unchanged").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args([
-            "validator-entry", "--name", "existing", "--stake", "1000000000",
-            "--hot-keys", hot_path.to_str().unwrap(), "--cold-file", cold_path.to_str().unwrap(),
-            "--vrf-proof", proof_path.to_str().unwrap(), "--output", output.to_str().unwrap(),
+            "validator-entry",
+            "--name",
+            "existing",
+            "--stake",
+            "1000000000",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            hot_export.to_str().unwrap(),
+            "--cold-export",
+            cold_export.to_str().unwrap(),
+            "--vrf-proof",
+            proof_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
         ])
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("already exists; refusing to overwrite"));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("already exists; refusing to overwrite")
+    );
     assert_eq!(std::fs::read(&output).unwrap(), b"must remain unchanged");
+    std::fs::remove_file(&output).unwrap();
+    let accepted = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "validator-entry",
+            "--name",
+            "existing",
+            "--stake",
+            "1000000000",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            hot_export.to_str().unwrap(),
+            "--cold-export",
+            cold_export.to_str().unwrap(),
+            "--vrf-proof",
+            proof_path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(accepted.status.success(), "{}", String::from_utf8_lossy(&accepted.stderr));
+    let swapped_hot = generate_from_master_seed("swapped-hot".to_string(), [0x32; 32]).unwrap();
+    let swapped_hot_path = dir.join("swapped-hot.json");
+    std::fs::write(&swapped_hot_path, indra_cli::encrypt_keys(&swapped_hot, b"pw").unwrap()).unwrap();
+    let swapped_hot_export = dir.join("swapped-hot-export.json");
+    let swapped = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
+        .args([
+            "export-public", "--keys", swapped_hot_path.to_str().unwrap(), "--chain-id",
+            "validator-entry-chain", "--output", swapped_hot_export.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(swapped.status.success(), "{}", String::from_utf8_lossy(&swapped.stderr));
+    let swapped_output = dir.join("swapped-entry.json");
+    let swapped_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "validator-entry", "--name", "existing", "--stake", "1000000000",
+            "--chain-id", "validator-entry-chain", "--hot-export", swapped_hot_export.to_str().unwrap(),
+            "--cold-export", cold_export.to_str().unwrap(), "--vrf-proof",
+            proof_path.to_str().unwrap(), "--output", swapped_output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!swapped_result.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&swapped_result.stderr),
+        "Error: genesis error: cold pairing proof does not match hot validator\n"
+    );
+    assert!(!swapped_output.exists());
+    let valid_proof_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
+    let mut bad_proof = valid_proof_json.clone();
+    bad_proof["vrf_possession_output"] = serde_json::Value::String("00".into());
+    std::fs::write(&proof_path, serde_json::to_vec(&bad_proof).unwrap()).unwrap();
+    let bad_output = dir.join("bad-entry.json");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "validator-entry",
+            "--name",
+            "existing",
+            "--stake",
+            "1000000000",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            hot_export.to_str().unwrap(),
+            "--cold-export",
+            cold_export.to_str().unwrap(),
+            "--vrf-proof",
+            proof_path.to_str().unwrap(),
+            "--output",
+            bad_output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert_eq!(String::from_utf8_lossy(&rejected.stderr), "Error: VRF proof output has wrong length\n");
+    assert!(!bad_output.exists());
+    let mut wrong_proof = valid_proof_json;
+    let proof_hex = wrong_proof["vrf_possession_proof"].as_str().unwrap().to_string();
+    let replacement = if proof_hex.starts_with("00") { "01" } else { "00" };
+    wrong_proof["vrf_possession_proof"] = serde_json::Value::String(format!("{replacement}{}", &proof_hex[2..]));
+    std::fs::write(&proof_path, serde_json::to_vec(&wrong_proof).unwrap()).unwrap();
+    let wrong_proof_output = dir.join("wrong-proof-entry.json");
+    let wrong_proof_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
+        .args([
+            "validator-entry", "--name", "existing", "--stake", "1000000000",
+            "--chain-id", "validator-entry-chain", "--hot-export", hot_export.to_str().unwrap(),
+            "--cold-export", cold_export.to_str().unwrap(), "--vrf-proof", proof_path.to_str().unwrap(),
+            "--output", wrong_proof_output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_proof_result.status.success());
+    assert_eq!(String::from_utf8_lossy(&wrong_proof_result.stderr), "Error: invalid VRF proof for hot export\n");
+    assert!(!wrong_proof_output.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -586,7 +911,11 @@ fn genesis_cli_inspect_warns_for_dominant_test_support_manifest() {
         .args(["inspect", "--genesis", path.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(String::from_utf8_lossy(&result.stdout).contains("WARNING: validator"));
     let _ = std::fs::remove_dir_all(dir);
 }

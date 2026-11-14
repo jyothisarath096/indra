@@ -33,6 +33,7 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod amount;
 pub mod canonical_scan;
@@ -40,6 +41,7 @@ pub mod error;
 pub mod genesis_cmd;
 pub mod keygen;
 pub mod query;
+pub mod rpc_client;
 pub mod scan_auth;
 pub mod staking;
 pub mod tx_builder;
@@ -49,18 +51,21 @@ pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
 pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{
-    build_genesis_config, entry_from_keys, entry_from_public_keys, with_cold_file,
-    holds_at_least_one_third, stake_share_bps, with_cold_manifest, GenesisConfig, GenesisEntry,
+    build_genesis_config, entry_from_keys, entry_from_public_keys, holds_at_least_one_third,
+    stake_share_bps, GenesisConfig, GenesisEntry,
 };
 pub use keygen::{
-    encrypt_cold_keys, encrypt_keys, generate_cold_keys_file, generate_cold_share_ceremony,
-    generate_from_master_seed, generate_from_new_mnemonic, generate_from_passphrase,
-    has_secret_value_in_argv, inspect_key_file_public_metadata, inspect_public_metadata,
-    cold_hybrid_pubkey, cold_password_source_from_args, load_cold_keys, load_keys, load_keys_for_cli, password_source_from_args, read_cold_share,
-    reconstruct_cold_shares, recover_from_mnemonic, validate_cold_share_manifest,
-    verify_cold_share, warn_if_key_file_permissive, write_cold_share_secure,
-    write_keys_file_secure, ColdKeysFile, ColdShareCeremony, ColdShareFile, ColdShareManifest,
-    ExpectedColdPublicKey, KeyFilePublicMetadata, KeysFile, PasswordSource, ValidatorKeys,
+    cold_hybrid_pubkey, cold_password_source_from_args, encrypt_cold_keys, encrypt_keys,
+    generate_cold_keys_file, generate_cold_share_ceremony, generate_from_master_seed,
+    generate_from_new_mnemonic, generate_from_passphrase, has_secret_value_in_argv,
+    inspect_key_file_public_metadata, inspect_public_metadata, load_cold_keys, load_keys,
+    load_keys_for_cli, password_source_from_args, read_cold_share, reconstruct_cold_shares,
+    recover_from_mnemonic, validate_cold_share_manifest, verify_cold_share,
+    warn_if_key_file_permissive, write_cold_share_secure, write_keys_file_secure, ColdKeysFile,
+    ColdShareCeremony, ColdShareFile, ColdShareManifest, ExpectedColdPublicKey,
+    KeyFilePublicMetadata, KeysFile, PasswordSource, ValidatorKeys,
+    cold_hot_pairing_message, public_export_from_cold_key_file, public_export_from_key_file,
+    validate_cold_hot_pairing, validate_public_export, PublicKeyExport,
 };
 pub use query::{rpc_call, QueryResult};
 pub use scan_auth::{
@@ -74,7 +79,10 @@ pub use staking::{
     fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
     ColdAuthorizedStakingAction, StakePositionExitSigner,
 };
-pub use tx_builder::{build_cold_transaction, build_transaction, BuiltStakingOp, BuiltTransaction, ColdTxParams, TxParams};
+pub use tx_builder::{
+    build_cold_transaction, build_transaction, BuiltStakingOp, BuiltTransaction, ColdTxParams,
+    TxParams,
+};
 pub use wallet::{seed_wallet_from_genesis, PendingChange, Wallet, WalletEntry};
 
 /// Exact error emitted when a command requires an explicit chain ID.

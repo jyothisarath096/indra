@@ -1,6 +1,3 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
-
 use indra_cli::{build_transaction, KeysFile, TxParams, Wallet};
 use indra_core::types::{
     crypto::HybridPubKey,
@@ -9,6 +6,10 @@ use indra_core::types::{
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Err(error) = indra_cli::rpc_client::configure_from_args(&args) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
     if args.len() < 2 {
         usage_and_exit();
     }
@@ -23,9 +24,12 @@ fn main() {
 
 fn usage_and_exit() -> ! {
     eprintln!("Usage:");
-    eprintln!("  indra-tx address --chain-id <id> --keys <keys.json> [--keys-password-file <path>]");
-    eprintln!("  indra-tx balance --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--address <hex>] [--wallet <wallet.json>] --rpc <url>");
-    eprintln!("  indra-tx send --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --rpc <url>");
+    eprintln!(
+        "  indra-tx address --chain-id <id> --keys <keys.json> [--keys-password-file <path>]"
+    );
+    eprintln!("  indra-tx balance --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--address <hex>] [--wallet <wallet.json>] --genesis-hash <64-hex> --rpc <url>");
+    eprintln!("  indra-tx send --chain-id <id> --keys <keys.json> [--keys-password-file <path>] [--wallet <wallet.json>] --to <address-hex> --amount <INDRA> --genesis-hash <64-hex> --rpc <url>");
+    eprintln!("{}", indra_cli::rpc_client::rpc_token_help());
     std::process::exit(1);
 }
 
@@ -61,6 +65,7 @@ fn cmd_balance(args: &[String]) {
         std::process::exit(1);
     });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let genesis_hash = required_genesis_hash(args);
     let wallet_path = get_arg(args, "--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
@@ -82,7 +87,7 @@ fn cmd_balance(args: &[String]) {
         );
         std::process::exit(1);
     }
-    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
+    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys, genesis_hash);
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
         pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
@@ -113,6 +118,7 @@ fn cmd_send(args: &[String]) {
             std::process::exit(1);
         });
     let rpc = get_arg(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let genesis_hash = required_genesis_hash(args);
     let keys = indra_cli::load_keys_for_cli(&keys_path, args).unwrap_or_else(|e| {
         eprintln!("Error loading {}: {}", keys_path, e);
         std::process::exit(1);
@@ -121,7 +127,7 @@ fn cmd_send(args: &[String]) {
     let ml_dsa_seed_bytes = keys.ml_dsa_seed.to_vec();
     let classical_pk = keys.public.hybrid_classical_pk;
     let pq_pk = keys.public.hybrid_pq_pk.clone();
-    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys);
+    let wallet = scan_wallet_or_exit(&rpc, &wallet_path, &keys, genesis_hash);
 
     let sender_pubkey = HybridPubKey {
         classical_pk: Bytes32::from(classical_pk),
@@ -173,7 +179,12 @@ fn parse_send_amount_spark(raw: &str) -> indra_cli::CliResult<u64> {
     indra_cli::parse_indra_amount_to_spark(raw, "--amount")
 }
 
-fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet {
+fn scan_wallet_or_exit(
+    rpc: &str,
+    wallet_path: &str,
+    keys: &KeysFile,
+    expected_genesis_hash: indra_core::types::primitives::Bytes32,
+) -> Wallet {
     let mut wallet = Wallet::load(wallet_path).unwrap_or_else(|error| {
         eprintln!("Error loading wallet {}: {}", wallet_path, error);
         std::process::exit(1);
@@ -185,12 +196,17 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
             std::process::exit(1);
         }),
     };
-    indra_cli::scan_canonical_blocks(rpc, &mut wallet, keys, &[owner_pubkey]).unwrap_or_else(
-        |error| {
+    indra_cli::scan_canonical_blocks(
+        rpc,
+        &mut wallet,
+        keys,
+        &[owner_pubkey],
+        expected_genesis_hash,
+    )
+    .unwrap_or_else(|error| {
             eprintln!("Error scanning canonical blocks: {}", error);
             std::process::exit(1);
-        },
-    );
+        });
     wallet.save(wallet_path).unwrap_or_else(|error| {
         eprintln!("Error saving wallet {}: {}", wallet_path, error);
         std::process::exit(1);
@@ -198,13 +214,25 @@ fn scan_wallet_or_exit(rpc: &str, wallet_path: &str, keys: &KeysFile) -> Wallet 
     wallet
 }
 
+fn required_genesis_hash(args: &[String]) -> indra_core::types::primitives::Bytes32 {
+    let raw = get_arg(args, "--genesis-hash").unwrap_or_else(|| {
+        eprintln!("Error: --genesis-hash required");
+        std::process::exit(1);
+    });
+    let bytes = hex::decode(raw).unwrap_or_else(|_| {
+        eprintln!("Error: --genesis-hash must be 32-byte hex");
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("Error: --genesis-hash must be 32-byte hex");
+        std::process::exit(1);
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes);
+    indra_core::types::primitives::Bytes32::from(hash)
+}
+
 fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
-    let url = url.trim_start_matches("http://");
-    let (host, path) = if let Some(pos) = url.find('/') {
-        (&url[..pos], &url[pos..])
-    } else {
-        (url, "/")
-    };
     let params_json = params
         .iter()
         .map(|p| format!("\"{}\"", p))
@@ -214,27 +242,10 @@ fn rpc_call(url: &str, method: &str, params: &[String]) -> String {
         r#"{{"jsonrpc":"2.0","method":"{}","params":[{}],"id":1}}"#,
         method, params_json
     );
-    let mut stream = TcpStream::connect(host).unwrap_or_else(|e| {
-        eprintln!("Error connecting to {}: {}", host, e);
+    indra_cli::rpc_client::post_json(url, &body).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
         std::process::exit(1);
-    });
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, body.len(), body
-    );
-    stream.write_all(request.as_bytes()).unwrap_or_else(|e| {
-        eprintln!("Error writing request: {}", e);
-        std::process::exit(1);
-    });
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap_or_else(|e| {
-        eprintln!("Error reading response: {}", e);
-        std::process::exit(1);
-    });
-    response
-        .find("\r\n\r\n")
-        .map(|pos| response[pos + 4..].to_string())
-        .unwrap_or(response)
+    })
 }
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
@@ -305,7 +316,9 @@ mod tests {
         assert_eq!(updated.pending_change_count(), 1);
         assert_eq!(updated.balance_owned_by(&test_owner()), 2_000_000);
         assert!(updated.select_utxos(&test_owner(), 2_000_000, 1).is_err());
-        assert!(updated.select_utxos(&test_owner(), 1_900_000, MIN_FEE_SPARK).is_ok());
+        assert!(updated
+            .select_utxos(&test_owner(), 1_900_000, MIN_FEE_SPARK)
+            .is_ok());
 
         let _ = std::fs::remove_file(wallet_path);
     }
@@ -332,5 +345,4 @@ mod tests {
             lock_height: 0,
         }
     }
-
 }

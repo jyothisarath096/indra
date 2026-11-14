@@ -34,25 +34,25 @@
 use std::collections::{BTreeSet, HashSet};
 
 use indra_core::{
+    EpochRecord,
     codec::{Decode, Encode},
     types::{
         block::BlockVNext,
         crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
-            Bytes32, BLOCK_FORMAT_VERSION, LIFETIME_SUPPLY_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            BLOCK_FORMAT_VERSION, Bytes32, LIFETIME_SUPPLY_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
         proposal::VerifiedProposal,
-        qc::{verify_qc_against_snapshot, QuorumCertificateV1, VerifiedQc},
+        qc::{QuorumCertificateV1, VerifiedQc, verify_qc_against_snapshot},
         slash_membership::SlashMembershipRootRecord,
         slashing::{SlashEvidenceV1, SlashEvidenceV2},
         staking::StakingOp,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
     },
-    EpochRecord,
 };
 use indra_crypto::{validate_classical_public_key, validate_pq_public_key, verify_hybrid};
 
@@ -548,8 +548,8 @@ pub fn verify_slash_candidate(
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
 
     fn apply_block(
         state: &mut ChainState,
@@ -573,18 +573,19 @@ mod tests {
     use crate::state_root::compute_state_root;
     use crate::validator::{ValidatorEntry, ValidatorStatus};
     use indra_core::{
+        Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
         codec::Encode,
         types::{
             block::{BlockHeaderVNext, BlockVNext},
             crypto::PQVoteSig,
             governance::{
-                compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
                 GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
+                compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
             },
             primitives::{
-                BLOCK_FORMAT_VERSION, DUST_LIMIT_SPARK,
-                INITIAL_BASE_FEE_SPARK_PER_KB, MAX_STAKING_OPS_PER_BLOCK,
-                MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TRANSACTION_PROTOCOL_VERSION,
+                BLOCK_FORMAT_VERSION, DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
+                MAX_STAKING_OPS_PER_BLOCK, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                TRANSACTION_PROTOCOL_VERSION,
             },
             slash_membership::build_slash_membership_proof,
             slashing::SlashEvidenceV2,
@@ -592,9 +593,8 @@ mod tests {
             transaction::{InputV1, OutputV1, TransactionV1},
             vote::{VoteStep, VoteV1},
         },
-        Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, sha256};
     use std::collections::BTreeMap;
 
     const TEST_INPUT_VALUE: u64 = 1_000_000;
@@ -1648,7 +1648,8 @@ mod tests {
             &validator_id,
             &snapshot_root,
             TEST_CHAIN_ID,
-        );
+        )
+        .unwrap();
         let sig = keypair.sign(&signing_bytes).unwrap();
         VoteV1 {
             height,
@@ -2445,9 +2446,10 @@ mod tests {
         let mut rolled_back = state.clone();
         crate::txn::set_fail_after_mutation(Some(1));
         let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("state transaction failpoint injected after mutation"));
+        assert!(
+            err.to_string()
+                .contains("state transaction failpoint injected after mutation")
+        );
         assert_same_consensus_state(&rolled_back, &state);
         let rollback_root = rolled_back.state_commitment_v2_root(rolled_back.height);
         rolled_back.rebuild_state_commitment_v2(rolled_back.height);
@@ -3198,7 +3200,9 @@ mod tests {
             economic_elapsed.as_millis(),
             plan_elapsed.saturating_sub(economic_elapsed).as_millis(),
             commit_elapsed.saturating_sub(plan_elapsed).as_millis(),
-            checkpoint_elapsed.saturating_sub(commit_elapsed).as_millis(),
+            checkpoint_elapsed
+                .saturating_sub(commit_elapsed)
+                .as_millis(),
             elapsed.as_millis()
         );
         // The debug suite proves the complete mutation/projection path. Wall
@@ -3441,14 +3445,16 @@ mod tests {
             membership_proof: proof,
         };
         let chain_id = state.chain_id.clone();
-        assert!(apply_slash_v2_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            u64::MAX,
-            None,
-        )
-        .is_err());
+        assert!(
+            apply_slash_v2_at_height_with_accounting(
+                &mut state,
+                &evidence,
+                &chain_id,
+                u64::MAX,
+                None,
+            )
+            .is_err()
+        );
 
         state.consensus_snapshots = vec![snapshot];
         state.height = u64::MAX;
@@ -3456,14 +3462,16 @@ mod tests {
             activation_height: u64::MAX,
             membership_root: Bytes32::from([0xEE; 32]),
         }];
-        assert!(apply_slash_v2_at_height_with_accounting(
-            &mut state,
-            &evidence,
-            &chain_id,
-            u64::MAX,
-            None,
-        )
-        .is_err());
+        assert!(
+            apply_slash_v2_at_height_with_accounting(
+                &mut state,
+                &evidence,
+                &chain_id,
+                u64::MAX,
+                None,
+            )
+            .is_err()
+        );
 
         state.slash_membership_roots = vec![SlashMembershipRootRecord {
             activation_height: u64::MAX,
@@ -4319,7 +4327,7 @@ fn verify_vote_sig_with_keys(
     chain_id: &str,
 ) -> Result<(), String> {
     use indra_crypto::{
-        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
+        ClassicalPublicKey, HybridPublicKey, PQ_PK_BYTES, PqPublicKey, verify_hybrid,
     };
 
     let pq_pk: [u8; PQ_PK_BYTES] = pq_pk_bytes.try_into().map_err(|_| {
@@ -4337,7 +4345,8 @@ fn verify_vote_sig_with_keys(
         &vote.validator_id,
         &vote.snapshot_root,
         chain_id,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     let pk = HybridPublicKey {
         classical: ClassicalPublicKey(*classical_pk),
         pq: PqPublicKey(pq_pk),
@@ -4852,14 +4861,12 @@ fn apply_block_inner(
     // accumulated into an epoch reserve. This transition also fails closed if
     // the persisted cumulative target is inconsistent with the prior height.
     txn.snapshot_epoch_scope();
-    let reward_selector = verified_qc.map_or(
-        crate::epoch::RewardRecipientSelector::AllMembers,
-        |qc| {
+    let reward_selector =
+        verified_qc.map_or(crate::epoch::RewardRecipientSelector::AllMembers, |qc| {
             crate::epoch::RewardRecipientSelector::Signers(
                 qc.signer_ids().iter().copied().collect::<BTreeSet<_>>(),
             )
-        },
-    );
+        });
     crate::epoch::apply_block_reward_issuance_with_selector(
         txn.state_mut(),
         block.header.height,
@@ -4897,12 +4904,14 @@ fn apply_block_inner(
     // Apply epoch transition if this is the last block of an epoch.
     let epoch_record = if let Some(context) = transition_context {
         txn.snapshot_epoch_scope();
-        Some(crate::epoch::apply_epoch_transition_at_height_with_selector(
-            txn.state_mut(),
-            &context,
-            timestamp_secs,
-            &reward_selector,
-        )?)
+        Some(
+            crate::epoch::apply_epoch_transition_at_height_with_selector(
+                txn.state_mut(),
+                &context,
+                timestamp_secs,
+                &reward_selector,
+            )?,
+        )
     } else {
         None
     };

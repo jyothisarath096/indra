@@ -4,6 +4,11 @@
 //! encrypts only the secret signing material. It is local operator storage:
 //! it does not affect consensus state, transaction formats, or state roots.
 
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
@@ -291,7 +296,8 @@ fn build_keys_file(
 
 /// Generate a complete canonical keystore from one 32-byte master seed.
 pub fn generate_from_master_seed(name: String, master_seed: [u8; 32]) -> KeystoreResult<KeysFile> {
-    let derived = derive_all_seeds(&master_seed);
+    let derived = derive_all_seeds(&master_seed)
+        .map_err(|error| KeystoreError::Crypto(error.to_string()))?;
     build_keys_file(
         name,
         derived.ed25519_seed,
@@ -374,7 +380,7 @@ pub fn decrypt_encrypted_keys(json: &str, password: &[u8]) -> KeystoreResult<Key
     let plaintext = decrypt_payload(password, &salt, &nonce, &aad, &ciphertext)?;
     let private: PrivatePayload =
         serde_json::from_slice(&plaintext).map_err(|e| KeystoreError::Parse(e.to_string()))?;
-    let keys = private.to_keys_file(container.name, public)?;
+    let keys = private.into_keys_file(container.name, public)?;
     verify_public_metadata(&keys)?;
     Ok(keys)
 }
@@ -598,7 +604,7 @@ impl PrivatePayload {
         }
     }
 
-    fn to_keys_file(self, name: String, public: ValidatorKeys) -> KeystoreResult<KeysFile> {
+    fn into_keys_file(self, name: String, public: ValidatorKeys) -> KeystoreResult<KeysFile> {
         Ok(KeysFile {
             name,
             public,
@@ -1176,7 +1182,7 @@ mod tests {
             }
         );
         assert_ne!(generated.classical_seed, generated.pq_seed);
-        let hot = derive_all_seeds(&[0x42; 32]);
+        let hot = derive_all_seeds(&[0x42; 32]).unwrap();
         for cold_seed in [generated.classical_seed, generated.pq_seed] {
             assert_ne!(cold_seed, hot.ed25519_seed);
             assert_ne!(cold_seed, hot.ml_dsa_seed);

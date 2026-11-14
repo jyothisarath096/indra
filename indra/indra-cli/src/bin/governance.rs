@@ -36,6 +36,7 @@ fn main() {
 
 fn run() -> CliResult<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    indra_cli::rpc_client::configure_from_args(&args)?;
     if args.is_empty() || has_flag(&args, "--help") || has_flag(&args, "-h") {
         print_help();
         return Ok(());
@@ -715,11 +716,12 @@ Vote flags:\n\
   Commit securely generates and saves an internal vote nonce; reveal reloads it.\n\
   Abstain by not submitting a reveal op."
     );
+    println!("  --rpc-token-file <path>  Private RPC token file (or INDRA_RPC_TOKEN_FILE)");
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use std::sync::Mutex;
 
     static UMASK_TEST_LOCK: Mutex<()> = Mutex::new(());

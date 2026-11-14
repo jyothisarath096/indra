@@ -1,7 +1,7 @@
 //! Canonical slash-evidence membership roots and proofs.
 
 use crate::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
     error::{IndraError, IndraResult},
     types::{
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
@@ -202,9 +202,14 @@ pub fn build_slash_membership_proof(
                 .ok_or_else(|| invalid_error("missing canonical sibling"))?,
         );
         level_nodes = level_nodes
-            .chunks_exact(2)
-            .map(|pair| node(level, pair[0], pair[1]))
-            .collect();
+            .chunks(2)
+            .map(|pair| match pair {
+                [left, right] => Ok(node(level, *left, *right)),
+                _ => Err(invalid_error(
+                    "slash membership tree has an incomplete pair",
+                )),
+            })
+            .collect::<IndraResult<Vec<_>>>()?;
         index /= 2;
         level = level
             .checked_add(1)
@@ -259,9 +264,14 @@ fn reduce_tree(mut nodes: Vec<Bytes32>) -> IndraResult<Bytes32> {
     let mut level = 0u8;
     while nodes.len() > 1 {
         nodes = nodes
-            .chunks_exact(2)
-            .map(|pair| node(level, pair[0], pair[1]))
-            .collect();
+            .chunks(2)
+            .map(|pair| match pair {
+                [left, right] => Ok(node(level, *left, *right)),
+                _ => Err(invalid_error(
+                    "slash membership tree has an incomplete pair",
+                )),
+            })
+            .collect::<IndraResult<Vec<_>>>()?;
         level = level
             .checked_add(1)
             .ok_or_else(|| invalid_error("tree level overflow"))?;
@@ -369,7 +379,7 @@ mod tests {
 
     #[test]
     fn membership_proofs_round_trip_and_verify_for_real_and_padded_trees() {
-        for count in [1u8, 4, 20, 50, 100, 200] {
+        for count in [1u8, 2, 3, 4, 5, 7, 8, 9, 16, 17, 20, 33, 65, 50, 100, 200] {
             let snapshot = snapshot(count);
             let root = SlashMembershipRootRecord {
                 activation_height: 301,
@@ -386,6 +396,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_leaf_proof_verifies_for_nine_and_seventeen_members() {
+        for count in [9u8, 17] {
+            let snapshot = snapshot(count);
+            let record = SlashMembershipRootRecord {
+                activation_height: 301,
+                membership_root: compute_slash_membership_root(&snapshot).unwrap(),
+            };
+            for position in 0..usize::from(count) {
+                build_slash_membership_proof(&snapshot, position)
+                    .unwrap()
+                    .verify(&record)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_membership_pair_is_rejected_exactly() {
+        let error = reduce_tree(vec![Bytes32::ZERO; 3]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid slash membership proof: slash membership tree has an incomplete pair"
+        );
     }
 
     #[test]

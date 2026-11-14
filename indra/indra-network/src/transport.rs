@@ -113,10 +113,18 @@ impl Connection {
         }
 
         let len_start = self.read_pos;
+        let length_prefix = self
+            .read_buf
+            .get(len_start..len_start + 4)
+            .ok_or_else(|| NetworkError::DecodeFailed {
+                reason: "truncated length prefix".to_string(),
+            })?;
         let total_len = u32::from_le_bytes(
-            self.read_buf[len_start..len_start + 4]
+            length_prefix
                 .try_into()
-                .expect("length prefix slice has fixed width"),
+                .map_err(|_| NetworkError::DecodeFailed {
+                    reason: "invalid length prefix".to_string(),
+                })?,
         ) as usize;
         if total_len > MAX_MSG_BYTES {
             return Err(NetworkError::MessageTooLarge {
@@ -281,8 +289,8 @@ mod tests {
             assert!(matches!(conn.recv().unwrap(), RecvStatus::NoData));
 
             let start = std::time::Instant::now();
-            loop {
-                match conn.recv().unwrap() {
+                loop {
+                    match conn.recv().unwrap() {
                     RecvStatus::Message(msg) => return msg,
                     RecvStatus::NoData => {
                         if start.elapsed() > Duration::from_secs(2) {
@@ -366,12 +374,10 @@ mod tests {
             let (stream, _) = server.accept().unwrap();
             let mut conn = Connection::from_stream(stream).unwrap();
 
-            let first = loop {
-                match conn.recv().unwrap() {
-                    RecvStatus::NoData => break RecvStatus::NoData,
-                    RecvStatus::Message(_) => panic!("unknown message should be skipped"),
-                    RecvStatus::Disconnected => panic!("connection closed unexpectedly"),
-                }
+            let first = match conn.recv().unwrap() {
+                RecvStatus::NoData => RecvStatus::NoData,
+                RecvStatus::Message(_) => panic!("unknown message should be skipped"),
+                RecvStatus::Disconnected => panic!("connection closed unexpectedly"),
             };
             assert!(matches!(first, RecvStatus::NoData));
 

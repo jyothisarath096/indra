@@ -1,7 +1,7 @@
 //! Canonical epoch-start commission and delegation snapshots for reward payout.
 
 use crate::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
     error::{IndraError, IndraResult},
     types::primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
 };
@@ -130,10 +130,14 @@ impl RewardEconomicValidatorEntry {
                 actual: self.delegators.len(),
             });
         }
-        for (index, delegator) in self.delegators.iter().enumerate() {
+        for delegator in &self.delegators {
             delegator.validate()?;
-            if index > 0 && self.delegators[index - 1].delegator_id >= delegator.delegator_id {
-                return invalid("delegator IDs are duplicate or not strictly ascending");
+        }
+        for pair in self.delegators.windows(2) {
+            if let [previous, next] = pair {
+                if previous.delegator_id >= next.delegator_id {
+                    return invalid("delegator IDs are duplicate or not strictly ascending");
+                }
             }
         }
         if self.total_active_delegated_spark != recompute_delegated_total(&self.delegators)? {
@@ -224,7 +228,7 @@ impl RewardEconomicSnapshot {
         self.validators
             .binary_search_by_key(&id.0, |entry| entry.validator_id.0)
             .ok()
-            .map(|position| &self.validators[position])
+            .and_then(|position| self.validators.get(position))
     }
 
     /// Validate format, ordering, nested entries, bound, and audit root.
@@ -245,10 +249,14 @@ impl RewardEconomicSnapshot {
                 actual: self.validators.len(),
             });
         }
-        for (index, validator) in self.validators.iter().enumerate() {
+        for validator in &self.validators {
             validator.validate(self.max_commission_bps_at_creation)?;
-            if index > 0 && self.validators[index - 1].validator_id >= validator.validator_id {
-                return invalid("validator IDs are duplicate or not strictly ascending");
+        }
+        for pair in self.validators.windows(2) {
+            if let [previous, next] = pair {
+                if previous.validator_id >= next.validator_id {
+                    return invalid("validator IDs are duplicate or not strictly ascending");
+                }
             }
         }
         let root = compute_snapshot_root(
@@ -369,22 +377,26 @@ mod tests {
     fn split_principal_and_commission_invariants_fail_closed() {
         assert!(RewardEconomicDelegatorEntry::new(Bytes32::ZERO, 0, 0).is_err());
         assert!(RewardEconomicDelegatorEntry::new(Bytes32::ZERO, u64::MAX, 1).is_err());
-        assert!(RewardEconomicValidatorEntry::new(
-            Bytes32::from([1; 32]),
-            2_001,
-            vec![delegator(2, 1, 0)],
-            2_000,
-        )
-        .is_err());
+        assert!(
+            RewardEconomicValidatorEntry::new(
+                Bytes32::from([1; 32]),
+                2_001,
+                vec![delegator(2, 1, 0)],
+                2_000,
+            )
+            .is_err()
+        );
         assert!(RewardEconomicSnapshot::new(301, 300, 10_001, vec![validator(1)]).is_err());
     }
 
     #[test]
     fn ordering_and_stored_total_are_canonical() {
         let unsorted = vec![delegator(3, 1, 0), delegator(2, 1, 0)];
-        assert!(
+        assert_eq!(
             RewardEconomicValidatorEntry::new(Bytes32::from([1; 32]), 1_000, unsorted, 2_000,)
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "invalid reward economic snapshot: delegator IDs are duplicate or not strictly ascending"
         );
 
         let valid = RewardEconomicSnapshot::new(301, 300, 2_000, vec![validator(1)]).unwrap();
@@ -394,6 +406,27 @@ mod tests {
         let total_offset = 1 + 8 + 8 + 4 + 4 + 32 + 4;
         bytes[total_offset..total_offset + 8].copy_from_slice(&999u64.to_le_bytes());
         assert!(RewardEconomicSnapshot::decode_exact(&bytes).is_err());
+    }
+
+    #[test]
+    fn validator_order_accepts_single_and_ascending_and_rejects_equal_or_descending() {
+        assert!(RewardEconomicSnapshot::new(301, 300, 2_000, vec![validator(1)]).is_ok());
+        assert!(
+            RewardEconomicSnapshot::new(301, 300, 2_000, vec![validator(1), validator(2)]).is_ok()
+        );
+        let descending =
+            RewardEconomicSnapshot::new(301, 300, 2_000, vec![validator(2), validator(1)])
+                .unwrap_err();
+        assert_eq!(
+            descending.to_string(),
+            "invalid reward economic snapshot: validator IDs are duplicate or not strictly ascending"
+        );
+        let equal = RewardEconomicSnapshot::new(301, 300, 2_000, vec![validator(1), validator(1)])
+            .unwrap_err();
+        assert_eq!(
+            equal.to_string(),
+            "invalid reward economic snapshot: validator IDs are duplicate or not strictly ascending"
+        );
     }
 
     #[test]

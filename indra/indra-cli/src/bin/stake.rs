@@ -25,6 +25,7 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> CliResult<()> {
+    indra_cli::rpc_client::configure_from_args(&args)?;
     let subcommand = args.get(1).map(String::as_str).unwrap_or("help");
     match subcommand {
         "register" => run_register(&args),
@@ -641,6 +642,7 @@ fn print_help() {
     println!(
         "INDRA Stake CLI\nUsage: indra-stake <subcommand> [flags]\n\nSubcommands:\n  register                Register a new validator with self-stake\n  self-stake              Add a UTXO to the validator's active position\n  self-unstake            Exit principal from a validator position\n  delegate                Add a UTXO to a delegated position\n  undelegate              Exit principal from a delegated position\n  claim-rewards           Claim pending staking rewards\n  set-commission          Update validator commission rate\n  auto-delegate           Set or clear validator auto-delegation\n  update-network-address  Set or clear validator P2P address\n  nonce                   Query current staking nonce for your key\n\nCommon flags:\n  --keys <path>    Path to keys.json (default: keys.json)\n  --keys-password-file <path>  Password file for encrypted keys.json\n  --node <url>     Node RPC URL (default: http://127.0.0.1:8545)\n  --dry-run        Build and sign but do not submit\n\nRun 'indra-stake <subcommand> --help' for subcommand-specific flags."
     );
+    println!("  --rpc-token-file <path>  Private RPC token file (or INDRA_RPC_TOKEN_FILE)");
 }
 
 fn print_register_help() {

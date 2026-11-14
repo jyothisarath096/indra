@@ -105,6 +105,8 @@ pub struct BuiltStakingOp {
     pub op_id: String,
 }
 
+type AssembledTransfer = (Vec<InputV1>, Vec<OutputV1>, u64, Option<PendingChange>);
+
 /// Key material and replay namespace for a canonical position exit.
 pub enum StakePositionExitSigner<'a> {
     /// Ordinary delegator authorization through the staking nonce namespace.
@@ -131,7 +133,7 @@ fn assemble_transfer(
     amount_spark: u64,
     fee_spark: u64,
     selected: &[&crate::wallet::WalletEntry],
-) -> CliResult<(Vec<InputV1>, Vec<OutputV1>, u64, Option<PendingChange>)> {
+) -> CliResult<AssembledTransfer> {
     let total_in = selected.iter().try_fold(0u64, |sum, entry| {
         sum.checked_add(entry.value_spark)
             .ok_or_else(|| CliError::Transaction("input value overflow".into()))
@@ -142,7 +144,9 @@ fn assemble_transfer(
         .ok_or_else(|| CliError::Transaction("inputs do not cover outputs and fee".into()))?;
     let inputs = selected
         .iter()
-        .map(|entry| InputV1 { utxo_id: entry.utxo_id })
+        .map(|entry| InputV1 {
+            utxo_id: entry.utxo_id,
+        })
         .collect();
     let mut outputs = vec![OutputV1 {
         value_spark: amount_spark,
@@ -157,20 +161,24 @@ fn assemble_transfer(
             owner_pubkey: owner_pubkey.clone(),
             lock_height: 0,
         };
-        pending_change = Some(PendingChange { output: change_output.clone() });
+        pending_change = Some(PendingChange {
+            output: change_output.clone(),
+        });
         outputs.push(change_output);
     } else if change_spark > 0 {
         effective_fee_spark = effective_fee_spark
             .checked_add(change_spark)
-            .ok_or_else(|| CliError::Transaction("fee overflow while folding dust change".into()))?;
+            .ok_or_else(|| {
+                CliError::Transaction("fee overflow while folding dust change".into())
+            })?;
     }
     Ok((inputs, outputs, effective_fee_spark, pending_change))
 }
 
-fn sign_transfer<'a, Sign>(
+fn sign_transfer<Sign>(
     chain_id: &str,
     mut tx: TransactionV1,
-    selected: &[&'a crate::wallet::WalletEntry],
+    selected: &[&crate::wallet::WalletEntry],
     pending_change: Option<PendingChange>,
     sign: Sign,
 ) -> CliResult<BuiltTransaction>
@@ -225,11 +233,10 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
 
     // 3. Coin selection
-    let selected = params.wallet.select_utxos(
-        &params.sender_pubkey,
-        params.amount_spark,
-        params.fee_spark,
-    )?;
+    let selected =
+        params
+            .wallet
+            .select_utxos(&params.sender_pubkey, params.amount_spark, params.fee_spark)?;
     let (inputs, outputs, effective_fee_spark, pending_change) = assemble_transfer(
         &params.sender_pubkey,
         recipient_pubkey,
@@ -279,17 +286,15 @@ pub fn build_cold_transaction(params: &ColdTxParams<'_>) -> CliResult<BuiltTrans
             params.fee_spark, MIN_FEE_SPARK
         )));
     }
-    let recipient_address = PaymentAddressV1::from_text(
-        params.recipient_address,
-        params.chain_id.as_bytes(),
-    )
-    .map_err(|e| CliError::Transaction(format!("invalid recipient payment address: {e}")))?;
+    let recipient_address =
+        PaymentAddressV1::from_text(params.recipient_address, params.chain_id.as_bytes()).map_err(
+            |e| CliError::Transaction(format!("invalid recipient payment address: {e}")),
+        )?;
     let recipient_pubkey = crypto_pubkey_to_wire(recipient_address.owner_pubkey())?;
-    let selected = params.wallet.select_utxos(
-        &params.owner_pubkey,
-        params.amount_spark,
-        params.fee_spark,
-    )?;
+    let selected =
+        params
+            .wallet
+            .select_utxos(&params.owner_pubkey, params.amount_spark, params.fee_spark)?;
     let (inputs, outputs, effective_fee_spark, pending_change) = assemble_transfer(
         &params.owner_pubkey,
         recipient_pubkey,
@@ -305,13 +310,9 @@ pub fn build_cold_transaction(params: &ColdTxParams<'_>) -> CliResult<BuiltTrans
         fee_amount: effective_fee_spark,
         signature: dummy_signature()?,
     };
-    sign_transfer(
-        params.chain_id,
-        tx,
-        &selected,
-        pending_change,
-        |bytes| params.keypair.sign(bytes).map_err(|e| e.to_string()),
-    )
+    sign_transfer(params.chain_id, tx, &selected, pending_change, |bytes| {
+        params.keypair.sign(bytes).map_err(|e| e.to_string())
+    })
 }
 
 /// Payload fields for an active-validator cold-authorized staking operation.
@@ -465,13 +466,17 @@ pub fn build_register_validator_op_with_cold(
         .sign(&message)
         .map_err(|e| CliError::Crypto(e.to_string()))?;
     op.signature = HybridSignature {
-        classical_sig: VariableBytes::from_slice(&hot_sig.classical.0).unwrap(),
-        pq_sig: VariableBytes::from_slice(&hot_sig.pq.0).unwrap(),
+        classical_sig: VariableBytes::from_slice(&hot_sig.classical.0)
+            .map_err(|_| CliError::Transaction("hot classical signature too large".into()))?,
+        pq_sig: VariableBytes::from_slice(&hot_sig.pq.0)
+            .map_err(|_| CliError::Transaction("hot PQ signature too large".into()))?,
     };
     if let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body {
         *cold_signature = HybridSignature {
-            classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
-            pq_sig: VariableBytes::from_slice(&cold_sig.pq.0).unwrap(),
+            classical_sig: VariableBytes::from_slice(&cold_sig.classical.0)
+                .map_err(|_| CliError::Transaction("cold classical signature too large".into()))?,
+            pq_sig: VariableBytes::from_slice(&cold_sig.pq.0)
+                .map_err(|_| CliError::Transaction("cold PQ signature too large".into()))?,
         };
     }
     let op_bytes = op.encode_to_vec();
@@ -672,11 +677,11 @@ fn dummy_signature() -> CliResult<HybridSignature> {
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::wallet::Wallet;
     use indra_core::codec::Decode;
     use indra_core::types::primitives::Bytes32;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::transaction::TransactionV1;
 
     fn make_wallet_with_funds() -> (Wallet, [u8; 32], Vec<u8>, HybridPubKey) {
@@ -709,30 +714,53 @@ mod tests {
 
     #[test]
     fn cold_cli_transfer_is_accepted_hot_signature_rejected_and_change_returns_to_cold_owner() {
-        let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
+        let entries = [
+            ([1; 32], [1; 32], [1; 32]),
+            ([2; 32], [2; 32], [2; 32]),
+            ([3; 32], [3; 32], [3; 32]),
+            ([4; 32], [4; 32], [4; 32]),
+        ];
         let manifest = indra_node::genesis::test_genesis_toml(TEST_CHAIN_ID, &entries);
-        let path = std::env::temp_dir().join(format!("indra-cli-cold-transfer-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "indra-cli-cold-transfer-{}.toml",
+            std::process::id()
+        ));
         std::fs::write(&path, manifest).unwrap();
         let state = indra_node::build_finalized_genesis_state(path.to_str()).unwrap();
         let mut cold_classical_seed = [1u8; 32];
         cold_classical_seed[0] ^= 0xA5;
         let mut cold_pq_seed = [1u8; 32];
         cold_pq_seed[0] ^= 0x5A;
-        let cold = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap();
+        let cold =
+            ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap();
         let cold_public = cold.public_key();
         let complete = cold_public.as_complete_hybrid();
         let cold_owner = HybridPubKey {
             classical_pk: Bytes32::from(complete.classical.0),
             pq_pk: VariableBytes::from_slice(&complete.pq.0).unwrap(),
         };
-        let entry = state.utxos.all_entries().find(|entry| entry.output.owner_pubkey == cold_owner).unwrap();
+        let entry = state
+            .utxos
+            .all_entries()
+            .find(|entry| entry.output.owner_pubkey == cold_owner)
+            .unwrap();
         let genesis_utxo_id = entry.utxo_id;
         let genesis_value = entry.output.value_spark;
         let mut wallet = Wallet::new();
-        wallet.add_utxo(genesis_utxo_id, genesis_value, entry.created_height, entry.tx_index, entry.output_index, cold_owner.clone());
+        wallet.add_utxo(
+            genesis_utxo_id,
+            genesis_value,
+            entry.created_height,
+            entry.tx_index,
+            entry.output_index,
+            cold_owner.clone(),
+        );
         let recipient = test_keypair(0x77);
         let recipient_owner = hybrid_pubkey_from_keypair(&recipient).unwrap();
-        let recipient_address = PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), recipient.public_key()).unwrap().to_text();
+        let recipient_address =
+            PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), recipient.public_key())
+                .unwrap()
+                .to_text();
         let built = build_cold_transaction(&ColdTxParams {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
@@ -741,15 +769,23 @@ mod tests {
             wallet: &wallet,
             keypair: &cold,
             owner_pubkey: cold_owner.clone(),
-        }).unwrap();
+        })
+        .unwrap();
         let tx = decode_built_tx(&built);
         assert_eq!(tx.outputs[0].value_spark, 1_000_000);
         assert_eq!(tx.outputs[0].owner_pubkey, recipient_owner);
         assert_eq!(tx.outputs[1].owner_pubkey, cold_owner);
         let mut accepted = state.clone();
-        assert_eq!(indra_state::try_apply_transaction_candidate_with_dust(
-            &mut accepted, &tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
-        ), Ok(()));
+        assert_eq!(
+            indra_state::try_apply_transaction_candidate_with_dust(
+                &mut accepted,
+                &tx,
+                1,
+                0,
+                indra_core::types::primitives::DUST_LIMIT_SPARK,
+            ),
+            Ok(())
+        );
         assert!(!accepted.utxos.contains(&genesis_utxo_id));
         assert!(accepted.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == cold_owner
@@ -760,13 +796,23 @@ mod tests {
         }));
         let mut hot_tx = tx.clone();
         let hot = test_keypair(1);
-        let signature = hot.sign(&hot_tx.signing_bytes(TEST_CHAIN_ID).unwrap()).unwrap();
+        let signature = hot
+            .sign(&hot_tx.signing_bytes(TEST_CHAIN_ID).unwrap())
+            .unwrap();
         hot_tx.signature = wire_hybrid_signature(&signature).unwrap();
         let mut rejected = state;
         let error = indra_state::try_apply_transaction_candidate_with_dust(
-            &mut rejected, &hot_tx, 1, 0, indra_core::types::primitives::DUST_LIMIT_SPARK,
-        ).unwrap_err();
-        assert_eq!(error.to_string(), "transaction signature invalid: Ed25519 signature verification failed");
+            &mut rejected,
+            &hot_tx,
+            1,
+            0,
+            indra_core::types::primitives::DUST_LIMIT_SPARK,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "transaction signature invalid: Ed25519 signature verification failed"
+        );
         assert!(rejected.utxos.contains(&genesis_utxo_id));
         std::fs::remove_file(path).unwrap();
     }
@@ -778,10 +824,10 @@ mod tests {
         let cold = test_cold_keypair(0x41);
         let cold_owner = crate::cold_hybrid_pubkey(&cold).unwrap();
         let recipient = test_keypair(0x51);
-        let recipient_address = PaymentAddressV1::new(
-            TEST_CHAIN_ID.as_bytes(),
-            recipient.public_key(),
-        ).unwrap().to_text();
+        let recipient_address =
+            PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), recipient.public_key())
+                .unwrap()
+                .to_text();
         let hot_id = Bytes32::from([0xA1; 32]);
         let cold_id = Bytes32::from([0xB2; 32]);
         let mut wallet = Wallet::new();
@@ -794,9 +840,13 @@ mod tests {
             fee_spark: MIN_FEE_SPARK,
             wallet: &wallet,
             ed25519_seed: [0x31; 32],
-            ml_dsa_seed_bytes: PqKeypair::from_seed(&[0x31; 32]).unwrap().secret_key_bytes().to_vec(),
+            ml_dsa_seed_bytes: PqKeypair::from_seed(&[0x31; 32])
+                .unwrap()
+                .secret_key_bytes()
+                .to_vec(),
             sender_pubkey: hot_owner,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(hot_built.spent_utxo_ids, vec![hot_id]);
         let cold_built = build_cold_transaction(&ColdTxParams {
             chain_id: TEST_CHAIN_ID,
@@ -806,7 +856,8 @@ mod tests {
             wallet: &wallet,
             keypair: &cold,
             owner_pubkey: cold_owner,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(cold_built.spent_utxo_ids, vec![cold_id]);
     }
 
@@ -1083,14 +1134,8 @@ mod tests {
         let keypair = test_keypair(0x72);
         let validator_id = Bytes32::from([0x01; 32]);
         let deposit_utxo_id = Bytes32::from([0x02; 32]);
-        let built = build_delegate_op(
-            validator_id,
-            deposit_utxo_id,
-            &keypair,
-            10,
-            TEST_CHAIN_ID,
-        )
-        .unwrap();
+        let built =
+            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 10, TEST_CHAIN_ID).unwrap();
         let op = decode_built(&built);
         assert!(matches!(
             op.body,
@@ -1277,14 +1322,7 @@ mod tests {
             )
             .unwrap(),
             build_self_stake_op(deposit_utxo_id, &keypair, 42, TEST_CHAIN_ID).unwrap(),
-            build_delegate_op(
-                validator_id,
-                deposit_utxo_id,
-                &keypair,
-                42,
-                TEST_CHAIN_ID,
-            )
-            .unwrap(),
+            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 42, TEST_CHAIN_ID).unwrap(),
             build_exit_stake_position_op(
                 Bytes32::from([0x31; 32]),
                 1_000,
@@ -1345,8 +1383,7 @@ mod tests {
             )
             .unwrap(),
             build_self_stake_op(deposit_utxo_id, &keypair, 2, TEST_CHAIN_ID).unwrap(),
-            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, TEST_CHAIN_ID)
-                .unwrap(),
+            build_delegate_op(validator_id, deposit_utxo_id, &keypair, 4, TEST_CHAIN_ID).unwrap(),
             build_exit_stake_position_op(
                 Bytes32::from([0x32; 32]),
                 1_000,

@@ -5,12 +5,15 @@ use std::{
 };
 
 use indra_cli::{
-    build_genesis_config, entry_from_public_keys, holds_at_least_one_third, stake_share_bps,
-    with_cold_file, GenesisEntry,
+    build_genesis_config, holds_at_least_one_third, stake_share_bps, validate_public_export,
+    validate_cold_hot_pairing, GenesisEntry,
+};
+use indra_core::codec::Encode;
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{Bytes32, VariableBytes},
 };
 use indra_state::compute_state_root;
-use indra_core::codec::Encode;
-use indra_core::types::{crypto::HybridPubKey, primitives::{Bytes32, VariableBytes}};
 
 fn required(args: &[String], flag: &str) -> Result<String, String> {
     args.iter()
@@ -82,48 +85,112 @@ fn create_vrf_proof(args: &[String]) -> Result<(), String> {
         "vrf_possession_proof": hex::encode(proof.0),
     });
     let mut file = create_new_output(&output)?;
-    file.write_all(&serde_json::to_vec_pretty(&json).unwrap())
+    let encoded = serde_json::to_vec_pretty(&json)
+        .map_err(|error| format!("cannot serialize VRF proof: {error}"))?;
+    file.write_all(&encoded)
         .map_err(|error| format!("cannot write {output}: {error}"))?;
     println!("Genesis VRF possession proof written to {output}");
     Ok(())
 }
 
 fn validator_entry(args: &[String]) -> Result<(), String> {
+    for argument in args.iter().filter(|argument| argument.starts_with("--")) {
+        if !matches!(argument.as_str(), "--name" | "--stake" | "--chain-id" | "--hot-export" | "--cold-export" | "--vrf-proof" | "--output") {
+            return Err(format!("unknown argument {argument}"));
+        }
+    }
     let name = required(args, "--name")?;
+    let chain_id = required(args, "--chain-id")?;
     let stake = required(args, "--stake")?
         .parse::<u64>()
         .map_err(|_| "invalid --stake")?;
-    let hot_keys = required(args, "--hot-keys")?;
-    let cold_file = required(args, "--cold-file")?;
+    let hot_export = required(args, "--hot-export")?;
+    let cold_export = required(args, "--cold-export")?;
     let proof_file = required(args, "--vrf-proof")?;
     let output = required(args, "--output")?;
-    let public = indra_cli::inspect_public_metadata(
-        &std::fs::read_to_string(&hot_keys).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?
-    .1;
-    let mut entry = entry_from_public_keys(&name, &public, stake);
-    entry = with_cold_file(
-        entry,
-        &std::fs::read_to_string(&cold_file).map_err(|error| error.to_string())?,
+    let hot = validate_public_export(
+        &std::fs::read_to_string(&hot_export).map_err(|error| error.to_string())?,
+        &chain_id,
     )
     .map_err(|error| error.to_string())?;
+    let cold = validate_public_export(
+        &std::fs::read_to_string(&cold_export).map_err(|error| error.to_string())?,
+        &chain_id,
+    )
+    .map_err(|error| error.to_string())?;
+    if hot.kind != "hot" || cold.kind != "cold" {
+        return Err("validator-entry requires a hot export followed by a cold export".into());
+    }
+    validate_cold_hot_pairing(&hot, &cold).map_err(|error| error.to_string())?;
+    let validator_id = hot.validator_id.clone().ok_or("hot export is missing validator_id")?;
+    let hot_classical = hot.hybrid_classical_pk.clone().ok_or("hot export is missing hybrid_classical_pk")?;
+    let hot_pq = hot.hybrid_pq_pk.clone().ok_or("hot export is missing hybrid_pq_pk")?;
+    let vrf_pk = hot.vrf_pk.clone().ok_or("hot export is missing vrf_pk")?;
+    let cold_classical = cold.cold_hybrid_classical_pk.clone().ok_or("cold export is missing cold_hybrid_classical_pk")?;
+    let cold_pq = cold.cold_hybrid_pq_pk.clone().ok_or("cold export is missing cold_hybrid_pq_pk")?;
+    if hot_classical == cold_classical || hot_pq == cold_pq {
+        return Err("hot and cold public keys must not be identical".into());
+    }
     let proof: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&proof_file).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    entry.vrf_possession_output = proof
+    let entry_vrf_output = proof
         .get("vrf_possession_output")
         .and_then(|value| value.as_str())
         .ok_or("VRF proof file lacks vrf_possession_output")?
         .to_string();
-    entry.vrf_possession_proof = proof
+    let entry_vrf_proof = proof
         .get("vrf_possession_proof")
         .and_then(|value| value.as_str())
         .ok_or("VRF proof file lacks vrf_possession_proof")?
         .to_string();
+    let validator_id_bytes: [u8; 32] = hex::decode(&validator_id)
+        .map_err(|_| "validator ID is invalid hex")?
+        .try_into()
+        .map_err(|_| "validator ID has wrong length")?;
+    let vrf_pk_bytes: [u8; 32] = hex::decode(&vrf_pk)
+        .map_err(|_| "VRF key is invalid hex")?
+        .try_into()
+        .map_err(|_| "VRF key has wrong length")?;
+    let output_bytes: [u8; 64] = hex::decode(&entry_vrf_output)
+        .map_err(|_| "VRF proof output is invalid hex")?
+        .try_into()
+        .map_err(|_| "VRF proof output has wrong length")?;
+    let proof_bytes: [u8; 80] = hex::decode(&entry_vrf_proof)
+        .map_err(|_| "VRF proof is invalid hex")?
+        .try_into()
+        .map_err(|_| "VRF proof has wrong length")?;
+    let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
+        &chain_id,
+        &indra_core::Bytes32::from(validator_id_bytes),
+        &indra_core::Bytes32::from(vrf_pk_bytes),
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    indra_crypto::vrf_verify(
+        &vrf_pk_bytes,
+        &challenge,
+        &indra_crypto::VrfOutput(output_bytes),
+        &indra_crypto::VrfProof(proof_bytes.to_vec()),
+    )
+    .map_err(|_| "invalid VRF proof for hot export")?;
+    let output_value = serde_json::json!({
+        "name": name,
+        "validator_id": validator_id,
+        "hybrid_classical_pk": hot_classical,
+        "hybrid_pq_pk": hot_pq,
+        "vrf_pk": vrf_pk,
+        "vrf_possession_output": entry_vrf_output,
+        "vrf_possession_proof": entry_vrf_proof,
+        "cold_hybrid_classical_pk": cold_classical,
+        "cold_hybrid_pq_pk": cold_pq,
+        "cold_key_version": 1,
+        "cold_nonce": 0,
+        "stake": stake,
+    });
     let mut file = create_new_output(&output)?;
-    file.write_all(&serde_json::to_vec_pretty(&entry).unwrap())
+    file.write_all(&serde_json::to_vec_pretty(&output_value).map_err(|error| error.to_string())?)
         .map_err(|error| format!("cannot write {output}: {error}"))?;
     Ok(())
 }
@@ -143,14 +210,17 @@ fn build(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("invalid validator entry {path}: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let config = build_genesis_config(&chain_id, genesis_timestamp, entries).map_err(|error| error.to_string())?;
+    let config = build_genesis_config(&chain_id, genesis_timestamp, entries)
+        .map_err(|error| error.to_string())?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("cannot read current Unix time: {error}"))?
         .as_secs();
     let difference = genesis_timestamp.abs_diff(now);
     if difference > 86_400 {
-        println!("WARNING: genesis timestamp differs from current Unix time by {difference} seconds");
+        println!(
+            "WARNING: genesis timestamp differs from current Unix time by {difference} seconds"
+        );
     }
     let mut file = create_new_output(&output)?;
     file.write_all(config.to_toml().as_bytes())
@@ -173,7 +243,10 @@ fn validate(args: &[String]) -> Result<(), String> {
     println!("chain_id={}", state.chain_id);
     println!("validator_count={}", state.validators.active_count());
     println!("fingerprint={}", state.genesis_fingerprint);
-    println!("genesis_block_hash={}", indra_node::genesis::genesis_block_hash(&state)?);
+    println!(
+        "genesis_block_hash={}",
+        indra_node::genesis::genesis_block_hash(&state)?
+    );
     Ok(())
 }
 
@@ -193,7 +266,10 @@ fn inspect_path(path: &str) -> Result<(), String> {
     println!("state_root={}", compute_state_root(&state));
     println!("snapshot_root={}", snapshot.snapshot_root);
     println!("fingerprint={}", state.genesis_fingerprint);
-    println!("genesis_block_hash={}", indra_node::genesis::genesis_block_hash(&state)?);
+    println!(
+        "genesis_block_hash={}",
+        indra_node::genesis::genesis_block_hash(&state)?
+    );
     println!("file_sha256={}", hex::encode(indra_crypto::sha256(&bytes)));
     let total = state.validators.total_active_stake();
     for validator in state.validators.active_validators() {
@@ -211,7 +287,10 @@ fn inspect_path(path: &str) -> Result<(), String> {
             )
         })?;
         let pq_pk = validator.cold_hybrid_pq_pk.clone().ok_or_else(|| {
-            format!("internal error: validator {} has no cold PQ key", validator.name)
+            format!(
+                "internal error: validator {} has no cold PQ key",
+                validator.name
+            )
         })?;
         let owner = HybridPubKey {
             classical_pk: Bytes32::from(classical_pk),
@@ -219,7 +298,10 @@ fn inspect_path(path: &str) -> Result<(), String> {
         };
         println!("owner_pubkey_hex={}", hex::encode(owner.encode_to_vec()));
         if holds_at_least_one_third(validator.stake_spark, total) {
-            println!("WARNING: validator {} holds >= 1/3 of genesis stake", validator.name);
+            println!(
+                "WARNING: validator {} holds >= 1/3 of genesis stake",
+                validator.name
+            );
         }
     }
     Ok(())
@@ -228,7 +310,7 @@ fn inspect_path(path: &str) -> Result<(), String> {
 fn print_help() {
     println!("Usage:");
     println!("  indra-genesis create-vrf-proof --chain-id ID --hot-keys keys.json --output proof.json [password options]");
-    println!("  indra-genesis validator-entry --name NAME --stake SPARK --hot-keys keys.json --cold-file cold.json --vrf-proof proof.json --output entry.json [password options]");
+    println!("  indra-genesis validator-entry --name NAME --stake SPARK --chain-id ID --hot-export hot.json --cold-export cold.json --vrf-proof proof.json --output entry.json");
     println!("  indra-genesis build --chain-id ID --genesis-timestamp SECONDS --validator-entry A.json --validator-entry B.json --validator-entry C.json --validator-entry D.json --output genesis.toml");
     println!("  indra-genesis validate --genesis genesis.toml");
     println!("  indra-genesis inspect --genesis genesis.toml");
@@ -243,19 +325,28 @@ mod tests {
     fn test_validators(chain_id: &str, count: usize) -> Vec<GenesisEntry> {
         (0..count)
             .map(|i| {
-                let keys = generate_from_master_seed(format!("validator-{i}"), [i as u8 + 1; 32]).unwrap();
+                let keys =
+                    generate_from_master_seed(format!("validator-{i}"), [i as u8 + 1; 32]).unwrap();
                 let cold_public = indra_crypto::ColdHybridKeypair::from_independent_seeds(
-                    [i as u8 + 41; 32], [i as u8 + 81; 32],
-                ).unwrap().public_key();
+                    [i as u8 + 41; 32],
+                    [i as u8 + 81; 32],
+                )
+                .unwrap()
+                .public_key();
                 let cold = cold_public.as_complete_hybrid();
-                let mut entry = entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10);
+                let mut entry =
+                    entry_from_keys(&format!("validator-{i}"), &keys, DUST_LIMIT_SPARK * 10);
                 entry.cold_hybrid_classical_pk = hex::encode(cold.classical.0);
                 entry.cold_hybrid_pq_pk = hex::encode(cold.pq.0);
                 let id = indra_core::Bytes32::from(keys.public.validator_id);
                 let vrf = indra_crypto::VrfKeypair::from_seed(&keys.vrf_seed);
                 let challenge = indra_core::types::staking::StakingOp::vrf_possession_challenge(
-                    chain_id, &id, &indra_core::Bytes32::from(vrf.public_key()), 0,
-                ).unwrap();
+                    chain_id,
+                    &id,
+                    &indra_core::Bytes32::from(vrf.public_key()),
+                    0,
+                )
+                .unwrap();
                 let (output, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
                 entry.vrf_possession_output = hex::encode(output.0);
                 entry.vrf_possession_proof = hex::encode(proof.0);
@@ -266,15 +357,24 @@ mod tests {
 
     #[test]
     fn genesis_with_4_validators() {
-        let config = build_genesis_config("indra-testnet-1", 1_700_000_000, test_validators("indra-testnet-1", 4)).unwrap();
+        let config = build_genesis_config(
+            "indra-testnet-1",
+            1_700_000_000,
+            test_validators("indra-testnet-1", 4),
+        )
+        .unwrap();
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
         assert_eq!(parsed.validators.len(), 4);
     }
 
     #[test]
     fn genesis_rejects_3_validators() {
-        let error = build_genesis_config("test", 1_700_000_000, test_validators("test", 3)).unwrap_err();
-        assert_eq!(error.to_string(), "genesis error: need at least 4 validators for BFT safety");
+        let error =
+            build_genesis_config("test", 1_700_000_000, test_validators("test", 3)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "genesis error: need at least 4 validators for BFT safety"
+        );
     }
 
     #[test]
@@ -294,7 +394,10 @@ mod tests {
         let mut validators = test_validators("dust", 4);
         validators[0].stake = 1;
         let error = build_genesis_config("dust", 1_700_000_000, validators).unwrap_err();
-        assert_eq!(error.to_string(), "genesis error: genesis validator validator-0 stake is below dust");
+        assert_eq!(
+            error.to_string(),
+            "genesis error: genesis validator validator-0 stake is below dust"
+        );
     }
 
     #[test]
@@ -302,14 +405,31 @@ mod tests {
         let mut validators = test_validators("duplicate", 4);
         validators[1] = validators[0].clone();
         let error = build_genesis_config("duplicate", 1_700_000_000, validators).unwrap_err();
-        assert_eq!(error.to_string(), "genesis error: duplicate genesis validator or key in validator-0");
+        assert_eq!(
+            error.to_string(),
+            "genesis error: duplicate genesis validator or key in validator-0"
+        );
     }
 
     #[test]
     fn toml_output_has_all_fields() {
-        let config = build_genesis_config("fields", 1_700_000_000, test_validators("fields", 4)).unwrap();
+        let config =
+            build_genesis_config("fields", 1_700_000_000, test_validators("fields", 4)).unwrap();
         let toml = config.to_toml();
-        for field in ["chain_id", "validator_id", "hybrid_classical_pk", "hybrid_pq_pk", "vrf_pk", "vrf_possession_output", "vrf_possession_proof", "cold_hybrid_classical_pk", "cold_hybrid_pq_pk", "cold_key_version", "cold_nonce", "stake"] {
+        for field in [
+            "chain_id",
+            "validator_id",
+            "hybrid_classical_pk",
+            "hybrid_pq_pk",
+            "vrf_pk",
+            "vrf_possession_output",
+            "vrf_possession_proof",
+            "cold_hybrid_classical_pk",
+            "cold_hybrid_pq_pk",
+            "cold_key_version",
+            "cold_nonce",
+            "stake",
+        ] {
             assert!(toml.contains(field), "missing {field}");
         }
     }
@@ -317,7 +437,8 @@ mod tests {
     #[test]
     fn toml_renderer_escapes_operator_text() {
         let chain_id = "indra-\"test\\chain";
-        let config = build_genesis_config(chain_id, 1_700_000_000, test_validators(chain_id, 4)).unwrap();
+        let config =
+            build_genesis_config(chain_id, 1_700_000_000, test_validators(chain_id, 4)).unwrap();
         let parsed = indra_node::parse_genesis_manifest_str(&config.to_toml()).unwrap();
         assert_eq!(parsed.genesis.chain_id, chain_id);
     }

@@ -6,14 +6,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
+        Bytes32, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS, VariableBytes,
         has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, validate_consensus_round,
-        Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
-    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
+    ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature, verify_classical, verify_pq,
 };
 
 use crate::{
@@ -342,7 +342,7 @@ pub fn verify_qc(
             &validator.validator_id,
             &qc.snapshot_root,
             chain_id,
-        );
+        )?;
         let pq_sig_bytes: [u8; indra_crypto::PQ_SIG_BYTES] =
             pq_sig.pq_sig.as_slice().try_into().map_err(|_| {
                 ConsensusError::InvalidPQSignature {
@@ -429,8 +429,8 @@ mod tests {
         primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
         qc::verify_qc_against_snapshot,
     };
-    use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
     use indra_crypto::VrfKeypair;
+    use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
 
     const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
 
@@ -539,16 +539,18 @@ mod tests {
             &b_key,
         )
         .unwrap();
-        assert!(build_qc(
-            1,
-            0,
-            block_hash,
-            TEST_CHAIN_ID,
-            root_a,
-            &[a, b],
-            vec![&vote_a, &vote_b],
-        )
-        .is_err());
+        assert!(
+            build_qc(
+                1,
+                0,
+                block_hash,
+                TEST_CHAIN_ID,
+                root_a,
+                &[a, b],
+                vec![&vote_a, &vote_b],
+            )
+            .is_err()
+        );
     }
 
     #[test]

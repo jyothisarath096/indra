@@ -1,17 +1,17 @@
 //! Canonical, versioned consensus membership and weight snapshots.
 
 use crate::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
     error::{IndraError, IndraResult},
-    sortition::{certified_log, validate_mainnet_f, CertifiedLogInterval},
+    sortition::{CertifiedLogInterval, certified_log, validate_mainnet_f},
     types::{
         block::VrfSuiteV1,
         primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
     },
 };
 use indra_crypto::{
-    sha256, validate_classical_public_key, validate_pq_public_key, validate_vrf_public_key,
-    ClassicalPublicKey, PqPublicKey, PQ_PK_BYTES,
+    ClassicalPublicKey, PQ_PK_BYTES, PqPublicKey, sha256, validate_classical_public_key,
+    validate_pq_public_key, validate_vrf_public_key,
 };
 
 /// Consensus snapshot wire and root format version.
@@ -72,7 +72,7 @@ impl ConsensusSnapshotEntry {
         }
         validate_classical_public_key(&ClassicalPublicKey(self.classical_vote_pk))
             .map_err(|err| invalid_error(format!("malformed Ed25519 vote key: {err}")))?;
-        validate_pq_public_key(&PqPublicKey(self.pq_vote_pk.clone()))
+        validate_pq_public_key(&PqPublicKey(self.pq_vote_pk))
             .map_err(|err| invalid_error(format!("malformed ML-DSA-87 vote key: {err}")))?;
         validate_vrf_public_key(&self.vrf_pk)
             .map_err(|err| invalid_error(format!("malformed VRF key: {err}")))?;
@@ -185,7 +185,7 @@ impl ConsensusSnapshot {
         self.entries
             .binary_search_by_key(&validator_id.0, |entry| entry.validator_id.0)
             .ok()
-            .map(|position| (position, &self.entries[position]))
+            .and_then(|position| self.entries.get(position).map(|entry| (position, entry)))
     }
 
     /// Decode the state-root-committed sortition certificate.
@@ -224,10 +224,14 @@ impl ConsensusSnapshot {
                 actual: self.entries.len(),
             });
         }
-        for (index, entry) in self.entries.iter().enumerate() {
+        for entry in &self.entries {
             entry.validate()?;
-            if index > 0 && self.entries[index - 1].validator_id >= entry.validator_id {
-                return invalid("validator IDs are duplicate or not strictly ascending");
+        }
+        for pair in self.entries.windows(2) {
+            if let [previous, next] = pair {
+                if previous.validator_id >= next.validator_id {
+                    return invalid("validator IDs are duplicate or not strictly ascending");
+                }
             }
         }
         let recomputed_total = recompute_total(&self.entries)?;
@@ -293,7 +297,10 @@ fn encode_q768(value: &num_bigint::BigUint) -> IndraResult<[u8; 128]> {
         return invalid("Q768 endpoint exceeds 1024 bits");
     }
     let mut out = [0; 128];
-    out[128 - bytes.len()..].copy_from_slice(&bytes);
+    let destination = out
+        .get_mut(128 - bytes.len()..)
+        .ok_or_else(|| invalid_error("Q768 endpoint offset underflow".to_string()))?;
+    destination.copy_from_slice(&bytes);
     Ok(out)
 }
 
@@ -307,6 +314,7 @@ fn recompute_total(entries: &[ConsensusSnapshotEntry]) -> IndraResult<u64> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_snapshot_root(
     format_version: u8,
     activation_height: u64,
@@ -522,7 +530,28 @@ mod tests {
 
     #[test]
     fn rejects_non_strict_validator_order() {
-        assert!(test_snapshot(301, 300, vec![entry(2, 2_000, 12), entry(1, 1_000, 11)]).is_err());
+        let error =
+            test_snapshot(301, 300, vec![entry(2, 2_000, 12), entry(1, 1_000, 11)]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid consensus snapshot: validator IDs are duplicate or not strictly ascending"
+        );
+    }
+
+    #[test]
+    fn validator_order_accepts_empty_single_and_ascending_and_rejects_equal() {
+        assert_eq!(
+            test_snapshot(301, 300, vec![]).unwrap_err().to_string(),
+            "invalid consensus snapshot: snapshot is empty"
+        );
+        assert!(test_snapshot(301, 300, vec![entry(1, 1_000, 11)]).is_ok());
+        assert!(test_snapshot(301, 300, vec![entry(1, 1_000, 11), entry(2, 2_000, 12)]).is_ok());
+        assert_eq!(
+            test_snapshot(301, 300, vec![entry(1, 1_000, 11), entry(1, 2_000, 12)])
+                .unwrap_err()
+                .to_string(),
+            "invalid consensus snapshot: validator IDs are duplicate or not strictly ascending"
+        );
     }
 
     #[test]
@@ -530,16 +559,18 @@ mod tests {
         let mut zero = entry(1, 1_000, 11);
         zero.consensus_weight_spark = 0;
         assert!(test_snapshot(301, 300, vec![zero]).is_err());
-        assert!(ConsensusSnapshotEntry::new(
-            Bytes32::from([1; 32]),
-            0,
-            entry(2, 1, 12).classical_vote_pk,
-            entry(2, 1, 12).pq_vote_pk,
-            entry(2, 1, 12).vrf_pk,
-            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
-            0,
-        )
-        .is_err());
+        assert!(
+            ConsensusSnapshotEntry::new(
+                Bytes32::from([1; 32]),
+                0,
+                entry(2, 1, 12).classical_vote_pk,
+                entry(2, 1, 12).pq_vote_pk,
+                entry(2, 1, 12).vrf_pk,
+                VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,10 @@
+use std::io::Write;
+
 use indra_core::codec::Encode;
-use indra_core::types::{crypto::HybridPubKey, primitives::{Bytes32, VariableBytes}};
+use indra_core::types::{
+    crypto::HybridPubKey,
+    primitives::{Bytes32, VariableBytes},
+};
 use indra_crypto::{ClassicalPublicKey, PaymentAddressV1, PqPublicKey};
 
 fn main() {
@@ -13,6 +18,10 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("inspect") {
         cmd_inspect(&args[2..]);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("export-public") {
+        cmd_export_public(&args[2..]);
         return;
     }
     if args.get(1).map(String::as_str) == Some("cold") {
@@ -179,7 +188,11 @@ fn cmd_inspect(args: &[String]) {
             );
             println!("PQ PK bytes:    {}", public.hybrid_pq_pk.len());
             println!("VRF PK:         {}", hex::encode(public.vrf_pk));
-            print_owner_details(public.hybrid_classical_pk, public.hybrid_pq_pk.clone(), &chain_id);
+            print_owner_details(
+                public.hybrid_classical_pk,
+                public.hybrid_pq_pk.clone(),
+                &chain_id,
+            );
         }
         indra_cli::KeyFilePublicMetadata::Cold {
             classical_pk,
@@ -194,11 +207,85 @@ fn cmd_inspect(args: &[String]) {
     }
 }
 
-fn print_owner_details(classical_pk: [u8; 32], pq_pk: Vec<u8>, chain_id: &str) {
-    let (owner_hex, address) = owner_details(classical_pk, pq_pk, chain_id).unwrap_or_else(|error| {
-        eprintln!("Failed to construct public owner details: {error}");
+fn cmd_export_public(args: &[String]) {
+    let keys_path = get(args, "--keys").unwrap_or_else(|| {
+        eprintln!("Error: missing required --keys");
         std::process::exit(1);
     });
+    let chain_id = indra_cli::required_chain_id(args).unwrap_or_else(|message| {
+        eprintln!("Error: {message}");
+        std::process::exit(1);
+    });
+    let output = get(args, "--output").unwrap_or_else(|| {
+        eprintln!("Error: missing required --output");
+        std::process::exit(1);
+    });
+    let json = std::fs::read_to_string(&keys_path).unwrap_or_else(|error| {
+        eprintln!("Error: cannot read {keys_path}: {error}");
+        std::process::exit(1);
+    });
+    let export = if let Some(hot_export_path) = get(args, "--hot-export") {
+        let hot_json = std::fs::read_to_string(&hot_export_path).unwrap_or_else(|error| {
+            eprintln!("Error: cannot read {hot_export_path}: {error}");
+            std::process::exit(1);
+        });
+        indra_cli::public_export_from_cold_key_file(
+            &keys_path,
+            indra_cli::cold_password_source_from_args(args),
+            &hot_json,
+            &chain_id,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        })
+    } else {
+        indra_cli::public_export_from_key_file(&json, &chain_id).unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        })
+    };
+    let contents = serde_json::to_vec_pretty(&export).unwrap_or_else(|error| {
+        eprintln!("Error: cannot serialize public export: {error}");
+        std::process::exit(1);
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .unwrap_or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                eprintln!("Error: {output} already exists; refusing to overwrite");
+            } else {
+                eprintln!("Error: cannot create {output}: {error}");
+            }
+            std::process::exit(1);
+        });
+    if let Err(error) = file.write_all(&contents) {
+        eprintln!("Error: cannot write {output}: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    if let Err(error) = std::fs::set_permissions(
+        &output,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    ) {
+        eprintln!("Error: cannot set permissions on {output}: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = file.sync_all() {
+        eprintln!("Error: cannot sync {output}: {error}");
+        std::process::exit(1);
+    }
+    println!("Public {} key export written to {}", export.kind, output);
+}
+
+fn print_owner_details(classical_pk: [u8; 32], pq_pk: Vec<u8>, chain_id: &str) {
+    let (owner_hex, address) =
+        owner_details(classical_pk, pq_pk, chain_id).unwrap_or_else(|error| {
+            eprintln!("Failed to construct public owner details: {error}");
+            std::process::exit(1);
+        });
     println!("chain_id={chain_id}");
     println!("owner_pubkey_hex={owner_hex}");
     println!("Payment Address:  {address}");
@@ -240,7 +327,10 @@ mod inspect_tests {
         let hot = indra_cli::generate_from_master_seed("hot".to_string(), [7; 32]).unwrap();
         let cold = indra_cli::ColdKeysFile::generate().unwrap();
         for (classical, pq) in [
-            (hot.public.hybrid_classical_pk, hot.public.hybrid_pq_pk.clone()),
+            (
+                hot.public.hybrid_classical_pk,
+                hot.public.hybrid_pq_pk.clone(),
+            ),
             (cold.classical_pk, cold.pq_pk.clone()),
         ] {
             let (owner_hex, address_text) = owner_details(classical, pq.clone(), chain_id).unwrap();
@@ -258,7 +348,6 @@ mod inspect_tests {
             }
         }
     }
-
 }
 
 fn cmd_cold(args: &[String]) {
@@ -610,9 +699,7 @@ fn keygen_password_source_slice(args: &[String]) -> indra_cli::PasswordSource<'_
 }
 
 fn print_help() {
-    println!(
-        "Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path] [--force]\n  indra-keygen cold ceremony --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold split --cold-keys <path> --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold verify --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> [--verification-output <receipt.json>]\n  indra-keygen cold recover --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --output <encrypted.json> --acknowledge-destroy-after-use\n  indra-keygen cold dealer-rekey --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen inspect --keys keys.json"
-    );
+    println!("Usage:\n  indra-keygen [--output keys.json] [--name name] [--chain-id id] [--recover|--passphrase] [--keys-password-file path]\n  indra-keygen cold --output validator-cold-keys.json [--keys-password-file path] [--force]\n  indra-keygen cold ceremony --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold split --cold-keys <path> --hot-keys <keys.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen cold verify --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> [--verification-output <receipt.json>]\n  indra-keygen cold recover --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --output <encrypted.json> --acknowledge-destroy-after-use\n  indra-keygen cold dealer-rekey --share <path> ... --hot-keys <keys.json> --expected-cold-file <cold.json> --threshold <m> --shares <n> --out-dir <dir>\n  indra-keygen inspect --keys keys.json --chain-id id\n  indra-keygen export-public --keys keys.json --chain-id id --output public.json [--keys-password-file path] [--hot-export hot-public.json]");
 }
 
 fn stdin_is_tty() -> bool {

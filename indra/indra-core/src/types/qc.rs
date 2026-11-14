@@ -5,17 +5,17 @@
 
 use crate::types::{consensus_snapshot::ConsensusSnapshot, vote::VoteStep};
 use crate::{
-    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
+    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
     error::{IndraError, IndraResult},
     types::{
-        crypto::{decode_fixed_signature, PQVoteSig},
+        crypto::{PQVoteSig, decode_fixed_signature},
         primitives::{
-            Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS,
+            Bytes32, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS, VariableBytes,
         },
     },
 };
 use indra_crypto::hybrid::{
-    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
+    ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature, verify_classical, verify_pq,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -113,6 +113,9 @@ pub enum QcVerificationError {
     /// QC round lies outside the finite consensus domain.
     #[error("QC contains an invalid consensus round")]
     InvalidRound,
+    /// Chain identifiers cannot be represented in the vote-signing encoding.
+    #[error("chain id longer than 65535 bytes")]
+    InvalidChainId,
     /// QC names a snapshot other than the supplied governing snapshot.
     #[error("QC snapshot root does not match the governing snapshot")]
     SnapshotRootMismatch,
@@ -206,7 +209,8 @@ pub fn verify_qc_against_snapshot(
             &signer.validator_id,
             &qc.snapshot_root,
             chain_id,
-        );
+        )
+        .map_err(|_| QcVerificationError::InvalidChainId)?;
         let pq_signature = pq
             .get(&signer.validator_id)
             .ok_or(QcVerificationError::MissingSignature)?;
@@ -218,7 +222,7 @@ pub fn verify_qc_against_snapshot(
         verify_pq(
             &signing_bytes,
             &PqSignature(pq_bytes),
-            &PqPublicKey(signer.pq_vote_pk.clone()),
+            &PqPublicKey(signer.pq_vote_pk),
         )
         .map_err(|_| QcVerificationError::InvalidPqSignature)?;
         let classical_signature = classical

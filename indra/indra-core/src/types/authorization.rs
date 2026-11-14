@@ -164,6 +164,7 @@ impl AuthorizationEnvelope {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         domain: AuthorizationDomain,
         authority_role: AuthorityRole,

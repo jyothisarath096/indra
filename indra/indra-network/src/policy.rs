@@ -142,7 +142,9 @@ impl<K: Clone + Eq + Hash, V> BoundedTtlMap<K, V> {
             .front()
             .is_some_and(|entry| entry.expires_at <= now)
         {
-            let entry = self.order.pop_front().expect("front exists");
+            let Some(entry) = self.order.pop_front() else {
+                break;
+            };
             if self
                 .values
                 .get(&entry.key)
@@ -400,7 +402,9 @@ impl<K: Clone + Eq + Hash> BoundedCooldownTracker<K> {
             .front()
             .is_some_and(|entry| entry.retention_deadline <= now)
         {
-            let entry = self.order.pop_front().expect("front exists");
+            let Some(entry) = self.order.pop_front() else {
+                break;
+            };
             if self.values.get(&entry.key).is_some_and(|value| {
                 value.generation == entry.generation && value.retention_deadline <= now
             }) {
