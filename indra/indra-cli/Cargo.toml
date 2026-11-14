@@ -20,6 +20,7 @@ serde.workspace = true
 rand.workspace = true
 libc.workspace = true
 zeroize.workspace = true
+ureq = { version = "=3.4.1", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 indra-core      = { path = "../indra-core", features = ["test-support"] }

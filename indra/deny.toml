@@ -14,9 +14,13 @@ allow = [
     "CC0-1.0",
     "ISC",
     "MIT",
-    "NCSA",
     "Unicode-3.0",
     "Zlib",
+]
+# Mozilla CA root data is distributed under this permissive licence and is
+# used only by the TLS client; keep it as a per-crate exception.
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], name = "webpki-roots" },
 ]
 
 [bans]
