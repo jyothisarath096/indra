@@ -9,7 +9,7 @@
 //! 5. Returns serialised hex ready for indra_sendTransaction RPC
 
 use indra_core::{
-    codec::Encode,
+    codec::{Decode, Encode},
     types::{
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
         primitives::{
@@ -31,9 +31,10 @@ use crate::{
     wallet::{PendingChange, Wallet},
 };
 
-/// Minimum fee in Spark.
-/// At 8 decimal places this is 0.0005 INDRA = 50,000 Spark.
-pub const MIN_FEE_SPARK: u64 = 50_000;
+/// Safety multiplier applied to the current consensus-required fee.
+/// The base-fee controller can rise by at most 12.5% per full block; 2x
+/// covers five consecutive full blocks before the sixth full block exceeds 2x.
+pub const FEE_SAFETY_MARGIN: u64 = 2;
 
 /// Dust limit — outputs below this are rejected.
 pub const DUST_LIMIT_SPARK: u64 = 100_000;
@@ -46,7 +47,7 @@ pub struct TxParams<'a> {
     pub recipient_address: &'a str,
     /// Amount to send in Spark.
     pub amount_spark: u64,
-    /// Fee in Spark (must be >= MIN_FEE_SPARK).
+    /// Fee in Spark.
     pub fee_spark: u64,
     /// Sender's wallet (for coin selection).
     pub wallet: &'a Wallet,
@@ -209,6 +210,106 @@ where
     })
 }
 
+/// Compute the consensus-required fee for an encoded transaction.
+pub fn required_fee_for_transaction(tx: &TransactionV1, base_fee_spark_per_kb: u64) -> CliResult<u64> {
+    base_fee_spark_per_kb
+        .checked_mul(tx.weight_kb())
+        .ok_or_else(|| CliError::Transaction("fee calculation overflow".into()))
+}
+
+/// Compute the default fee offered by the CLI for the current base fee.
+pub fn default_fee_for_base_fee(base_fee_spark_per_kb: u64) -> CliResult<u64> {
+    base_fee_spark_per_kb
+        .checked_mul(FEE_SAFETY_MARGIN)
+        .ok_or_else(|| CliError::Transaction("fee calculation overflow".into()))
+}
+
+fn required_fee_from_built(built: &BuiltTransaction, base_fee: u64) -> CliResult<u64> {
+    let bytes = hex::decode(&built.tx_hex)
+        .map_err(|_| CliError::Transaction("built transaction is not canonical hex".into()))?;
+    let tx = TransactionV1::decode_exact(&bytes)
+        .map_err(|error| CliError::Transaction(format!("built transaction decode failed: {error}")))?;
+    required_fee_for_transaction(&tx, base_fee)
+}
+
+/// Build a transfer using the current chain fee. If `requested_fee` is None,
+/// offer the checked safety-margin default; otherwise enforce the requested fee.
+pub fn build_transaction_with_fee_policy(
+    params: &TxParams<'_>,
+    base_fee_spark_per_kb: u64,
+    requested_fee: Option<u64>,
+) -> CliResult<(BuiltTransaction, u64)> {
+    let mut fee = match requested_fee {
+        Some(fee) => fee,
+        None => default_fee_for_base_fee(base_fee_spark_per_kb)?,
+    };
+    for _ in 0..8 {
+        let attempt = TxParams {
+            chain_id: params.chain_id,
+            recipient_address: params.recipient_address,
+            amount_spark: params.amount_spark,
+            fee_spark: fee,
+            wallet: params.wallet,
+            ed25519_seed: params.ed25519_seed,
+            ml_dsa_seed_bytes: params.ml_dsa_seed_bytes.clone(),
+            sender_pubkey: params.sender_pubkey.clone(),
+        };
+        let built = build_transaction(&attempt)?;
+        let required = required_fee_from_built(&built, base_fee_spark_per_kb)?;
+        if fee < required {
+            if requested_fee.is_some() {
+                return Err(CliError::Transaction(format!(
+                    "fee {fee} spark is below the minimum {required} spark for this transaction at base fee {base_fee_spark_per_kb} spark/KiB"
+                )));
+            }
+            fee = required
+                .checked_mul(FEE_SAFETY_MARGIN)
+                .ok_or_else(|| CliError::Transaction("fee calculation overflow".into()))?;
+            continue;
+        }
+        return Ok((built, required));
+    }
+    Err(CliError::Transaction("fee calculation did not converge".into()))
+}
+
+/// Build a cold transfer using the current chain fee.
+pub fn build_cold_transaction_with_fee_policy(
+    params: &ColdTxParams<'_>,
+    base_fee_spark_per_kb: u64,
+    requested_fee: Option<u64>,
+) -> CliResult<(BuiltTransaction, u64)> {
+    let mut fee = match requested_fee {
+        Some(fee) => fee,
+        None => default_fee_for_base_fee(base_fee_spark_per_kb)?,
+    };
+    for _ in 0..8 {
+        let attempt = ColdTxParams {
+            chain_id: params.chain_id,
+            recipient_address: params.recipient_address,
+            amount_spark: params.amount_spark,
+            fee_spark: fee,
+            wallet: params.wallet,
+            keypair: params.keypair,
+            owner_pubkey: params.owner_pubkey.clone(),
+        };
+        let built = build_cold_transaction(&attempt)?;
+        let required = required_fee_from_built(&built, base_fee_spark_per_kb)?;
+        if fee < required {
+            if requested_fee.is_some() {
+                return Err(CliError::Transaction(format!(
+                    "fee {fee} spark is below the minimum {required} spark for this transaction at base fee {base_fee_spark_per_kb} spark/KiB"
+                )));
+            }
+            fee = required
+                .checked_mul(FEE_SAFETY_MARGIN)
+                .ok_or_else(|| CliError::Transaction("fee calculation overflow".into()))?;
+            continue;
+        }
+        return Ok((built, required));
+    }
+    Err(CliError::Transaction("fee calculation did not converge".into()))
+}
+
 /// Build and sign a transaction.
 pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
     // 1. Validate amount and fee
@@ -216,12 +317,6 @@ pub fn build_transaction(params: &TxParams<'_>) -> CliResult<BuiltTransaction> {
         return Err(CliError::Transaction(format!(
             "amount {} Spark is below dust limit {}",
             params.amount_spark, DUST_LIMIT_SPARK
-        )));
-    }
-    if params.fee_spark < MIN_FEE_SPARK {
-        return Err(CliError::Transaction(format!(
-            "fee {} Spark is below minimum {}",
-            params.fee_spark, MIN_FEE_SPARK
         )));
     }
 
@@ -278,12 +373,6 @@ pub fn build_cold_transaction(params: &ColdTxParams<'_>) -> CliResult<BuiltTrans
         return Err(CliError::Transaction(format!(
             "amount {} Spark is below dust limit {}",
             params.amount_spark, DUST_LIMIT_SPARK
-        )));
-    }
-    if params.fee_spark < MIN_FEE_SPARK {
-        return Err(CliError::Transaction(format!(
-            "fee {} Spark is below minimum {}",
-            params.fee_spark, MIN_FEE_SPARK
         )));
     }
     let recipient_address =
@@ -678,6 +767,8 @@ fn dummy_signature() -> CliResult<HybridSignature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_FEE_SPARK: u64 = 50_000;
     use crate::wallet::Wallet;
     use indra_core::codec::Decode;
     use indra_core::types::primitives::Bytes32;
@@ -710,6 +801,116 @@ mod tests {
 
     fn test_cold_keypair(seed: u8) -> ColdHybridKeypair {
         ColdHybridKeypair::from_independent_seeds([seed; 32], [seed.wrapping_add(1); 32]).unwrap()
+    }
+
+    #[test]
+    fn fee_weight_rounds_at_1023_1024_and_1025_bytes() {
+        let mut found = [None, None, None];
+        for pq_len in 0..2048 {
+            let tx = TransactionV1 {
+                version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+                signature_module_id: 1,
+                inputs: vec![InputV1 { utxo_id: Bytes32::ZERO }],
+                outputs: vec![OutputV1 {
+                    value_spark: 1,
+                    owner_pubkey: HybridPubKey {
+                        classical_pk: Bytes32::ZERO,
+                        pq_pk: VariableBytes::from_slice(&vec![0; pq_len]).unwrap(),
+                    },
+                    lock_height: 0,
+                }],
+                fee_amount: 1,
+                signature: HybridSignature {
+                    classical_sig: VariableBytes::default(),
+                    pq_sig: VariableBytes::default(),
+                },
+            };
+            let len = tx.encoded_len();
+            if (1023..=1025).contains(&len) {
+                found[len - 1023] = Some(tx);
+            }
+        }
+        assert_eq!(found[0].as_ref().map(TransactionV1::encoded_len), Some(1023));
+        assert_eq!(found[1].as_ref().map(TransactionV1::encoded_len), Some(1024));
+        assert_eq!(found[2].as_ref().map(TransactionV1::encoded_len), Some(1025));
+        assert_eq!(found[0].as_ref().map(TransactionV1::weight_kb), Some(1));
+        assert_eq!(found[1].as_ref().map(TransactionV1::weight_kb), Some(1));
+        assert_eq!(found[2].as_ref().map(TransactionV1::weight_kb), Some(2));
+    }
+
+    #[test]
+    fn fee_policy_default_is_required_fee_times_two_and_overflow_is_typed() {
+        assert_eq!(default_fee_for_base_fee(123).unwrap(), 246);
+        let tx = TransactionV1 {
+            version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
+            signature_module_id: 1,
+            inputs: vec![InputV1 { utxo_id: Bytes32::ZERO }],
+            outputs: vec![OutputV1 {
+                value_spark: 1,
+                owner_pubkey: HybridPubKey {
+                    classical_pk: Bytes32::ZERO,
+                    pq_pk: VariableBytes::default(),
+                },
+                lock_height: 0,
+            }],
+            fee_amount: 1,
+            signature: HybridSignature {
+                classical_sig: VariableBytes::default(),
+                pq_sig: VariableBytes::default(),
+            },
+        };
+        assert_eq!(required_fee_for_transaction(&tx, 123).unwrap(), 123);
+        let mut oversized = tx.clone();
+        oversized.outputs[0].owner_pubkey.pq_pk =
+            VariableBytes::from_slice(&vec![0; 2048]).unwrap();
+        let overflow = required_fee_for_transaction(&oversized, u64::MAX).unwrap_err();
+        assert_eq!(overflow.to_string(), "transaction error: fee calculation overflow");
+    }
+
+    #[test]
+    fn fee_policy_rejects_below_required_with_exact_message() {
+        let (wallet, seed, pq_seed, sender) = make_wallet_with_funds();
+        let recipient = test_keypair(0x77);
+        let address = PaymentAddressV1::new(TEST_CHAIN_ID.as_bytes(), recipient.public_key())
+            .unwrap()
+            .to_text();
+        let baseline = build_transaction(&TxParams {
+            chain_id: TEST_CHAIN_ID,
+            recipient_address: &address,
+            amount_spark: 1_000_000,
+            fee_spark: 1,
+            wallet: &wallet,
+            ed25519_seed: seed,
+            ml_dsa_seed_bytes: pq_seed.clone(),
+            sender_pubkey: sender.clone(),
+        })
+        .unwrap();
+        let required = required_fee_from_built(&baseline, 1).unwrap();
+        let error = match build_transaction_with_fee_policy(
+            &TxParams {
+                chain_id: TEST_CHAIN_ID,
+                recipient_address: &address,
+                amount_spark: 1_000_000,
+                fee_spark: required.saturating_sub(1),
+                wallet: &wallet,
+                ed25519_seed: seed,
+                ml_dsa_seed_bytes: pq_seed,
+                sender_pubkey: sender,
+            },
+            1,
+            Some(required.saturating_sub(1)),
+        ) {
+            Ok(_) => panic!("below-required fee unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "transaction error: fee {} spark is below the minimum {} spark for this transaction at base fee 1 spark/KiB",
+                required.saturating_sub(1),
+                required
+            )
+        );
     }
 
     #[test]
@@ -765,7 +966,7 @@ mod tests {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
+            fee_spark: TEST_FEE_SPARK,
             wallet: &wallet,
             keypair: &cold,
             owner_pubkey: cold_owner.clone(),
@@ -789,7 +990,7 @@ mod tests {
         assert!(!accepted.utxos.contains(&genesis_utxo_id));
         assert!(accepted.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == cold_owner
-                && entry.output.value_spark == genesis_value - 1_000_000 - MIN_FEE_SPARK
+                && entry.output.value_spark == genesis_value - 1_000_000 - TEST_FEE_SPARK
         }));
         assert!(accepted.utxos.all_entries().any(|entry| {
             entry.output.owner_pubkey == recipient_owner && entry.output.value_spark == 1_000_000
@@ -837,7 +1038,7 @@ mod tests {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 100_000,
-            fee_spark: MIN_FEE_SPARK,
+            fee_spark: TEST_FEE_SPARK,
             wallet: &wallet,
             ed25519_seed: [0x31; 32],
             ml_dsa_seed_bytes: PqKeypair::from_seed(&[0x31; 32])
@@ -852,7 +1053,7 @@ mod tests {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 100_000,
-            fee_spark: MIN_FEE_SPARK,
+            fee_spark: TEST_FEE_SPARK,
             wallet: &wallet,
             keypair: &cold,
             owner_pubkey: cold_owner,
@@ -942,7 +1143,7 @@ mod tests {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
+            fee_spark: TEST_FEE_SPARK,
             wallet: &wallet,
             ed25519_seed: seed,
             ml_dsa_seed_bytes: pq_seed,
@@ -966,7 +1167,7 @@ mod tests {
             chain_id: TEST_CHAIN_ID,
             recipient_address: &recipient_address,
             amount_spark: 1_000_000,
-            fee_spark: MIN_FEE_SPARK,
+            fee_spark: TEST_FEE_SPARK,
             wallet: &wallet,
             ed25519_seed: seed,
             ml_dsa_seed_bytes: pq_seed,
@@ -984,12 +1185,12 @@ mod tests {
         for remainder in [1, DUST_LIMIT_SPARK] {
             let (wallet, seed, pq_seed, sender_pubkey) = make_wallet_with_funds();
             let recipient_address = payment_address(&test_keypair(0x6A));
-            let amount = 10_000_000 - MIN_FEE_SPARK - remainder;
+            let amount = 10_000_000 - TEST_FEE_SPARK - remainder;
             let built = build_transaction(&TxParams {
                 chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark: amount,
-                fee_spark: MIN_FEE_SPARK,
+                fee_spark: TEST_FEE_SPARK,
                 wallet: &wallet,
                 ed25519_seed: seed,
                 ml_dsa_seed_bytes: pq_seed,
@@ -1000,7 +1201,7 @@ mod tests {
             assert_eq!(built.change_spark, 0);
             assert!(built.pending_change.is_none());
             assert_eq!(tx.outputs.len(), 1);
-            assert_eq!(tx.fee_amount, MIN_FEE_SPARK + remainder);
+            assert_eq!(tx.fee_amount, TEST_FEE_SPARK + remainder);
             assert_eq!(tx.outputs[0].value_spark + tx.fee_amount, 10_000_000);
         }
     }
@@ -1016,7 +1217,7 @@ mod tests {
                 chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark: 1_000_000,
-                fee_spark: MIN_FEE_SPARK,
+                fee_spark: TEST_FEE_SPARK,
                 wallet: &wallet,
                 ed25519_seed: seed,
                 ml_dsa_seed_bytes: pq_seed.clone(),
@@ -1035,7 +1236,7 @@ mod tests {
                 chain_id: TEST_CHAIN_ID,
                 recipient_address: &recipient_address,
                 amount_spark,
-                fee_spark: MIN_FEE_SPARK,
+                fee_spark: TEST_FEE_SPARK,
                 wallet: &wallet,
                 ed25519_seed: seed,
                 ml_dsa_seed_bytes: pq_seed.clone(),

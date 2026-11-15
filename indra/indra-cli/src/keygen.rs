@@ -543,7 +543,11 @@ mod tests {
             include_str!("bin/wallet_scan.rs"),
             include_str!("bin/send.rs"),
         ];
-        for source in consumers {
+        for (index, source) in consumers.iter().enumerate() {
+            if index == 3 {
+                assert!(source.contains("--owner-pubkey"));
+                continue;
+            }
             assert!(
                 source.contains("load_keys_for_cli"),
                 "CLI key consumer bypasses shared encrypted loader"

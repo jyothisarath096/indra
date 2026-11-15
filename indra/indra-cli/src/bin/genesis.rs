@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -286,7 +289,7 @@ fn inspect_path(path: &str) -> Result<(), String> {
                 validator.name
             )
         })?;
-        let pq_pk = validator.cold_hybrid_pq_pk.clone().ok_or_else(|| {
+        let pq_pk = validator.cold_hybrid_pq_pk.ok_or_else(|| {
             format!(
                 "internal error: validator {} has no cold PQ key",
                 validator.name

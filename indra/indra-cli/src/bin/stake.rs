@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! `indra-stake` — build and submit staking operations.
 
 use indra_cli::{
@@ -482,6 +485,7 @@ fn run_nonce(args: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_op(
     args: &[String],
     op_name: &str,
@@ -525,6 +529,7 @@ fn finish_op(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_confirmation(
     title: &str,
     op_name: &str,

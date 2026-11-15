@@ -13,6 +13,67 @@ use crate::{build_scan_authorization, json_string, rpc_call_raw_params, KeysFile
 /// Maximum number of canonical blocks requested per RPC page.
 pub const CANONICAL_SCAN_PAGE_SIZE: u64 = 25;
 
+/// Scan with ownership authorization so retained protocol-generated outputs,
+/// including tranche refunds, are returned by the RPC.
+pub fn scan_canonical_blocks_authorized(
+    node_url: &str,
+    wallet: &mut Wallet,
+    keys: &KeysFile,
+    owner_pubkeys: &[HybridPubKey],
+    expected_genesis_hash: Bytes32,
+) -> Result<usize, String> {
+    if wallet.scan_tip().is_none() {
+        let authorization = build_scan_authorization(node_url, keys).map_err(|error| error.to_string())?;
+        let response = rpc_call_raw_params(
+            node_url,
+            "indra_getCanonicalBlocks",
+            &[
+                "0".into(),
+                "1".into(),
+                json_string(&hex::encode(Bytes32::ZERO.0)),
+                json_string(&authorization.payment_address),
+                authorization.proof.clone(),
+            ],
+        ).map_err(|error| error.to_string())?;
+        let genesis = canonical_blocks_from_rpc(&response)?.into_iter().find(|block| block.header.height == 0)
+            .ok_or_else(|| "canonical genesis block is missing from node response".to_string())?;
+        if genesis.header.block_hash() != expected_genesis_hash {
+            return Err("node genesis hash does not match the expected genesis hash".into());
+        }
+        wallet.record_scanned_block(0, genesis.header.block_hash());
+    }
+    let mut discovered = 0usize;
+    loop {
+        let authorization = build_scan_authorization(node_url, keys).map_err(|error| error.to_string())?;
+        let (from_height, expected_parent) = wallet.scan_tip()
+            .ok_or_else(|| "canonical scan wallet has no genesis anchor".to_string())?;
+        let response = rpc_call_raw_params(
+            node_url,
+            "indra_getCanonicalBlocks",
+            &[
+                from_height.saturating_add(1).to_string(),
+                CANONICAL_SCAN_PAGE_SIZE.to_string(),
+                json_string(&hex::encode(expected_parent.0)),
+                json_string(&authorization.payment_address),
+                authorization.proof.clone(),
+            ],
+        ).map_err(|error| error.to_string())?;
+        if response.contains("exceeds current tip") || response.contains("not retained") {
+            break;
+        }
+        let refunds = tranche_refunds_from_rpc(&response)?;
+        let blocks = canonical_blocks_from_rpc(&response)?;
+        if blocks.is_empty() { break; }
+        for entry in refunds { discovered += scan_tranche_refund(wallet, &entry, owner_pubkeys)?; }
+        for block in blocks {
+            discovered += scan_canonical_block(wallet, &block, owner_pubkeys)?;
+            wallet.record_scanned_block(block.header.height, block.header.block_hash());
+        }
+        if response.contains("\"next_height\":null") { break; }
+    }
+    Ok(discovered)
+}
+
 fn format_scan_progress(current_height: u64, tip_height: u64) -> String {
     format!("Scanning canonical blocks: height {current_height}/{tip_height}")
 }
@@ -22,23 +83,23 @@ fn format_scan_progress(current_height: u64, tip_height: u64) -> String {
 pub fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut Wallet,
-    keys: &KeysFile,
     owner_pubkeys: &[HybridPubKey],
     expected_genesis_hash: Bytes32,
 ) -> Result<usize, String> {
+    eprintln!(
+        "note: protocol-generated outputs of kind tranche_refund are not scanned in public mode"
+    );
     let mut discovered = 0usize;
     #[cfg(not(test))]
     let mut last_progress = Instant::now() - Duration::from_secs(1);
     if wallet.scan_tip().is_none() {
-        anchor_fresh_wallet_at_genesis(node_url, wallet, keys, expected_genesis_hash)?;
+        anchor_fresh_wallet_at_genesis(node_url, wallet, expected_genesis_hash)?;
     }
     loop {
         let (from_height, expected_parent) = wallet
             .scan_tip()
             .ok_or_else(|| "canonical scan wallet has no genesis anchor".to_string())
             .map(|(height, hash)| (height + 1, hash))?;
-        let authorization =
-            build_scan_authorization(node_url, keys).map_err(|error| error.to_string())?;
         let response = rpc_call_raw_params(
             node_url,
             "indra_getCanonicalBlocks",
@@ -46,8 +107,6 @@ pub fn scan_canonical_blocks(
                 from_height.to_string(),
                 CANONICAL_SCAN_PAGE_SIZE.to_string(),
                 json_string(&hex::encode(expected_parent.0)),
-                json_string(&authorization.payment_address),
-                authorization.proof,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -118,11 +177,8 @@ fn json_u64_field(json: &str, field: &str) -> Option<u64> {
 fn anchor_fresh_wallet_at_genesis(
     node_url: &str,
     wallet: &mut Wallet,
-    keys: &KeysFile,
     expected_genesis_hash: Bytes32,
 ) -> Result<(), String> {
-    let authorization =
-        build_scan_authorization(node_url, keys).map_err(|error| error.to_string())?;
     let response = rpc_call_raw_params(
         node_url,
         "indra_getCanonicalBlocks",
@@ -130,8 +186,6 @@ fn anchor_fresh_wallet_at_genesis(
             "0".to_string(),
             "1".to_string(),
             json_string(&hex::encode(Bytes32::ZERO.0)),
-            json_string(&authorization.payment_address),
-            authorization.proof,
         ],
     )
     .map_err(|error| {
@@ -545,7 +599,7 @@ mod tests {
         let (node, server) = mock_scan_server(
             genesis.clone(),
             vec![block_one, block_two.clone()],
-            6,
+            2,
             false,
         );
         let mut wallet = Wallet::new();
@@ -553,7 +607,6 @@ mod tests {
             scan_canonical_blocks(
                 &node,
                 &mut wallet,
-                &keys,
                 &[owner.clone()],
                 genesis.header.block_hash(),
             )
@@ -568,14 +621,13 @@ mod tests {
 
     #[test]
     fn scan_resumes_from_existing_tip_without_refetching_genesis() {
-        let keys = crate::generate_from_master_seed("scan-resume".to_string(), [0x32; 32]).unwrap();
         let genesis = scan_block(0, Bytes32::ZERO, None);
         let block_one = scan_block(1, genesis.header.block_hash(), None);
-        let (node, server) = mock_scan_server(genesis.clone(), vec![block_one.clone()], 3, false);
+        let (node, server) = mock_scan_server(genesis.clone(), vec![block_one.clone()], 1, false);
         let mut wallet = Wallet::new();
         wallet.record_scanned_block(0, genesis.header.block_hash());
         assert_eq!(
-            scan_canonical_blocks(&node, &mut wallet, &keys, &[], genesis.header.block_hash())
+            scan_canonical_blocks(&node, &mut wallet, &[], genesis.header.block_hash())
                 .unwrap(),
             0
         );
@@ -585,14 +637,11 @@ mod tests {
 
     #[test]
     fn scan_fails_with_exact_error_when_genesis_block_missing() {
-        let keys =
-            crate::generate_from_master_seed("scan-missing".to_string(), [0x33; 32]).unwrap();
         let genesis = scan_block(0, Bytes32::ZERO, None);
-        let (node, server) = mock_scan_server(genesis.clone(), Vec::new(), 3, true);
+        let (node, server) = mock_scan_server(genesis.clone(), Vec::new(), 1, true);
         let error = scan_canonical_blocks(
             &node,
             &mut Wallet::new(),
-            &keys,
             &[],
             genesis.header.block_hash(),
         )
@@ -606,15 +655,12 @@ mod tests {
 
     #[test]
     fn scan_fails_with_exact_error_when_height_one_parent_disagrees_with_genesis() {
-        let keys = crate::generate_from_master_seed("scan-parent-mismatch".to_string(), [0x34; 32])
-            .unwrap();
         let genesis = scan_block(0, Bytes32::ZERO, None);
         let block_one = scan_block(1, Bytes32::from([0xEE; 32]), None);
-        let (node, server) = mock_scan_server(genesis.clone(), vec![block_one], 6, false);
+        let (node, server) = mock_scan_server(genesis.clone(), vec![block_one], 2, false);
         let error = scan_canonical_blocks(
             &node,
             &mut Wallet::new(),
-            &keys,
             &[],
             genesis.header.block_hash(),
         )
@@ -628,18 +674,44 @@ mod tests {
 
     #[test]
     fn scan_rejects_genesis_hash_mismatch_with_exact_error() {
-        let keys = crate::generate_from_master_seed("scan-mismatch".to_string(), [0x35; 32]).unwrap();
         let genesis = scan_block(0, Bytes32::ZERO, None);
-        let (node, server) = mock_scan_server(genesis.clone(), Vec::new(), 3, false);
+        let (node, server) = mock_scan_server(genesis.clone(), Vec::new(), 1, false);
         let error = scan_canonical_blocks(
             &node,
             &mut Wallet::new(),
-            &keys,
             &[],
             Bytes32::from([0xAB; 32]),
         )
         .unwrap_err();
         server.join().unwrap();
         assert_eq!(error, "node genesis hash does not match the expected genesis hash");
+    }
+
+    #[test]
+    fn public_scan_fixture_of_1000_blocks_reports_wall_time() {
+        let owner = HybridPubKey {
+            classical_pk: Bytes32::from([0x61; 32]),
+            pq_pk: VariableBytes::from_slice(&[0x62; 32]).unwrap(),
+        };
+        let mut wallet = Wallet::new();
+        let mut previous = Bytes32::ZERO;
+        let started = std::time::Instant::now();
+        for height in 0..=1_000 {
+            let block = scan_block(
+                height,
+                previous,
+                (height == 1_000).then_some(OutputV1 {
+                    value_spark: 123_456,
+                    owner_pubkey: owner.clone(),
+                    lock_height: 0,
+                }),
+            );
+            if height > 0 {
+                scan_canonical_block(&mut wallet, &block, &[owner.clone()]).unwrap();
+            }
+            previous = block.header.block_hash();
+        }
+        eprintln!("public scan fixture: 1000 blocks in {:?}", started.elapsed());
+        assert_eq!(wallet.balance_owned_by(&owner), 123_456);
     }
 }

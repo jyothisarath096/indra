@@ -51,6 +51,17 @@ pub fn fetch_chain_id(node_url: &str) -> CliResult<String> {
         .ok_or_else(|| CliError::Rpc("cannot parse chain_id from response".into()))
 }
 
+/// Fetch the current consensus base fee in Spark per encoded KiB.
+pub fn fetch_base_fee(node_url: &str) -> CliResult<u64> {
+    let body = r#"{"jsonrpc":"2.0","method":"indra_getChainInfo","params":[],"id":1}"#;
+    let response = http_post(node_url, body)?;
+    if let Some(message) = rpc_error_message(&response) {
+        return Err(CliError::Rpc(message));
+    }
+    parse_u64_json_field(&response, "base_fee")
+        .ok_or_else(|| CliError::Rpc("cannot parse base_fee from response".into()))
+}
+
 /// Fetch the registered cold-key version and next cold-role nonce.
 pub fn fetch_validator_cold_replay(node_url: &str, validator_id: &str) -> CliResult<(u64, u64)> {
     let body = format!(

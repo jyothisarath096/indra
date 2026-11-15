@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! `indra send` — build and submit a transaction to a running node.
 //!
 //! Usage:
@@ -45,13 +48,15 @@ fn main() {
         eprintln!("Error: --amount required");
         std::process::exit(1);
     });
-    let fee_str = get("--fee").unwrap_or_else(|| "0.0001".to_string());
+    let requested_fee_spark = get("--fee").map(|raw| parse_amount_or_exit(&raw, "--fee"));
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let genesis_path = get("--genesis");
 
     let amount_spark = parse_amount_or_exit(&amount_str, "--amount");
-    let fee_spark =
-        parse_amount_or_exit(&fee_str, "--fee").max(indra_cli::tx_builder::MIN_FEE_SPARK);
+    let base_fee = indra_cli::fetch_base_fee(&node_url).unwrap_or_else(|error| {
+        eprintln!("Error fetching current base fee: {error}");
+        std::process::exit(1);
+    });
 
     println!("INDRA Send");
     println!("──────────────────────────────────────");
@@ -59,7 +64,7 @@ fn main() {
     println!("Wallet:  {}", wallet_path);
     println!("To:      {}...", &to[..to.len().min(16)]);
     println!("Amount:  {} INDRA ({} Spark)", amount_str, amount_spark);
-    println!("Fee:     {} INDRA ({} Spark)", fee_str, fee_spark);
+    println!("Base fee: {} Spark/KiB", base_fee);
     println!("Node:    {}", node_url);
     println!("──────────────────────────────────────");
 
@@ -100,9 +105,10 @@ fn main() {
             std::process::exit(1);
         })
     } else {
-        let keys = hot_keys
-            .as_ref()
-            .expect("hot keys loaded when cold mode is off");
+        let Some(keys) = hot_keys.as_ref() else {
+            eprintln!("Error: hot keys required when --cold-keys is absent");
+            std::process::exit(1);
+        };
         indra_core::types::crypto::HybridPubKey {
             classical_pk: indra_core::types::primitives::Bytes32::from(
                 keys.public.hybrid_classical_pk,
@@ -119,7 +125,7 @@ fn main() {
 
     // Build transaction. Cold mode requires owner-tagged wallet entries, which
     // are produced by `indra-wallet-scan --cold-owner`.
-    let built = if let Some(cold_keypair) = cold_keypair.as_ref() {
+    let (built, required_fee) = if let Some(cold_keypair) = cold_keypair.as_ref() {
         if let Some(genesis_path) = genesis_path.as_deref() {
             indra_cli::seed_wallet_from_genesis(&mut wallet, genesis_path, &signer_owner)
                 .unwrap_or_else(|error| {
@@ -127,35 +133,44 @@ fn main() {
                     std::process::exit(1);
                 });
         }
-        indra_cli::build_cold_transaction(&indra_cli::ColdTxParams {
+        indra_cli::build_cold_transaction_with_fee_policy(&indra_cli::ColdTxParams {
             chain_id: &chain_id,
             recipient_address: &to,
             amount_spark,
-            fee_spark,
+            fee_spark: requested_fee_spark.unwrap_or(0),
             wallet: &wallet,
             keypair: cold_keypair,
             owner_pubkey: signer_owner.clone(),
-        })
+        }, base_fee, requested_fee_spark)
     } else {
-        let keys = hot_keys
-            .as_ref()
-            .expect("hot keys loaded when cold mode is off");
+        let Some(keys) = hot_keys.as_ref() else {
+            eprintln!("Error: hot keys required when --cold-keys is absent");
+            std::process::exit(1);
+        };
         let sender_pubkey = signer_owner.clone();
-        indra_cli::build_transaction(&indra_cli::tx_builder::TxParams {
+        indra_cli::build_transaction_with_fee_policy(&indra_cli::tx_builder::TxParams {
             chain_id: &chain_id,
             recipient_address: &to,
             amount_spark,
-            fee_spark,
+            fee_spark: requested_fee_spark.unwrap_or(0),
             wallet: &wallet,
             ed25519_seed: keys.ed25519_seed,
             ml_dsa_seed_bytes: keys.ml_dsa_seed.to_vec(),
             sender_pubkey,
-        })
+        }, base_fee, requested_fee_spark)
     }
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
+
+    println!("Required fee: {} Spark", required_fee);
+    if let Some(given) = requested_fee_spark {
+        let default_fee = indra_cli::default_fee_for_base_fee(base_fee).unwrap_or(u64::MAX);
+        if given < default_fee {
+            println!("Warning: requested fee may be rejected if the base fee rises before inclusion");
+        }
+    }
 
     println!(
         "Wallet balance: {} Spark ({:.8} INDRA)",

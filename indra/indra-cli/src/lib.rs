@@ -48,7 +48,7 @@ pub mod tx_builder;
 pub mod wallet;
 
 pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
-pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks};
+pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks, scan_canonical_blocks_authorized};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{
     build_genesis_config, entry_from_keys, entry_from_public_keys, holds_at_least_one_third,
@@ -76,12 +76,13 @@ pub use staking::{
     build_claim_rewards_op, build_cold_authorized_staking_op, build_delegate_op,
     build_exit_stake_position_op, build_register_validator_op_with_cold,
     build_update_network_address_op, fetch_chain_id, fetch_staking_nonce,
-    fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
+    fetch_base_fee, fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
     ColdAuthorizedStakingAction, StakePositionExitSigner,
 };
 pub use tx_builder::{
-    build_cold_transaction, build_transaction, BuiltStakingOp, BuiltTransaction, ColdTxParams,
-    TxParams,
+    build_cold_transaction, build_cold_transaction_with_fee_policy, build_transaction,
+    build_transaction_with_fee_policy, default_fee_for_base_fee, required_fee_for_transaction,
+    BuiltStakingOp, BuiltTransaction, ColdTxParams, FEE_SAFETY_MARGIN, TxParams,
 };
 pub use wallet::{seed_wallet_from_genesis, PendingChange, Wallet, WalletEntry};
 

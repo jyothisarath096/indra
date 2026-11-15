@@ -1,4 +1,7 @@
-use indra_cli::{build_transaction, KeysFile, TxParams, Wallet};
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+use indra_cli::{KeysFile, TxParams, Wallet};
 use indra_core::types::{
     crypto::HybridPubKey,
     primitives::{Bytes32, VariableBytes},
@@ -137,22 +140,42 @@ fn cmd_send(args: &[String]) {
         }),
     };
 
-    let built = build_transaction(&TxParams {
+    let requested_fee = get_arg(args, "--fee").map(|raw| {
+        indra_cli::parse_indra_amount_to_spark(&raw, "--fee").unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        })
+    });
+    let base_fee = indra_cli::fetch_base_fee(&rpc).unwrap_or_else(|error| {
+        eprintln!("Error fetching current base fee: {error}");
+        std::process::exit(1);
+    });
+    let (built, _required_fee) = indra_cli::build_transaction_with_fee_policy(&TxParams {
         chain_id: &chain_id,
         recipient_address: &recipient_address,
         amount_spark,
-        fee_spark: indra_cli::tx_builder::MIN_FEE_SPARK,
+        fee_spark: requested_fee.unwrap_or(0),
         wallet: &wallet,
         ed25519_seed,
         ml_dsa_seed_bytes,
         sender_pubkey,
-    })
+    }, base_fee, requested_fee)
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
     });
 
-    let response = rpc_call(&rpc, "indra_sendTransaction", &[built.tx_hex.clone()]);
+    if let Some(given) = requested_fee {
+        let default_fee = indra_cli::default_fee_for_base_fee(base_fee).unwrap_or(u64::MAX);
+        if given < default_fee {
+            eprintln!("Warning: requested fee may be rejected if the base fee rises before inclusion");
+        }
+    }
+    let response = rpc_call(
+        &rpc,
+        "indra_sendTransaction",
+        std::slice::from_ref(&built.tx_hex),
+    );
     if response.contains("\"error\"") {
         eprintln!("{}", response);
         std::process::exit(1);
@@ -199,7 +222,6 @@ fn scan_wallet_or_exit(
     indra_cli::scan_canonical_blocks(
         rpc,
         &mut wallet,
-        keys,
         &[owner_pubkey],
         expected_genesis_hash,
     )
@@ -264,7 +286,7 @@ fn required_arg(args: &[String], flag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indra_cli::tx_builder::MIN_FEE_SPARK;
+    const TEST_FEE_SPARK: u64 = 50_000;
     use indra_core::types::{primitives::VariableBytes, transaction::OutputV1};
     use indra_crypto::{hybrid::ClassicalKeypair, PqKeypair};
 
@@ -317,7 +339,7 @@ mod tests {
         assert_eq!(updated.balance_owned_by(&test_owner()), 2_000_000);
         assert!(updated.select_utxos(&test_owner(), 2_000_000, 1).is_err());
         assert!(updated
-            .select_utxos(&test_owner(), 1_900_000, MIN_FEE_SPARK)
+            .select_utxos(&test_owner(), 1_900_000, TEST_FEE_SPARK)
             .is_ok());
 
         let _ = std::fs::remove_file(wallet_path);

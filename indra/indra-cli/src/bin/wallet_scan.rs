@@ -1,9 +1,11 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! Wallet scan — discover outputs owned by this keypair from canonical blocks.
 //!
 //! ## Usage
 //!
-//! indra-wallet-scan --keys keys.json --wallet wallet.json \
-//!                   [--keys-password-file keys.pass] \
+//! indra-wallet-scan --owner-pubkey <encoded-hybrid-pubkey-hex> --wallet wallet.json \
 //!                   [--cold-owner <encoded-hybrid-pubkey-hex>] \
 //!                   --genesis-hash <64-hex> --node http://127.0.0.1:8545
 //!                   [--rpc-token-file token.path]
@@ -11,7 +13,7 @@
 use indra_core::codec::Decode;
 use indra_core::types::{
     crypto::HybridPubKey,
-    primitives::{Bytes32, VariableBytes},
+    primitives::Bytes32,
 };
 
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
@@ -29,7 +31,6 @@ fn main() {
             .cloned()
     };
 
-    let keys_path = get("--keys").unwrap_or_else(|| "keys.json".to_string());
     let wallet_path = get("--wallet").unwrap_or_else(|| "wallet.json".to_string());
     let node_url = get("--node").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let genesis_hash = get("--genesis-hash").unwrap_or_else(|| {
@@ -37,23 +38,19 @@ fn main() {
         std::process::exit(1);
     });
     let add_utxo = get("--add-utxo");
-    let cold_owner_hex = get("--cold-owner");
 
     println!("INDRA Wallet Scanner");
     println!("─────────────────────────────────────────");
-    println!("Keys:   {}", keys_path);
+    println!("Owner:  {}", get("--owner-pubkey").or_else(|| get("--cold-owner")).unwrap_or_default());
     println!("Wallet: {}", wallet_path);
     println!("Node:   {}", node_url);
     println!("Genesis: {}", genesis_hash);
     println!("─────────────────────────────────────────");
 
-    let keys = indra_cli::load_keys_for_cli(&keys_path, &args).unwrap_or_else(|e| {
-        eprintln!("Error loading keys: {}", e);
+    let owner_hex = get("--owner-pubkey").or_else(|| get("--cold-owner")).unwrap_or_else(|| {
+        eprintln!("Error: --owner-pubkey or --cold-owner is required");
         std::process::exit(1);
     });
-    let classical_pk = keys.public.hybrid_classical_pk;
-    let pubkey_hex = hex::encode(classical_pk);
-    println!("Scanning for UTXOs owned by: {}...", &pubkey_hex[..16]);
 
     let mut wallet = indra_cli::Wallet::load(&wallet_path).unwrap_or_else(|e| {
         eprintln!("Warning: could not load wallet ({}), starting fresh", e);
@@ -122,20 +119,11 @@ fn main() {
     }
 
     println!("\nScanning canonical blocks locally...");
-    let owner_pubkey = HybridPubKey {
-        classical_pk: Bytes32::from(keys.public.hybrid_classical_pk),
-        pq_pk: VariableBytes::from_slice(&keys.public.hybrid_pq_pk).unwrap_or_else(|_| {
-            eprintln!("Error: invalid canonical hybrid public key");
-            std::process::exit(1);
-        }),
-    };
-    let mut owner_pubkeys = vec![owner_pubkey.clone()];
-    if let Some(raw_owner) = cold_owner_hex.as_deref() {
-        owner_pubkeys.push(parse_cold_owner(raw_owner).unwrap_or_else(|error| {
-            eprintln!("Error: {error}");
-            std::process::exit(1);
-        }));
-    }
+    let owner_pubkey = parse_cold_owner(&owner_hex).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+    let owner_pubkeys = vec![owner_pubkey.clone()];
     let genesis_hash = hex::decode(&genesis_hash).unwrap_or_else(|_| {
         eprintln!("Error: --genesis-hash must be 32-byte hex");
         std::process::exit(1);
@@ -149,7 +137,6 @@ fn main() {
     match scan_canonical_blocks(
         &node_url,
         &mut wallet,
-        &keys,
         &owner_pubkeys,
         indra_core::types::primitives::Bytes32::from(expected_genesis_hash),
     ) {
@@ -185,14 +172,12 @@ fn parse_cold_owner(raw: &str) -> Result<HybridPubKey, &'static str> {
 fn scan_canonical_blocks(
     node_url: &str,
     wallet: &mut indra_cli::Wallet,
-    keys: &indra_cli::KeysFile,
     owner_pubkeys: &[HybridPubKey],
     expected_genesis_hash: indra_core::types::primitives::Bytes32,
 ) -> Result<usize, String> {
     indra_cli::scan_canonical_blocks(
         node_url,
         wallet,
-        keys,
         owner_pubkeys,
         expected_genesis_hash,
     )
@@ -202,6 +187,7 @@ fn scan_canonical_blocks(
 mod tests {
     use super::*;
     use indra_core::codec::Encode;
+    use indra_core::types::primitives::VariableBytes;
 
     fn owner() -> HybridPubKey {
         HybridPubKey {

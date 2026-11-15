@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! `indra-governance` — build and submit governance operations.
 
 use std::{
@@ -97,15 +100,18 @@ fn run() -> CliResult<()> {
             GovernancePayload::Propose {
                 action: parse_governable_action(&args)?,
                 deposit_utxo_id,
-                proposer_pubkey: cold_hybrid_pubkey(
-                    &cold_context.as_ref().expect("cold context required").0,
-                )?,
+                proposer_pubkey: {
+                    let Some((cold_keypair, _, _)) = cold_context.as_ref() else {
+                        return Err(CliError::Parse("cold context required".into()));
+                    };
+                    cold_hybrid_pubkey(cold_keypair)?
+                },
                 title: variable_bytes(&required_flag(&args, "--title")?, "--title")?,
                 description: variable_bytes(
                     &required_flag(&args, "--description")?,
                     "--description",
                 )?,
-                cold_authorization: Some(cold_authorization(&cold_context)),
+                cold_authorization: Some(cold_authorization(&cold_context)?),
             }
         }
         "commit" => {
@@ -115,7 +121,7 @@ fn run() -> CliResult<()> {
             GovernancePayload::Commit {
                 proposal_id,
                 commit_hash: governance_vote_commit_hash(proposal_id, signer_id, vote, vote_nonce),
-                cold_authorization: Some(cold_authorization(&cold_context)),
+                cold_authorization: Some(cold_authorization(&cold_context)?),
             }
         }
         "reveal" => {
@@ -124,7 +130,7 @@ fn run() -> CliResult<()> {
                 proposal_id,
                 vote: parse_vote(&required_flag(&args, "--vote")?)?,
                 nonce: vote_nonce_for_reveal(&args, &keys_path, proposal_id, signer_id)?,
-                cold_authorization: Some(cold_authorization(&cold_context)),
+                cold_authorization: Some(cold_authorization(&cold_context)?),
             }
         }
         "redelegate" => GovernancePayload::Redelegate {
@@ -138,7 +144,7 @@ fn run() -> CliResult<()> {
         },
         "cancel" => GovernancePayload::Cancel {
             proposal_id: parse_hex32_required(&args, "--proposal-id")?,
-            cold_authorization: Some(cold_authorization(&cold_context)),
+            cold_authorization: Some(cold_authorization(&cold_context)?),
         },
         _ => {
             print_help();
@@ -227,12 +233,14 @@ fn build_governance_op(
 
 fn cold_authorization(
     context: &Option<(indra_crypto::ColdHybridKeypair, u64, u64)>,
-) -> ColdGovernanceAuthorization {
-    let (_, cold_key_version, cold_nonce) = context.as_ref().expect("cold context required");
-    ColdGovernanceAuthorization {
+) -> CliResult<ColdGovernanceAuthorization> {
+    let Some((_, cold_key_version, cold_nonce)) = context.as_ref() else {
+        return Err(CliError::Parse("cold context required".into()));
+    };
+    Ok(ColdGovernanceAuthorization {
         cold_key_version: *cold_key_version,
         cold_nonce: *cold_nonce,
-    }
+    })
 }
 
 fn cold_hybrid_pubkey(keypair: &indra_crypto::ColdHybridKeypair) -> CliResult<HybridPubKey> {
