@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! Sign INDRA DNS discovery node lists with ML-DSA-87.
 //!
 //! This helper is intentionally separate from Cloudflare publishing. The DNS

@@ -1,3 +1,6 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! INDRA v2 node binary.
 //!
 //! Networking runs on a Tokio runtime with authenticated encrypted transport.
