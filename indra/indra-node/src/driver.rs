@@ -184,6 +184,8 @@ pub enum DriverAction {
     },
     /// No action needed.
     None,
+    /// A fatal local invariant failure that must terminate the node.
+    Fatal(NodeError),
 }
 
 #[cfg(test)]
@@ -268,8 +270,8 @@ pub struct ConsensusDriver {
 }
 
 impl ConsensusDriver {
-    /// Create a new driver from a node engine.
-    pub fn new(engine: NodeEngine, vote_safety: VoteSafetyStore) -> Self {
+    /// Create a new driver from a node engine, failing if durable vote safety cannot be restored.
+    pub fn try_new(engine: NodeEngine, vote_safety: VoteSafetyStore) -> NodeResult<Self> {
         let mut driver = Self {
             engine,
             slash_detector: SlashDetector::new(),
@@ -312,8 +314,14 @@ impl ConsensusDriver {
             driver.restore_last_qc_for_startup();
         }
         driver.refresh_registered_voters();
-        driver.apply_vote_safety();
-        driver
+        driver.apply_vote_safety()?;
+        Ok(driver)
+    }
+
+    /// Create a driver in unit tests, where construction errors fail the test immediately.
+    #[cfg(test)]
+    pub fn new(engine: NodeEngine, vote_safety: VoteSafetyStore) -> Self {
+        Self::try_new(engine, vote_safety).expect("test driver construction")
     }
 
     /// Replace the registered voter set for the current epoch.
@@ -711,14 +719,15 @@ impl ConsensusDriver {
     }
 
     /// External round-reset hook used after height advancement.
-    pub fn reset_round(&mut self) {
+    pub fn reset_round(&mut self) -> NodeResult<()> {
         self.valid_proposal = None;
-        self.start_round(0).expect("round zero is always legal");
-        self.apply_vote_safety();
+        self.start_round(0)?;
+        self.apply_vote_safety()?;
+        Ok(())
     }
 
     /// Re-enter consensus cleanly after block download catchup.
-    pub fn on_sync_caught_up(&mut self) {
+    pub fn on_sync_caught_up(&mut self) -> NodeResult<()> {
         self.sync.mark_caught_up(self.engine.state.height);
         self.refresh_registered_voters();
         self.pending_blocks.clear();
@@ -728,8 +737,9 @@ impl ConsensusDriver {
         self.vote_collectors.clear();
         self.round_advance_evidence.clear();
         self.seen_round_votes.clear();
-        self.start_round(0).expect("round zero is always legal");
-        self.apply_vote_safety();
+        self.start_round(0)?;
+        self.apply_vote_safety()?;
+        Ok(())
     }
 
     /// Process one inbound event and return the resulting driver actions.
@@ -895,7 +905,7 @@ impl ConsensusDriver {
     }
 
     /// Restore durable vote and lock safety state before participating.
-    fn apply_vote_safety(&mut self) {
+    fn apply_vote_safety(&mut self) -> NodeResult<()> {
         let next_height = self.engine.state.height.saturating_add(1);
         match self.vote_safety.load() {
             VoteSafetyLoadResult::NoRecord => {
@@ -908,7 +918,7 @@ impl ConsensusDriver {
                             let message = format!("persisted consensus lock is invalid: {reason}");
                             eprintln!("[vote_safety] CRITICAL: {message}");
                             self.vote_safety_unavailable = Some(message);
-                            return;
+                            return Ok(())
                         }
                     } else if lock.height > next_height {
                         let message = format!(
@@ -917,7 +927,7 @@ impl ConsensusDriver {
                         );
                         eprintln!("[vote_safety] CRITICAL: {message}");
                         self.vote_safety_unavailable = Some(message);
-                        return;
+                        return Ok(())
                     }
                 }
                 self.vote_safety_unavailable = None;
@@ -935,15 +945,14 @@ impl ConsensusDriver {
                             );
                             eprintln!("[vote_safety] CRITICAL: {message}");
                             self.vote_safety_unavailable = Some(message);
-                            return;
+                            return Ok(())
                         }
                     };
                     eprintln!(
                         "[vote_safety] restarted: skipping to round {} (already voted at height={} round={} step={})",
                         safe_round, record.height, record.round, record.step
                     );
-                    self.start_round(safe_round)
-                        .expect("safe persisted round was validated above");
+                    self.start_round(safe_round)?;
                 }
             }
             VoteSafetyLoadResult::Corrupt(reason) => {
@@ -954,6 +963,7 @@ impl ConsensusDriver {
                 self.vote_safety_unavailable = Some(msg);
             }
         }
+        Ok(())
     }
 
     fn next_height(&self) -> u64 {
@@ -1229,7 +1239,10 @@ impl ConsensusDriver {
             }
         } else {
             // Rule 3
-            let valid_round = block.header.polc_round.expect("checked Some above");
+            let valid_round = match block.header.polc_round {
+                Some(round) => round,
+                None => return vec![],
+            };
             if valid_round < self.current_round
                 && self.has_quorum_for_value_hash(
                     height,
@@ -1745,9 +1758,14 @@ impl ConsensusDriver {
             "[consensus] quorum-certified round advance: {} → {} at height={} (stake={}/{})",
             self.current_round, target_round, height, signed_stake, total_stake
         );
-        self.start_round(target_round)
-            .expect("certified target round was validated before mutation");
-        self.apply_vote_safety();
+        if let Err(error) = self.start_round(target_round) {
+            eprintln!("[consensus] CRITICAL: certified round advance failed: {error}");
+            return Vec::new();
+        }
+        if let Err(error) = self.apply_vote_safety() {
+            eprintln!("[vote_safety] CRITICAL: failed after certified round advance: {error}");
+            return Vec::new();
+        }
         self.prune_stalled_collections();
         self.maybe_prevote_current_round_proposal()
     }
@@ -2042,16 +2060,16 @@ impl ConsensusDriver {
         {
             self.vote_admission_metrics.qc_formations += 1;
         }
+        let governing_snapshot = match self.engine.state.snapshot_for_consensus_height(height) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return vec![DriverAction::Fatal(error.into())],
+        };
         let qc = match build_qc(
             height,
             round,
             block_hash,
             &self.engine.state.chain_id,
-            self.engine
-                .state
-                .snapshot_for_consensus_height(height)
-                .expect("governing snapshot already resolved")
-                .snapshot_root,
+            governing_snapshot.snapshot_root,
             &qc_validators,
             quorum_votes,
         ) {
@@ -2145,7 +2163,10 @@ impl ConsensusDriver {
                         "[vote_safety] WARNING: failed to clear committed-height safety record: {error}"
                     );
                 }
-                self.start_round(0).expect("round zero is always legal");
+                if let Err(error) = self.start_round(0) {
+                    eprintln!("[consensus] CRITICAL: post-commit round reset failed: {error}");
+                    return vec![DriverAction::None];
+                }
 
                 self.vote_collectors
                     .retain(|(vote_height, _, _), _| *vote_height > height);

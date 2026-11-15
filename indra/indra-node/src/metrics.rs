@@ -19,6 +19,7 @@
 //! ```
 
 use std::fmt::Write as _;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -35,6 +36,17 @@ pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9615";
 
 /// Default Prometheus metrics endpoint for observer nodes.
 pub const DEFAULT_OBSERVER_METRICS_ADDR: &str = "127.0.0.1:9616";
+
+/// A metrics snapshot could not be computed from the authoritative state.
+#[derive(Debug, thiserror::Error)]
+pub enum MetricsError {
+    /// The next height cannot be represented.
+    #[error("metrics height overflow")]
+    HeightOverflow,
+    /// The monetary schedule did not provide a reward for the next height.
+    #[error("metrics reward unavailable: {0}")]
+    RewardUnavailable(String),
+}
 
 /// Shared metrics state for cumulative values.
 pub struct MetricsState {
@@ -71,6 +83,8 @@ pub struct MetricsState {
     pub rpc_invalid_governance_validation_total: Arc<AtomicU64>,
     /// Node process start time.
     pub started_at: Instant,
+    /// Panic counts for isolated handlers, keyed by stable component name.
+    pub handler_panics_total: Mutex<BTreeMap<String, u64>>,
 }
 
 /// Per-listener bridge that contributes bounded-map gauges/counters to the
@@ -116,6 +130,7 @@ impl MetricsState {
             rpc_invalid_governance_structural_total: Arc::new(AtomicU64::new(0)),
             rpc_invalid_governance_validation_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
+            handler_panics_total: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -139,6 +154,14 @@ impl MetricsState {
                     evictions.saturating_add(current.1),
                 )
             })
+    }
+
+    /// Record a panic that was isolated to a listener or connection handler.
+    pub fn record_handler_panic(&self, component: &str) {
+        if let Ok(mut counts) = self.handler_panics_total.lock() {
+            let count = counts.entry(component.to_string()).or_default();
+            *count = count.saturating_add(1);
+        }
     }
 }
 
@@ -180,20 +203,20 @@ pub fn render_metrics(
     last_block_timestamp: &AtomicU64,
     data_dir: &str,
     version: &str,
-) -> String {
+) -> Result<String, MetricsError> {
     let snapshot = {
         let Ok(d) = driver.lock() else {
-            return "# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string();
+            return Ok("# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string());
         };
-        MetricsSnapshot::from_driver(&d, connected_validator_peers, observer_count)
+        MetricsSnapshot::from_driver(&d, connected_validator_peers, observer_count)?
     };
-    render_snapshot(
+    Ok(render_snapshot(
         snapshot,
         metrics_state,
         last_block_timestamp,
         data_dir,
         version,
-    )
+    ))
 }
 
 /// Render observer-node metrics from a standalone node engine.
@@ -204,20 +227,20 @@ pub fn render_observer_metrics(
     last_block_timestamp: &AtomicU64,
     data_dir: &str,
     version: &str,
-) -> String {
+) -> Result<String, MetricsError> {
     let snapshot = {
         let Ok(engine) = engine.lock() else {
-            return "# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string();
+            return Ok("# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string());
         };
-        MetricsSnapshot::from_engine(&engine, 0, observer_count, 0, true, 0)
+        MetricsSnapshot::from_engine(&engine, 0, observer_count, 0, true, 0)?
     };
-    render_snapshot(
+    Ok(render_snapshot(
         snapshot,
         metrics_state,
         last_block_timestamp,
         data_dir,
         version,
-    )
+    ))
 }
 
 /// Start a Prometheus metrics server for validator/full nodes.
@@ -251,18 +274,33 @@ pub fn start_metrics_server(
                     let data_dir = data_dir.clone();
                     let version = version.clone();
                     std::thread::spawn(move || {
-                        let peer_count = connected_validator_peers.load(Ordering::Relaxed);
-                        let body = render_metrics(
-                            &driver,
-                            &observer_count,
-                            peer_count,
-                            &metrics_state,
-                            &last_block_timestamp,
-                            &data_dir,
-                            &version,
-                        );
-                        if let Err(e) = write_http_metrics(stream, &body) {
-                            eprintln!("[metrics] connection error: {}", e);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let peer_count = connected_validator_peers.load(Ordering::Relaxed);
+                            let body = match render_metrics(
+                                &driver,
+                                &observer_count,
+                                peer_count,
+                                &metrics_state,
+                                &last_block_timestamp,
+                                &data_dir,
+                                &version,
+                            ) {
+                                Ok(body) => body,
+                                Err(error) => {
+                                    eprintln!("[metrics] snapshot failed: {error}");
+                                    if let Err(write_error) = write_http_metrics_error(stream, &error.to_string()) {
+                                        eprintln!("[metrics] connection error: {write_error}");
+                                    }
+                                    return;
+                                }
+                            };
+                            if let Err(e) = write_http_metrics(stream, &body) {
+                                eprintln!("[metrics] connection error: {}", e);
+                            }
+                        }));
+                        if result.is_err() {
+                            eprintln!("[metrics] handler panicked");
+                            metrics_state.record_handler_panic("metrics");
                         }
                     });
                 }
@@ -301,16 +339,31 @@ pub fn start_observer_metrics_server(
                     let data_dir = data_dir.clone();
                     let version = version.clone();
                     std::thread::spawn(move || {
-                        let body = render_observer_metrics(
-                            &engine,
-                            &observer_count,
-                            &metrics_state,
-                            &last_block_timestamp,
-                            &data_dir,
-                            &version,
-                        );
-                        if let Err(e) = write_http_metrics(stream, &body) {
-                            eprintln!("[metrics] connection error: {}", e);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let body = match render_observer_metrics(
+                                &engine,
+                                &observer_count,
+                                &metrics_state,
+                                &last_block_timestamp,
+                                &data_dir,
+                                &version,
+                            ) {
+                                Ok(body) => body,
+                                Err(error) => {
+                                    eprintln!("[metrics] snapshot failed: {error}");
+                                    if let Err(write_error) = write_http_metrics_error(stream, &error.to_string()) {
+                                        eprintln!("[metrics] connection error: {write_error}");
+                                    }
+                                    return;
+                                }
+                            };
+                            if let Err(e) = write_http_metrics(stream, &body) {
+                                eprintln!("[metrics] connection error: {}", e);
+                            }
+                        }));
+                        if result.is_err() {
+                            eprintln!("[metrics] observer handler panicked");
+                            metrics_state.record_handler_panic("observer-metrics");
                         }
                     });
                 }
@@ -353,7 +406,7 @@ impl MetricsSnapshot {
         driver: &ConsensusDriver,
         connected_validator_peers: usize,
         observer_count: &AtomicUsize,
-    ) -> Self {
+    ) -> Result<Self, MetricsError> {
         Self::from_engine(
             &driver.engine,
             connected_validator_peers,
@@ -371,7 +424,7 @@ impl MetricsSnapshot {
         round: u32,
         sync_caught_up: bool,
         sync_target: u64,
-    ) -> Self {
+    ) -> Result<Self, MetricsError> {
         let s = &engine.state;
         let total_staked = s
             .validators
@@ -381,20 +434,18 @@ impl MetricsSnapshot {
             .validator_id()
             .map(|id| hex::encode(&id.0[..4]))
             .unwrap_or_else(|| "none".to_string());
-        Self {
+        let (_next_height, block_reward) = metrics_values_for_height(
+            s.height,
+            s.monetary_ledger.reward_budget_spark,
+        )?;
+        Ok(Self {
             height: s.height,
             epoch: s.current_epoch(),
             era: era_for_height(s.height),
             base_fee: s.base_fee,
             total_supply: s.total_supply,
             total_staked,
-            block_reward: indra_state::monetary::block_reward_for_budget(
-                s.monetary_ledger.reward_budget_spark,
-                s.height
-                    .checked_add(1)
-                    .expect("validated chain height must admit a successor"),
-            )
-            .expect("validated monetary schedule must produce the next reward"),
+            block_reward,
             round,
             connected_validator_peers,
             observer_connections: observer_count.load(Ordering::Relaxed),
@@ -415,8 +466,18 @@ impl MetricsSnapshot {
             chain_id: s.chain_id.clone(),
             validator_id_hex,
             is_validator: engine.config.is_validator(),
-        }
+        })
     }
+}
+
+fn metrics_values_for_height(
+    height: u64,
+    reward_budget_spark: u64,
+) -> Result<(u64, u64), MetricsError> {
+    let next_height = height.checked_add(1).ok_or(MetricsError::HeightOverflow)?;
+    let reward = indra_state::monetary::block_reward_for_budget(reward_budget_spark, next_height)
+        .map_err(|error| MetricsError::RewardUnavailable(error.to_string()))?;
+    Ok((next_height, reward))
 }
 
 fn render_snapshot(
@@ -428,6 +489,19 @@ fn render_snapshot(
 ) -> String {
     let mut buf = String::new();
     let (rpc_limiter_entries, rpc_limiter_evictions) = metrics_state.rpc_limiter_totals();
+    if let Ok(panics) = metrics_state.handler_panics_total.lock() {
+        let _ = writeln!(
+            buf,
+            "# HELP indra_handler_panics_total Isolated handler panics by component\n# TYPE indra_handler_panics_total counter"
+        );
+        for (component, count) in panics.iter() {
+            let _ = writeln!(
+                buf,
+                "indra_handler_panics_total{{component=\"{}\"}} {}",
+                component, count
+            );
+        }
+    }
     gauge(
         &mut buf,
         "indra_block_height",
@@ -714,6 +788,15 @@ fn write_http_metrics(mut stream: TcpStream, body: &str) -> std::io::Result<()> 
     stream.write_all(response.as_bytes())
 }
 
+fn write_http_metrics_error(mut stream: TcpStream, reason: &str) -> std::io::Result<()> {
+    let body = format!("metrics unavailable: {reason}\n");
+    let response = format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(response.as_bytes())
+}
+
 fn drain_http_request(stream: &mut TcpStream) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut buf = [0u8; 512];
@@ -768,6 +851,22 @@ fn escape_label_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_height_overflow_is_typed() {
+        assert!(matches!(
+            metrics_values_for_height(u64::MAX, 0),
+            Err(MetricsError::HeightOverflow)
+        ));
+    }
+
+    #[test]
+    fn metrics_missing_reward_is_typed() {
+        assert!(matches!(
+            metrics_values_for_height(u64::MAX - 1, u64::MAX),
+            Err(MetricsError::RewardUnavailable(_))
+        ));
+    }
     use std::net::TcpStream;
     use std::sync::atomic::AtomicUsize;
 
@@ -817,7 +916,8 @@ mod tests {
             &last_block_timestamp,
             &data_dir,
             "0.1.0",
-        );
+        )
+        .expect("metrics render");
         for name in [
             "indra_block_height",
             "indra_epoch",
@@ -863,7 +963,8 @@ mod tests {
             &last_block_timestamp,
             &data_dir,
             "0.1.0",
-        );
+        )
+        .expect("metrics render");
         let mut last_help = "";
         let mut last_type = "";
         for line in output.lines() {
@@ -906,7 +1007,8 @@ mod tests {
             &last_block_timestamp,
             &data_dir,
             "0.1.0",
-        );
+        )
+        .expect("metrics render");
         let node_info = output
             .lines()
             .find(|line| line.starts_with("indra_node_info{"))
@@ -976,7 +1078,8 @@ mod tests {
             &AtomicU64::new(0),
             &data_dir,
             "0.1.0",
-        );
+        )
+        .expect("metrics render");
         assert!(output.contains("indra_rpc_requests_total 7"));
         assert!(output.contains("indra_rpc_active_connections 3"));
         assert!(output.contains("indra_rpc_limiter_entries 11"));

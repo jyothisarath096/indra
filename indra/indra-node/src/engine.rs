@@ -59,6 +59,22 @@ fn evaluate_disk_writable(available: std::io::Result<u64>) -> NodeResult<()> {
 fn ensure_disk_writable(data_dir: &std::path::Path) -> NodeResult<()> {
     evaluate_disk_writable(fs2::available_space(data_dir))
 }
+
+fn protocol_hybrid_pubkey_parts(classical: [u8; 32], pq: &[u8]) -> NodeResult<HybridPubKey> {
+    Ok(HybridPubKey {
+        classical_pk: Bytes32::from(classical),
+        pq_pk: VariableBytes::from_slice(pq).map_err(|_| {
+            NodeError::ValidatorConfigIncomplete {
+                detail: "configured ML-DSA-87 public key is too large".to_string(),
+            }
+        })?,
+    })
+}
+
+fn protocol_hybrid_pubkey(keypair: &HybridKeypair) -> NodeResult<HybridPubKey> {
+    let public = keypair.public_key();
+    protocol_hybrid_pubkey_parts(public.classical.0, &public.pq.0)
+}
 use indra_crypto::{
     hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair},
     VrfKeypair,
@@ -118,6 +134,8 @@ pub struct NodeEngine {
     pub(crate) network_qc_verifier: NetworkQcVerifier,
     /// The validator's hybrid keypair (if this is a validator node).
     hybrid_keypair: Option<HybridKeypair>,
+    /// The protocol public key derived once from the validator keypair at startup.
+    reporter_pubkey: Option<HybridPubKey>,
     /// The validator's VRF keypair.
     vrf_keypair: Option<VrfKeypair>,
     /// This validator's identity (SHA-256 of hybrid public key classical component).
@@ -577,6 +595,10 @@ impl NodeEngine {
                 }
                 (None, None) => (None, None, None),
             };
+        let reporter_pubkey = hybrid_keypair
+            .as_ref()
+            .map(protocol_hybrid_pubkey)
+            .transpose()?;
         if let (Some(id), Some(vrf)) = (validator_id, vrf_keypair.as_ref()) {
             let registered =
                 state
@@ -623,6 +645,7 @@ impl NodeEngine {
             state_store,
             network_qc_verifier: NetworkQcVerifier::new(),
             hybrid_keypair,
+            reporter_pubkey,
             vrf_keypair,
             validator_id,
         })
@@ -724,7 +747,11 @@ impl NodeEngine {
                 .state
                 .stake_positions
                 .get(&position_id)
-                .expect("verified exit footprint has a canonical position")
+                .ok_or_else(|| {
+                    NodeError::InvalidStakingOp(
+                        "verified exit footprint references a missing stake position".into(),
+                    )
+                })?
                 .validator_id;
             let reserved_position = self
                 .staking_dependency_index
@@ -979,14 +1006,7 @@ impl NodeEngine {
         let mut scratch = self.state.clone();
         let transaction_dust_limit =
             indra_core::types::primitives::transaction_dust_limit_spark(self.state.utxos.len());
-        let reporter_pubkey = self.hybrid_keypair.as_ref().map(|keypair| {
-            let public = keypair.public_key();
-            HybridPubKey {
-                classical_pk: Bytes32::from(public.classical.0),
-                pq_pk: VariableBytes::from_slice(&public.pq.0)
-                    .expect("ML-DSA-87 public key fits protocol bound"),
-            }
-        });
+        let reporter_pubkey = self.reporter_pubkey.as_ref();
 
         let transaction_candidates: Vec<_> = self
             .mempool
@@ -1091,7 +1111,7 @@ impl NodeEngine {
                 &mut scratch,
                 &evidence,
                 height,
-                reporter_pubkey.as_ref(),
+                reporter_pubkey,
                 slash_evidence.len() as u32,
             ) {
                 Ok(()) => {
@@ -1907,6 +1927,18 @@ mod tests {
         DEFAULT_COMMISSION_BPS, DUST_LIMIT_SPARK, MAX_ROUNDS_PER_HEIGHT,
         TRANSACTION_PROTOCOL_VERSION,
     };
+
+    #[test]
+    fn protocol_hybrid_pubkey_conversion_and_error_mapping() {
+        let keypair = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0x11; 32]),
+            PqKeypair::from_seed(&[0x11; 32]).expect("test PQ key"),
+        );
+        assert!(protocol_hybrid_pubkey(&keypair).is_ok());
+        let error = protocol_hybrid_pubkey_parts([0u8; 32], &[0u8; MAX_PQ_SIG_BYTES + 1])
+            .expect_err("oversized protocol key must fail");
+        assert!(matches!(error, NodeError::ValidatorConfigIncomplete { .. }));
+    }
     use indra_core::types::slashing::SlashEvidenceV1;
     use indra_core::types::stake_position::{
         ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1,
@@ -2043,6 +2075,12 @@ mod tests {
             ClassicalKeypair::from_seed(&seed),
             PqKeypair::from_seed(&seed).unwrap(),
         ));
+        engine.reporter_pubkey = engine
+            .hybrid_keypair
+            .as_ref()
+            .map(protocol_hybrid_pubkey)
+            .transpose()
+            .unwrap();
         engine.vrf_keypair = Some(VrfKeypair::from_seed(&seed));
         hybrid
     }

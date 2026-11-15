@@ -5915,7 +5915,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.engine.state.height = 4;
         driver.vote_safety.record(5, 7, 0, None).unwrap();
 
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("vote safety should apply");
 
         assert_eq!(driver.current_round(), 8);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5929,7 +5929,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             .record(1, MAX_ROUNDS_PER_HEIGHT - 1, 1, None)
             .unwrap();
         let before = driver.current_round();
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("final-round vote safety should fail closed");
         assert_eq!(driver.current_round(), before);
         assert!(driver
             .vote_safety_unavailable
@@ -5944,7 +5944,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.engine.state.height = 5;
         driver.vote_safety.record(3, 10, 0, None).unwrap();
 
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("old-height vote safety should be ignored");
 
         assert_eq!(driver.current_round(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5954,7 +5954,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     fn corrupt_vote_safety_record_prevents_voting() {
         let (mut driver, dir) = local_driver([0x71u8; 32], "vote_safety_corrupt_blocks");
         std::fs::write(driver.engine.config.vote_safety_path(), [0xAA, 0xBB]).unwrap();
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("corrupt vote safety should be recorded");
         let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
         assert!(
             !actions
@@ -5969,7 +5969,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     fn missing_vote_safety_record_allows_voting_on_fresh_start() {
         let (mut driver, dir) = local_driver([0x72u8; 32], "vote_safety_missing_allows");
         let _ = std::fs::remove_file(driver.engine.config.vote_safety_path());
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("fresh vote safety should apply");
         let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
         assert!(
             actions
@@ -6000,7 +6000,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     fn valid_vote_safety_record_constrains_future_rounds() {
         let (mut driver, dir) = local_driver([0x74u8; 32], "vote_safety_valid_constrains");
         driver.vote_safety.record(1, 2, 0, None).unwrap();
-        driver.apply_vote_safety();
+        driver.apply_vote_safety().expect("valid vote safety should apply");
         assert_eq!(driver.current_round(), 3);
         let actions = driver.sign_and_record_local_vote(1, 3, VoteStep::Prevote, Bytes32::ZERO);
         assert!(
@@ -6824,7 +6824,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.promote_block_header_qc(&block2, "sync").unwrap();
         driver.refresh_registered_voters();
         driver.sync_mut().on_block_imported(block2.header.height);
-        driver.reset_round();
+        driver.reset_round().expect("sync round reset");
 
         assert_eq!(driver.height(), 2);
         assert_eq!(driver.last_qc_bytes(), qc_for_height_1);
@@ -6859,9 +6859,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             driver.engine.commit_proposal(block).unwrap();
             driver.promote_block_header_qc(block, "sync").unwrap();
             driver.sync_mut().on_block_imported(block.header.height);
-            driver.reset_round();
+            driver.reset_round().expect("sync round reset");
         }
-        driver.on_sync_caught_up();
+        driver.on_sync_caught_up().expect("sync catch-up round reset");
 
         assert_eq!(driver.height(), 2);
         assert_eq!(driver.last_qc_height(), Some(1));

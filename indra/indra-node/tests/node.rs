@@ -422,7 +422,10 @@ fn local_driver(seed: [u8; 32], suffix: &str) -> (ConsensusDriver, PathBuf) {
     config.genesis_path = Some(write_single_validator_genesis(&dir, seed, "local"));
     let engine = NodeEngine::init(config).unwrap();
     let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
-    (ConsensusDriver::new(engine, vote_safety), dir)
+    (
+        ConsensusDriver::try_new(engine, vote_safety).expect("test driver construction"),
+        dir,
+    )
 }
 
 fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {

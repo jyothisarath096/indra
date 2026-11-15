@@ -202,12 +202,13 @@ pub fn start_hardened_observer_rpc(
                 total.fetch_sub(1, Ordering::AcqRel);
                 continue;
             }
-            {
-                let mut counts = per_ip_connections.lock().unwrap();
-                if !reserve_ip_connection(&mut counts, ip, PER_IP_CONNECTION_CAP) {
-                    total.fetch_sub(1, Ordering::AcqRel);
-                    continue;
-                }
+            if !try_reserve_ip_connection(
+                &per_ip_connections,
+                &total,
+                ip,
+                PER_IP_CONNECTION_CAP,
+            ) {
+                continue;
             }
             metrics
                 .rpc_active_connections
@@ -224,19 +225,25 @@ pub fn start_hardened_observer_rpc(
             let metrics = Arc::clone(&metrics);
             let limiter_telemetry = Arc::clone(&limiter_telemetry);
             std::thread::spawn(move || {
-                handle(
-                    stream,
-                    ip,
-                    &publisher,
-                    &storage,
-                    &per_ip_rate,
-                    &global_rate,
-                    &expensive_per_ip,
-                    &expensive_global,
-                    &expensive,
-                    &metrics,
-                    &limiter_telemetry,
-                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle(
+                        stream,
+                        ip,
+                        &publisher,
+                        &storage,
+                        &per_ip_rate,
+                        &global_rate,
+                        &expensive_per_ip,
+                        &expensive_global,
+                        &expensive,
+                        &metrics,
+                        &limiter_telemetry,
+                    );
+                }));
+                if result.is_err() {
+                    eprintln!("[observer-rpc] handler panicked for {ip}");
+                    metrics.record_handler_panic("observer-rpc");
+                }
                 total.fetch_sub(1, Ordering::AcqRel);
                 if let Ok(mut counts) = per_ip_connections.lock() {
                     if let Some(count) = counts.get_mut(&ip) {
@@ -267,6 +274,27 @@ fn reserve_ip_connection(counts: &mut HashMap<IpAddr, u64>, ip: IpAddr, cap: u64
     }
     *count += 1;
     true
+}
+
+fn try_reserve_ip_connection(
+    counts: &Mutex<HashMap<IpAddr, u64>>,
+    total: &AtomicU64,
+    ip: IpAddr,
+    cap: u64,
+) -> bool {
+    let mut counts = match counts.lock() {
+        Ok(counts) => counts,
+        Err(_) => {
+            eprintln!("[observer-rpc] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
+            total.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+    };
+    let accepted = reserve_ip_connection(&mut counts, ip, cap);
+    if !accepted {
+        total.fetch_sub(1, Ordering::AcqRel);
+    }
+    accepted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,6 +631,26 @@ mod tests {
             assert!(reserve_ip_connection(&mut counts, ip, 4));
         }
         assert!(!reserve_ip_connection(&mut counts, ip, 4));
+    }
+
+    #[test]
+    fn observer_rejects_poisoned_per_ip_mutex_and_restores_total() {
+        let counts = Mutex::new(HashMap::new());
+        let poison = std::sync::Arc::new(counts);
+        let poisoned = std::sync::Arc::clone(&poison);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test");
+        })
+        .join();
+        let total = AtomicU64::new(1);
+        assert!(!try_reserve_ip_connection(
+            &poison,
+            &total,
+            "192.0.2.10".parse().unwrap(),
+            4
+        ));
+        assert_eq!(total.load(Ordering::Acquire), 0);
     }
 
     #[test]

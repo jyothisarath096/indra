@@ -46,6 +46,7 @@ pub mod recovery;
 pub mod rpc_snapshot;
 pub mod slash;
 pub mod sync;
+pub mod supervisor;
 #[cfg(feature = "audit-harness")]
 pub mod audit_harness;
 

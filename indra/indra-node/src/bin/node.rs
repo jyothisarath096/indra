@@ -1189,6 +1189,7 @@ fn start_network_runtime(
     dns_seed_signed_public_key: Option<Vec<u8>>,
     signed_dns_replay_state_path: PathBuf,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
+    critical_tasks: &mut indra_node::supervisor::CriticalTasks,
 ) -> (
     Arc<NetworkBridge>,
     Arc<Mutex<HashSet<String>>>,
@@ -1241,7 +1242,7 @@ fn start_network_runtime(
     let inbound_by_ip = Arc::new(Mutex::new(HashMap::<IpAddr, u8>::new()));
     let inbound_cooldowns = Arc::new(Mutex::new(InboundCooldowns::new()));
 
-    std::thread::spawn({
+    critical_tasks.spawn("p2p-runtime", {
         let connected_addrs = Arc::clone(&connected_addrs);
         let peer_addrs = Arc::clone(&peer_addrs);
         let addr_validators = Arc::clone(&addr_validators);
@@ -2448,7 +2449,11 @@ fn main() {
     eprintln!("\nStarting P2P and consensus...\n");
 
     let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
-    let mut driver_state = ConsensusDriver::new(engine, vote_safety);
+    let mut driver_state = ConsensusDriver::try_new(engine, vote_safety)
+        .unwrap_or_else(|error| {
+            eprintln!("ERROR: failed to initialize consensus driver: {error}");
+            std::process::exit(1);
+        });
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
     let handshake_config = build_handshake_config(&driver_state.engine)
@@ -2465,6 +2470,7 @@ fn main() {
     let metrics_state = Arc::new(MetricsState::new());
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
     let op_relay_seen = Arc::new(Mutex::new(InboundDedupCaches::new()));
+    let mut critical_tasks = indra_node::supervisor::CriticalTasks::new();
     let (gossip, discovered_peers, authenticated_peer_addrs, peer_sources, network_events) =
         start_network_runtime(
             p2p_addr.clone(),
@@ -2478,6 +2484,7 @@ fn main() {
             dns_seed_signed_public_key.clone(),
             signed_dns_replay_state_path(Path::new(&data_dir)),
             Arc::clone(&handshake_config),
+            &mut critical_tasks,
         );
     if let Some(addr) = observer_addr {
         start_observer_runtime(addr, Arc::clone(&driver), Arc::clone(&observer_count));
@@ -2516,7 +2523,7 @@ fn main() {
         let op_relay_seen = Arc::clone(&op_relay_seen);
         let sync_diagnostic_dir = PathBuf::from(data_dir.clone());
 
-        std::thread::spawn(move || {
+        critical_tasks.spawn("authenticated-network-events", move || {
             let mut sync_cooldowns =
                 CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60));
             while let Ok(event) = network_events.recv() {
@@ -2657,7 +2664,10 @@ fn main() {
                                                 }
                                                 d.sync_mut().on_block_imported(*height);
                                                 d.refresh_registered_voters();
-                                                d.reset_round();
+                                                if let Err(error) = d.reset_round() {
+                                                    eprintln!("[sync] CRITICAL: round reset failed after block import: {error}");
+                                                    break;
+                                                }
                                                 sync_cooldowns.reset(&validator_id);
                                                 record_block_commit(
                                                     &metrics_state,
@@ -3075,7 +3085,10 @@ fn main() {
                                                         finalized.block.block.header.height,
                                                     );
                                                     d.refresh_registered_voters();
-                                                    d.reset_round();
+                                                    if let Err(error) = d.reset_round() {
+                                                        eprintln!("[sync] CRITICAL: round reset failed after QC promotion: {error}");
+                                                        break;
+                                                    }
                                                     // One canonical promotion per event-loop
                                                     // iteration bounds mutex hold time. The next
                                                     // request re-fetches the carrier as the next
@@ -3223,7 +3236,10 @@ fn main() {
                                             .rotate_after_failure(new_height, Instant::now());
                                     }
                                     if d.sync().is_caught_up() {
-                                        d.on_sync_caught_up();
+                                        if let Err(error) = d.on_sync_caught_up() {
+                                            eprintln!("[sync] CRITICAL: catch-up round reset failed: {error}");
+                                            continue;
+                                        }
                                         qc_recovery_actions = d.request_qc_if_needed();
                                         caught_up_height = Some(new_height);
                                     }
@@ -3333,7 +3349,7 @@ fn main() {
         let metrics_state = Arc::clone(&metrics_state);
         let last_block_timestamp = Arc::clone(&last_block_timestamp);
 
-        std::thread::spawn(move || {
+        critical_tasks.spawn("consensus-driver", move || {
             // Wait for peer connections to establish
             std::thread::sleep(Duration::from_secs(3));
 
@@ -3789,6 +3805,13 @@ fn main() {
     let genesis_peer_addrs_main: HashSet<String> = genesis_seed_peers.iter().cloned().collect();
 
     loop {
+        if let Ok(indra_node::supervisor::CriticalTaskOutcome::TaskExited { name, reason }) =
+            critical_tasks.try_recv()
+        {
+            eprintln!("[supervisor] CRITICAL: task {name} exited unexpectedly: {reason}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
+        }
         std::thread::sleep(STATUS_INTERVAL);
         tick += 1;
 
@@ -3909,6 +3932,11 @@ fn process_driver_actions(
 ) {
     let mut recorded_commit = false;
     for action in actions {
+        if let DriverAction::Fatal(error) = &action {
+            eprintln!("[consensus] FATAL: {error}");
+            indra_node::supervisor::report_unexpected("consensus-driver", error.to_string());
+            return;
+        }
         if let DriverAction::RequestQC { height } = &action {
             let peers: Vec<SocketAddr> = gossip.connected_addrs();
             eprintln!(
@@ -4508,7 +4536,15 @@ fn spawn_rpc_listener(
                     }
                     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
                     if let Some(ip) = peer_ip {
-                        let mut counts = rpc_ip_connections.lock().unwrap();
+                        let mut counts = match rpc_ip_connections.lock() {
+                            Ok(counts) => counts,
+                            Err(_) => {
+                                eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
+                                release_rpc_connection(&rpc_conn_count);
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         if !reserve_rpc_ip_connection(&mut counts, ip, policy.per_ip_connection_cap)
                         {
                             release_rpc_connection(&rpc_conn_count);
@@ -4542,37 +4578,47 @@ fn spawn_rpc_listener(
                     let metrics = Arc::clone(&metrics);
                     let policy = Arc::clone(&policy);
                     std::thread::spawn(move || {
-                        handle_rpc(
-                            stream,
-                            &driver_rpc,
-                            &rpc_snapshot,
-                            &rpc_storage,
-                            &gossip_rpc,
-                            &discovered_peers_rpc,
-                            &op_relay_seen_rpc,
-                            &observer_count_rpc,
-                            peer_ip,
-                            &rpc_rate_limiter,
-                            rpc_global_rate_limiter.as_deref(),
-                            &expensive_limiter,
-                            &expensive_global_limiter,
-                            &expensive_semaphore,
-                            &rejection_counters,
-                            &rpc_cors_origins,
-                            mode,
-                            &policy,
-                            admin_token.as_ref().as_deref(),
-                            access_token.as_ref().as_deref(),
-                            &metrics,
-                            &limiter_telemetry,
-                        );
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_rpc(
+                                stream,
+                                &driver_rpc,
+                                &rpc_snapshot,
+                                &rpc_storage,
+                                &gossip_rpc,
+                                &discovered_peers_rpc,
+                                &op_relay_seen_rpc,
+                                &observer_count_rpc,
+                                peer_ip,
+                                &rpc_rate_limiter,
+                                rpc_global_rate_limiter.as_deref(),
+                                &expensive_limiter,
+                                &expensive_global_limiter,
+                                &expensive_semaphore,
+                                &rejection_counters,
+                                &rpc_cors_origins,
+                                mode,
+                                &policy,
+                                admin_token.as_ref().as_deref(),
+                                access_token.as_ref().as_deref(),
+                                &metrics,
+                                &limiter_telemetry,
+                            );
+                        }));
+                        if result.is_err() {
+                            eprintln!("[{label}] handler panicked for {:?}", peer_ip);
+                            metrics.record_handler_panic(label);
+                        }
                         if let Some(ip) = peer_ip {
-                            let mut counts = rpc_ip_connections.lock().unwrap();
-                            if let Some(count) = counts.get_mut(&ip) {
-                                *count = count.saturating_sub(1);
-                                if *count == 0 {
-                                    counts.remove(&ip);
+                            match rpc_ip_connections.lock() {
+                                Ok(mut counts) => {
+                                    if let Some(count) = counts.get_mut(&ip) {
+                                        *count = count.saturating_sub(1);
+                                        if *count == 0 {
+                                            counts.remove(&ip);
+                                        }
+                                    }
                                 }
+                                Err(_) => eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned during cleanup for {ip}"),
                             }
                         }
                         release_rpc_connection(&rpc_conn_count);
@@ -5853,7 +5899,10 @@ mod tests {
         config.pq_seed = Some(pq.secret_key_bytes());
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
-        (ConsensusDriver::new(engine, vote_safety), dir)
+        (
+            ConsensusDriver::try_new(engine, vote_safety).expect("test driver construction"),
+            dir,
+        )
     }
 
     fn add_active_proposer_candidate(
