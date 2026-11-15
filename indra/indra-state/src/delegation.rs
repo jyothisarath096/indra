@@ -488,10 +488,12 @@ fn apply_staking_op_mode(
 
     result?;
     if active_cold_validator {
-        let cold_nonce = op
-            .cold_authorization()
-            .expect("active cold authorization was verified")
-            .cold_nonce;
+        let Some(authorization) = op.cold_authorization() else {
+            return Err(StateError::InvalidStakingOp(
+                "active cold authorization was verified".into(),
+            ));
+        };
+        let cold_nonce = authorization.cold_nonce;
         let validator = state
             .validators
             .get_mut(&signer_id)

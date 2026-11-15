@@ -743,7 +743,10 @@ impl ChainState {
             let Some(active) = position.active else {
                 continue;
             };
-            if let Some(owners) = principals.get_mut(&source.auto_delegate_to.expect("filtered")) {
+            let Some(target) = source.auto_delegate_to else {
+                continue;
+            };
+            if let Some(owners) = principals.get_mut(&target) {
                 let (_, auto) = owners.entry(source.validator_id).or_default();
                 *auto = auto.checked_add(active.principal_spark).ok_or_else(|| {
                     crate::error::StateError::InvalidRewardEconomicSnapshot(
@@ -1385,13 +1388,17 @@ fn validate_consensus_snapshot_collection(
             actual: snapshots.len(),
         });
     }
-    for (index, snapshot) in snapshots.iter().enumerate() {
+    let mut previous = None;
+    for snapshot in snapshots {
         snapshot.validate()?;
-        if index > 0 && snapshots[index - 1].activation_height >= snapshot.activation_height {
+        if previous.is_some_and(|previous: &ConsensusSnapshot| {
+            previous.activation_height >= snapshot.activation_height
+        }) {
             return Err(IndraError::InvalidConsensusSnapshot(
                 "snapshot activation heights are not strictly ascending".to_string(),
             ));
         }
+        previous = Some(snapshot);
     }
     let next_height = state_height.saturating_add(1);
     if snapshots
@@ -1421,7 +1428,8 @@ fn validate_retained_consensus_snapshots_for_lookup(
             reason: "snapshot collection exceeds the three-snapshot retention bound".to_string(),
         });
     }
-    for (index, snapshot) in snapshots.iter().enumerate() {
+    let mut previous = None;
+    for snapshot in snapshots {
         snapshot.validate().map_err(|error| {
             ConsensusSnapshotLookupError::InvalidRetainedState {
                 reason: error.to_string(),
@@ -1439,11 +1447,14 @@ fn validate_retained_consensus_snapshots_for_lookup(
                 reason: "activation height is not source boundary height plus one".to_string(),
             });
         }
-        if index > 0 && snapshots[index - 1].activation_height >= snapshot.activation_height {
+        if previous.is_some_and(|previous: &ConsensusSnapshot| {
+            previous.activation_height >= snapshot.activation_height
+        }) {
             return Err(ConsensusSnapshotLookupError::InvalidRetainedState {
                 reason: "activation heights are duplicate or not strictly ascending".to_string(),
             });
         }
+        previous = Some(snapshot);
     }
     Ok(())
 }
@@ -2341,6 +2352,22 @@ mod tests {
         assert!(matches!(
             empty.snapshot_for_consensus_height(601),
             Err(ConsensusSnapshotLookupError::InvalidRetainedState { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_validation_keeps_item_error_precedence_before_order_error() {
+        let mut state = snapshot_state();
+        state.rotate_consensus_snapshot_after_boundary(600).unwrap();
+        state.consensus_snapshots[1].activation_height =
+            state.consensus_snapshots[0].activation_height;
+        state.consensus_snapshots[1].snapshot_root = Bytes32::ZERO;
+
+        let error = ChainState::decode_exact(&state.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            error,
+            IndraError::InvalidConsensusSnapshot(message)
+                if message.contains("stored snapshot root does not match recomputation")
         ));
     }
 

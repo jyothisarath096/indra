@@ -1121,6 +1121,21 @@ mod tests {
             assert_eq!(set.get(&Bytes32::from([id; 32])).unwrap().status, expected);
         }
     }
+
+    #[test]
+    fn strictly_sorted_boundary_cases_are_exact() {
+        let empty: Vec<Bytes32> = Vec::new();
+        let single = vec![Bytes32::from([1; 32])];
+        let ascending = vec![Bytes32::from([1; 32]), Bytes32::from([2; 32])];
+        let equal = vec![Bytes32::from([1; 32]), Bytes32::from([1; 32])];
+        let descending = vec![Bytes32::from([2; 32]), Bytes32::from([1; 32])];
+
+        assert!(strictly_sorted(&empty));
+        assert!(strictly_sorted(&single));
+        assert!(strictly_sorted(&ascending));
+        assert!(!strictly_sorted(&equal));
+        assert!(!strictly_sorted(&descending));
+    }
 }
 
 /// Cold-key custody retained after a validator is evicted from the bounded live registry.
@@ -1224,7 +1239,9 @@ impl EvictedValidatorTombstoneV2 {
 }
 
 fn strictly_sorted(values: &[Bytes32]) -> bool {
-    values.windows(2).all(|pair| pair[0] < pair[1])
+    values
+        .windows(2)
+        .all(|pair| matches!(pair, [a, b] if a < b))
 }
 
 impl Encode for EvictedValidatorTombstoneV2 {

@@ -228,7 +228,12 @@ fn apply_verified_slash_directive(
         let active = position.active.ok_or(StateError::InvariantViolation {
             message: "verified slash position lost active principal",
         })?;
-        let amount = allocations[&SlashTarget::Position(*position_id)];
+        let amount = allocations
+            .get(&SlashTarget::Position(*position_id))
+            .copied()
+            .ok_or(StateError::InvariantViolation {
+                message: "verified slash position allocation disappeared",
+            })?;
         let remaining = active
             .principal_spark
             .checked_sub(amount)
@@ -254,7 +259,12 @@ fn apply_verified_slash_directive(
                 message: "verified slash tranche disappeared",
             },
         )?;
-        let amount = allocations[&SlashTarget::Tranche(*tranche_id)];
+        let amount = allocations
+            .get(&SlashTarget::Tranche(*tranche_id))
+            .copied()
+            .ok_or(StateError::InvariantViolation {
+                message: "verified slash tranche allocation disappeared",
+            })?;
         let remaining = tranche
             .principal_spark
             .checked_sub(amount)
@@ -305,8 +315,13 @@ fn apply_verified_slash_directive(
         .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
     let exact = active_principal_slashed
         .checked_add(directive.tranche_ids.iter().try_fold(0u64, |sum, id| {
-            sum.checked_add(allocations[&SlashTarget::Tranche(*id)])
-                .ok_or(StateError::ValueOverflow)
+            let amount = allocations
+                .get(&SlashTarget::Tranche(*id))
+                .copied()
+                .ok_or(StateError::InvariantViolation {
+                    message: "verified slash tranche aggregate allocation disappeared",
+                })?;
+            sum.checked_add(amount).ok_or(StateError::ValueOverflow)
         })?)
         .ok_or(StateError::ValueOverflow)?;
     if exact != slash_amount {
