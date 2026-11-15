@@ -1219,13 +1219,13 @@ fn start_network_runtime(
     signed_dns_replay_state_path: PathBuf,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
     critical_tasks: &mut indra_node::supervisor::CriticalTasks,
-) -> (
+) -> indra_node::NodeResult<(
     Arc<NetworkBridge>,
     Arc<Mutex<HashSet<String>>>,
     Arc<Mutex<HashSet<String>>>,
     Arc<Mutex<HashMap<String, PeerSource>>>,
     std::sync::mpsc::Receiver<NetworkEvent>,
-) {
+)> {
     let ban_store_path = signed_dns_replay_state_path.with_file_name("peer_bans");
     let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
     let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
@@ -1270,6 +1270,12 @@ fn start_network_runtime(
     let inbound_count = Arc::new(AtomicU64::new(0));
     let inbound_by_ip = Arc::new(Mutex::new(HashMap::<IpAddr, u8>::new()));
     let inbound_cooldowns = Arc::new(Mutex::new(InboundCooldowns::new()));
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+            detail: format!("failed to build P2P Tokio runtime: {error}"),
+        })?;
 
     critical_tasks.spawn("p2p-runtime", {
         let connected_addrs = Arc::clone(&connected_addrs);
@@ -1288,11 +1294,6 @@ fn start_network_runtime(
         let inbound_cooldowns = Arc::clone(&inbound_cooldowns);
         let ban_store_path = ban_store_path.clone();
         move || {
-            let runtime = TokioRuntimeBuilder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-
             runtime.block_on(async move {
                 let (async_event_tx, mut async_event_rx) = tokio_mpsc::channel::<NetworkEvent>(1024);
                 let initial_handshake_config = handshake_config.read().unwrap().clone();
@@ -1848,20 +1849,24 @@ fn start_network_runtime(
         }
     });
 
-    let peer_manager = handle_rx.recv().expect("peer manager handle");
+    let peer_manager = handle_rx.recv().map_err(|error| {
+        indra_node::NodeError::InvalidConfiguration {
+            detail: format!("peer manager failed before publishing its handle: {error}"),
+        }
+    })?;
     let bridge = Arc::new(NetworkBridge::new(
         peer_manager,
         peer_addrs,
         addr_validators,
     ));
 
-    (
+    Ok((
         bridge,
         discovered_peers,
         authenticated_peer_addrs,
         peer_sources,
         event_rx,
-    )
+    ))
 }
 
 fn start_observer_runtime(
@@ -1869,13 +1874,14 @@ fn start_observer_runtime(
     driver: Arc<Mutex<ConsensusDriver>>,
     observer_count: Arc<AtomicUsize>,
     metrics: Arc<MetricsState>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let runtime = TokioRuntimeBuilder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
+) -> indra_node::NodeResult<std::thread::JoinHandle<()>> {
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+            detail: format!("failed to build observer Tokio runtime: {error}"),
+        })?;
+    Ok(std::thread::spawn(move || {
         runtime.block_on(async move {
             let listener = match tokio::net::TcpListener::bind(&observer_addr).await {
                 Ok(listener) => listener,
@@ -1923,7 +1929,7 @@ fn start_observer_runtime(
                 });
             }
         })
-    })
+    }))
 }
 
 async fn observer_block_poller(
@@ -2405,7 +2411,13 @@ fn main() {
     check_disk_space(Path::new(&data_dir));
 
     // Load keys
-    let keys_data = load_keys_data(&keys_path, cfg_file.keys_password_file.as_deref());
+    let keys_data = match load_keys_data(&keys_path, cfg_file.keys_password_file.as_deref()) {
+        Ok(keys) => keys,
+        Err(error) => {
+            eprintln!("ERROR: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let bootstrap_peers: Vec<String> = if cfg_file.bootstrap_peers.is_empty() {
         eprintln!("Bootstrap: (none; DNS/persisted/genesis discovery enabled)");
@@ -2468,7 +2480,13 @@ fn main() {
     config.metrics_addr = metrics_addr.clone();
 
     // Init node engine + consensus driver
-    let engine = NodeEngine::init(config).unwrap_or_else(|e| panic!("Node init failed: {}", e));
+    let engine = match NodeEngine::init(config) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("ERROR: node initialization failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!(
         "Validator set: {} active validators",
@@ -2493,10 +2511,17 @@ fn main() {
         });
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
-    let handshake_config = build_handshake_config(&driver_state.engine)
-        .unwrap_or_else(|error| panic!("failed to resolve P2P validator authority: {error}"))
-        .map(|config| Arc::new(RwLock::new(config)))
-        .unwrap_or_else(|| panic!("authenticated transport requires validator networking keys"));
+    let handshake_config = match build_handshake_config(&driver_state.engine) {
+        Ok(Some(config)) => Arc::new(RwLock::new(config)),
+        Ok(None) => {
+            eprintln!("ERROR: authenticated transport requires validator networking keys");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("ERROR: failed to resolve P2P validator authority: {error}");
+            std::process::exit(1);
+        }
+    };
     let driver = driver_state;
 
     // Shared state between threads
@@ -2512,7 +2537,7 @@ fn main() {
         critical_tasks.adopt("network-qc-verifier", handle);
     }
     let (gossip, discovered_peers, authenticated_peer_addrs, peer_sources, network_events) =
-        start_network_runtime(
+        match start_network_runtime(
             p2p_addr.clone(),
             bootstrap_peers.clone(),
             genesis_seed_peers.clone(),
@@ -2525,14 +2550,26 @@ fn main() {
             signed_dns_replay_state_path(Path::new(&data_dir)),
             Arc::clone(&handshake_config),
             &mut critical_tasks,
-        );
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("ERROR: network runtime startup failed: {error}");
+                std::process::exit(1);
+            }
+        };
     if let Some(addr) = observer_addr {
-        let handle = start_observer_runtime(
+        let handle = match start_observer_runtime(
             addr,
             Arc::clone(&driver),
             Arc::clone(&observer_count),
             Arc::clone(&metrics_state),
-        );
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("ERROR: observer runtime startup failed: {error}");
+                std::process::exit(1);
+            }
+        };
         critical_tasks.adopt("observer-runtime", handle);
     }
     if let Some(addr) = metrics_addr {
@@ -2695,10 +2732,13 @@ fn main() {
                                 match verified {
                                     Ok(()) => {
                                         let mut d = driver.lock().unwrap();
-                                        let finalized = d
-                                            .sync_mut()
-                                            .take_provisional()
-                                            .expect("verified provisional exists");
+                                        let Some(finalized) = d.sync_mut().take_provisional() else {
+                                            indra_node::supervisor::report_unexpected(
+                                                "network-event-loop",
+                                                "verified provisional was missing during finalization",
+                                            );
+                                            continue;
+                                        };
                                         match d.engine.commit_prepared_sync_block(
                                             &finalized.block,
                                             finalized.prepared,
@@ -2768,7 +2808,13 @@ fn main() {
                                 continue;
                             }
                             Message::StakingOp(op) => {
-                                let key = op_relay_key(&msg).expect("staking relay key");
+                                let Some(key) = op_relay_key(&msg) else {
+                                    indra_node::supervisor::report_unexpected(
+                                        "network-event-loop",
+                                        "staking message did not produce an operation relay key",
+                                    );
+                                    continue;
+                                };
                                 if op_relay_seen
                                     .lock()
                                     .map(|mut cache| cache.operation_seen(&key, Instant::now()))
@@ -2800,7 +2846,13 @@ fn main() {
                                 continue;
                             }
                             Message::GovernanceOp(op) => {
-                                let key = op_relay_key(&msg).expect("governance relay key");
+                                let Some(key) = op_relay_key(&msg) else {
+                                    indra_node::supervisor::report_unexpected(
+                                        "network-event-loop",
+                                        "governance message did not produce an operation relay key",
+                                    );
+                                    continue;
+                                };
                                 if op_relay_seen
                                     .lock()
                                     .map(|mut cache| cache.operation_seen(&key, Instant::now()))
@@ -3110,10 +3162,15 @@ fn main() {
                                                 d.engine.network_qc_verifier(),
                                             ) {
                                                 Ok(()) => {
-                                                    let finalized = d
-                                                        .sync_mut()
-                                                        .take_provisional()
-                                                        .expect("provisional exists");
+                                                    let Some(finalized) =
+                                                        d.sync_mut().take_provisional()
+                                                    else {
+                                                        indra_node::supervisor::report_unexpected(
+                                                            "network-event-loop",
+                                                            "provisional certificate was missing during finalization",
+                                                        );
+                                                        continue;
+                                                    };
                                                     if let Err(error) =
                                                         d.engine.commit_prepared_sync_block(
                                                             &finalized.block,
@@ -3632,10 +3689,15 @@ fn main() {
                                                 proposal_mode,
                                                 ProposalMode::Reproposal
                                             ) {
-                                                let (valid_block, valid_round) = valid_reproposal
-                                                    .expect(
-                                                        "reproposal mode requires a valid block",
+                                                let Some((valid_block, valid_round)) =
+                                                    valid_reproposal
+                                                else {
+                                                    indra_node::supervisor::report_unexpected(
+                                                        "consensus-loop",
+                                                        "reproposal mode was selected without a valid block",
                                                     );
+                                                    continue;
+                                                };
                                                 d.engine.repropose(
                                                     &valid_block,
                                                     round,
@@ -4516,7 +4578,10 @@ fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn load_keys_data(keys_path: &str, password_file: Option<&str>) -> KeysData {
+fn load_keys_data(
+    keys_path: &str,
+    password_file: Option<&str>,
+) -> indra_node::NodeResult<KeysData> {
     let password_source = match password_file {
         Some(path) => indra_keystore::PasswordSource::File {
             path: Path::new(path),
@@ -4524,18 +4589,19 @@ fn load_keys_data(keys_path: &str, password_file: Option<&str>) -> KeysData {
         },
         None => indra_keystore::PasswordSource::None,
     };
-    let keys = indra_keystore::load_keys(keys_path, password_source).unwrap_or_else(|e| {
-        panic!(
-            "Cannot load {}: {}. Encrypted validator keys require [keys].password_file or --keys-password-file for unattended startup.",
-            keys_path, e
-        )
-    });
-    KeysData {
+    let keys = indra_keystore::load_keys(keys_path, password_source).map_err(|error| {
+        indra_node::NodeError::InvalidConfiguration {
+            detail: format!(
+                "cannot load {keys_path}: {error}. Encrypted validator keys require [keys].password_file or --keys-password-file for unattended startup"
+            ),
+        }
+    })?;
+    Ok(KeysData {
         ed25519_seed: keys.ed25519_seed,
         vrf_seed: keys.vrf_seed,
         ml_dsa_seed: keys.ml_dsa_seed,
         pq_pk: keys.public.hybrid_pq_pk.clone(),
-    }
+    })
 }
 
 fn reserve_rpc_connection(count: &AtomicU64) -> bool {
@@ -6912,7 +6978,8 @@ mod tests {
         let loaded = load_keys_data(
             keys_path.to_str().unwrap(),
             Some(password_path.to_str().unwrap()),
-        );
+        )
+        .expect("encrypted test keys should load");
         assert_eq!(loaded.ed25519_seed, keys.ed25519_seed);
         assert_eq!(loaded.vrf_seed, keys.vrf_seed);
         assert_eq!(loaded.ml_dsa_seed, keys.ml_dsa_seed);
@@ -6933,7 +7000,7 @@ mod tests {
         let encrypted = indra_keystore::encrypt_keys(&keys, b"pw").unwrap();
         indra_keystore::write_keys_secure(keys_path.to_str().unwrap(), &encrypted).unwrap();
 
-        let result = std::panic::catch_unwind(|| load_keys_data(keys_path.to_str().unwrap(), None));
+        let result = load_keys_data(keys_path.to_str().unwrap(), None);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6957,12 +7024,10 @@ mod tests {
         std::fs::write(&password_path, "pw\n").unwrap();
         std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let result = std::panic::catch_unwind(|| {
-            load_keys_data(
-                keys_path.to_str().unwrap(),
-                Some(password_path.to_str().unwrap()),
-            )
-        });
+        let result = load_keys_data(
+            keys_path.to_str().unwrap(),
+            Some(password_path.to_str().unwrap()),
+        );
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
