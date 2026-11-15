@@ -5951,18 +5951,70 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     }
 
     #[test]
-    fn corrupt_vote_safety_record_prevents_voting() {
-        let (mut driver, dir) = local_driver([0x71u8; 32], "vote_safety_corrupt_blocks");
+    fn corrupt_vote_safety_record_refuses_startup() {
+        let (driver, dir) = local_driver([0x71u8; 32], "vote_safety_corrupt_blocks");
         std::fs::write(driver.engine.config.vote_safety_path(), [0xAA, 0xBB]).unwrap();
-        driver.apply_vote_safety().expect("corrupt vote safety should be recorded");
-        let actions = driver.sign_and_record_local_vote(1, 0, VoteStep::Prevote, Bytes32::ZERO);
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, DriverAction::BroadcastVote(_))),
-            "corrupt vote_safety.dat must fail closed and block vote broadcast"
-        );
+        let config = driver.engine.config.clone();
+        drop(driver);
+        let engine = NodeEngine::init(config).unwrap();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let error = match ConsensusDriver::try_new(engine, vote_safety) {
+            Ok(_) => panic!("corrupt vote safety must refuse startup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            NodeError::VoteSafetyUnavailable { detail }
+                if detail.contains("vote_safety.dat is corrupt or unreadable")
+        ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_vote_safety_lock_ahead_of_chain_refuses_startup() {
+        let seed = [0x75u8; 32];
+        let (mut driver, dir) = local_driver(seed, "vote_safety_ahead_of_chain");
+        let local = install_active_validator(&mut driver, seed, "local");
+        driver.refresh_registered_voters();
+        let proposal = make_strict_block(&driver, seed, 0, vec![]);
+        let block_hash = proposal.header.block_hash();
+        let prevote = indra_consensus::vote::produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            block_hash,
+            validator_id_for(&local),
+            governing_snapshot_root(&driver, 1),
+            TEST_CHAIN_ID,
+            &local,
+        )
+        .unwrap();
+        let lock = PersistedConsensusLock {
+            height: 2,
+            round: 0,
+            block_hash,
+            value_hash: proposal.header.value_hash,
+            proposal,
+            polc_votes: vec![prevote],
+        };
+        driver
+            .vote_safety
+            .record(2, 0, VoteStep::Prevote as u8, Some(&lock))
+            .unwrap();
+        let config = driver.engine.config.clone();
+        drop(driver);
+        let engine = NodeEngine::init(config).unwrap();
+        let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
+        let error = match ConsensusDriver::try_new(engine, vote_safety) {
+            Ok(_) => panic!("a lock ahead of the chain must refuse startup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            NodeError::VoteSafetyUnavailable { detail }
+                if detail.contains("persisted consensus lock height 2 is ahead of next height 1")
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -6128,13 +6180,16 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         drop(driver);
         let engine = NodeEngine::init(config).unwrap();
         let vote_safety = VoteSafetyStore::open(engine.config.vote_safety_path());
-        let restarted = ConsensusDriver::new(engine, vote_safety);
-        assert!(restarted.locked_round.is_none());
-        assert!(restarted.locked_value.is_none());
-        assert!(restarted
-            .vote_safety_unavailable
-            .as_deref()
-            .is_some_and(|reason| reason.contains("persisted lock proposal failed verification")));
+        let error = match ConsensusDriver::try_new(engine, vote_safety) {
+            Ok(_) => panic!("invalid persisted lock must refuse startup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            NodeError::VoteSafetyUnavailable { detail }
+                if detail.contains("persisted consensus lock is invalid")
+                    && detail.contains("persisted lock proposal failed verification")
+        ));
 
         let _ = std::fs::remove_dir_all(dir);
     }

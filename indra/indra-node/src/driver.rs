@@ -917,8 +917,7 @@ impl ConsensusDriver {
                         if let Err(reason) = self.verify_and_restore_consensus_lock(lock) {
                             let message = format!("persisted consensus lock is invalid: {reason}");
                             eprintln!("[vote_safety] CRITICAL: {message}");
-                            self.vote_safety_unavailable = Some(message);
-                            return Ok(())
+                            return Err(NodeError::VoteSafetyUnavailable { detail: message });
                         }
                     } else if lock.height > next_height {
                         let message = format!(
@@ -926,8 +925,7 @@ impl ConsensusDriver {
                             lock.height
                         );
                         eprintln!("[vote_safety] CRITICAL: {message}");
-                        self.vote_safety_unavailable = Some(message);
-                        return Ok(())
+                        return Err(NodeError::VoteSafetyUnavailable { detail: message });
                     }
                 }
                 self.vote_safety_unavailable = None;
@@ -960,10 +958,21 @@ impl ConsensusDriver {
                     "vote_safety.dat is corrupt or unreadable: {reason}; refusing to vote until operator recovery"
                 );
                 eprintln!("[vote_safety] CRITICAL: {msg}");
-                self.vote_safety_unavailable = Some(msg);
+                return Err(NodeError::VoteSafetyUnavailable { detail: msg });
             }
         }
         Ok(())
+    }
+
+    /// Whether the validator is currently unable to vote without violating its
+    /// durable final-round safety boundary.
+    pub fn vote_safety_unavailable(&self) -> bool {
+        self.vote_safety_unavailable.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_vote_safety_unavailable_for_test(&mut self) {
+        self.vote_safety_unavailable = Some("test final-round safety boundary".to_string());
     }
 
     fn next_height(&self) -> u64 {

@@ -400,6 +400,7 @@ struct MetricsSnapshot {
     chain_id: String,
     validator_id_hex: String,
     is_validator: bool,
+    vote_safety_unavailable: bool,
 }
 
 impl MetricsSnapshot {
@@ -408,14 +409,16 @@ impl MetricsSnapshot {
         connected_validator_peers: usize,
         observer_count: &AtomicUsize,
     ) -> Result<Self, MetricsError> {
-        Self::from_engine(
+        let mut snapshot = Self::from_engine(
             &driver.engine,
             connected_validator_peers,
             observer_count,
             driver.current_round(),
             driver.sync().is_caught_up(),
             driver.sync().target_height().unwrap_or(0),
-        )
+        )?;
+        snapshot.vote_safety_unavailable = driver.vote_safety_unavailable();
+        Ok(snapshot)
     }
 
     fn from_engine(
@@ -467,6 +470,7 @@ impl MetricsSnapshot {
             chain_id: s.chain_id.clone(),
             validator_id_hex,
             is_validator: engine.config.is_validator(),
+            vote_safety_unavailable: false,
         })
     }
 }
@@ -550,6 +554,12 @@ fn render_snapshot(
         "indra_consensus_round",
         "Current consensus round at current height",
         snapshot.round,
+    );
+    gauge(
+        &mut buf,
+        "indra_vote_safety_unavailable",
+        "1 if this validator cannot vote at the current height without operator recovery",
+        if snapshot.vote_safety_unavailable { 1 } else { 0 },
     );
     gauge(
         &mut buf,
@@ -890,6 +900,26 @@ mod tests {
             buf,
             "# HELP indra_example Example gauge\n# TYPE indra_example gauge\nindra_example 7\n"
         );
+    }
+
+    #[test]
+    fn vote_safety_unavailable_gauge_is_exported() {
+        let (driver, data_dir) = test_driver();
+        driver
+            .lock()
+            .unwrap()
+            .mark_vote_safety_unavailable_for_test();
+        let output = render_metrics(
+            &driver,
+            &Arc::new(AtomicUsize::new(0)),
+            0,
+            &MetricsState::new(),
+            &AtomicU64::new(0),
+            &data_dir.path().to_string_lossy(),
+            "0.1.0",
+        )
+        .expect("metrics render");
+        assert!(output.contains("indra_vote_safety_unavailable 1"));
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub mod error;
 pub mod genesis;
 pub mod hardened_read_rpc;
 pub mod metrics;
+pub mod locks;
 pub mod net_driver;
 mod pending_dependencies;
 pub mod qc_verification;

@@ -47,6 +47,7 @@ use indra_node::{
     },
     driver::{ConsensusDriver, DriverAction, DriverEvent, RoundPhase},
     genesis::load_genesis_seed_peers,
+    locks,
     metrics::{record_block_commit, DEFAULT_METRICS_ADDR},
     net_driver::{action_to_message, message_to_event},
     sync::{PairVerificationError, SYNC_BATCH_SIZE},
@@ -579,15 +580,18 @@ impl NetworkBridge {
         self.handle.connected_peer_count()
     }
 
-    fn connected_addrs(&self) -> Vec<SocketAddr> {
-        self.peer_addrs.lock().unwrap().values().copied().collect()
+    fn connected_addrs(&self) -> indra_node::NodeResult<Vec<SocketAddr>> {
+        Ok(locks::lock(&self.peer_addrs, "network.peer_addrs")?
+            .values()
+            .copied()
+            .collect())
     }
 
-    fn peer_topology(&self) -> Vec<indra_rpc::handlers::PeerTopologyEntry> {
-        let mut peers: Vec<_> = self
-            .peer_addrs
-            .lock()
-            .unwrap()
+    fn peer_topology(
+        &self,
+    ) -> indra_node::NodeResult<Vec<indra_rpc::handlers::PeerTopologyEntry>> {
+        let peer_addrs = locks::lock(&self.peer_addrs, "network.peer_addrs")?;
+        let mut peers: Vec<_> = peer_addrs
             .iter()
             .map(
                 |(validator_id, addr)| indra_rpc::handlers::PeerTopologyEntry {
@@ -601,7 +605,7 @@ impl NetworkBridge {
                 .cmp(&b.validator_id)
                 .then(a.address.cmp(&b.address))
         });
-        peers
+        Ok(peers)
     }
 
     fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
@@ -2600,8 +2604,18 @@ fn main() {
                             .store(gossip.connection_count(), Ordering::Relaxed);
                         eprintln!("[p2p] authenticated peer connected: {}", addr);
                         let self_addrs = configured_self_addr_set(&local_p2p_addr);
+                        let connected = match gossip.connected_addrs() {
+                            Ok(addrs) => addrs,
+                            Err(error) => {
+                                indra_node::supervisor::report_unexpected(
+                                    "network-event-loop",
+                                    error.to_string(),
+                                );
+                                return;
+                            }
+                        };
                         let known_addrs = peer_list_payload_with_identities(
-                            gossip.connected_addrs(),
+                            connected,
                             Some(addr),
                             &self_addrs,
                             &gossip.addr_validators.lock().unwrap(),
@@ -2934,12 +2948,22 @@ fn main() {
                                     let Some(addr) = resolve_peer_addr(&entry.addr) else {
                                         continue;
                                     };
+                                    let connected = match gossip.connected_addrs() {
+                                        Ok(addrs) => addrs,
+                                        Err(error) => {
+                                            indra_node::supervisor::report_unexpected(
+                                                "network-event-loop",
+                                                error.to_string(),
+                                            );
+                                            return;
+                                        }
+                                    };
                                     if discovery_accepts_peer_addr(
                                         &addr,
                                         entry.validator_id,
                                         local_validator_id,
                                         &local_p2p_addr,
-                                        &gossip.connected_addrs(),
+                                        &connected,
                                     ) {
                                         if insert_discovered_peer_if_not_self(
                                             &mut new_peers,
@@ -3904,7 +3928,16 @@ fn main() {
             if !on_chain_addrs.is_empty() {
                 let source_addrs = on_chain_addrs.clone();
                 let local_validator_id = handshake_config.read().unwrap().my_validator_id;
-                let connected = gossip.connected_addrs();
+                let connected = match gossip.connected_addrs() {
+                    Ok(addrs) => addrs,
+                    Err(error) => {
+                        indra_node::supervisor::report_unexpected(
+                            "network-event-loop",
+                            error.to_string(),
+                        );
+                        return;
+                    }
+                };
                 let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
                 let accepted = insert_on_chain_validator_network_addrs(
                     &mut discovered_peers.lock().unwrap(),
@@ -3940,8 +3973,15 @@ fn main() {
         let peer_list_ticks = (PEER_LIST_INTERVAL_SECS / STATUS_INTERVAL.as_secs()).max(1);
         if tick.is_multiple_of(peer_list_ticks) {
             let self_addrs = configured_self_addr_set(&p2p_addr);
+            let connected = match gossip.connected_addrs() {
+                Ok(addrs) => addrs,
+                Err(error) => {
+                    indra_node::supervisor::report_unexpected("network-event-loop", error.to_string());
+                    return;
+                }
+            };
             let known_addrs = peer_list_payload_with_identities(
-                gossip.connected_addrs(),
+                connected,
                 None,
                 &self_addrs,
                 &gossip.addr_validators.lock().unwrap(),
@@ -3983,7 +4023,13 @@ fn process_driver_actions(
             return;
         }
         if let DriverAction::RequestQC { height } = &action {
-            let peers: Vec<SocketAddr> = gossip.connected_addrs();
+            let peers: Vec<SocketAddr> = match gossip.connected_addrs() {
+                Ok(peers) => peers,
+                Err(error) => {
+                    indra_node::supervisor::report_unexpected("consensus-driver", error.to_string());
+                    return;
+                }
+            };
             eprintln!(
                 "[driver] requesting QC for height {} from {} peers",
                 height,
@@ -5357,12 +5403,24 @@ fn handle_rpc(
         None
     };
 
-    let validator_peer_addrs: Vec<String> = gossip
-        .connected_addrs()
+    let connected_addrs = match gossip.connected_addrs() {
+        Ok(addrs) => addrs,
+        Err(error) => {
+            indra_node::supervisor::report_unexpected("rpc-handler", error.to_string());
+            return;
+        }
+    };
+    let validator_peer_addrs: Vec<String> = connected_addrs
         .iter()
         .map(|addr| addr.to_string())
         .collect();
-    let validator_peer_topology = gossip.peer_topology();
+    let validator_peer_topology = match gossip.peer_topology() {
+        Ok(topology) => topology,
+        Err(error) => {
+            indra_node::supervisor::report_unexpected("rpc-handler", error.to_string());
+            return;
+        }
+    };
     let connected_validator_peer_count = gossip.connection_count();
     let discovered_count = discovered_peers.lock().unwrap().len();
     let observer_count_val = observer_count.load(Ordering::Relaxed);

@@ -143,6 +143,20 @@ pub enum NodeError {
         /// Why the snapshot and block log disagree.
         reason: String,
     },
+
+    /// Durable vote-safety state exists but cannot be trusted at startup.
+    #[error("vote safety unavailable: {detail}")]
+    VoteSafetyUnavailable {
+        /// Why the persisted safety record was rejected.
+        detail: String,
+    },
+
+    /// A poisoned synchronization primitive means shared state may be torn.
+    #[error("lock poisoned: {name}")]
+    LockPoisoned {
+        /// Stable name assigned to the poisoned lock.
+        name: &'static str,
+    },
 }
 
 /// Convenience alias.
