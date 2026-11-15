@@ -115,7 +115,10 @@ impl StateStore {
         snapshot_bytes.extend_from_slice(&state_bytes);
         write_atomic_synced(&tmp_path, &final_path, &snapshot_bytes)?;
 
-        let roots = compute_state_roots(state);
+        let roots = compute_state_roots(state).map_err(|error| StorageError::Corruption {
+            height,
+            detail: error.to_string(),
+        })?;
         let meta = SnapshotMeta {
             height,
             block_hash: state.tip_hash,
@@ -350,7 +353,10 @@ impl StateStore {
                 ),
             });
         }
-        let roots = compute_state_roots(state);
+        let roots = compute_state_roots(state).map_err(|error| StorageError::Corruption {
+            height: state.height,
+            detail: error.to_string(),
+        })?;
         if meta.state_root != roots.state_root {
             return Err(StorageError::SnapshotRootMismatch {
                 height: state.height,
@@ -520,7 +526,9 @@ fn validate_snapshot_state(mut state: ChainState, file_height: u64) -> Result<Ch
             file_height, state.height
         ));
     }
-    state.rebuild_state_commitment_v2(state.height);
+    state
+        .rebuild_state_commitment_v2(state.height)
+        .map_err(|error| error.to_string())?;
     Ok(state)
 }
 
@@ -647,7 +655,7 @@ mod tests {
         state.height = 42;
         state.base_fee = 500;
         move_genesis_principal_to_fee_pool(&mut state, 777);
-        state.rebuild_state_commitment_v2(state.height);
+        state.rebuild_state_commitment_v2(state.height).unwrap();
 
         store.save(&state).unwrap();
 
@@ -664,7 +672,7 @@ mod tests {
         let mut state = finalized_test_state();
         state.height = 123;
         move_genesis_principal_to_fee_pool(&mut state, 456);
-        state.rebuild_state_commitment_v2(state.height);
+        state.rebuild_state_commitment_v2(state.height).unwrap();
         store.save(&state).unwrap();
         assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         let loaded = store.load_latest().unwrap().unwrap();
@@ -880,7 +888,7 @@ mod tests {
 
         let mut projected = state.clone();
         apply_block(&mut projected, &block, 0).unwrap();
-        let roots = compute_state_roots(&projected);
+        let roots = compute_state_roots(&projected).unwrap();
         block.header.state_root = roots.state_root;
         block.header.validator_set_root = roots.validator_set_root;
         block.header.value_hash = block.compute_value_hash(projected.total_supply);

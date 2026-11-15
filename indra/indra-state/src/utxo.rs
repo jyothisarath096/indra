@@ -187,7 +187,7 @@ impl UtxoSet {
             }
             set.entries.insert(entry.utxo_id, entry);
         }
-        set.rebuild_compressed_cache();
+        set.rebuild_compressed_cache()?;
         Ok(set)
     }
 
@@ -372,13 +372,16 @@ impl UtxoSet {
         self.entries.get(id).map(Self::leaf_value)
     }
 
-    fn rebuild_compressed_cache(&mut self) {
+    fn rebuild_compressed_cache(&mut self) -> IndraResult<()> {
         self.compressed = PersistentAuthTree::from_pairs(
             self.entries
                 .values()
                 .map(|entry| (entry.utxo_id.0, Self::leaf_value(entry))),
         )
-        .expect("UTXO IDs are unique in UtxoSet");
+        .map_err(|_| IndraError::DuplicateEntries {
+            field: "snapshot.utxos",
+        })?;
+        Ok(())
     }
 
     fn leaf_value(entry: &UtxoEntry) -> [u8; 32] {
@@ -474,6 +477,28 @@ mod tests {
                 }) if version == old_version
             ));
         }
+    }
+
+    #[test]
+    fn utxo_decode_rejects_duplicate_snapshot_keys() {
+        let entry = UtxoEntry {
+            utxo_id: Bytes32::from([0xD2; 32]),
+            output: dummy_output(2),
+            created_height: 1,
+            tx_index: 0,
+            output_index: 0,
+            tranche_refund: None,
+        };
+        let mut encoded = Vec::new();
+        2u32.encode(&mut encoded);
+        entry.encode(&mut encoded);
+        entry.encode(&mut encoded);
+        assert!(matches!(
+            UtxoSet::decode(&mut ByteReader::new(&encoded)),
+            Err(IndraError::DuplicateEntries {
+                field: "snapshot.utxos"
+            })
+        ));
     }
 
     #[test]

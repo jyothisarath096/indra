@@ -357,7 +357,7 @@ mod tests {
 
         let mut scratch = pre_state.clone();
         apply_block(&mut scratch, &projected_candidate, 0).unwrap();
-        let roots = state_root::compute_state_roots(&scratch);
+        let roots = state_root::compute_state_roots(&scratch).unwrap();
         assert_eq!(block.header.state_root, roots.state_root);
         assert_eq!(block.header.validator_set_root, roots.validator_set_root);
         projected_candidate.header.state_root = block.header.state_root;
@@ -379,7 +379,7 @@ mod tests {
 
         let mut scratch = pre_state.clone();
         apply_block(&mut scratch, &reference, 0).unwrap();
-        let roots = state_root::compute_state_roots(&scratch);
+        let roots = state_root::compute_state_roots(&scratch).unwrap();
         reference.header.state_root = roots.state_root;
         reference.header.validator_set_root = roots.validator_set_root;
         reference.header.value_hash = reference.compute_value_hash(scratch.total_supply);

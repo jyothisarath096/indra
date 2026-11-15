@@ -146,7 +146,7 @@ pub struct NodeState<'a> {
     /// Number of locally retained blocks.
     pub blocks_retained: usize,
     /// Canonical state root cached by the published read snapshot.
-    pub state_root: Bytes32,
+    pub state_root: Result<Bytes32, String>,
     /// Optional network context for validator-node-only peer methods.
     pub network: Option<NetworkContext<'a>>,
     /// RPC listener mode serving this request.
@@ -296,8 +296,9 @@ pub trait RpcEngineView {
     /// Return the number of locally retained blocks.
     fn blocks_retained(&self) -> usize;
     /// Return the canonical state root for this immutable view.
-    fn state_root(&self) -> Bytes32 {
+    fn state_root(&self) -> Result<Bytes32, String> {
         indra_state::compute_state_root(self.chain_state())
+            .map_err(|error| error.to_string())
     }
     /// Precomputed position identifiers for one principal owner, when available.
     fn position_ids_by_owner(&self, _owner: &Bytes32) -> Option<&[Bytes32]> {
@@ -2754,7 +2755,10 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
         .chain
         .utxos
         .prove_at_height(&utxo_id, state.chain.height);
-    let state_root = state.state_root;
+    let state_root = state
+        .state_root
+        .as_ref()
+        .map_err(|error| RpcError::Internal(format!("state root unavailable: {error}")))?;
     match proof {
         AuthTreeProof::V2Compressed(proof) => {
             let value_hash = proof.value.map(hex::encode).unwrap_or_default();

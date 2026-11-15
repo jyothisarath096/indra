@@ -21,7 +21,7 @@ use indra_core::{
 
 use crate::{
     chain::ChainState,
-    error::StateResult,
+    error::{StateError, StateResult},
     governance::{
         GovernanceSnapshot, ProposalPhase, ProposalRecord, QueuedExecution,
         GOVERNANCE_DEPOSIT_RETURN_SUPPORT_BPS, MAX_RETAINED_TERMINAL_GOVERNANCE_PROPOSALS,
@@ -124,7 +124,7 @@ pub fn apply_epoch_transition(
     match apply_epoch_transition_at_height_with_selector(state, context, timestamp_secs, &selector)
     .and_then(|record| {
         state.refresh_and_reconcile_monetary_state()?;
-        state.rebuild_state_commitment_v2(context.boundary_height);
+        state.rebuild_state_commitment_v2(context.boundary_height)?;
         Ok(record)
     }) {
         Ok(record) => Ok(record),
@@ -378,7 +378,7 @@ fn apply_epoch_transition_final(
     state.monetary_ledger.epoch_fee_burned_spark = 0;
     state.monetary_ledger.epoch_slash_burned_spark = 0;
     state.monetary_ledger.epoch_governance_burned_spark = 0;
-    state.rebuild_state_commitment_v2(height);
+    state.rebuild_state_commitment_v2(height)?;
     Ok(record)
 }
 
@@ -435,13 +435,13 @@ pub fn apply_governance_phase_transitions(
     // phase, and the transition takes effect immediately afterward.
     let proposal_ids: Vec<Bytes32> = state.governance.proposals.keys().copied().collect();
     for proposal_id in proposal_ids {
-        let phase = match state.governance.proposals.get(&proposal_id) {
-            Some(proposal) => proposal.phase,
+        let proposal = match state.governance.proposals.get(&proposal_id) {
+            Some(proposal) => proposal,
             None => continue,
         };
-        match phase {
+        match proposal.phase {
             ProposalPhase::Deliberation => {
-                let commit_start = state.governance.proposals[&proposal_id].commit_start_epoch;
+                let commit_start = proposal.commit_start_epoch;
                 if current_epoch >= commit_start {
                     let snapshot1 = take_governance_snapshot(state);
                     if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
@@ -455,7 +455,7 @@ pub fn apply_governance_phase_transitions(
                 }
             }
             ProposalPhase::Commit => {
-                let reveal_start = state.governance.proposals[&proposal_id].reveal_start_epoch;
+                let reveal_start = proposal.reveal_start_epoch;
                 if current_epoch >= reveal_start {
                     if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
                         proposal.phase = ProposalPhase::Reveal;
@@ -467,13 +467,13 @@ pub fn apply_governance_phase_transitions(
                 }
             }
             ProposalPhase::Reveal => {
-                let tally_epoch = state.governance.proposals[&proposal_id].tally_epoch;
+                let tally_epoch = proposal.tally_epoch;
                 if current_epoch >= tally_epoch {
                     tally_proposal(state, proposal_id, height)?;
                 }
             }
             ProposalPhase::ExecDelay => {
-                auto_execute_ready(state, proposal_id, current_epoch, height);
+                auto_execute_ready(state, proposal_id, current_epoch, height)?;
             }
             _ => {}
         }
@@ -558,19 +558,32 @@ fn auto_execute_ready(
     proposal_id: Bytes32,
     current_epoch: u64,
     height: u64,
-) {
+) -> StateResult<()> {
     let Some(exec_index) = state.governance.queued_executions.iter().position(|exec| {
         exec.proposal_id == proposal_id && !exec.executed && current_epoch >= exec.executable_epoch
     }) else {
-        return;
+        return Ok(());
     };
-    let action = state.governance.queued_executions[exec_index]
+    let action = state
+        .governance
+        .queued_executions
+        .get(exec_index)
+        .ok_or(StateError::InvariantViolation {
+            message: "queued execution index invalid before revalidation",
+        })?
         .action
         .clone();
     match revalidate_queued_governance_action_or_fail(state, proposal_id, &action, height) {
         Ok(true) => {
             state.governance.params.apply_action(&action);
-            state.governance.queued_executions[exec_index].executed = true;
+            state
+                .governance
+                .queued_executions
+                .get_mut(exec_index)
+                .ok_or(StateError::InvariantViolation {
+                    message: "queued execution index invalid after revalidation",
+                })?
+                .executed = true;
             if let Some(proposal) = state.governance.proposals.get_mut(&proposal_id) {
                 proposal.phase = ProposalPhase::Executed;
             }
@@ -581,7 +594,14 @@ fn auto_execute_ready(
             );
         }
         Ok(false) => {
-            state.governance.queued_executions[exec_index].executed = true;
+            state
+                .governance
+                .queued_executions
+                .get_mut(exec_index)
+                .ok_or(StateError::InvariantViolation {
+                    message: "queued execution index invalid after revalidation",
+                })?
+                .executed = true;
         }
         Err(err) => {
             eprintln!(
@@ -591,6 +611,7 @@ fn auto_execute_ready(
             );
         }
     }
+    Ok(())
 }
 
 /// Take a governance stake snapshot.
@@ -659,9 +680,13 @@ pub fn compute_snapshot2(proposal: &ProposalRecord) -> GovernanceSnapshot {
             );
             continue;
         }
-        let from_weight = weights
-            .get_mut(&redelegation.from_validator)
-            .expect("from_validator presence checked above");
+        let Some(from_weight) = weights.get_mut(&redelegation.from_validator) else {
+            eprintln!(
+                "[governance] skipping malformed redelegation: from_validator {} absent from snapshot1",
+                hex::encode(&redelegation.from_validator.0[..4])
+            );
+            continue;
+        };
         if *from_weight < redelegation.amount_spark {
             eprintln!(
                 "[governance] skipping malformed redelegation: amount {} exceeds snapshot weight {} for validator {}",
@@ -672,9 +697,13 @@ pub fn compute_snapshot2(proposal: &ProposalRecord) -> GovernanceSnapshot {
             continue;
         }
         *from_weight = from_weight.saturating_sub(redelegation.amount_spark);
-        let to_weight = weights
-            .get_mut(&redelegation.to_validator)
-            .expect("to_validator presence checked above");
+        let Some(to_weight) = weights.get_mut(&redelegation.to_validator) else {
+            eprintln!(
+                "[governance] skipping malformed redelegation: to_validator {} absent from snapshot1",
+                hex::encode(&redelegation.to_validator.0[..4])
+            );
+            continue;
+        };
         *to_weight = to_weight.saturating_add(redelegation.amount_spark);
     }
     GovernanceSnapshot {

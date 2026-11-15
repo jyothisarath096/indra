@@ -291,7 +291,7 @@ fn decode_hex_len_any(value: &str, field: &str) -> Result<Vec<u8>, String> {
 /// Compute the genesis fingerprint from state commitments and metadata.
 pub fn genesis_fingerprint(state: &ChainState) -> Result<Bytes32, String> {
     use indra_core::codec::Encode;
-    let roots = indra_state::compute_state_roots(state);
+    let roots = indra_state::compute_state_roots(state).map_err(|error| error.to_string())?;
     let snapshot = state.snapshot_for_consensus_height(1).map_err(|error| error.to_string())?;
     let mut preimage = b"INDRA-GENESIS-FINGERPRINT-v1".to_vec();
     let chain = state.chain_id.as_bytes();
@@ -309,7 +309,7 @@ pub fn genesis_fingerprint(state: &ChainState) -> Result<Bytes32, String> {
 
 /// Build the deterministic genesis block.
 pub fn build_genesis_block(state: &ChainState) -> Result<BlockVNext, String> {
-    let roots = indra_state::compute_state_roots(state);
+    let roots = indra_state::compute_state_roots(state).map_err(|error| error.to_string())?;
     let fingerprint = genesis_fingerprint(state)?;
     Ok(BlockVNext {
         header: BlockHeaderVNext {
@@ -966,7 +966,9 @@ mod tests {
         let mut state = four_validator_test_state("fingerprint");
         let validator_id = state.validators.all_validators().next().unwrap().validator_id;
         state.validators.get_mut(&validator_id).unwrap().stake_spark += 1;
-        state.rebuild_state_commitment_v2(state.height);
+        state
+            .rebuild_state_commitment_v2(state.height)
+            .unwrap();
         assert_ne!(original, genesis_fingerprint(&state).unwrap());
         let mut state = four_validator_test_state("fingerprint");
         state.genesis_timestamp += 1;

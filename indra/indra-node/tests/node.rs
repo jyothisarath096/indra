@@ -807,7 +807,7 @@ fn full_node_pipeline() {
                 [0x14u8; 32],
             );
             assert_eq!(state.height, i);
-            compute_state_root(&state)
+            compute_state_root(&state).unwrap()
         })
         .collect();
 

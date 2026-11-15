@@ -490,7 +490,13 @@ fn apply_execute(
         .iter()
         .position(|exec| exec.proposal_id == *proposal_id)
         .ok_or(StateError::GovernanceProposalNotFound)?;
-    let exec = &state.governance.queued_executions[exec_index];
+    let exec = state
+        .governance
+        .queued_executions
+        .get(exec_index)
+        .ok_or(StateError::InvariantViolation {
+            message: "queued execution index invalid before validation",
+        })?;
     if exec.executed {
         return invalid("proposal already executed");
     }
@@ -499,11 +505,25 @@ fn apply_execute(
     }
     let action = exec.action.clone();
     if !revalidate_queued_governance_action_or_fail(state, *proposal_id, &action, current_height)? {
-        state.governance.queued_executions[exec_index].executed = true;
+        state
+            .governance
+            .queued_executions
+            .get_mut(exec_index)
+            .ok_or(StateError::InvariantViolation {
+                message: "queued execution index invalid after revalidation",
+            })?
+            .executed = true;
         return Ok(());
     }
     state.governance.params.apply_action(&action);
-    state.governance.queued_executions[exec_index].executed = true;
+    state
+        .governance
+        .queued_executions
+        .get_mut(exec_index)
+        .ok_or(StateError::InvariantViolation {
+            message: "queued execution index invalid after revalidation",
+        })?
+        .executed = true;
     if let Some(proposal) = state.governance.proposals.get_mut(proposal_id) {
         proposal.phase = ProposalPhase::Executed;
     }
@@ -562,7 +582,7 @@ fn apply_cancel(
         .governance
         .proposals
         .get_mut(proposal_id)
-        .expect("proposal exists after governance deposit burn")
+        .ok_or(StateError::GovernanceProposalNotFound)?
         .phase = ProposalPhase::Cancelled;
     Ok(())
 }
@@ -576,7 +596,9 @@ fn apply_governance_nonce(
     if cold_authorized {
         let cold_nonce = op
             .cold_authorization()
-            .expect("verified cold governance operation has authorization")
+            .ok_or_else(|| StateError::InvalidGovernanceOp {
+                reason: "cold authorization missing for cold-authorized governance operation".into(),
+            })?
             .cold_nonce;
         let validator = state
             .validators
@@ -856,14 +878,14 @@ pub fn burn_governance_deposit(state: &mut ChainState, proposal_id: Bytes32) -> 
         .epoch_governance_burned_spark
         .checked_add(amount)
         .ok_or(StateError::ValueOverflow)?;
-    state.total_supply = new_total_supply;
-    state.monetary_ledger.cumulative_governance_burned_spark = cumulative_governance_burned_spark;
-    state.monetary_ledger.epoch_governance_burned_spark = epoch_ledger_burned_spark;
     let proposal = state
         .governance
         .proposals
         .get_mut(&proposal_id)
-        .expect("proposal exists after checked governance burn accounting");
+        .ok_or(StateError::GovernanceProposalNotFound)?;
+    state.total_supply = new_total_supply;
+    state.monetary_ledger.cumulative_governance_burned_spark = cumulative_governance_burned_spark;
+    state.monetary_ledger.epoch_governance_burned_spark = epoch_ledger_burned_spark;
     proposal.deposit_spark = 0;
     proposal.deposit_burned = true;
     Ok(amount)

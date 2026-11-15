@@ -4624,7 +4624,7 @@ impl indra_rpc::handlers::RpcEngineView for RpcSnapshot {
         self.read.blocks_retained()
     }
 
-    fn state_root(&self) -> indra_core::Bytes32 {
+    fn state_root(&self) -> Result<indra_core::Bytes32, String> {
         self.read.state_root()
     }
 
@@ -7511,6 +7511,7 @@ mod tests {
         chain.height = 42;
         let snapshot = RpcSnapshot {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 3, false, 0, 43)
+                .unwrap()
                 .load(),
             requested_blocks: HashMap::new(),
             latest_epoch: None,
@@ -7635,6 +7636,7 @@ mod tests {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(
                 &chain, 0, true, 126_677, 50_000,
             )
+            .unwrap()
             .load(),
             requested_blocks: HashMap::from([(height, block.block)]),
             latest_epoch: None,
@@ -7705,7 +7707,7 @@ mod tests {
         };
         let expected_hash = hex::encode(block.header.block_hash().0);
         let snapshot = RpcSnapshot {
-            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).load(),
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).unwrap().load(),
             requested_blocks: HashMap::from([(1, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),

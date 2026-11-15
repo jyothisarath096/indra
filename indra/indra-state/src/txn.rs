@@ -375,7 +375,7 @@ impl<'a> StateTxn<'a> {
     /// Ensure StateCommitmentV2 exists when active.
     pub(crate) fn ensure_state_commitment_v2(&mut self) -> StateResult<()> {
         self.mark_commitment_touched();
-        self.state.ensure_state_commitment_v2(self.height);
+        self.state.ensure_state_commitment_v2(self.height)?;
         self.after_mutation()
     }
 
@@ -969,7 +969,7 @@ mod tests {
         };
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.slash_membership_roots = vec![original_record];
-        state.rebuild_state_commitment_v2(height);
+        state.rebuild_state_commitment_v2(height).unwrap();
         let root_before = state.state_commitment_v2_root(height);
 
         set_fail_after_mutation(Some(1));
@@ -1031,7 +1031,7 @@ mod tests {
             )
             .unwrap(),
         );
-        state.rebuild_state_commitment_v2(state.height);
+        state.rebuild_state_commitment_v2(state.height).unwrap();
         let original = state.clone();
 
         set_fail_after_mutation(Some(1));

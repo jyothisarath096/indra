@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     fn install_inert_gate_snapshot_fixture(state: &mut ChainState) {
-        state.rebuild_state_commitment_v2(state.height);
+        state.rebuild_state_commitment_v2(state.height).unwrap();
     }
 
     fn assert_same_consensus_state(left: &ChainState, right: &ChainState) {
@@ -1960,7 +1960,7 @@ mod tests {
         state.reward_economic_snapshot = None;
         state.slash_membership_roots.clear();
         state.finalize_genesis().unwrap();
-        state.rebuild_state_commitment_v2(0);
+        state.rebuild_state_commitment_v2(0).unwrap();
         let action = GovernableAction::SetMinDelegationSpark { value: 100_000 };
         let proposal_id = compute_proposal_id(proposer_id, &action, 0, TEST_CHAIN_ID);
         let mut proposal = test_proposal_record(
@@ -2063,7 +2063,7 @@ mod tests {
         install_inert_gate_snapshot_fixture(&mut state);
         state.height = 0;
         state.tip_hash = Bytes32::ZERO;
-        state.rebuild_state_commitment_v2(state.height);
+        state.rebuild_state_commitment_v2(state.height).unwrap();
         assert!(
             state.state_commitment_v2.is_some(),
             "test setup must start with a warm StateCommitmentV2 cache"
@@ -2071,7 +2071,7 @@ mod tests {
         let original = state.clone();
         let original_root = state.state_commitment_v2_root(state.height);
         let mut rebuilt_original = state.clone();
-        rebuilt_original.rebuild_state_commitment_v2(state.height);
+        rebuilt_original.rebuild_state_commitment_v2(state.height).unwrap();
         assert_eq!(
             rebuilt_original.state_commitment_v2_root(state.height),
             original_root,
@@ -2087,7 +2087,7 @@ mod tests {
             "successful rollback projection must preserve a cache that was already warm"
         );
         let success_rollback_root = state.state_commitment_v2_root(original.height);
-        state.rebuild_state_commitment_v2(original.height);
+        state.rebuild_state_commitment_v2(original.height).unwrap();
         assert_eq!(
             state.state_commitment_v2_root(original.height),
             success_rollback_root,
@@ -2111,7 +2111,7 @@ mod tests {
             "failed rollback projection must preserve a cache that was already warm"
         );
         let failure_rollback_root = failing_state.state_commitment_v2_root(original.height);
-        failing_state.rebuild_state_commitment_v2(original.height);
+        failing_state.rebuild_state_commitment_v2(original.height).unwrap();
         assert_eq!(
             failing_state.state_commitment_v2_root(original.height),
             failure_rollback_root,
@@ -2452,7 +2452,7 @@ mod tests {
         crate::txn::set_fail_after_mutation(None);
         apply_block(&mut success, &block, 0).unwrap();
         let success_root = success.state_commitment_v2_root(block.header.height);
-        success.rebuild_state_commitment_v2(block.header.height);
+        success.rebuild_state_commitment_v2(block.header.height).unwrap();
         assert_eq!(
             success.state_commitment_v2_root(block.header.height),
             success_root
@@ -2467,7 +2467,7 @@ mod tests {
         );
         assert_same_consensus_state(&rolled_back, &state);
         let rollback_root = rolled_back.state_commitment_v2_root(rolled_back.height);
-        rolled_back.rebuild_state_commitment_v2(rolled_back.height);
+        rolled_back.rebuild_state_commitment_v2(rolled_back.height).unwrap();
         assert_eq!(
             rolled_back.state_commitment_v2_root(rolled_back.height),
             rollback_root
@@ -2583,8 +2583,8 @@ mod tests {
         let mut b = canonical_test_genesis();
         a.staking_nonces.insert(Bytes32::from([0xAA; 32]), 1);
         b.staking_nonces.insert(Bytes32::from([0xAA; 32]), 2);
-        a.rebuild_state_commitment_v2(a.height);
-        b.rebuild_state_commitment_v2(b.height);
+        a.rebuild_state_commitment_v2(a.height).unwrap();
+        b.rebuild_state_commitment_v2(b.height).unwrap();
 
         assert_ne!(
             crate::state_root::compute_state_root(&a),
@@ -3142,7 +3142,7 @@ mod tests {
             state.stake_positions.insert(position.position_id, position);
         }
         state.rebuild_position_tranche_index().unwrap();
-        state.rebuild_state_commitment_v2(1);
+        state.rebuild_state_commitment_v2(1).unwrap();
         let public = keypair.public_key();
         let started = std::time::Instant::now();
         let consensus = state.build_consensus_snapshot(1, 0).unwrap();
@@ -4588,7 +4588,7 @@ pub fn project_block_for_roots(
         match apply_block_inner(&mut txn, block, verified_qc.as_ref(), timestamp_secs) {
             Ok(epoch_record) => {
                 let projected_state = txn.state();
-                let roots = crate::state_root::compute_state_roots(projected_state);
+                let roots = crate::state_root::compute_state_roots(projected_state)?;
                 let mut value_block = block.clone();
                 value_block.header.state_root = roots.state_root;
                 value_block.header.validator_set_root = roots.validator_set_root;
@@ -4899,7 +4899,7 @@ fn apply_block_inner(
             &revoked_consensus_authorities,
         )?;
         txn.state_mut()
-            .rebuild_state_commitment_v2(block.header.height);
+            .rebuild_state_commitment_v2(block.header.height)?;
         txn.after_mutation()?;
     }
 
@@ -4954,7 +4954,7 @@ fn apply_block_inner(
         let boundary_height = context.boundary_height;
         txn.state_mut()
             .create_consensus_snapshot_after_boundary(boundary_height)?;
-        txn.state_mut().rebuild_state_commitment_v2(boundary_height);
+        txn.state_mut().rebuild_state_commitment_v2(boundary_height)?;
         txn.after_mutation()?;
     }
 

@@ -1,5 +1,9 @@
 use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+
+fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root::ComputedStateRoots {
+    indra_state::compute_state_roots(state).unwrap()
+}
     use crate::NodeConfig;
     use indra_consensus::{
         producer::{produce_block, BlockTemplate},
@@ -1099,10 +1103,10 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         }
         let final_tip = fixture.drivers[0].engine.state.tip_hash;
         let height2_hash = final_tip;
-        let canonical_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let canonical_roots = test_state_roots(&fixture.drivers[0].engine.state);
         for d in &fixture.drivers {
             assert_eq!(d.engine.state.height, 2); assert_eq!(d.engine.state.tip_hash, final_tip); assert_eq!(d.current_round(), 0); assert_eq!(d.current_phase(), RoundPhase::Propose); assert_eq!(d.last_qc_height(), Some(2));
-            let roots = indra_state::compute_state_roots(&d.engine.state);
+            let roots = test_state_roots(&d.engine.state);
             assert_eq!(roots.state_root, canonical_roots.state_root);
             assert_eq!(roots.validator_set_root, canonical_roots.validator_set_root);
             assert!(d.locked_round.is_none() && d.locked_value.is_none() && d.locked_value_hash.is_none() && d.locked_polc_votes.is_empty() && d.valid_round.is_none() && d.valid_value.is_none() && d.valid_proposal.is_none());
@@ -1114,12 +1118,12 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, TEST_CHAIN_ID).unwrap();
         }
         let d0 = &mut fixture.drivers[0];
-        let before_roots = indra_state::compute_state_roots(&d0.engine.state);
+        let before_roots = test_state_roots(&d0.engine.state);
         let before = (d0.engine.state.height, d0.engine.state.tip_hash, before_roots.state_root, before_roots.validator_set_root, d0.last_qc_bytes(), d0.last_qc_height(), d0.current_round(), d0.current_phase(), d0.vote_admission_metrics.qc_formations);
         d0.process(DriverEvent::InboundBlock { from: None, proposal: height1_proposal.unwrap() });
         d0.process(DriverEvent::InboundVote { from: "127.0.0.1:18000".parse().unwrap(), vote: height1_prevote.unwrap() });
         d0.process(DriverEvent::InboundVote { from: "127.0.0.1:18001".parse().unwrap(), vote: height1_precommit.unwrap() });
-        let after_roots = indra_state::compute_state_roots(&d0.engine.state);
+        let after_roots = test_state_roots(&d0.engine.state);
         let after = (d0.engine.state.height, d0.engine.state.tip_hash, after_roots.state_root, after_roots.validator_set_root, d0.last_qc_bytes(), d0.last_qc_height(), d0.current_round(), d0.current_phase(), d0.vote_admission_metrics.qc_formations);
         assert_eq!(before, after);
         assert!(d0.pending_proposal(&height1_hash).is_none() && d0.pending_proposal(&height2_hash).is_none());
@@ -1177,9 +1181,9 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         for i in 0..4 { for j in 0..4 { if i != j { let acts = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",20000+j).parse().unwrap(), vote: pvs[j].clone() }); if let Some(v)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { pcs.push((i,v)); } } } }
         pcs.sort_by_key(|(i,_)|*i);
         for i in 0..4 { for (j,v) in &pcs { if *j != i { fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",21000+j).parse().unwrap(), vote: v.clone() }); } } }
-        let roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
-        for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,recovered_hash); assert_eq!(d.current_round(), 0); assert_eq!(d.current_phase(), RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.block_hash),(1,recovered_hash)); let snap=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&snap,TEST_CHAIN_ID).unwrap(); }
-        let a = &mut fixture.drivers[0]; let before_roots=indra_state::compute_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,before_roots.state_root,before_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19000".parse().unwrap(),vote:votes[0].clone()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19001".parse().unwrap(),vote:partition_nil_precommit.clone().unwrap()}); let after_roots=indra_state::compute_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,after_roots.state_root,after_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after);
+        let roots = test_state_roots(&fixture.drivers[0].engine.state);
+        for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,recovered_hash); assert_eq!(d.current_round(), 0); assert_eq!(d.current_phase(), RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=test_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.block_hash),(1,recovered_hash)); let snap=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&snap,TEST_CHAIN_ID).unwrap(); }
+        let a = &mut fixture.drivers[0]; let before_roots=test_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,before_roots.state_root,before_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19000".parse().unwrap(),vote:votes[0].clone()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:19001".parse().unwrap(),vote:partition_nil_precommit.clone().unwrap()}); let after_roots=test_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,after_roots.state_root,after_roots.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after);
         let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
         let _ = (hash, partition, partition_nil_precommit.clone());
     }
@@ -1224,8 +1228,8 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         let mut votes=Vec::new(); for i in 0..4 { let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}).unwrap(); post_gst_emitted_messages+=1; votes.push((i,v,delivery_step)); }
         let mut pcs=Vec::new(); let delivered_step=delivery_step+1; for (j,v,emitted) in &votes { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if i!=*j { let acts=fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",22000+j).parse().unwrap(),vote:v.clone()}); if let Some(pc)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)}else{None}){post_gst_emitted_messages+=1; pcs.push((i,pc,delivered_step));} } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step;
         pcs.sort_by_key(|(i,_,_)|*i); let delivered_step=delivery_step+1; for (j,v,emitted) in &pcs { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if *j!=i { fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",23000+j).parse().unwrap(),vote:v.clone()}); } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step; assert!(delivery_step > 0); assert_eq!(post_gst_emitted_messages,post_gst_delivered_broadcasts);
-        let roots=indra_state::compute_state_roots(&fixture.drivers[0].engine.state); for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,hash); assert_eq!(d.current_round(),0); assert_eq!(d.current_phase(),RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=indra_state::compute_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.round,qc.block_hash),(1,round,hash)); let s=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&s,TEST_CHAIN_ID).unwrap(); }
-        let a=&mut fixture.drivers[0]; let rb=indra_state::compute_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,rb.state_root,rb.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundBlock{from:None,proposal:delayed_proposal}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24000".parse().unwrap(),vote:old_prevote.unwrap()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24001".parse().unwrap(),vote:old_precommit.unwrap()}); let ra=indra_state::compute_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,ra.state_root,ra.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after); assert!(a.pending_proposal(&_initial_hash).is_none()); assert!(a.locked_round.is_none()&&a.locked_value.is_none()&&a.valid_round.is_none()&&a.valid_value.is_none());
+        let roots=test_state_roots(&fixture.drivers[0].engine.state); for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,hash); assert_eq!(d.current_round(),0); assert_eq!(d.current_phase(),RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=test_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.round,qc.block_hash),(1,round,hash)); let s=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&s,TEST_CHAIN_ID).unwrap(); }
+        let a=&mut fixture.drivers[0]; let rb=test_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,rb.state_root,rb.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundBlock{from:None,proposal:delayed_proposal}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24000".parse().unwrap(),vote:old_prevote.unwrap()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24001".parse().unwrap(),vote:old_precommit.unwrap()}); let ra=test_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,ra.state_root,ra.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after); assert!(a.pending_proposal(&_initial_hash).is_none()); assert!(a.locked_round.is_none()&&a.locked_value.is_none()&&a.valid_round.is_none()&&a.valid_value.is_none());
         let dirs=fixture.dirs; drop(fixture.drivers); for dir in dirs { let _=std::fs::remove_dir_all(dir); }
     }
 
@@ -1665,14 +1669,14 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             });
         }
 
-        let roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let roots = test_state_roots(&fixture.drivers[0].engine.state);
         for driver in &fixture.drivers {
             assert_eq!(driver.engine.state.height, 1);
             assert_eq!(driver.engine.state.tip_hash, committed_hash);
             assert_eq!(driver.current_round(), 0);
             assert_eq!(driver.current_phase(), RoundPhase::Propose);
             assert_eq!(driver.last_qc_height(), Some(1));
-            let driver_roots = indra_state::compute_state_roots(&driver.engine.state);
+            let driver_roots = test_state_roots(&driver.engine.state);
             assert_eq!(driver_roots.state_root, roots.state_root);
             assert_eq!(driver_roots.validator_set_root, roots.validator_set_root);
             let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -1721,7 +1725,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         }
 
         let driver = &mut fixture.drivers[0];
-        let before_roots = indra_state::compute_state_roots(&driver.engine.state);
+        let before_roots = test_state_roots(&driver.engine.state);
         let before = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -1745,7 +1749,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             from: "127.0.0.1:25601".parse().unwrap(),
             vote: old_precommit,
         });
-        let after_roots = indra_state::compute_state_roots(&driver.engine.state);
+        let after_roots = test_state_roots(&driver.engine.state);
         let after = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -2134,14 +2138,14 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             });
         }
 
-        let canonical_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let canonical_roots = test_state_roots(&fixture.drivers[0].engine.state);
         for driver in fixture.drivers.iter().take(3) {
             assert_eq!(driver.engine.state.height, 1);
             assert_eq!(driver.engine.state.tip_hash, proposal_hash);
             assert_eq!(driver.current_round(), 0);
             assert_eq!(driver.current_phase(), RoundPhase::Propose);
             assert_eq!(driver.last_qc_height(), Some(1));
-            let roots = indra_state::compute_state_roots(&driver.engine.state);
+            let roots = test_state_roots(&driver.engine.state);
             assert_eq!(roots.state_root, canonical_roots.state_root);
             assert_eq!(roots.validator_set_root, canonical_roots.validator_set_root);
             let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -2155,7 +2159,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         }
 
         let driver = &mut fixture.drivers[0];
-        let roots_before = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_before = test_state_roots(&driver.engine.state);
         let before = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -2187,7 +2191,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             from: None,
             proposal,
         });
-        let roots_after = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_after = test_state_roots(&driver.engine.state);
         let after = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -2568,14 +2572,14 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             vote: precommits[1].clone().unwrap(),
         });
 
-        let canonical_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let canonical_roots = test_state_roots(&fixture.drivers[0].engine.state);
         for driver in &fixture.drivers {
             assert_eq!(driver.engine.state.height, 1);
             assert_eq!(driver.engine.state.tip_hash, proposal_hash);
             assert_eq!(driver.current_round(), 0);
             assert_eq!(driver.current_phase(), RoundPhase::Propose);
             assert_eq!(driver.last_qc_height(), Some(1));
-            let roots = indra_state::compute_state_roots(&driver.engine.state);
+            let roots = test_state_roots(&driver.engine.state);
             assert_eq!(roots.state_root, canonical_roots.state_root);
             assert_eq!(roots.validator_set_root, canonical_roots.validator_set_root);
             let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -2589,7 +2593,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         }
 
         let driver = &mut fixture.drivers[0];
-        let roots_before = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_before = test_state_roots(&driver.engine.state);
         let before = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -2613,7 +2617,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             from: "127.0.0.1:27602".parse().unwrap(),
             vote: precommit_c,
         });
-        let roots_after = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_after = test_state_roots(&driver.engine.state);
         let after = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -3158,14 +3162,14 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
             });
         }
 
-        let canonical_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let canonical_roots = test_state_roots(&fixture.drivers[0].engine.state);
         for driver in &fixture.drivers {
             assert_eq!(driver.engine.state.height, 1);
             assert_eq!(driver.engine.state.tip_hash, recovery_hash);
             assert_eq!(driver.current_round(), 0);
             assert_eq!(driver.current_phase(), RoundPhase::Propose);
             assert_eq!(driver.last_qc_height(), Some(1));
-            let roots = indra_state::compute_state_roots(&driver.engine.state);
+            let roots = test_state_roots(&driver.engine.state);
             assert_eq!(roots.state_root, canonical_roots.state_root);
             assert_eq!(roots.validator_set_root, canonical_roots.validator_set_root);
             let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -3179,7 +3183,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         }
 
         let driver = &mut fixture.drivers[0];
-        let roots_before = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_before = test_state_roots(&driver.engine.state);
         let before = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -3227,7 +3231,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
                 vote: recovery_precommits[1].clone().unwrap(),
             });
         }
-        let roots_after = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_after = test_state_roots(&driver.engine.state);
         let after = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -4041,7 +4045,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
                 assert_multiseed_chaos_safety(&fixture.drivers);
             }
 
-            let canonical_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+            let canonical_roots = test_state_roots(&fixture.drivers[0].engine.state);
             let snapshot = fixture.drivers[0]
                 .engine
                 .state
@@ -4054,7 +4058,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
                 assert_eq!(driver.current_round(), 0);
                 assert_eq!(driver.current_phase(), RoundPhase::Propose);
                 assert_eq!(driver.last_qc_height(), Some(height));
-                let roots = indra_state::compute_state_roots(&driver.engine.state);
+                let roots = test_state_roots(&driver.engine.state);
                 assert_eq!(roots.state_root, canonical_roots.state_root);
                 assert_eq!(roots.validator_set_root, canonical_roots.validator_set_root);
                 let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -4105,14 +4109,14 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
 
         assert_eq!(committed_hashes.len(), 3);
         let final_tip = committed_hashes[2];
-        let final_roots = indra_state::compute_state_roots(&fixture.drivers[0].engine.state);
+        let final_roots = test_state_roots(&fixture.drivers[0].engine.state);
         for driver in &fixture.drivers {
             assert_eq!(driver.engine.state.height, 3);
             assert_eq!(driver.engine.state.tip_hash, final_tip);
             assert_eq!(driver.current_round(), 0);
             assert_eq!(driver.current_phase(), RoundPhase::Propose);
             assert_eq!(driver.last_qc_height(), Some(3));
-            let roots = indra_state::compute_state_roots(&driver.engine.state);
+            let roots = test_state_roots(&driver.engine.state);
             assert_eq!(roots.state_root, final_roots.state_root);
             assert_eq!(roots.validator_set_root, final_roots.validator_set_root);
             let qc = QuorumCertificateV1::decode_exact(&driver.last_qc_bytes()).unwrap();
@@ -4135,7 +4139,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
         // the seeded state machine and must leave the entire committed identity
         // and QC-formation count unchanged.
         let driver = &mut fixture.drivers[0];
-        let roots_before = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_before = test_state_roots(&driver.engine.state);
         let before = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,
@@ -4180,7 +4184,7 @@ use indra_core::types::primitives::TEST_CHAIN_ID;
                 });
             }
         }
-        let roots_after = indra_state::compute_state_roots(&driver.engine.state);
+        let roots_after = test_state_roots(&driver.engine.state);
         let after = (
             driver.engine.state.height,
             driver.engine.state.tip_hash,

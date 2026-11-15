@@ -266,7 +266,10 @@ fn inspect_path(path: &str) -> Result<(), String> {
     println!("chain_id={}", state.chain_id);
     println!("validator_count={}", state.validators.active_count());
     println!("seed={}", hex::encode(state.election_seed.0));
-    println!("state_root={}", compute_state_root(&state));
+    println!(
+        "state_root={}",
+        compute_state_root(&state).map_err(|error| error.to_string())?
+    );
     println!("snapshot_root={}", snapshot.snapshot_root);
     println!("fingerprint={}", state.genesis_fingerprint);
     println!(

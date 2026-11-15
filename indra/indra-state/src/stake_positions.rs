@@ -790,7 +790,7 @@ mod tests {
             (11, 13)
         );
         let incremental = state.state_commitment_v2.as_ref().unwrap().root();
-        state.rebuild_state_commitment_v2(13);
+        state.rebuild_state_commitment_v2(13).unwrap();
         assert_eq!(
             state.state_commitment_v2.as_ref().unwrap().root(),
             incremental

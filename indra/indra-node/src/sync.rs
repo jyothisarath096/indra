@@ -1123,7 +1123,10 @@ pub(crate) fn project_and_verify_block_state_root(
         })?;
     let epoch_record = outcome.epoch_record;
 
-    let actual_roots = compute_state_roots(&projected);
+    let actual_roots = compute_state_roots(&projected).map_err(|error| NodeError::BlockInvalid {
+        height: block.header.height,
+        reason: format!("state commitment rebuild failed: {error}"),
+    })?;
     if actual_roots.state_root != expected_state_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
@@ -1858,7 +1861,7 @@ mod tests {
         assert_eq!(record.end_height, EPOCH_DURATION_BLOCKS);
         assert_eq!(record.timestamp_secs, timestamp_secs);
         assert_eq!(state.height, EPOCH_DURATION_BLOCKS);
-        assert_eq!(compute_state_root(&state), block.header.state_root);
+        assert_eq!(compute_state_root(&state).unwrap(), block.header.state_root);
     }
 
     #[test]

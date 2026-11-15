@@ -14,7 +14,7 @@ use indra_core::{
 };
 use indra_crypto::sha256;
 
-use crate::ChainState;
+use crate::{error::StateResult, ChainState};
 
 /// Root values computed from the same post-state snapshot.
 ///
@@ -31,15 +31,15 @@ pub struct ComputedStateRoots {
 }
 
 /// Compute the full state root for the given chain state.
-pub fn compute_state_root(state: &ChainState) -> Bytes32 {
-    compute_state_roots(state).state_root
+pub fn compute_state_root(state: &ChainState) -> StateResult<Bytes32> {
+    Ok(compute_state_roots(state)?.state_root)
 }
 
 /// Compute the full state root and the validator/delegation commitment in one
 /// pass.
-pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
+pub fn compute_state_roots(state: &ChainState) -> StateResult<ComputedStateRoots> {
     let utxo_root = state.utxos.root_at_height(state.height);
-    let validator_set_root = compute_validator_set_root(state);
+    let validator_set_root = compute_validator_set_root(state)?;
 
     let chain_id = VariableBytes::<MAX_CHAIN_ID_BYTES>::from_slice(state.chain_id.as_bytes())
         .unwrap_or_default();
@@ -63,19 +63,22 @@ pub fn compute_state_roots(state: &ChainState) -> ComputedStateRoots {
     combined.extend_from_slice(&utxo_root);
     combined.extend_from_slice(&validator_set_root.0);
     combined.extend_from_slice(&metadata_hash);
-    ComputedStateRoots {
+    Ok(ComputedStateRoots {
         state_root: Bytes32::from(sha256(&combined)),
         validator_set_root,
-    }
+    })
 }
 
 /// Compute the validator/delegation commitment.
-pub fn compute_validator_set_root(state: &ChainState) -> Bytes32 {
+pub fn compute_validator_set_root(state: &ChainState) -> StateResult<Bytes32> {
     compute_validator_set_root_at_height(state, state.height)
 }
 
 /// Compute the canonical validator/delegation commitment.
-pub fn compute_validator_set_root_at_height(state: &ChainState, height: u64) -> Bytes32 {
+pub fn compute_validator_set_root_at_height(
+    state: &ChainState,
+    height: u64,
+) -> StateResult<Bytes32> {
     state.state_commitment_v2_root(height)
 }
 
@@ -110,7 +113,7 @@ mod tests {
             )
             .unwrap();
         state.height = 1;
-        state.rebuild_state_commitment_v2(1);
+        state.rebuild_state_commitment_v2(1).unwrap();
         assert_ne!(before, compute_state_root(&state));
         assert_eq!(
             compute_validator_set_root_at_height(&state, 1),
@@ -123,7 +126,7 @@ mod tests {
         let first = ChainState::new_genesis(TEST_CHAIN_ID);
         let mut second = first.clone();
         second.chain_id = "other-chain".to_string();
-        second.rebuild_state_commitment_v2(second.height);
+        second.rebuild_state_commitment_v2(second.height).unwrap();
         assert_ne!(compute_state_root(&first), compute_state_root(&second));
     }
 

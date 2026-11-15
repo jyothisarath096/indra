@@ -572,15 +572,17 @@ impl ChainState {
     }
 
     /// Ensure the derived StateCommitmentV2 cache exists at `height`.
-    pub fn ensure_state_commitment_v2(&mut self, height: u64) {
+    pub fn ensure_state_commitment_v2(&mut self, height: u64) -> crate::error::StateResult<()> {
         if self.state_commitment_v2.is_none() {
-            self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
+            self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height)?);
         }
+        Ok(())
     }
 
     /// Rebuild the derived StateCommitmentV2 cache from canonical state.
-    pub fn rebuild_state_commitment_v2(&mut self, height: u64) {
-        self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height));
+    pub fn rebuild_state_commitment_v2(&mut self, height: u64) -> crate::error::StateResult<()> {
+        self.state_commitment_v2 = Some(StateCommitmentV2::from_state(self, height)?);
+        Ok(())
     }
 
     /// Rebuild and validate the non-canonical position-to-tranche index.
@@ -603,11 +605,12 @@ impl ChainState {
 
     /// Return the StateCommitmentV2 root, rebuilding from canonical state if
     /// this decoded/restarted state does not yet have a warm cache.
-    pub fn state_commitment_v2_root(&self, height: u64) -> Bytes32 {
+    pub fn state_commitment_v2_root(&self, height: u64) -> crate::error::StateResult<Bytes32> {
         self.state_commitment_v2
             .as_ref()
             .map(StateCommitmentV2::root)
-            .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).root())
+            .map(Ok)
+            .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).map(|commitment| commitment.root()))
     }
 
     /// Resolve the one authoritative snapshot for a governed consensus height.
@@ -886,7 +889,7 @@ impl ChainState {
         self.install_consensus_snapshot(snapshot)?;
         self.reward_economic_snapshot = Some(economic);
         self.append_slash_membership_root(membership)?;
-        self.rebuild_state_commitment_v2(1);
+        self.rebuild_state_commitment_v2(1)?;
         Ok(())
     }
 
@@ -2072,7 +2075,7 @@ mod tests {
             validator.status = crate::validator::ValidatorStatus::Slashed;
             validator.slashed_offense_id = Some(Bytes32::from([0xA5; 32]));
         }
-        state.rebuild_state_commitment_v2(10);
+        state.rebuild_state_commitment_v2(10).unwrap();
         state
             .rotate_consensus_snapshot_after_slash(10, &BTreeSet::from([revoked]))
             .unwrap();
@@ -2104,11 +2107,11 @@ mod tests {
             let validator = state.validators.get_mut(&revoked).unwrap();
             validator.status = crate::validator::ValidatorStatus::Slashed;
             validator.slashed_offense_id = Some(Bytes32::from([0x5A; 32]));
-            state.rebuild_state_commitment_v2(299);
+            state.rebuild_state_commitment_v2(299).unwrap();
             state
                 .rotate_consensus_snapshot_after_slash(299, &BTreeSet::from([revoked]))
                 .unwrap();
-            state.rebuild_state_commitment_v2(299);
+            state.rebuild_state_commitment_v2(299).unwrap();
             state
         }
 
@@ -2202,7 +2205,7 @@ mod tests {
                 retained_tranche_ids: Vec::new(),
             },
         );
-        state.rebuild_state_commitment_v2(u64::MAX);
+        state.rebuild_state_commitment_v2(u64::MAX).unwrap();
 
         assert_eq!(state.consensus_snapshots.len(), 2);
         assert_eq!(state.consensus_snapshots[0].activation_height, 901);
@@ -2485,7 +2488,7 @@ mod tests {
             .unwrap();
         reference.height = u64::MAX;
         reference.tip_hash = Bytes32::from([0xF0; 32]);
-        reference.rebuild_state_commitment_v2(reference.height);
+        reference.rebuild_state_commitment_v2(reference.height).unwrap();
 
         // Independently replay the same historical event transcript from
         // genesis rather than cloning the reference state.
@@ -2537,7 +2540,7 @@ mod tests {
         }
         replayed.height = u64::MAX;
         replayed.tip_hash = Bytes32::from([0xF0; 32]);
-        replayed.rebuild_state_commitment_v2(replayed.height);
+        replayed.rebuild_state_commitment_v2(replayed.height).unwrap();
 
         assert_eq!(reference.consensus_snapshots.len(), 2);
         assert_eq!(reference.consensus_snapshots, replayed.consensus_snapshots);

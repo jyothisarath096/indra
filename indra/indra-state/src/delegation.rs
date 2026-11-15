@@ -1053,7 +1053,7 @@ pub(crate) fn commit_tranche_eviction_plan(
         .evicted_validator_tombstones
         .insert(validator_id, plan.tombstone);
     crate::txn::complex_mutation_checkpoint()?;
-    state.rebuild_state_commitment_v2(current_height);
+    state.rebuild_state_commitment_v2(current_height)?;
     crate::txn::complex_mutation_checkpoint()?;
     Ok(())
 }
@@ -3163,7 +3163,7 @@ mod tests {
         );
 
         let incremental_root = state.state_commitment_v2_root(release_height);
-        state.rebuild_state_commitment_v2(release_height);
+        state.rebuild_state_commitment_v2(release_height).unwrap();
         assert_eq!(
             state.state_commitment_v2_root(release_height),
             incremental_root

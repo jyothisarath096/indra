@@ -57,7 +57,7 @@ impl RpcEngineView for PublishedView {
     fn blocks_retained(&self) -> usize {
         self.read.blocks_retained()
     }
-    fn state_root(&self) -> Bytes32 {
+    fn state_root(&self) -> Result<Bytes32, String> {
         self.read.state_root()
     }
     fn get_block_by_height(&self, height: u64) -> Result<Option<BlockVNext>, String> {

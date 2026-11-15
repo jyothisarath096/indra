@@ -607,7 +607,7 @@ impl NodeEngine {
         Ok(Self {
             config,
             state,
-            rpc_snapshot,
+            rpc_snapshot: rpc_snapshot.map_err(|detail| NodeError::InvalidConfiguration { detail })?,
             mempool,
             staking_mempool: Vec::new(),
             governance_mempool: Vec::new(),
@@ -1632,7 +1632,10 @@ impl NodeEngine {
                 let manifest = ChainManifest {
                     committed_height: projected_state.height,
                     committed_block_hash: projected_state.tip_hash,
-                    state_root: indra_state::compute_state_root(projected_state),
+                    state_root: indra_state::compute_state_root(projected_state)
+                        .map_err(|error| NodeError::InvalidConfiguration {
+                            detail: error.to_string(),
+                        })?,
                     snapshot_height: state_store.latest_snapshot_height()?.unwrap_or(0),
                     block_log_next_height,
                     last_qc_height,
@@ -1657,7 +1660,8 @@ impl NodeEngine {
             !self.block_store.is_archive(),
             self.block_store.lowest_height(),
             self.block_store.len(),
-        );
+        )
+        .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
         Ok(())
     }
 
@@ -1675,7 +1679,11 @@ impl NodeEngine {
         let manifest = ChainManifest {
             committed_height: self.state.height,
             committed_block_hash: self.state.tip_hash,
-            state_root: indra_state::compute_state_root(&self.state),
+            state_root: indra_state::compute_state_root(&self.state).map_err(|error| {
+                NodeError::InvalidConfiguration {
+                    detail: error.to_string(),
+                }
+            })?,
             snapshot_height: self.state_store.latest_snapshot_height()?.unwrap_or(0),
             block_log_next_height: self.block_store.next_height(),
             last_qc_height,
@@ -1844,7 +1852,11 @@ fn validate_manifest_if_present(
             }
             .into());
         }
-        let state_root = indra_state::compute_state_root(state);
+        let state_root = indra_state::compute_state_root(state).map_err(|error| {
+            NodeError::InvalidConfiguration {
+                detail: error.to_string(),
+            }
+        })?;
         if state_root != manifest.state_root {
             return Err(indra_storage::StorageError::ManifestMismatch {
                 detail: "state root does not match manifest".into(),
@@ -3826,7 +3838,7 @@ mod tests {
         assert_eq!(manifest.committed_block_hash, engine.state.tip_hash);
         assert_eq!(
             manifest.state_root,
-            indra_state::compute_state_root(&engine.state)
+            indra_state::compute_state_root(&engine.state).unwrap()
         );
         assert_eq!(
             manifest.block_log_next_height,
