@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -149,12 +150,12 @@ pub fn start_hardened_observer_rpc(
     trusted_tls_proxy: bool,
     engine: Arc<Mutex<NodeEngine>>,
     metrics: Arc<MetricsState>,
-) {
+) -> Option<JoinHandle<()>> {
     if !observer_bind_allowed(&addr, trusted_tls_proxy) {
         eprintln!(
             "[observer-rpc] refusing non-loopback bind without trusted TLS proxy acknowledgement"
         );
-        return;
+        return None;
     }
     let (publisher, storage) = match engine.lock() {
         Ok(engine) => (
@@ -166,12 +167,12 @@ pub fn start_hardened_observer_rpc(
         ),
         Err(_) => {
             eprintln!("[observer-rpc] engine lock poisoned before startup");
-            return;
+            return None;
         }
     };
     let limiter_telemetry = Arc::new(RpcLimiterTelemetry::default());
     metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry));
-    std::thread::spawn(move || {
+    Some(std::thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(listener) => listener,
             Err(error) => {
@@ -258,7 +259,7 @@ pub fn start_hardened_observer_rpc(
                     .fetch_sub(1, Ordering::Relaxed);
             });
         }
-    });
+    }))
 }
 
 fn observer_bind_allowed(addr: &str, trusted_tls_proxy: bool) -> bool {

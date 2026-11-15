@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -64,6 +64,7 @@ struct Request {
 pub struct NetworkQcVerifier {
     sender: mpsc::SyncSender<Request>,
     expensive_verifications: Arc<AtomicU64>,
+    worker_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl NetworkQcVerifier {
@@ -72,11 +73,18 @@ impl NetworkQcVerifier {
         let (sender, receiver) = mpsc::sync_channel::<Request>(NETWORK_QC_QUEUE_CAPACITY);
         let expensive_verifications = Arc::new(AtomicU64::new(0));
         let worker_count = Arc::clone(&expensive_verifications);
-        std::thread::spawn(move || worker(receiver, &worker_count));
+        let worker_handle = std::thread::spawn(move || worker(receiver, &worker_count));
         Self {
             sender,
             expensive_verifications,
+            worker_handle: Arc::new(Mutex::new(Some(worker_handle))),
         }
+    }
+
+    /// Take ownership of the verifier worker so the node supervisor can
+    /// treat an unexpected worker exit as process-fatal.
+    pub fn take_worker_handle(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.worker_handle.lock().ok()?.take()
     }
 
     /// Queue and await one network-sourced QC verification result.
@@ -159,5 +167,36 @@ fn worker(receiver: mpsc::Receiver<Request>, expensive_verifications: &AtomicU64
             }
         }
         let _ = request.response.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supervisor::{CriticalTaskOutcome, CriticalTasks};
+
+    #[test]
+    fn qc_worker_exit_is_reported_as_task_exit() {
+        let verifier = NetworkQcVerifier::new();
+        let handle = verifier.take_worker_handle().expect("worker handle");
+        drop(verifier);
+        let mut tasks = CriticalTasks::new();
+        tasks.adopt("network-qc-verifier", handle);
+        let outcome = loop {
+            match tasks.try_recv() {
+                Ok(outcome) => break outcome,
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("supervisor disconnected")
+                }
+            }
+        };
+        assert_eq!(
+            outcome,
+            CriticalTaskOutcome::TaskExited {
+                name: "network-qc-verifier".into(),
+                reason: "returned".into()
+            }
+        );
     }
 }

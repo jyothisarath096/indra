@@ -89,6 +89,35 @@ impl CriticalTasks {
         self.handles.push((name, handle));
     }
 
+    /// Adopt an already-spawned critical task and report its termination.
+    pub fn adopt(&mut self, name: impl Into<String>, handle: JoinHandle<()>) {
+        let name = name.into();
+        let task_name = name.clone();
+        let tx = self.tx.clone();
+        let watcher_name = format!("{name}-watcher");
+        let watcher = thread::Builder::new()
+            .name(watcher_name.clone())
+            .spawn(move || {
+                let reason = match handle.join() {
+                    Ok(()) => "returned".to_string(),
+                    Err(payload) => panic_reason(payload),
+                };
+                if let Err(error) = tx.send(critical_task_decision(false, &task_name, reason)) {
+                    eprintln!("[supervisor] failed to report adopted task exit: {error}");
+                }
+            });
+        match watcher {
+            Ok(watcher) => self.handles.push((watcher_name, watcher)),
+            Err(error) => {
+                let _ = self.tx.send(critical_task_decision(
+                    false,
+                    &name,
+                    format!("watcher start failed: {error}"),
+                ));
+            }
+        }
+    }
+
     /// Receive an unexpected task stop, if one has occurred.
     pub fn try_recv(&self) -> Result<CriticalTaskOutcome, mpsc::TryRecvError> {
         self.rx.try_recv()
@@ -145,6 +174,27 @@ mod tests {
         assert_eq!(
             critical_task_decision(true, "consensus", "returned"),
             CriticalTaskOutcome::Shutdown
+        );
+    }
+
+    #[test]
+    fn adopted_task_exit_is_reported() {
+        let mut tasks = CriticalTasks::new();
+        let handle = thread::spawn(|| {});
+        tasks.adopt("writer", handle);
+        let outcome = loop {
+            match tasks.try_recv() {
+                Ok(outcome) => break outcome,
+                Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
+                Err(mpsc::TryRecvError::Disconnected) => panic!("supervisor disconnected"),
+            }
+        };
+        assert_eq!(
+            outcome,
+            CriticalTaskOutcome::TaskExited {
+                name: "writer".into(),
+                reason: "returned".into()
+            }
         );
     }
 }

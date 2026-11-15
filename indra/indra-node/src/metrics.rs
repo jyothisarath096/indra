@@ -27,6 +27,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{ConsensusDriver, NodeEngine};
@@ -253,7 +254,7 @@ pub fn start_metrics_server(
     connected_validator_peers: Arc<AtomicUsize>,
     data_dir: String,
     version: String,
-) {
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(listener) => listener,
@@ -307,7 +308,7 @@ pub fn start_metrics_server(
                 Err(e) => eprintln!("[metrics] accept error: {}", e),
             }
         }
-    });
+    })
 }
 
 /// Start a Prometheus metrics server for observer nodes.
@@ -319,7 +320,7 @@ pub fn start_observer_metrics_server(
     last_block_timestamp: Arc<AtomicU64>,
     data_dir: String,
     version: String,
-) {
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(listener) => listener,
@@ -370,7 +371,7 @@ pub fn start_observer_metrics_server(
                 Err(e) => eprintln!("[metrics] accept error: {}", e),
             }
         }
-    });
+    })
 }
 
 #[derive(Debug)]

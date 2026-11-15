@@ -148,20 +148,23 @@ async fn run() -> Result<(), String> {
     let metrics_state = Arc::new(MetricsState::new());
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
     let observer_count = Arc::new(AtomicUsize::new(0));
+    let mut critical_tasks = indra_node::supervisor::CriticalTasks::new();
 
-    indra_node::hardened_read_rpc::start_hardened_observer_rpc(
+    if let Some(handle) = indra_node::hardened_read_rpc::start_hardened_observer_rpc(
         rpc_addr.clone(),
         cfg_file.rpc_trusted_tls_proxy == Some(true),
         Arc::clone(&engine),
         Arc::clone(&metrics_state),
-    );
+    ) {
+        critical_tasks.adopt("observer-rpc", handle);
+    }
     eprintln!("[observer] rpc listening on {}", rpc_addr);
     if let Some(addr) = observer_addr {
         start_observer_reserve(&addr, Arc::clone(&engine), Arc::clone(&observer_count));
         eprintln!("[observer] re-serving observer port on {}", addr);
     }
     if let Some(addr) = metrics_addr {
-        indra_node::start_observer_metrics_server(
+        let handle = indra_node::start_observer_metrics_server(
             addr,
             Arc::clone(&engine),
             Arc::clone(&observer_count),
@@ -170,11 +173,17 @@ async fn run() -> Result<(), String> {
             data_dir.to_string_lossy().to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         );
+        critical_tasks.adopt("observer-metrics-listener", handle);
     }
 
     let mut backoff = Duration::from_secs(2);
     let mut peer_index = 0usize;
     loop {
+        if let Ok(indra_node::supervisor::CriticalTaskOutcome::TaskExited { name, reason }) =
+            critical_tasks.try_recv()
+        {
+            return Err(format!("critical observer task {name} exited: {reason}"));
+        }
         let peer = &connect_peers[peer_index % connect_peers.len()];
         peer_index = peer_index.saturating_add(1);
         match connect_and_sync(

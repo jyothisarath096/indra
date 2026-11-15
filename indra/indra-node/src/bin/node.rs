@@ -19,6 +19,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::available_space;
+use futures_util::FutureExt;
 use indra_core::codec::Encode;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
@@ -87,6 +88,30 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic with non-string payload".to_string()
+    }
+}
+
+fn run_isolated_handler<F>(component: &str, metrics: &MetricsState, handler: F) -> bool
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(handler) {
+        Ok(()) => true,
+        Err(payload) => {
+            eprintln!("[{component}] handler panicked: {}", panic_reason(payload));
+            metrics.record_handler_panic(component);
+            false
+        }
+    }
 }
 
 fn write_sync_recovery_diagnostic(data_dir: &Path, height: u64, tip_hash: indra_core::Bytes32) {
@@ -1839,7 +1864,8 @@ fn start_observer_runtime(
     observer_addr: String,
     driver: Arc<Mutex<ConsensusDriver>>,
     observer_count: Arc<AtomicUsize>,
-) {
+    metrics: Arc<MetricsState>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = TokioRuntimeBuilder::new_multi_thread()
             .enable_all()
@@ -1870,23 +1896,30 @@ fn start_observer_runtime(
                 };
                 let driver = Arc::clone(&driver);
                 let observer_count = Arc::clone(&observer_count);
+                let metrics = Arc::clone(&metrics);
                 let mut block_rx = block_tx.subscribe();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_observer_connection(
+                    let result = std::panic::AssertUnwindSafe(handle_observer_connection(
                         stream,
                         addr,
                         driver,
                         observer_count,
                         &mut block_rx,
-                    )
-                    .await
-                    {
-                        eprintln!("[observer] connection {} closed: {}", addr, e);
+                    ))
+                    .catch_unwind()
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("[observer] connection {} closed: {}", addr, e),
+                        Err(payload) => {
+                            eprintln!("[observer] handler panicked for {}: {}", addr, panic_reason(payload));
+                            metrics.record_handler_panic("observer");
+                        }
                     }
                 });
             }
-        });
-    });
+        })
+    })
 }
 
 async fn observer_block_poller(
@@ -2471,6 +2504,9 @@ fn main() {
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
     let op_relay_seen = Arc::new(Mutex::new(InboundDedupCaches::new()));
     let mut critical_tasks = indra_node::supervisor::CriticalTasks::new();
+    if let Some(handle) = driver.lock().unwrap().engine.network_qc_verifier().take_worker_handle() {
+        critical_tasks.adopt("network-qc-verifier", handle);
+    }
     let (gossip, discovered_peers, authenticated_peer_addrs, peer_sources, network_events) =
         start_network_runtime(
             p2p_addr.clone(),
@@ -2487,10 +2523,16 @@ fn main() {
             &mut critical_tasks,
         );
     if let Some(addr) = observer_addr {
-        start_observer_runtime(addr, Arc::clone(&driver), Arc::clone(&observer_count));
+        let handle = start_observer_runtime(
+            addr,
+            Arc::clone(&driver),
+            Arc::clone(&observer_count),
+            Arc::clone(&metrics_state),
+        );
+        critical_tasks.adopt("observer-runtime", handle);
     }
     if let Some(addr) = metrics_addr {
-        indra_node::start_metrics_server(
+        let handle = indra_node::start_metrics_server(
             addr,
             Arc::clone(&driver),
             Arc::clone(&observer_count),
@@ -2500,6 +2542,7 @@ fn main() {
             data_dir.clone(),
             env!("CARGO_PKG_VERSION").to_string(),
         );
+        critical_tasks.adopt("metrics-listener", handle);
     }
 
     // ── Thread 3: Authenticated network event loop ──────────────────────────
@@ -3746,7 +3789,7 @@ fn main() {
         let rpc_addr = get_arg("--rpc-addr")
             .or_else(|| cfg_file.rpc_addr.clone())
             .unwrap_or_else(|| "127.0.0.1:8545".to_string());
-        spawn_rpc_listener(
+        let handle = spawn_rpc_listener(
             "rpc",
             rpc_addr,
             indra_rpc::handlers::RpcMode::Full,
@@ -3769,6 +3812,7 @@ fn main() {
                 .filter(|token| !token.trim().is_empty()),
             Arc::clone(&metrics_state),
         );
+        critical_tasks.adopt("full-rpc-listener", handle);
     } else {
         eprintln!("[rpc] RPC server disabled by config");
     }
@@ -3779,7 +3823,7 @@ fn main() {
             .clone()
             .filter(|addr| !addr.trim().is_empty())
             .unwrap_or_else(|| "127.0.0.1:8547".to_string());
-        spawn_rpc_listener(
+        let handle = spawn_rpc_listener(
             "rpc-public",
             rpc_public_addr,
             indra_rpc::handlers::RpcMode::ReadOnly,
@@ -3796,6 +3840,7 @@ fn main() {
             None,
             Arc::clone(&metrics_state),
         );
+        critical_tasks.adopt("public-rpc-listener", handle);
     }
 
     // ── Main thread: status printer ─────────────────────────────────────────
@@ -4495,7 +4540,7 @@ fn spawn_rpc_listener(
     admin_token: Option<String>,
     access_token: Option<String>,
     metrics: Arc<MetricsState>,
-) {
+) -> std::thread::JoinHandle<()> {
     let rpc_cors_origins = Arc::new(cors_origins);
     let admin_token = Arc::new(admin_token);
     let access_token = Arc::new(access_token);
@@ -4578,7 +4623,7 @@ fn spawn_rpc_listener(
                     let metrics = Arc::clone(&metrics);
                     let policy = Arc::clone(&policy);
                     std::thread::spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let completed = run_isolated_handler(label, &metrics, || {
                             handle_rpc(
                                 stream,
                                 &driver_rpc,
@@ -4603,10 +4648,9 @@ fn spawn_rpc_listener(
                                 &metrics,
                                 &limiter_telemetry,
                             );
-                        }));
-                        if result.is_err() {
+                        });
+                        if !completed {
                             eprintln!("[{label}] handler panicked for {:?}", peer_ip);
-                            metrics.record_handler_panic(label);
                         }
                         if let Some(ip) = peer_ip {
                             match rpc_ip_connections.lock() {
@@ -4630,7 +4674,7 @@ fn spawn_rpc_listener(
                 Err(e) => eprintln!("[{}] accept error: {}", label, e),
             }
         }
-    });
+    })
 }
 
 fn reserve_rpc_ip_connection(counts: &mut HashMap<IpAddr, u64>, ip: IpAddr, cap: u64) -> bool {
@@ -5781,6 +5825,15 @@ fn decode_node_rpc_transaction(
 mod tests {
     use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+
+    #[test]
+    fn full_rpc_handler_panic_is_counted_and_next_handler_runs() {
+        let metrics = MetricsState::new();
+        assert!(!run_isolated_handler("full_rpc", &metrics, || panic!("test panic")));
+        assert!(run_isolated_handler("full_rpc", &metrics, || {}));
+        let counts = metrics.handler_panics_total.lock().unwrap();
+        assert_eq!(counts.get("full_rpc"), Some(&1));
+    }
 
     fn test_manifest(chain_id: &str, entries: &[([u8; 32], [u8; 32], [u8; 32])]) -> String {
         use indra_core::types::staking::StakingOp;
