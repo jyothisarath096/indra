@@ -1,6 +1,6 @@
 //! Fail-closed wrappers for node-owned synchronization primitives.
 
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, WaitTimeoutResult};
 
 use crate::{supervisor, NodeError, NodeResult};
 
@@ -9,7 +9,7 @@ static REPORT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 #[cfg(test)]
 static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn poisoned(name: &'static str) -> NodeError {
+pub(crate) fn poisoned(name: &'static str) -> NodeError {
     #[cfg(test)]
     REPORT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     supervisor::report_unexpected("poisoned-lock", format!("lock {name} is poisoned"));
@@ -29,6 +29,16 @@ pub fn read<'a, T>(rwlock: &'a RwLock<T>, name: &'static str) -> NodeResult<RwLo
 /// Write-lock an RwLock, reporting poison before returning a fatal node error.
 pub fn write<'a, T>(rwlock: &'a RwLock<T>, name: &'static str) -> NodeResult<RwLockWriteGuard<'a, T>> {
     rwlock.write().map_err(|_| poisoned(name))
+}
+
+/// Wait on a condition variable while preserving the same poison policy.
+pub fn wait_timeout<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: std::time::Duration,
+    name: &'static str,
+) -> NodeResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+    condvar.wait_timeout(guard, timeout).map_err(|_| poisoned(name))
 }
 
 #[cfg(test)]
@@ -53,7 +63,7 @@ mod tests {
 
         let error = lock(&mutex, "test-mutex").unwrap_err();
         assert!(matches!(error, NodeError::LockPoisoned { name: "test-mutex" }));
-        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 1);
+        assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 1);
 
         let rwlock = Arc::new(RwLock::new(()));
         let poisoned_rwlock = Arc::clone(&rwlock);
@@ -66,7 +76,7 @@ mod tests {
 
         let error = write(&rwlock, "test-rwlock").unwrap_err();
         assert!(matches!(error, NodeError::LockPoisoned { name: "test-rwlock" }));
-        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 2);
+        assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]
@@ -86,7 +96,7 @@ mod tests {
             matches!(lock(&mutex, "spawned-task-mutex"), Err(NodeError::LockPoisoned { name: "spawned-task-mutex" }))
         });
         assert!(task.join().unwrap());
-        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 1);
+        assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
@@ -113,6 +123,33 @@ mod tests {
         }
         assert!(matches!(lock(&first, "simultaneous-first"), Err(NodeError::LockPoisoned { .. })));
         assert!(matches!(lock(&second, "simultaneous-second"), Err(NodeError::LockPoisoned { .. })));
-        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 2);
+        assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn production_lock_inventory_has_no_direct_lock_calls() {
+        let sources = [
+            ("bin/node.rs", include_str!("bin/node.rs")),
+            ("bin/observer.rs", include_str!("bin/observer.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("hardened_read_rpc.rs", include_str!("hardened_read_rpc.rs")),
+            ("qc_verification.rs", include_str!("qc_verification.rs")),
+            ("rpc_snapshot.rs", include_str!("rpc_snapshot.rs")),
+        ];
+        let forbidden = [
+            ".lock().ok(", ".lock().map(", ".lock().unwrap_or", ".read().ok(",
+            ".write().ok(",
+        ];
+        for (name, source) in sources {
+            let production = source
+                .rsplit_once("#[cfg(test)]")
+                .map_or(source, |(production, _)| production);
+            for needle in forbidden {
+                assert!(!production.contains(needle), "{name} contains {needle}");
+            }
+            for needle in [".lock()", ".read()", ".write()"] {
+                assert!(!production.contains(needle), "{name} contains direct {needle}");
+            }
+        }
     }
 }

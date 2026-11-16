@@ -208,7 +208,9 @@ where
     tokio::spawn(async move {
         if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
             eprintln!("[{component}] handler panicked: {}", panic_reason(payload));
-            metrics.record_handler_panic(component);
+            if let Err(error) = metrics.record_handler_panic(component) {
+                eprintln!("[{component}] failed to record handler panic: {error}");
+            }
         }
     })
 }

@@ -10,6 +10,7 @@ use indra_core::types::{
     stake_position::{StakePositionV1, UnbondingTrancheV1},
 };
 use indra_state::{compute_state_root, ChainState, PersistentOrdMap};
+use crate::{locks, NodeResult, NodeError};
 
 /// Dedicated append-independent storage readers used by historical RPCs.
 #[derive(Clone)]
@@ -290,12 +291,10 @@ impl RpcSnapshotPublisher {
     }
 
     /// Obtain a consistent snapshot without touching the consensus mutex.
-    pub fn load(&self) -> Arc<RpcReadSnapshot> {
-        let snapshot = self
-            .current
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(&snapshot)
+    pub fn load(&self) -> NodeResult<Arc<RpcReadSnapshot>> {
+        let snapshot = locks::read(&self.current, "rpc-snapshot.current")
+            ?;
+        Ok(Arc::clone(&snapshot))
     }
 
     /// Build and publish the state following a successful canonical commit.
@@ -306,18 +305,17 @@ impl RpcSnapshotPublisher {
         pruned_mode: bool,
         lowest_block: u64,
         blocks_retained: usize,
-    ) -> Result<(), String> {
+    ) -> NodeResult<()> {
         let next = Arc::new(RpcReadSnapshot::build(
             state,
             Arc::clone(&self.mempool_size),
             pruned_mode,
             lowest_block,
             blocks_retained,
-        )?);
-        let mut current = self
-            .current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        )
+        .map_err(NodeError::RpcSnapshot)?);
+        let mut current = locks::write(&self.current, "rpc-snapshot.current")
+            ?;
         *current = next;
         self.mempool_size.store(mempool_size, Ordering::Relaxed);
         Ok(())
@@ -332,8 +330,8 @@ impl RpcSnapshotPublisher {
         pruned_mode: bool,
         lowest_block: u64,
         blocks_retained: usize,
-    ) -> Result<(), String> {
-        let previous = self.load();
+    ) -> NodeResult<()> {
+        let previous = self.load()?;
         let next = Arc::new(RpcReadSnapshot::build_incremental(
             &previous,
             state,
@@ -342,11 +340,10 @@ impl RpcSnapshotPublisher {
             pruned_mode,
             lowest_block,
             blocks_retained,
-        )?);
-        *self
-            .current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        )
+        .map_err(NodeError::RpcSnapshot)?);
+        *locks::write(&self.current, "rpc-snapshot.current")
+            ? = next;
         self.mempool_size.store(mempool_size, Ordering::Relaxed);
         Ok(())
     }
@@ -582,17 +579,31 @@ mod tests {
     fn publication_is_prior_or_new_and_never_torn() {
         let old = ChainState::new_genesis(TEST_CHAIN_ID);
         let publisher = RpcSnapshotPublisher::new(&old, 0, false, 0, 0).unwrap();
-        let held_old = publisher.load();
+        let held_old = publisher.load().unwrap();
         let mut new = old.clone();
         new.height = 7;
         new.base_fee = 99;
         publisher.publish(&new, 0, false, 0, 0).unwrap();
-        let held_new = publisher.load();
+        let held_new = publisher.load().unwrap();
         assert_eq!(
             (held_old.height(), held_old.chain.base_fee),
             (0, old.base_fee)
         );
         assert_eq!((held_new.height(), held_new.chain.base_fee), (7, 99));
+    }
+
+    #[test]
+    fn poisoned_snapshot_is_not_served_as_current_or_replaced() {
+        let state = ChainState::new_genesis(TEST_CHAIN_ID);
+        let publisher = RpcSnapshotPublisher::new(&state, 0, false, 0, 0).unwrap();
+        let slot = Arc::clone(&publisher.current);
+        let _ = std::thread::spawn(move || {
+            let _guard = slot.write().unwrap();
+            panic!("poison snapshot slot");
+        })
+        .join();
+        assert!(publisher.load().is_err());
+        assert!(publisher.publish(&state, 0, false, 0, 0).is_err());
     }
 
     #[test]
@@ -610,7 +621,7 @@ mod tests {
             .position_tranche_capacity_changed_for
             .insert(position_id);
         publisher.publish_with_effects(&after, &effects, 0, false, 0, 0).unwrap();
-        assert_eq!(publisher.load().indexes, build_indexes(&after));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes(&after));
     }
 
     #[test]
@@ -632,7 +643,7 @@ mod tests {
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.stake_positions_changed.insert(changed_position_id);
         publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
-        assert_eq!(publisher.load().indexes, build_indexes(&state));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
 
         let removed_position_id = position_ids[1];
         let removed_tranche_id = *state
@@ -646,13 +657,13 @@ mod tests {
             .position_tranche_capacity_changed_for
             .insert(removed_position_id);
         publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
-        assert_eq!(publisher.load().indexes, build_indexes(&state));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
 
         state.stake_positions.remove(&removed_position_id);
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.stake_positions_changed.insert(removed_position_id);
         publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
-        assert_eq!(publisher.load().indexes, build_indexes(&state));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
     }
 
     /// Real-scale benchmark requested by the Segment 6 review. Run explicitly
@@ -690,7 +701,7 @@ mod tests {
             "rpc snapshot structural-cap benchmark: incremental_median={incremental_median:?} full_median={full_median:?} incremental_samples={incremental:?} full_samples={full:?} positions={COUNT} tranches={COUNT}"
         );
         assert!(incremental_median < full_median);
-        assert_eq!(publisher.load().indexes, build_indexes(&state));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
     }
 
     #[test]
@@ -734,6 +745,6 @@ mod tests {
             "rpc snapshot dominant-validator incremental benchmark: median={:?} samples={samples:?} positions={COUNT} tranches={COUNT}",
             samples[samples.len() / 2]
         );
-        assert_eq!(publisher.load().indexes, build_indexes_bulk(&state));
+        assert_eq!(publisher.load().unwrap().indexes, build_indexes_bulk(&state));
     }
 }

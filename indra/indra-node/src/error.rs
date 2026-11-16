@@ -157,6 +157,10 @@ pub enum NodeError {
         /// Stable name assigned to the poisoned lock.
         name: &'static str,
     },
+
+    /// The published RPC snapshot could not be loaded or updated.
+    #[error("RPC snapshot error: {0}")]
+    RpcSnapshot(String),
 }
 
 /// Convenience alias.

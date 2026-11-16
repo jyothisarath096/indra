@@ -30,7 +30,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{ConsensusDriver, NodeEngine};
+use crate::{locks, ConsensusDriver, NodeEngine, NodeResult};
 
 /// Default Prometheus metrics endpoint for validator/full nodes.
 pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9615";
@@ -47,6 +47,9 @@ pub enum MetricsError {
     /// The monetary schedule did not provide a reward for the next height.
     #[error("metrics reward unavailable: {0}")]
     RewardUnavailable(String),
+    /// A shared metrics lock was poisoned.
+    #[error("metrics lock poisoned: {0}")]
+    LockPoisoned(&'static str),
 }
 
 /// Shared metrics state for cumulative values.
@@ -142,17 +145,14 @@ impl MetricsState {
     }
 
     /// Register one listener-owned limiter gauge source.
-    pub fn register_rpc_limiter_telemetry(&self, telemetry: Arc<RpcLimiterTelemetry>) {
-        self.rpc_limiter_telemetry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub fn register_rpc_limiter_telemetry(&self, telemetry: Arc<RpcLimiterTelemetry>) -> NodeResult<()> {
+        locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?
             .push(telemetry);
+        Ok(())
     }
 
-    fn rpc_limiter_totals(&self) -> (u64, u64) {
-        self.rpc_limiter_telemetry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn rpc_limiter_totals(&self) -> NodeResult<(u64, u64)> {
+        Ok(locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?
             .iter()
             .map(|telemetry| telemetry.load())
             .fold((0u64, 0u64), |(entries, evictions), current| {
@@ -160,15 +160,15 @@ impl MetricsState {
                     entries.saturating_add(current.0),
                     evictions.saturating_add(current.1),
                 )
-            })
+            }))
     }
 
     /// Record a panic that was isolated to a listener or connection handler.
-    pub fn record_handler_panic(&self, component: &str) {
-        if let Ok(mut counts) = self.handler_panics_total.lock() {
-            let count = counts.entry(component.to_string()).or_default();
-            *count = count.saturating_add(1);
-        }
+    pub fn record_handler_panic(&self, component: &str) -> NodeResult<()> {
+        let mut counts = locks::lock(&self.handler_panics_total, "metrics.handler_panics_total")?;
+        let count = counts.entry(component.to_string()).or_default();
+        *count = count.saturating_add(1);
+        Ok(())
     }
 
     /// Count a verified sync response that arrived after its provisional slot was cleared.
@@ -226,18 +226,17 @@ pub fn render_metrics(
     version: &str,
 ) -> Result<String, MetricsError> {
     let snapshot = {
-        let Ok(d) = driver.lock() else {
-            return Ok("# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string());
-        };
+        let d = locks::lock(driver, "metrics.consensus_driver")
+            .map_err(|_| MetricsError::LockPoisoned("metrics.consensus_driver"))?;
         MetricsSnapshot::from_driver(&d, connected_validator_peers, observer_count)?
     };
-    Ok(render_snapshot(
+    render_snapshot(
         snapshot,
         metrics_state,
         last_block_timestamp,
         data_dir,
         version,
-    ))
+    )
 }
 
 /// Render observer-node metrics from a standalone node engine.
@@ -250,18 +249,17 @@ pub fn render_observer_metrics(
     version: &str,
 ) -> Result<String, MetricsError> {
     let snapshot = {
-        let Ok(engine) = engine.lock() else {
-            return Ok("# HELP indra_metrics_lock_error Metrics lock failure\n# TYPE indra_metrics_lock_error gauge\nindra_metrics_lock_error 1\n".to_string());
-        };
+        let engine = locks::lock(engine, "metrics.node_engine")
+            .map_err(|_| MetricsError::LockPoisoned("metrics.node_engine"))?;
         MetricsSnapshot::from_engine(&engine, 0, observer_count, 0, true, 0)?
     };
-    Ok(render_snapshot(
+    render_snapshot(
         snapshot,
         metrics_state,
         last_block_timestamp,
         data_dir,
         version,
-    ))
+    )
 }
 
 /// Start a Prometheus metrics server for validator/full nodes.
@@ -321,7 +319,9 @@ pub fn start_metrics_server(
                         }));
                         if result.is_err() {
                             eprintln!("[metrics] handler panicked");
-                            metrics_state.record_handler_panic("metrics");
+                            if let Err(error) = metrics_state.record_handler_panic("metrics") {
+                                eprintln!("[metrics] failed to record handler panic: {error}");
+                            }
                         }
                     });
                 }
@@ -384,7 +384,9 @@ pub fn start_observer_metrics_server(
                         }));
                         if result.is_err() {
                             eprintln!("[metrics] observer handler panicked");
-                            metrics_state.record_handler_panic("observer-metrics");
+                            if let Err(error) = metrics_state.record_handler_panic("observer-metrics") {
+                                eprintln!("[metrics] failed to record handler panic: {error}");
+                            }
                         }
                     });
                 }
@@ -511,10 +513,14 @@ fn render_snapshot(
     last_block_timestamp: &AtomicU64,
     data_dir: &str,
     version: &str,
-) -> String {
+) -> Result<String, MetricsError> {
     let mut buf = String::new();
-    let (rpc_limiter_entries, rpc_limiter_evictions) = metrics_state.rpc_limiter_totals();
-    if let Ok(panics) = metrics_state.handler_panics_total.lock() {
+    let (rpc_limiter_entries, rpc_limiter_evictions) = metrics_state
+        .rpc_limiter_totals()
+        .map_err(|_| MetricsError::LockPoisoned("metrics.rpc_limiter_telemetry"))?;
+    let panics = locks::lock(&metrics_state.handler_panics_total, "metrics.handler_panics_total")
+        .map_err(|_| MetricsError::LockPoisoned("metrics.handler_panics_total"))?;
+    {
         let _ = writeln!(
             buf,
             "# HELP indra_handler_panics_total Isolated handler panics by component\n# TYPE indra_handler_panics_total counter"
@@ -816,7 +822,7 @@ fn render_snapshot(
         escape_label_value(&snapshot.validator_id_hex),
         snapshot.is_validator
     );
-    buf
+    Ok(buf)
 }
 
 fn write_http_metrics(mut stream: TcpStream, body: &str) -> std::io::Result<()> {
@@ -1135,7 +1141,7 @@ mod tests {
         metrics.rpc_active_connections.store(3, Ordering::Relaxed);
         let limiter = Arc::new(RpcLimiterTelemetry::default());
         limiter.update(11, 0);
-        metrics.register_rpc_limiter_telemetry(limiter);
+        metrics.register_rpc_limiter_telemetry(limiter).unwrap();
         metrics
             .rpc_invalid_tx_validation_total
             .store(2, Ordering::Relaxed);
@@ -1166,13 +1172,13 @@ mod tests {
         let metrics = MetricsState::new();
         let full = Arc::new(RpcLimiterTelemetry::default());
         let public = Arc::new(RpcLimiterTelemetry::default());
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&full));
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&public));
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&full)).unwrap();
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&public)).unwrap();
         full.update(7, 2);
         public.update(5, 3);
-        assert_eq!(metrics.rpc_limiter_totals(), (12, 5));
+        assert_eq!(metrics.rpc_limiter_totals().unwrap(), (12, 5));
         full.update(4, 4);
-        assert_eq!(metrics.rpc_limiter_totals(), (9, 7));
+        assert_eq!(metrics.rpc_limiter_totals().unwrap(), (9, 7));
     }
 
     #[test]
@@ -1182,8 +1188,8 @@ mod tests {
         let metrics = MetricsState::new();
         let full = Arc::new(RpcLimiterTelemetry::default());
         let public = Arc::new(RpcLimiterTelemetry::default());
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&full));
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&public));
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&full)).unwrap();
+        metrics.register_rpc_limiter_telemetry(Arc::clone(&public)).unwrap();
 
         let barrier = Arc::new(Barrier::new(9));
         let mut workers = Vec::new();
@@ -1210,6 +1216,6 @@ mod tests {
         // aggregate exact regardless of every racing update that preceded it.
         full.update(41, 101);
         public.update(59, 202);
-        assert_eq!(metrics.rpc_limiter_totals(), (100, 303));
+        assert_eq!(metrics.rpc_limiter_totals().unwrap(), (100, 303));
     }
 }

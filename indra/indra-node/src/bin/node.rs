@@ -135,7 +135,9 @@ where
         Ok(()) => true,
         Err(payload) => {
             eprintln!("[{component}] handler panicked: {}", panic_reason(payload));
-            metrics.record_handler_panic(component);
+            if let Err(error) = metrics.record_handler_panic(component) {
+                eprintln!("[{component}] failed to record handler panic: {error}");
+            }
             false
         }
     }
@@ -189,39 +191,26 @@ impl RpcSemaphore {
         }
     }
 
-    fn acquire_until(&self, deadline: Instant) -> Option<RpcPermit<'_>> {
-        let mut available = match self.available.lock() {
-            Ok(available) => available,
-            Err(_) => {
-                indra_node::supervisor::report_unexpected(
-                    "rpc-semaphore",
-                    "lock rpc semaphore is poisoned",
-                );
-                return None;
-            }
-        };
+    fn acquire_until(&self, deadline: Instant) -> indra_node::NodeResult<Option<RpcPermit<'_>>> {
+        let mut available = indra_node::locks::lock(&self.available, "rpc-semaphore")?;
         loop {
             if *available > 0 {
                 *available -= 1;
-                return Some(RpcPermit { semaphore: self });
+                return Ok(Some(RpcPermit { semaphore: self }));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return None;
+                return Ok(None);
             }
-            let (next, timeout) = match self.changed.wait_timeout(available, remaining) {
-                Ok(result) => result,
-                Err(_) => {
-                    indra_node::supervisor::report_unexpected(
-                        "rpc-semaphore",
-                        "lock rpc semaphore is poisoned while waiting",
-                    );
-                    return None;
-                }
-            };
+            let (next, timeout) = indra_node::locks::wait_timeout(
+                &self.changed,
+                available,
+                remaining,
+                "rpc-semaphore",
+            )?;
             available = next;
             if timeout.timed_out() {
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -233,15 +222,12 @@ struct RpcPermit<'a> {
 
 impl Drop for RpcPermit<'_> {
     fn drop(&mut self) {
-        match self.semaphore.available.lock() {
+        match indra_node::locks::lock(&self.semaphore.available, "rpc-semaphore") {
             Ok(mut available) => {
                 *available = available.saturating_add(1);
                 self.semaphore.changed.notify_one();
             }
-            Err(_) => indra_node::supervisor::report_unexpected(
-                "rpc-semaphore",
-                "lock rpc semaphore is poisoned while releasing",
-            ),
+            Err(error) => indra_node::supervisor::terminate_fatal("rpc-semaphore", error),
         }
     }
 }
@@ -2652,7 +2638,7 @@ fn run() -> indra_node::NodeResult<()> {
     if let Some(handle) = locks::lock(&driver, "main.driver.network_qc_verifier")?
         .engine
         .network_qc_verifier()
-        .take_worker_handle()
+        .take_worker_handle()?
     {
         critical_tasks.adopt("network-qc-verifier", handle);
     }
@@ -4070,7 +4056,7 @@ fn run() -> indra_node::NodeResult<()> {
                 .clone()
                 .filter(|token| !token.trim().is_empty()),
             Arc::clone(&metrics_state),
-        );
+        )?;
         critical_tasks.adopt("full-rpc-listener", handle);
     } else {
         eprintln!("[rpc] RPC server disabled by config");
@@ -4098,7 +4084,7 @@ fn run() -> indra_node::NodeResult<()> {
             None,
             None,
             Arc::clone(&metrics_state),
-        );
+        )?;
         critical_tasks.adopt("public-rpc-listener", handle);
     }
 
@@ -4833,7 +4819,7 @@ fn spawn_rpc_listener(
     admin_token: Option<String>,
     access_token: Option<String>,
     metrics: Arc<MetricsState>,
-) -> std::thread::JoinHandle<()> {
+) -> indra_node::NodeResult<std::thread::JoinHandle<()>> {
     let rpc_cors_origins = Arc::new(cors_origins);
     let admin_token = Arc::new(admin_token);
     let access_token = Arc::new(access_token);
@@ -4850,10 +4836,11 @@ fn spawn_rpc_listener(
     let expensive_semaphore = Arc::new(RpcSemaphore::new(MAX_CONCURRENT_EXPENSIVE_RPC));
     let rejection_counters = Arc::new(RpcRejectionCounters::default());
     let limiter_telemetry = Arc::new(RpcLimiterTelemetry::default());
-    metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry));
+    metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry))
+        .map_err(|_| indra_node::NodeError::LockPoisoned { name: "metrics.rpc_limiter_telemetry" })?;
     eprintln!("[{}] listening on {} ({:?})", label, rpc_addr, mode);
 
-    std::thread::spawn(move || {
+    Ok(std::thread::spawn(move || {
         let listener = match std::net::TcpListener::bind(&rpc_addr) {
             Ok(l) => l,
             Err(e) => {
@@ -4874,13 +4861,10 @@ fn spawn_rpc_listener(
                     }
                     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
                     if let Some(ip) = peer_ip {
-                        let mut counts = match rpc_ip_connections.lock() {
+                        let mut counts = match indra_node::locks::lock(&rpc_ip_connections, "rpc-ip-state") {
                             Ok(counts) => counts,
                             Err(error) => {
-                                indra_node::supervisor::report_unexpected(
-                                    "rpc-ip-state",
-                                    format!("per-IP connection mutex poisoned for {ip}: {error}"),
-                                );
+                                eprintln!("[{label}] rejecting connection after lock failure: {error}");
                                 eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
                                 release_rpc_connection(&rpc_conn_count);
                                 drop(stream);
@@ -4950,7 +4934,7 @@ fn spawn_rpc_listener(
                             eprintln!("[{label}] handler panicked for {:?}", peer_ip);
                         }
                         if let Some(ip) = peer_ip {
-                            match rpc_ip_connections.lock() {
+                            match indra_node::locks::lock(&rpc_ip_connections, "rpc-ip-state") {
                                 Ok(mut counts) => {
                                     if let Some(count) = counts.get_mut(&ip) {
                                         *count = count.saturating_sub(1);
@@ -4960,10 +4944,7 @@ fn spawn_rpc_listener(
                                     }
                                 }
                                 Err(error) => {
-                                    indra_node::supervisor::report_unexpected(
-                                        "rpc-ip-state",
-                                        format!("per-IP connection mutex poisoned during cleanup for {ip}: {error}"),
-                                    );
+                                    eprintln!("[{label}] connection cleanup failed: {error}");
                                     eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned during cleanup for {ip}");
                                 }
                             }
@@ -4977,7 +4958,7 @@ fn spawn_rpc_listener(
                 Err(e) => eprintln!("[{}] accept error: {}", label, e),
             }
         }
-    })
+    }))
 }
 
 fn reserve_rpc_ip_connection(counts: &mut HashMap<IpAddr, u64>, ip: IpAddr, cap: u64) -> bool {
@@ -5104,7 +5085,7 @@ fn snapshot_rpc_state(
     storage: &indra_node::rpc_snapshot::RpcStorageReadHandles,
     req: &indra_rpc::types::RpcRequest,
 ) -> Result<RpcSnapshot, String> {
-    let read = publisher.load();
+    let read = publisher.load().map_err(|error| error.to_string())?;
     let block_heights = requested_block_heights_for_rpc(req, read.chain_state());
     let needs_epoch_storage = matches!(
         req.method.as_str(),
@@ -5242,11 +5223,17 @@ fn dispatch_public_light_method(
     }
     match method {
         "indra_getHeight" => {
-            let snapshot = publisher.load();
+            let snapshot = match publisher.load() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Some(Err(indra_rpc::RpcError::Internal(error.to_string()))),
+            };
             Some(Ok(format!(r#"{{"height":{}}}"#, snapshot.height())))
         }
         "indra_getTip" => {
-            let snapshot = publisher.load();
+            let snapshot = match publisher.load() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Some(Err(indra_rpc::RpcError::Internal(error.to_string()))),
+            };
             Some(Ok(format!(
                 r#"{{"height":{},"tip_hash":"{}"}}"#,
                 snapshot.chain_state().height,
@@ -5254,7 +5241,10 @@ fn dispatch_public_light_method(
             )))
         }
         "indra_getMempoolSize" => {
-            let snapshot = publisher.load();
+            let snapshot = match publisher.load() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Some(Err(indra_rpc::RpcError::Internal(error.to_string()))),
+            };
             Some(Ok(format!(r#"{{"size":{}}}"#, snapshot.mempool_size())))
         }
         "indra_getPeers" => Some(Ok(format!(
@@ -5573,7 +5563,7 @@ fn handle_rpc(
 
     if req.method == "indra_getSyncDiagnostics" {
         let lock_started = Instant::now();
-        let diagnostic = match driver.lock() {
+        let diagnostic = match indra_node::locks::lock(driver, "rpc-driver.diagnostics") {
             Ok(guard) => {
                 metrics.rpc_lock_wait_micros_total.fetch_add(
                     lock_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
@@ -5589,10 +5579,7 @@ fn handle_rpc(
                 diagnostic
             }
             Err(error) => {
-                indra_node::supervisor::report_unexpected(
-                    "rpc-driver",
-                    format!("lock consensus driver is poisoned: {error}"),
-                );
+                eprintln!("[rpc] diagnostics request failed closed: {error}");
                 let body = RpcResponse::err(
                     req.id.clone(),
                     -32000,
@@ -5645,8 +5632,8 @@ fn handle_rpc(
             return;
         }
         match expensive_semaphore.acquire_until(read_deadline) {
-            Some(permit) => Some(permit),
-            None => {
+            Ok(Some(permit)) => Some(permit),
+            Ok(None) => {
                 rejection_counters
                     .expensive_method_limited
                     .fetch_add(1, Ordering::Relaxed);
@@ -5656,6 +5643,12 @@ fn handle_rpc(
                     "expensive RPC concurrency limit exceeded".to_string(),
                 )
                 .to_json();
+                send_http(&stream, &cors, &body, metrics);
+                return;
+            }
+            Err(error) => {
+                eprintln!("[rpc-semaphore] request failed closed: {error}");
+                let body = RpcResponse::err(req.id.clone(), -32000, error.to_string()).to_json();
                 send_http(&stream, &cors, &body, metrics);
                 return;
             }
@@ -5904,13 +5897,9 @@ fn handle_rpc(
                             });
                         match submit_result {
                             Ok(tx_id) => {
-                                let mut cache = match op_relay_seen.lock() {
+                                let mut cache = match indra_node::locks::lock(&op_relay_seen, "rpc.op_relay_seen") {
                                     Ok(cache) => cache,
                                     Err(_) => {
-                                        indra_node::supervisor::report_unexpected(
-                                            "rpc-relay",
-                                            "lock op_relay_seen is poisoned",
-                                        );
                                         return send_http(
                                             &stream,
                                             &cors,
@@ -5983,13 +5972,8 @@ fn lock_driver_for_rpc<'a>(
     metrics: &MetricsState,
 ) -> Result<std::sync::MutexGuard<'a, indra_node::driver::ConsensusDriver>, String> {
     let started = Instant::now();
-    let result = driver.lock().map_err(|_| {
-        indra_node::supervisor::report_unexpected(
-            "rpc-driver",
-            "lock consensus driver is poisoned",
-        );
-        "consensus driver lock poisoned".to_string()
-    });
+    let result = indra_node::locks::lock(driver, "rpc-driver")
+        .map_err(|error| error.to_string());
     metrics.rpc_lock_wait_micros_total.fetch_add(
         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         Ordering::Relaxed,
@@ -7947,10 +7931,11 @@ mod tests {
         let permits: Vec<_> = (0..4)
             .map(|_| semaphore.acquire_until(deadline).unwrap())
             .collect();
-        assert!(semaphore.acquire_until(Instant::now()).is_none());
+        assert!(semaphore.acquire_until(Instant::now()).unwrap().is_none());
         drop(permits);
         assert!(semaphore
             .acquire_until(Instant::now() + Duration::from_millis(10))
+            .unwrap()
             .is_some());
     }
 
@@ -7961,7 +7946,7 @@ mod tests {
         let snapshot = RpcSnapshot {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 3, false, 0, 43)
                 .unwrap()
-                .load(),
+                .load().unwrap(),
             requested_blocks: HashMap::new(),
             latest_epoch: None,
             epoch_records: HashMap::new(),
@@ -8086,7 +8071,7 @@ mod tests {
                 &chain, 0, true, 126_677, 50_000,
             )
             .unwrap()
-            .load(),
+            .load().unwrap(),
             requested_blocks: HashMap::from([(height, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
@@ -8156,7 +8141,7 @@ mod tests {
         };
         let expected_hash = hex::encode(block.header.block_hash().0);
         let snapshot = RpcSnapshot {
-            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).unwrap().load(),
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).unwrap().load().unwrap(),
             requested_blocks: HashMap::from([(1, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),

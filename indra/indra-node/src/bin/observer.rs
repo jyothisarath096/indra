@@ -276,7 +276,7 @@ async fn serve_observer_peer(
     .await
     .map_err(|e| e.to_string())?;
     let mut stream = result.stream;
-    write_message(&mut stream, &local_status(&engine)).await?;
+    write_message(&mut stream, &local_status(&engine)?).await?;
     loop {
         let frame = read_frame_plain(&mut stream)
             .await
@@ -288,7 +288,8 @@ async fn serve_observer_peer(
                 to_height,
             } => {
                 let blocks = {
-                    let mut engine = engine.lock().map_err(|_| "engine lock poisoned")?;
+                    let mut engine = indra_node::locks::lock(&engine, "observer-client.engine")
+                        .map_err(|error| error.to_string())?;
                     let end = to_height.min(
                         from_height
                             .saturating_add(SYNC_BATCH_SIZE)
@@ -334,7 +335,7 @@ async fn connect_and_sync(
     let mut stream = result.stream;
     eprintln!("[observer] connected to {}", peer);
 
-    let status = local_status(&engine);
+    let status = local_status(&engine)?;
     write_message(&mut stream, &status).await?;
     let mut ping_interval = tokio::time::interval(Duration::from_secs(OBSERVER_PING_INTERVAL_SECS));
     let mut last_pong = std::time::Instant::now();
@@ -342,8 +343,8 @@ async fn connect_and_sync(
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
-                write_message(&mut stream, &local_status(&engine)).await?;
-                write_message(&mut stream, &Message::Ping(local_height(&engine))).await?;
+                write_message(&mut stream, &local_status(&engine)?).await?;
+                write_message(&mut stream, &Message::Ping(local_height(&engine)?)).await?;
                 if last_pong.elapsed() > Duration::from_secs(OBSERVER_PING_INTERVAL_SECS + OBSERVER_PONG_TIMEOUT_SECS) {
                     return Err("pong timeout".to_string());
                 }
@@ -353,7 +354,7 @@ async fn connect_and_sync(
                 let msg = Message::decode_wire(&frame).map_err(|e| e.to_string())?;
                 match msg {
                     Message::Status { height, .. } => {
-                        let local = local_height(&engine);
+                        let local = local_height(&engine)?;
                         if height > local {
                             eprintln!("[observer] syncing: height {} -> {}", local, height);
                             request_blocks(&mut stream, local.saturating_add(1), height).await?;
@@ -371,7 +372,7 @@ async fn connect_and_sync(
                                 &last_block_timestamp,
                             )?;
                         }
-                        let local = local_height(&engine);
+                        let local = local_height(&engine)?;
                         request_blocks(&mut stream, local.saturating_add(1), local.saturating_add(SYNC_BATCH_SIZE)).await?;
                     }
                     Message::Pong(_) => {
@@ -419,9 +420,8 @@ fn import_observer_block(
     metrics_state: &MetricsState,
     last_block_timestamp: &AtomicU64,
 ) -> Result<(), String> {
-    let mut engine = engine
-        .lock()
-        .map_err(|_| "engine lock poisoned".to_string())?;
+    let mut engine = indra_node::locks::lock(engine, "observer-import.engine")
+        .map_err(|error| error.to_string())?;
     let height = proposal.block.header.height;
     if height <= engine.height() {
         return Ok(());
@@ -441,17 +441,20 @@ fn import_observer_block(
     Ok(())
 }
 
-fn local_status(engine: &Arc<Mutex<NodeEngine>>) -> Message {
-    let engine = engine.lock().unwrap();
-    Message::Status {
+fn local_status(engine: &Arc<Mutex<NodeEngine>>) -> Result<Message, String> {
+    let engine = indra_node::locks::lock(engine, "observer-local-status.engine")
+        .map_err(|error| error.to_string())?;
+    Ok(Message::Status {
         height: engine.height(),
         tip_hash: engine.state.tip_hash,
         round: 0,
-    }
+    })
 }
 
-fn local_height(engine: &Arc<Mutex<NodeEngine>>) -> u64 {
-    engine.lock().map(|engine| engine.height()).unwrap_or(0)
+fn local_height(engine: &Arc<Mutex<NodeEngine>>) -> Result<u64, String> {
+    Ok(indra_node::locks::lock(engine, "observer-local-height.engine")
+        .map_err(|error| error.to_string())?
+        .height())
 }
 
 async fn write_message(stream: &mut tokio::net::TcpStream, msg: &Message) -> Result<(), String> {

@@ -1680,8 +1680,7 @@ impl NodeEngine {
             !self.block_store.is_archive(),
             self.block_store.lowest_height(),
             self.block_store.len(),
-        )
-        .map_err(|detail| NodeError::InvalidConfiguration { detail })?;
+        )?;
         Ok(())
     }
 

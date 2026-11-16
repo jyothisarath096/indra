@@ -110,21 +110,28 @@ struct Semaphore {
 }
 
 impl Semaphore {
-    fn acquire(&self, deadline: Instant) -> Option<Permit<'_>> {
-        let mut available = self.available.lock().ok()?;
+    fn acquire(&self, deadline: Instant) -> Result<Option<Permit<'_>>, String> {
+        let mut available = crate::locks::lock(&self.available, "observer-rpc.semaphore")
+            .map_err(|error| error.to_string())?;
         while *available == 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return None;
+                return Ok(None);
             }
-            let (next, timed) = self.changed.wait_timeout(available, remaining).ok()?;
+            let (next, timed) = crate::locks::wait_timeout(
+                &self.changed,
+                available,
+                remaining,
+                "observer-rpc.semaphore",
+            )
+            .map_err(|error| error.to_string())?;
             available = next;
             if timed.timed_out() {
-                return None;
+                return Ok(None);
             }
         }
         *available -= 1;
-        Some(Permit { semaphore: self })
+        Ok(Some(Permit { semaphore: self }))
     }
 }
 
@@ -134,9 +141,12 @@ struct Permit<'a> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut available) = self.semaphore.available.lock() {
-            *available = available.saturating_add(1);
-            self.semaphore.changed.notify_one();
+        match crate::locks::lock(&self.semaphore.available, "observer-rpc.semaphore") {
+            Ok(mut available) => {
+                *available = available.saturating_add(1);
+                self.semaphore.changed.notify_one();
+            }
+            Err(error) => crate::supervisor::terminate_fatal("observer-rpc.semaphore", error),
         }
     }
 }
@@ -157,7 +167,7 @@ pub fn start_hardened_observer_rpc(
         );
         return None;
     }
-    let (publisher, storage) = match engine.lock() {
+    let (publisher, storage) = match crate::locks::lock(&engine, "observer-rpc.engine") {
         Ok(engine) => (
             engine.rpc_snapshot.clone(),
             crate::rpc_snapshot::RpcStorageReadHandles {
@@ -165,13 +175,16 @@ pub fn start_hardened_observer_rpc(
                 epochs: engine.epoch_store.read_handle(),
             },
         ),
-        Err(_) => {
-            eprintln!("[observer-rpc] engine lock poisoned before startup");
+        Err(error) => {
+            eprintln!("[observer-rpc] engine lock failed before startup: {error}");
             return None;
         }
     };
     let limiter_telemetry = Arc::new(RpcLimiterTelemetry::default());
-    metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry));
+    if let Err(error) = metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry)) {
+        eprintln!("[observer-rpc] metrics registration failed: {error}");
+        return None;
+    }
     Some(std::thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(listener) => listener,
@@ -243,16 +256,21 @@ pub fn start_hardened_observer_rpc(
                 }));
                 if result.is_err() {
                     eprintln!("[observer-rpc] handler panicked for {ip}");
-                    metrics.record_handler_panic("observer-rpc");
+                    if let Err(error) = metrics.record_handler_panic("observer-rpc") {
+                        eprintln!("[observer-rpc] failed to record handler panic: {error}");
+                    }
                 }
                 total.fetch_sub(1, Ordering::AcqRel);
-                if let Ok(mut counts) = per_ip_connections.lock() {
-                    if let Some(count) = counts.get_mut(&ip) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            counts.remove(&ip);
+                match crate::locks::lock(&per_ip_connections, "observer-rpc.per_ip_connections") {
+                    Ok(mut counts) => {
+                        if let Some(count) = counts.get_mut(&ip) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                counts.remove(&ip);
+                            }
                         }
                     }
+                    Err(error) => eprintln!("[observer-rpc] connection cleanup failed: {error}"),
                 }
                 metrics
                     .rpc_active_connections
@@ -283,10 +301,10 @@ fn try_reserve_ip_connection(
     ip: IpAddr,
     cap: u64,
 ) -> bool {
-    let mut counts = match counts.lock() {
+    let mut counts = match crate::locks::lock(counts, "observer-rpc.per_ip_connections") {
         Ok(counts) => counts,
         Err(_) => {
-            eprintln!("[observer-rpc] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
+            eprintln!("[observer-rpc] per-IP connection mutex failed for {ip}; rejecting connection");
             total.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
@@ -373,7 +391,9 @@ fn handle(
             write_raw(&stream, &rpc_rate_limited_response(), metrics);
             return;
         }
-        let Some(permit) = expensive.acquire(deadline) else {
+        let permit = match expensive.acquire(deadline) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
             write_json_error(
                 &stream,
                 -32029,
@@ -381,12 +401,24 @@ fn handle(
                 metrics,
             );
             return;
+            }
+            Err(error) => {
+                write_json_error(&stream, -32000, &error, metrics);
+                return;
+            }
         };
         Some(permit)
     } else {
         None
     };
-    let view = match build_view(storage, publisher.load(), &req) {
+    let read = match publisher.load() {
+        Ok(read) => read,
+        Err(error) => {
+            write_json_error(&stream, -32000, &error.to_string(), metrics);
+            return;
+        }
+    };
+    let view = match build_view(storage, read, &req) {
         Ok(view) => view,
         Err(error) => {
             write_json_error(&stream, -32000, &error, metrics);

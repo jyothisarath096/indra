@@ -16,6 +16,8 @@ use indra_core::types::{
     qc::{verify_qc_against_snapshot, QcVerificationError, QuorumCertificateV1},
 };
 
+use crate::{locks, NodeResult};
+
 /// Failure returned by the network-only QC scheduler.
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkQcVerificationError {
@@ -83,8 +85,8 @@ impl NetworkQcVerifier {
 
     /// Take ownership of the verifier worker so the node supervisor can
     /// treat an unexpected worker exit as process-fatal.
-    pub fn take_worker_handle(&self) -> Option<std::thread::JoinHandle<()>> {
-        self.worker_handle.lock().ok()?.take()
+    pub fn take_worker_handle(&self) -> NodeResult<Option<std::thread::JoinHandle<()>>> {
+        Ok(locks::lock(&self.worker_handle, "network-qc-verifier.worker_handle")?.take())
     }
 
     /// Queue and await one network-sourced QC verification result.
@@ -178,13 +180,21 @@ mod tests {
     #[test]
     fn qc_worker_exit_is_reported_as_task_exit() {
         let verifier = NetworkQcVerifier::new();
-        let handle = verifier.take_worker_handle().expect("worker handle");
+        let handle = verifier.take_worker_handle().unwrap().expect("worker handle");
         drop(verifier);
         let mut tasks = CriticalTasks::new();
         tasks.adopt("network-qc-verifier", handle);
         let outcome = loop {
             match tasks.try_recv() {
-                Ok(outcome) => break outcome,
+                Ok(outcome) => {
+                    if matches!(
+                        &outcome,
+                        CriticalTaskOutcome::TaskExited { name, reason }
+                            if name == "network-qc-verifier" && reason == "returned"
+                    ) {
+                        break outcome;
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     panic!("supervisor disconnected")
@@ -198,5 +208,20 @@ mod tests {
                 reason: "returned".into()
             }
         );
+    }
+
+    #[test]
+    fn poisoned_worker_handle_is_not_reported_as_absent() {
+        let verifier = NetworkQcVerifier::new();
+        let slot = Arc::clone(&verifier.worker_handle);
+        let _ = std::thread::spawn(move || {
+            let _guard = slot.lock().unwrap();
+            panic!("poison worker handle slot");
+        })
+        .join();
+        assert!(matches!(
+            verifier.take_worker_handle(),
+            Err(crate::NodeError::LockPoisoned { name: "network-qc-verifier.worker_handle" })
+        ));
     }
 }
