@@ -20,7 +20,6 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::available_space;
-use futures_util::FutureExt;
 use indra_core::codec::Encode;
 use indra_core::types::primitives::{
     DEFAULT_PRUNE_KEEP_BLOCKS, DISK_CRITICAL_THRESHOLD_BYTES, DISK_WARN_THRESHOLD_BYTES,
@@ -90,6 +89,32 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn wait_for_shutdown_signal() -> indra_node::NodeResult<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+            detail: format!("failed to install SIGTERM handler: {error}"),
+        })?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|error| indra_node::NodeError::InvalidConfiguration {
+                detail: format!("failed to receive SIGINT: {error}"),
+            }),
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+                detail: format!("failed to receive shutdown signal: {error}"),
+            })
+    }
 }
 
 fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -165,7 +190,16 @@ impl RpcSemaphore {
     }
 
     fn acquire_until(&self, deadline: Instant) -> Option<RpcPermit<'_>> {
-        let mut available = self.available.lock().ok()?;
+        let mut available = match self.available.lock() {
+            Ok(available) => available,
+            Err(_) => {
+                indra_node::supervisor::report_unexpected(
+                    "rpc-semaphore",
+                    "lock rpc semaphore is poisoned",
+                );
+                return None;
+            }
+        };
         loop {
             if *available > 0 {
                 *available -= 1;
@@ -175,7 +209,16 @@ impl RpcSemaphore {
             if remaining.is_zero() {
                 return None;
             }
-            let (next, timeout) = self.changed.wait_timeout(available, remaining).ok()?;
+            let (next, timeout) = match self.changed.wait_timeout(available, remaining) {
+                Ok(result) => result,
+                Err(_) => {
+                    indra_node::supervisor::report_unexpected(
+                        "rpc-semaphore",
+                        "lock rpc semaphore is poisoned while waiting",
+                    );
+                    return None;
+                }
+            };
             available = next;
             if timeout.timed_out() {
                 return None;
@@ -190,9 +233,15 @@ struct RpcPermit<'a> {
 
 impl Drop for RpcPermit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut available) = self.semaphore.available.lock() {
-            *available = available.saturating_add(1);
-            self.semaphore.changed.notify_one();
+        match self.semaphore.available.lock() {
+            Ok(mut available) => {
+                *available = available.saturating_add(1);
+                self.semaphore.changed.notify_one();
+            }
+            Err(_) => indra_node::supervisor::report_unexpected(
+                "rpc-semaphore",
+                "lock rpc semaphore is poisoned while releasing",
+            ),
         }
     }
 }
@@ -682,9 +731,14 @@ fn broadcast_locally_accepted_op(
     msg: Message,
 ) {
     if let Some(key) = op_relay_key(&msg) {
-        if let Ok(mut seen) = op_relay_seen.lock() {
-            seen.mark_operation(key, Instant::now());
-        }
+        let mut seen = match locks::lock(op_relay_seen, "network.op_relay_seen.local") {
+            Ok(seen) => seen,
+            Err(error) => {
+                indra_node::supervisor::report_unexpected("network-relay", error.to_string());
+                return;
+            }
+        };
+        seen.mark_operation(key, Instant::now());
     }
     gossip.broadcast(&msg);
 }
@@ -696,11 +750,14 @@ fn rebroadcast_inbound_accepted_op(
     msg: Message,
 ) {
     if let Some(key) = op_relay_key(&msg) {
-        if let Ok(mut seen) = op_relay_seen.lock() {
-            seen.mark_operation(key, Instant::now());
-        } else {
-            return;
-        }
+        let mut seen = match locks::lock(op_relay_seen, "network.op_relay_seen.rebroadcast") {
+            Ok(seen) => seen,
+            Err(error) => {
+                indra_node::supervisor::report_unexpected("network-relay", error.to_string());
+                return;
+            }
+        };
+        seen.mark_operation(key, Instant::now());
     }
     gossip.broadcast_except(origin, &msg);
 }
@@ -1230,8 +1287,7 @@ fn start_network_runtime(
                 Ok(guard) => guard,
                 Err(error) => {
                     eprintln!("[p2p] lock failure ({}) : {}", $name, error);
-                    indra_node::supervisor::report_unexpected("p2p-runtime", error.to_string());
-                    std::process::exit(1);
+                    indra_node::supervisor::terminate_fatal("p2p-runtime", error);
                 }
             }
         }};
@@ -1242,8 +1298,7 @@ fn start_network_runtime(
                 Ok(guard) => guard,
                 Err(error) => {
                     eprintln!("[p2p] lock failure ({}) : {}", $name, error);
-                    indra_node::supervisor::report_unexpected("p2p-runtime", error.to_string());
-                    std::process::exit(1);
+                    indra_node::supervisor::terminate_fatal("p2p-runtime", error);
                 }
             }
         }};
@@ -1856,7 +1911,8 @@ fn start_network_runtime(
                     let peers_file_path = peers_file_path.clone();
                     let local_p2p_addr = p2p_addr.clone();
                     async move {
-                        if tokio::signal::ctrl_c().await.is_ok() {
+                        eprintln!("[shutdown] watcher ready");
+                        if wait_for_shutdown_signal().await.is_ok() {
                             let peers_to_save = peer_addresses_to_persist(
                                 &*fatal_lock!(discovered_peers, "network.discovered_peers.shutdown"),
                                 &*fatal_lock!(peer_addrs, "network.peer_addrs.shutdown"),
@@ -1923,7 +1979,7 @@ fn start_observer_runtime(
 
             let (block_tx, _) =
                 tokio::sync::broadcast::channel::<indra_core::types::block::BlockProposalVNext>(64);
-            tokio::spawn(observer_block_poller(Arc::clone(&driver), block_tx.clone()));
+            indra_node::supervisor::spawn_critical("observer-block-poller", observer_block_poller(Arc::clone(&driver), block_tx.clone()));
 
             loop {
                 let (stream, addr) = match listener.accept().await {
@@ -1937,23 +1993,17 @@ fn start_observer_runtime(
                 let observer_count = Arc::clone(&observer_count);
                 let metrics = Arc::clone(&metrics);
                 let mut block_rx = block_tx.subscribe();
-                tokio::spawn(async move {
-                    let result = std::panic::AssertUnwindSafe(handle_observer_connection(
+                indra_node::supervisor::spawn_connection("observer", Arc::clone(&metrics), async move {
+                    match handle_observer_connection(
                         stream,
                         addr,
                         driver,
                         observer_count,
+                        Arc::clone(&metrics),
                         &mut block_rx,
-                    ))
-                    .catch_unwind()
-                    .await;
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => eprintln!("[observer] connection {} closed: {}", addr, e),
-                        Err(payload) => {
-                            eprintln!("[observer] handler panicked for {}: {}", addr, panic_reason(payload));
-                            metrics.record_handler_panic("observer");
-                        }
+                    ).await {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("[observer] connection {} closed: {}", addr, e),
                     }
                 });
             }
@@ -1993,6 +2043,7 @@ async fn handle_observer_connection(
     addr: SocketAddr,
     driver: Arc<Mutex<ConsensusDriver>>,
     observer_count: Arc<AtomicUsize>,
+    metrics: Arc<MetricsState>,
     block_rx: &mut tokio::sync::broadcast::Receiver<indra_core::types::block::BlockProposalVNext>,
 ) -> indra_network::NetworkResult<()> {
     let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL).await?;
@@ -2018,7 +2069,7 @@ async fn handle_observer_connection(
     let mut request_blocks_limiter =
         TokenBucket::new(OBSERVER_REQUEST_BLOCKS_RATE, OBSERVER_REQUEST_BLOCKS_BURST);
 
-    let writer_task = tokio::spawn(async move {
+    let writer_task = indra_node::supervisor::spawn_connection("observer-writer", Arc::clone(&metrics), async move {
         while let Some(msg) = write_rx.recv().await {
             if write_message_plain(&mut writer, &msg).await.is_err() {
                 break;
@@ -2177,7 +2228,39 @@ where
     write_frame_plain(writer, &wire[4..]).await
 }
 
+macro_rules! supervised_lock {
+    ($mutex:expr, $name:literal) => {{
+        match locks::lock(&$mutex, $name) {
+            Ok(guard) => guard,
+            Err(error) => {
+                indra_node::supervisor::report_unexpected("node-task", error.to_string());
+                return;
+            }
+        }
+    }};
+}
+
+macro_rules! supervised_read {
+    ($rwlock:expr, $name:literal) => {{
+        match locks::read(&$rwlock, $name) {
+            Ok(guard) => guard,
+            Err(error) => {
+                indra_node::supervisor::report_unexpected("node-task", error.to_string());
+                return;
+            }
+        }
+    }};
+}
+
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("ERROR: {error}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(1);
+    }
+}
+
+fn run() -> indra_node::NodeResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let get_arg = |flag: &str| -> Option<String> {
         args.iter()
@@ -2187,11 +2270,11 @@ fn main() {
     };
     if args.iter().any(|arg| arg == "--init") {
         run_init();
-        return;
+        return Ok(());
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_help();
-        return;
+        return Ok(());
     }
     let config_path = get_arg("--config");
     let mut cfg_file = if let Some(ref path) = config_path {
@@ -2566,7 +2649,11 @@ fn main() {
     let last_block_timestamp = Arc::new(AtomicU64::new(0));
     let op_relay_seen = Arc::new(Mutex::new(InboundDedupCaches::new()));
     let mut critical_tasks = indra_node::supervisor::CriticalTasks::new();
-    if let Some(handle) = driver.lock().unwrap().engine.network_qc_verifier().take_worker_handle() {
+    if let Some(handle) = locks::lock(&driver, "main.driver.network_qc_verifier")?
+        .engine
+        .network_qc_verifier()
+        .take_worker_handle()
+    {
         critical_tasks.adopt("network-qc-verifier", handle);
     }
     let (gossip, discovered_peers, authenticated_peer_addrs, peer_sources, network_events) =
@@ -2645,9 +2732,7 @@ fn main() {
             let mut sync_cooldowns =
                 CooldownTracker::new(Duration::from_secs(2), Duration::from_secs(60));
             while let Ok(event) = network_events.recv() {
-                if let Some(expired) = driver
-                    .lock()
-                    .unwrap()
+                if let Some(expired) = supervised_lock!(driver, "network.driver.expire")
                     .sync_mut()
                     .expire_outstanding(Instant::now())
                 {
@@ -2666,9 +2751,7 @@ fn main() {
                     NetworkEvent::PeerConnected {
                         validator_id, addr, ..
                     } => {
-                        driver
-                            .lock()
-                            .unwrap()
+                        supervised_lock!(driver, "network.driver.peer_connected")
                             .sync_mut()
                             .peer_connected(validator_id);
                         connected_validator_peers
@@ -2685,11 +2768,24 @@ fn main() {
                                 return;
                             }
                         };
+                        let addr_validators = match locks::lock(
+                            &gossip.addr_validators,
+                            "network.addr_validators",
+                        ) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                indra_node::supervisor::report_unexpected(
+                                    "network-event-loop",
+                                    error.to_string(),
+                                );
+                                return;
+                            }
+                        };
                         let known_addrs = peer_list_payload_with_identities(
                             connected,
                             Some(addr),
                             &self_addrs,
-                            &gossip.addr_validators.lock().unwrap(),
+                            &addr_validators,
                         );
                         if !known_addrs.is_empty() {
                             gossip.send_to_validator(validator_id, &Message::PeerList(known_addrs));
@@ -2714,9 +2810,7 @@ fn main() {
                     NetworkEvent::PeerDisconnected {
                         validator_id, addr, ..
                     } => {
-                        driver
-                            .lock()
-                            .unwrap()
+                        supervised_lock!(driver, "network.driver.peer_disconnected")
                             .sync_mut()
                             .peer_disconnected(validator_id, addr);
                         connected_validator_peers
@@ -2727,7 +2821,7 @@ fn main() {
                         metrics_state
                             .slash_events_total
                             .fetch_add(1, Ordering::Relaxed);
-                        let mut d = driver.lock().unwrap();
+                        let mut d = supervised_lock!(driver, "network.driver.slash");
                         if let Err(error) = d.engine.add_slash_evidence(evidence) {
                             eprintln!("[slash] rejected network evidence: {error}");
                         }
@@ -2745,7 +2839,7 @@ fn main() {
                             }
                             Message::QCResponse { height, qc_bytes } => {
                                 let pending = {
-                                    let d = driver.lock().unwrap();
+                                    let d = supervised_lock!(driver, "network.driver.pending_qc");
                                     let Some(pending) = d.sync().provisional().cloned() else {
                                         continue;
                                     };
@@ -2762,7 +2856,7 @@ fn main() {
                                     pending
                                 };
                                 let verified = {
-                                    let d = driver.lock().unwrap();
+                                    let d = supervised_lock!(driver, "network.driver.verify_qc");
                                     indra_node::sync::verify_network_direct_provisional_qc(
                                         &pending.block,
                                         qc_bytes,
@@ -2772,7 +2866,7 @@ fn main() {
                                 };
                                 match verified {
                                     Ok(()) => {
-                                        let mut d = driver.lock().unwrap();
+                                        let mut d = supervised_lock!(driver, "network.driver.take_qc");
                                         let Some(finalized) = d.sync_mut().take_provisional() else {
                                             eprintln!(
                                                 "[sync] verified provisional was already cleared; dropping stale QC response"
@@ -2846,9 +2940,7 @@ fn main() {
                                         );
                                         sync_cooldowns
                                             .record_failure_at(validator_id, Instant::now());
-                                        driver
-                                            .lock()
-                                            .unwrap()
+                                        supervised_lock!(driver, "network.driver.source_failed")
                                             .sync_mut()
                                             .source_failed(validator_id, addr);
                                     }
@@ -2863,22 +2955,15 @@ fn main() {
                                     );
                                     continue;
                                 };
-                                if op_relay_seen
-                                    .lock()
-                                    .map(|mut cache| cache.operation_seen(&key, Instant::now()))
-                                    .unwrap_or(true)
-                                {
+                                let relay_seen = supervised_lock!(op_relay_seen, "network.op_relay_seen.staking")
+                                    .operation_seen(&key, Instant::now());
+                                if relay_seen {
                                     continue;
                                 }
-                                let result = driver
-                                    .lock()
-                                    .map_err(|_| "consensus driver lock poisoned".to_string())
-                                    .and_then(|mut guard| {
-                                        guard
-                                            .engine
-                                            .add_staking_op(op.clone())
-                                            .map_err(|e| e.to_string())
-                                    });
+                                let result = supervised_lock!(driver, "network.driver.staking")
+                                    .engine
+                                    .add_staking_op(op.clone())
+                                    .map_err(|e| e.to_string());
                                 if result.is_ok() {
                                     rebroadcast_inbound_accepted_op(
                                         &gossip,
@@ -2901,22 +2986,15 @@ fn main() {
                                     );
                                     continue;
                                 };
-                                if op_relay_seen
-                                    .lock()
-                                    .map(|mut cache| cache.operation_seen(&key, Instant::now()))
-                                    .unwrap_or(true)
-                                {
+                                let relay_seen = supervised_lock!(op_relay_seen, "network.op_relay_seen.governance")
+                                    .operation_seen(&key, Instant::now());
+                                if relay_seen {
                                     continue;
                                 }
-                                let result = driver
-                                    .lock()
-                                    .map_err(|_| "consensus driver lock poisoned".to_string())
-                                    .and_then(|mut guard| {
-                                        guard
-                                            .engine
-                                            .add_governance_op(op.clone())
-                                            .map_err(|e| e.to_string())
-                                    });
+                                let result = supervised_lock!(driver, "network.driver.governance")
+                                    .engine
+                                    .add_governance_op(op.clone())
+                                    .map_err(|e| e.to_string());
                                 if result.is_ok() {
                                     rebroadcast_inbound_accepted_op(
                                         &gossip,
@@ -2934,30 +3012,20 @@ fn main() {
                             Message::Tx(tx) => {
                                 let tx_id = indra_core::Bytes32::from(sha256(&tx.encode_to_vec()));
                                 gossip.observe_tx_fluff(tx_id);
-                                if op_relay_seen
-                                    .lock()
-                                    .map(|mut cache| {
-                                        cache.transactions.contains_at(&tx_id, Instant::now())
-                                    })
-                                    .unwrap_or(true)
-                                {
+                                let relay_seen = supervised_lock!(op_relay_seen, "network.op_relay_seen.transaction")
+                                    .transactions
+                                    .contains_at(&tx_id, Instant::now());
+                                if relay_seen {
                                     continue;
                                 }
-                                let result = driver
-                                    .lock()
-                                    .map_err(|_| "consensus driver lock poisoned".to_string())
-                                    .and_then(|mut guard| {
-                                        let engine = &mut guard.engine;
-                                        engine
-                                            .add_transaction(tx.clone())
-                                            .map_err(|error| error.to_string())
-                                    });
+                                let result = supervised_lock!(driver, "network.driver.transaction")
+                                    .engine
+                                    .add_transaction(tx.clone())
+                                    .map_err(|error| error.to_string());
                                 match result {
                                     Ok(_) => {
-                                        if let Ok(mut cache) = op_relay_seen.lock() {
-                                            let _ =
-                                                cache.transactions.insert_at(tx_id, Instant::now());
-                                        }
+                                        let mut cache = supervised_lock!(op_relay_seen, "network.op_relay_seen.transaction_insert");
+                                        let _ = cache.transactions.insert_at(tx_id, Instant::now());
                                         if let Some(event) = admission_score_event(
                                             InboundAdmissionKind::Transaction,
                                             true,
@@ -2979,33 +3047,23 @@ fn main() {
                             }
                             Message::TxStem(tx) => {
                                 let tx_id = indra_core::Bytes32::from(sha256(&tx.encode_to_vec()));
-                                if op_relay_seen
-                                    .lock()
-                                    .map(|mut cache| {
-                                        cache.transactions.contains_at(&tx_id, Instant::now())
-                                    })
-                                    .unwrap_or(true)
-                                {
+                                let relay_seen = supervised_lock!(op_relay_seen, "network.op_relay_seen.tx_stem")
+                                    .transactions
+                                    .contains_at(&tx_id, Instant::now());
+                                if relay_seen {
                                     // A repeated admitted stem is a loop signal. The
                                     // peer manager immediately transitions it to fluff.
                                     gossip.accepted_tx_stem(validator_id, tx.clone());
                                     continue;
                                 }
-                                let result = driver
-                                    .lock()
-                                    .map_err(|_| "consensus driver lock poisoned".to_string())
-                                    .and_then(|mut guard| {
-                                        guard
-                                            .engine
-                                            .add_transaction(tx.clone())
-                                            .map_err(|error| error.to_string())
-                                    });
+                                let result = supervised_lock!(driver, "network.driver.tx_stem")
+                                    .engine
+                                    .add_transaction(tx.clone())
+                                    .map_err(|error| error.to_string());
                                 match result {
                                     Ok(_) => {
-                                        if let Ok(mut cache) = op_relay_seen.lock() {
-                                            let _ =
-                                                cache.transactions.insert_at(tx_id, Instant::now());
-                                        }
+                                        let mut cache = supervised_lock!(op_relay_seen, "network.op_relay_seen.tx_stem_insert");
+                                        let _ = cache.transactions.insert_at(tx_id, Instant::now());
                                         if let Some(event) = admission_score_event(
                                             InboundAdmissionKind::Transaction,
                                             true,
@@ -3027,22 +3085,17 @@ fn main() {
                             }
                             Message::PeerList(addrs) => {
                                 let peer_list_hash = sha256(&msg.encode_wire().unwrap_or_default());
-                                if op_relay_seen
-                                    .lock()
-                                    .map(|mut cache| {
-                                        cache
-                                            .peer_lists
-                                            .contains_at(&peer_list_hash, Instant::now())
-                                    })
-                                    .unwrap_or(true)
-                                {
+                                let relay_seen = supervised_lock!(op_relay_seen, "network.op_relay_seen.peer_list")
+                                    .peer_lists
+                                    .contains_at(&peer_list_hash, Instant::now());
+                                if relay_seen {
                                     continue;
                                 }
-                                let mut new_peers = discovered_peers.lock().unwrap();
+                                let mut new_peers = supervised_lock!(discovered_peers, "network.discovered_peers");
                                 let authenticated =
-                                    authenticated_peer_addrs.lock().unwrap().clone();
+                                    supervised_lock!(authenticated_peer_addrs, "network.authenticated_peer_addrs").clone();
                                 let local_validator_id =
-                                    handshake_config.read().unwrap().my_validator_id;
+                                    supervised_read!(handshake_config, "network.handshake_config").my_validator_id;
                                 let mut accepted = 0usize;
                                 for entry in addrs.iter().take(MAX_PEER_LIST_SIZE) {
                                     let Some(addr) = resolve_peer_addr(&entry.addr) else {
@@ -3073,9 +3126,7 @@ fn main() {
                                             &local_p2p_addr,
                                             addr.to_string(),
                                         ) {
-                                            peer_sources
-                                                .lock()
-                                                .unwrap()
+                                            supervised_lock!(peer_sources, "network.peer_sources")
                                                 .entry(addr.to_string())
                                                 .or_insert(PeerSource::PeerExchange);
                                             accepted = accepted.saturating_add(1);
@@ -3088,10 +3139,8 @@ fn main() {
                                     addr,
                                     accepted
                                 );
-                                if let Ok(mut cache) = op_relay_seen.lock() {
-                                    let _ =
-                                        cache.peer_lists.insert_at(peer_list_hash, Instant::now());
-                                }
+                                let mut cache = supervised_lock!(op_relay_seen, "network.op_relay_seen.peer_list_insert");
+                                let _ = cache.peer_lists.insert_at(peer_list_hash, Instant::now());
                                 continue;
                             }
                             Message::RequestBlocks {
@@ -3099,7 +3148,7 @@ fn main() {
                                 to_height,
                             } => {
                                 let (blocks_to_send, lowest_available, highest_available) = {
-                                    let mut d = driver.lock().unwrap();
+                                    let mut d = supervised_lock!(driver, "network.driver.blocks");
                                     blocks_for_range_with_availability(
                                         &mut d.engine.block_store,
                                         *from_height,
@@ -3125,7 +3174,7 @@ fn main() {
                                 hash,
                             } => {
                                 let proposal = {
-                                    let mut d = driver.lock().unwrap();
+                                    let mut d = supervised_lock!(driver, "network.driver.proposal");
                                     d.pending_proposal(hash)
                                         .or_else(|| d.engine.block_store.get(*height).ok())
                                         .filter(|block| {
@@ -3143,7 +3192,7 @@ fn main() {
                                 highest_available,
                             } => {
                                 let binding = {
-                                    driver.lock().unwrap().sync_mut().accept_response(
+                                    supervised_lock!(driver, "network.driver.accept_response").sync_mut().accept_response(
                                         validator_id,
                                         addr,
                                         blocks,
@@ -3168,7 +3217,7 @@ fn main() {
                                             addr, lowest, highest
                                         );
                                     }
-                                    driver.lock().unwrap().sync_mut().on_empty_response();
+                                    supervised_lock!(driver, "network.driver.empty_response").sync_mut().on_empty_response();
                                     sync_cooldowns.record_failure_at(validator_id, Instant::now());
                                     gossip.score_peer(
                                         validator_id,
@@ -3183,7 +3232,7 @@ fn main() {
                                 let mut request_provisional_qc = None;
                                 let mut scored_failures = Vec::new();
                                 {
-                                    let mut d = driver.lock().unwrap();
+                                    let mut d = supervised_lock!(driver, "network.driver.import_blocks");
                                     for block in blocks {
                                         let now = Instant::now();
                                         let expected_height = d
@@ -3440,7 +3489,7 @@ fn main() {
                                     }
                                 }
                                 if imported_any {
-                                    if driver.lock().unwrap().height() > 0 {
+                                    if supervised_lock!(driver, "network.driver.height").height() > 0 {
                                         record_block_commit(&metrics_state, &last_block_timestamp);
                                         let _ = height_tx.send(());
                                         if let Err(error) = broadcast_status(&driver, &gossip) {
@@ -3482,7 +3531,7 @@ fn main() {
                             }
                             Message::Ping(_) => {
                                 let (height, tip_hash, round) = {
-                                    let d = driver.lock().unwrap();
+                                    let d = supervised_lock!(driver, "network.driver.status");
                                     (d.height(), d.engine.state.tip_hash, d.current_round())
                                 };
                                 gossip.send_to_validator(
@@ -3499,8 +3548,8 @@ fn main() {
                         }
 
                         if let Some(event) = message_to_event(msg, addr, validator_id) {
-                            let previous_height = driver.lock().unwrap().height();
-                            let actions = driver.lock().unwrap().process(event);
+                            let previous_height = supervised_lock!(driver, "network.driver.previous_height").height();
+                            let actions = supervised_lock!(driver, "network.driver.process").process(event);
                             if let Err(error) = process_driver_actions(
                                 &driver,
                                 &gossip,
@@ -3518,10 +3567,10 @@ fn main() {
                                 );
                                 return;
                             }
-                            let new_height = driver.lock().unwrap().height();
+                            let new_height = supervised_lock!(driver, "network.driver.new_height").height();
                             if new_height > previous_height {
                                 if let Err(error) = refresh_handshake_and_relay_config(
-                                    &driver.lock().unwrap().engine,
+                                    &supervised_lock!(driver, "network.driver.refresh_handshake").engine,
                                     &handshake_config,
                                     &gossip,
                                 ) {
@@ -3574,7 +3623,7 @@ fn main() {
 
             loop {
                 let (height, round, phase, sync_target, sync_caught_up, connected, tip_hash) = {
-                    let d = driver.lock().unwrap();
+                    let d = supervised_lock!(driver, "consensus.driver.state");
                     (
                         d.height(),
                         d.current_round(),
@@ -3585,14 +3634,14 @@ fn main() {
                         d.engine.state.tip_hash,
                     )
                 };
-                let last_qc_bytes_empty = driver.lock().unwrap().last_qc_bytes().is_empty();
+                let last_qc_bytes_empty = supervised_lock!(driver, "consensus.driver.last_qc").last_qc_bytes().is_empty();
                 if height > last_observed_height {
                     last_commit_time = Some(std::time::SystemTime::now());
                     last_observed_height = height;
                 }
 
                 if last_qc_bytes_empty && round % 10 == 0 {
-                    let actions = driver.lock().unwrap().request_qc_if_needed();
+                    let actions = supervised_lock!(driver, "consensus.driver.request_qc").request_qc_if_needed();
                     if !actions.is_empty() {
                         if let Err(error) = process_driver_actions(
                             &driver,
@@ -3659,7 +3708,7 @@ fn main() {
                     match phase {
                         RoundPhase::Propose => {
                             let (should_propose, next_height, proposal_round) = {
-                                let d = driver.lock().unwrap();
+                                let d = supervised_lock!(driver, "consensus.driver.election");
                                 let height = d.engine.state.height + 1;
                                 let round = d.current_round();
                                 match proposer_election_for_slot(&d, height, round) {
@@ -3690,7 +3739,7 @@ fn main() {
                             let already_have_proposal =
                                 proposed_at_slot == Some((next_height, proposal_round));
                             let valid_reproposal = if should_propose {
-                                driver.lock().unwrap().take_valid_block_for_reproposal()
+                                supervised_lock!(driver, "consensus.driver.reproposal").take_valid_block_for_reproposal()
                             } else {
                                 None
                             };
@@ -3743,7 +3792,7 @@ fn main() {
                                 }
 
                                 let proposal = {
-                                    let mut d = driver.lock().unwrap();
+                                    let mut d = supervised_lock!(driver, "consensus.driver.proposal_build");
                                     let height = d.engine.state.height + 1;
                                     let round = d.current_round();
                                     if height != next_height || round != proposal_round {
@@ -3862,7 +3911,7 @@ fn main() {
                             }
 
                             if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
-                                let actions = driver.lock().unwrap().on_propose_timeout();
+                                let actions = supervised_lock!(driver, "consensus.driver.propose_timeout").on_propose_timeout();
                                 if let Err(error) = process_driver_actions(
                                     &driver,
                                     &gossip,
@@ -3885,7 +3934,7 @@ fn main() {
                         }
                         RoundPhase::Prevote => {
                             if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
-                                let actions = driver.lock().unwrap().on_prevote_timeout();
+                                let actions = supervised_lock!(driver, "consensus.driver.prevote_timeout").on_prevote_timeout();
                                 if let Err(error) = process_driver_actions(
                                     &driver,
                                     &gossip,
@@ -3907,7 +3956,7 @@ fn main() {
                             }
                         }
                         RoundPhase::Precommit => {
-                            let actions = driver.lock().unwrap().retry_precommit_if_waiting();
+                            let actions = supervised_lock!(driver, "consensus.driver.precommit_retry").retry_precommit_if_waiting();
                             if !actions.is_empty() {
                                 if let Err(error) = process_driver_actions(
                                     &driver,
@@ -3929,11 +3978,11 @@ fn main() {
                             }
                             if phase_started_at.elapsed() >= PRECOMMIT_TIMEOUT {
                                 let (old_round, height_before) = {
-                                    let d = driver.lock().unwrap();
+                                    let d = supervised_lock!(driver, "consensus.driver.precommit_state");
                                     (d.current_round(), d.height())
                                 };
                                 {
-                                    let mut d = driver.lock().unwrap();
+                                    let mut d = supervised_lock!(driver, "consensus.driver.precommit_timeout");
                                     if let Err(error) = d.on_precommit_timeout() {
                                         eprintln!(
                                             "[consensus] FATAL: deterministic round exhaustion: {error}"
@@ -3967,7 +4016,7 @@ fn main() {
     }
 
     if !startup_qc_request.is_empty() {
-        let current_height = driver.lock().unwrap().height();
+        let current_height = locks::lock(&driver, "main.driver.startup_height")?.height();
         if let Err(error) = process_driver_actions(
             &driver,
             &gossip,
@@ -3986,7 +4035,7 @@ fn main() {
     // ── Thread 5: RPC server ────────────────────────────────────────────────
     // Readers use the immutable state published at canonical commit boundaries.
     let (rpc_snapshot, rpc_storage) = {
-        let guard = driver.lock().unwrap();
+        let guard = locks::lock(&driver, "main.driver.rpc_snapshot")?;
         (
             guard.engine.rpc_snapshot.clone(),
             indra_node::rpc_snapshot::RpcStorageReadHandles {
@@ -4071,7 +4120,7 @@ fn main() {
         tick += 1;
 
         let (height, base_fee, mempool, peers) = {
-            let d = driver.lock().unwrap();
+            let d = locks::lock(&driver, "main.driver.status")?;
             (
                 d.height(),
                 d.engine.state.base_fee,
@@ -4098,7 +4147,7 @@ fn main() {
 
         {
             let on_chain_addrs = {
-                let d = driver.lock().unwrap();
+                let d = locks::lock(&driver, "main.driver.discovery")?;
                 let consensus_height = d.height().saturating_add(1);
                 match on_chain_validator_network_addrs_for_height(&d.engine, consensus_height) {
                     Ok(addrs) => addrs,
@@ -4113,7 +4162,7 @@ fn main() {
             };
             if !on_chain_addrs.is_empty() {
                 let source_addrs = on_chain_addrs.clone();
-                let local_validator_id = handshake_config.read().unwrap().my_validator_id;
+                let local_validator_id = locks::read(&handshake_config, "main.handshake_config")?.my_validator_id;
                 let connected = match gossip.connected_addrs() {
                     Ok(addrs) => addrs,
                     Err(error) => {
@@ -4121,12 +4170,15 @@ fn main() {
                             "network-event-loop",
                             error.to_string(),
                         );
-                        return;
+                        return Err(indra_node::NodeError::InvalidConfiguration {
+                            detail: format!("network address query failed: {error}"),
+                        });
                     }
                 };
-                let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+                let authenticated = locks::lock(&authenticated_peer_addrs, "main.authenticated_peer_addrs")?.clone();
+                let mut discovered_guard = locks::lock(&discovered_peers, "main.discovered_peers")?;
                 let accepted = insert_on_chain_validator_network_addrs(
-                    &mut discovered_peers.lock().unwrap(),
+                    &mut discovered_guard,
                     &authenticated,
                     &bootstrap_peer_addrs_main,
                     &genesis_peer_addrs_main,
@@ -4135,8 +4187,8 @@ fn main() {
                     &connected,
                     on_chain_addrs,
                 );
-                let discovered = discovered_peers.lock().unwrap();
-                let mut sources = peer_sources.lock().unwrap();
+                let discovered = locks::lock(&discovered_peers, "main.discovered_peers_sources")?;
+                let mut sources = locks::lock(&peer_sources, "main.peer_sources")?;
                 for address in source_addrs {
                     if let Some(addr) = resolve_peer_addr(&address) {
                         let canonical = addr.to_string();
@@ -4163,21 +4215,23 @@ fn main() {
                 Ok(addrs) => addrs,
                 Err(error) => {
                     indra_node::supervisor::report_unexpected("network-event-loop", error.to_string());
-                    return;
+                    return Err(indra_node::NodeError::InvalidConfiguration {
+                        detail: format!("network address query failed: {error}"),
+                    });
                 }
             };
+            let addr_validators = locks::lock(&gossip.addr_validators, "main.addr_validators")?;
             let known_addrs = peer_list_payload_with_identities(
                 connected,
                 None,
                 &self_addrs,
-                &gossip.addr_validators.lock().unwrap(),
+                &addr_validators,
             );
             if !known_addrs.is_empty() {
                 let message = Message::PeerList(known_addrs);
                 if let Ok(wire) = message.encode_wire() {
-                    if let Ok(mut cache) = op_relay_seen.lock() {
-                        let _ = cache.peer_lists.insert_at(sha256(&wire), Instant::now());
-                    }
+                    let mut cache = locks::lock(&op_relay_seen, "main.op_relay_seen.peer_list")?;
+                    let _ = cache.peer_lists.insert_at(sha256(&wire), Instant::now());
                 }
                 gossip.broadcast(&message);
             }
@@ -4822,7 +4876,11 @@ fn spawn_rpc_listener(
                     if let Some(ip) = peer_ip {
                         let mut counts = match rpc_ip_connections.lock() {
                             Ok(counts) => counts,
-                            Err(_) => {
+                            Err(error) => {
+                                indra_node::supervisor::report_unexpected(
+                                    "rpc-ip-state",
+                                    format!("per-IP connection mutex poisoned for {ip}: {error}"),
+                                );
                                 eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
                                 release_rpc_connection(&rpc_conn_count);
                                 drop(stream);
@@ -4901,7 +4959,13 @@ fn spawn_rpc_listener(
                                         }
                                     }
                                 }
-                                Err(_) => eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned during cleanup for {ip}"),
+                                Err(error) => {
+                                    indra_node::supervisor::report_unexpected(
+                                        "rpc-ip-state",
+                                        format!("per-IP connection mutex poisoned during cleanup for {ip}: {error}"),
+                                    );
+                                    eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned during cleanup for {ip}");
+                                }
                             }
                         }
                         release_rpc_connection(&rpc_conn_count);
@@ -5524,7 +5588,11 @@ fn handle_rpc(
                     .exists();
                 diagnostic
             }
-            Err(_) => {
+            Err(error) => {
+                indra_node::supervisor::report_unexpected(
+                    "rpc-driver",
+                    format!("lock consensus driver is poisoned: {error}"),
+                );
                 let body = RpcResponse::err(
                     req.id.clone(),
                     -32000,
@@ -5836,9 +5904,27 @@ fn handle_rpc(
                             });
                         match submit_result {
                             Ok(tx_id) => {
-                                if let Ok(mut cache) = op_relay_seen.lock() {
-                                    let _ = cache.transactions.insert_at(tx_id, Instant::now());
-                                }
+                                let mut cache = match op_relay_seen.lock() {
+                                    Ok(cache) => cache,
+                                    Err(_) => {
+                                        indra_node::supervisor::report_unexpected(
+                                            "rpc-relay",
+                                            "lock op_relay_seen is poisoned",
+                                        );
+                                        return send_http(
+                                            &stream,
+                                            &cors,
+                                            &RpcResponse::err(
+                                                req.id.clone(),
+                                                -32000,
+                                                "internal relay state unavailable".to_string(),
+                                            )
+                                            .to_json(),
+                                            metrics,
+                                        );
+                                    }
+                                };
+                                let _ = cache.transactions.insert_at(tx_id, Instant::now());
                                 gossip.start_tx_stem(tx);
                                 RpcResponse::ok(
                                     req.id.clone(),
@@ -5897,9 +5983,13 @@ fn lock_driver_for_rpc<'a>(
     metrics: &MetricsState,
 ) -> Result<std::sync::MutexGuard<'a, indra_node::driver::ConsensusDriver>, String> {
     let started = Instant::now();
-    let result = driver
-        .lock()
-        .map_err(|_| "consensus driver lock poisoned".to_string());
+    let result = driver.lock().map_err(|_| {
+        indra_node::supervisor::report_unexpected(
+            "rpc-driver",
+            "lock consensus driver is poisoned",
+        );
+        "consensus driver lock poisoned".to_string()
+    });
     metrics.rpc_lock_wait_micros_total.fetch_add(
         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         Ordering::Relaxed,

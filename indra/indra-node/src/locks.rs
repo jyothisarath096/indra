@@ -6,6 +6,8 @@ use crate::{supervisor, NodeError, NodeResult};
 
 #[cfg(test)]
 static REPORT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn poisoned(name: &'static str) -> NodeError {
     #[cfg(test)]
@@ -38,6 +40,7 @@ mod tests {
 
     #[test]
     fn poisoned_mutex_and_rwlock_report_once_each() {
+        let _serial = TEST_SERIAL.lock().unwrap();
         REPORT_COUNT.store(0, Ordering::SeqCst);
         let mutex = Arc::new(Mutex::new(()));
         let poisoned_mutex = Arc::clone(&mutex);
@@ -63,6 +66,53 @@ mod tests {
 
         let error = write(&rwlock, "test-rwlock").unwrap_err();
         assert!(matches!(error, NodeError::LockPoisoned { name: "test-rwlock" }));
+        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn poisoned_lock_in_spawned_task_reports_once_and_returns_error() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        REPORT_COUNT.store(0, Ordering::SeqCst);
+        let mutex = Arc::new(Mutex::new(()));
+        let poison = Arc::clone(&mutex);
+        thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison spawned mutex");
+        })
+        .join()
+        .unwrap_err();
+
+        let task = thread::spawn(move || {
+            matches!(lock(&mutex, "spawned-task-mutex"), Err(NodeError::LockPoisoned { name: "spawned-task-mutex" }))
+        });
+        assert!(task.join().unwrap());
+        assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn simultaneous_poisoned_locks_report_without_deadlock() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        REPORT_COUNT.store(0, Ordering::SeqCst);
+        let first = Arc::new(Mutex::new(()));
+        let second = Arc::new(Mutex::new(()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers = [Arc::clone(&first), Arc::clone(&second)]
+            .into_iter()
+            .map(|mutex| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let _guard = mutex.lock().unwrap();
+                    panic!("simultaneous poison");
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap_err();
+        }
+        assert!(matches!(lock(&first, "simultaneous-first"), Err(NodeError::LockPoisoned { .. })));
+        assert!(matches!(lock(&second, "simultaneous-second"), Err(NodeError::LockPoisoned { .. })));
         assert_eq!(REPORT_COUNT.load(Ordering::SeqCst), 2);
     }
 }

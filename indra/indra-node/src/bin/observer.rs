@@ -161,7 +161,13 @@ async fn run() -> Result<(), String> {
     }
     eprintln!("[observer] rpc listening on {}", rpc_addr);
     if let Some(addr) = observer_addr {
-        start_observer_reserve(&addr, Arc::clone(&engine), Arc::clone(&observer_count));
+        let handle = start_observer_reserve(
+            &addr,
+            Arc::clone(&engine),
+            Arc::clone(&observer_count),
+            Arc::clone(&metrics_state),
+        );
+        critical_tasks.adopt("observer-reserve-runtime", handle);
         eprintln!("[observer] re-serving observer port on {}", addr);
     }
     if let Some(addr) = metrics_addr {
@@ -215,7 +221,8 @@ fn start_observer_reserve(
     addr: &str,
     engine: Arc<Mutex<NodeEngine>>,
     observer_count: Arc<AtomicUsize>,
-) {
+    metrics: Arc<MetricsState>,
+) -> std::thread::JoinHandle<()> {
     let addr = addr.to_string();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -246,7 +253,7 @@ fn start_observer_reserve(
                 };
                 let engine = Arc::clone(&engine);
                 let observer_count = Arc::clone(&observer_count);
-                tokio::spawn(async move {
+                indra_node::supervisor::spawn_connection("observer-reserve", Arc::clone(&metrics), async move {
                     observer_count.fetch_add(1, Ordering::Relaxed);
                     if let Err(e) = serve_observer_peer(stream, engine).await {
                         eprintln!("[observer] reserve peer {} closed: {}", peer, e);
@@ -255,7 +262,7 @@ fn start_observer_reserve(
                 });
             }
         });
-    });
+    })
 }
 
 async fn serve_observer_peer(

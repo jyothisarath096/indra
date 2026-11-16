@@ -193,3 +193,66 @@ fn node_refuses_corrupt_vote_safety_record_without_panic() {
     let output = run_node(&args);
     assert_refused(&output, "vote safety");
 }
+
+#[cfg(unix)]
+#[test]
+fn node_started_from_valid_fixture_stops_cleanly_on_sigterm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (key_file, keys, password) = encrypted_keys(dir.path(), b"correct");
+    let genesis = dir.path().join("valid-genesis.toml");
+    fs::write(&genesis, valid_genesis_for(&key_file)).expect("write valid genesis");
+    let data = dir.path().join("data");
+    let config = config_file(dir.path(), &data, &keys, &genesis);
+    let stdout_path = dir.path().join("node.stdout");
+    let stderr_path = dir.path().join("node.stderr");
+    let p2p_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve p2p port")
+        .local_addr()
+        .expect("p2p address")
+        .port();
+    let stdout = fs::File::create(&stdout_path).expect("create stdout log");
+    let stderr = fs::File::create(&stderr_path).expect("create stderr log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_node"))
+        .args(["--config", config.to_str().expect("config path")])
+        .args([
+            "--p2p-addr",
+            &format!("127.0.0.1:{p2p_port}"),
+            "--no-observer-port",
+            "--no-metrics",
+        ])
+        .args(["--keys-password-file", password.to_str().expect("password path")])
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn node");
+
+    let startup_deadline = Instant::now() + Duration::from_secs(60);
+    let mut started = false;
+    while Instant::now() < startup_deadline {
+        let log = fs::read_to_string(&stderr_path).unwrap_or_default();
+        if log.contains("Starting P2P and consensus") && log.contains("[shutdown] watcher ready") {
+            started = true;
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("poll node") {
+            panic!("node exited before startup: {status}\n{log}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(started, "node did not reach startup:\n{}", fs::read_to_string(&stderr_path).unwrap_or_default());
+
+    let kill_result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(kill_result, 0, "send SIGTERM");
+    let shutdown_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll shutdown") {
+            break status;
+        }
+        assert!(Instant::now() < shutdown_deadline, "node did not stop within 10 seconds");
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = fs::read_to_string(&stderr_path).expect("read stderr log");
+    assert_eq!(status.code(), Some(0), "unexpected exit status: {status}\n{stderr}");
+    assert!(!stderr.contains("ERROR"), "clean shutdown emitted ERROR:\n{stderr}");
+    assert!(!stderr.contains("panicked at"), "clean shutdown panicked:\n{stderr}");
+}

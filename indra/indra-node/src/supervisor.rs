@@ -3,6 +3,8 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::sync::OnceLock;
+use std::fmt::Display;
+use std::io::Write;
 
 use futures_util::FutureExt;
 
@@ -141,6 +143,15 @@ pub fn report_unexpected(name: &str, reason: impl Into<String>) {
             eprintln!("[supervisor] failed to report fatal event: {error}");
         }
     }
+}
+
+/// Terminate the process after routing a fatal runtime error through the supervisor.
+pub fn terminate_fatal(name: &str, error: impl Display) -> ! {
+    let reason = error.to_string();
+    report_unexpected(name, reason.clone());
+    eprintln!("ERROR: {reason}");
+    let _ = std::io::stderr().flush();
+    std::process::exit(1)
 }
 
 /// Spawn a Tokio task whose termination is always reported to the node
@@ -287,5 +298,22 @@ mod tests {
         });
         handle.await.unwrap();
         assert_eq!(metrics.handler_panics_total.lock().unwrap().get("test-connection"), Some(&1));
+    }
+
+    #[test]
+    fn terminate_fatal_subprocess_exits_one_and_reports_once() {
+        const CHILD: &str = "INDRA_SUPERVISOR_TERMINATE_FATAL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            terminate_fatal("test-fatal", "supervisor test cause");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervisor::tests::terminate_fatal_subprocess_exits_one_and_reports_once", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.matches("ERROR: supervisor test cause").count(), 1, "{stderr}");
+        assert!(!stderr.contains("panicked at"), "{stderr}");
     }
 }
