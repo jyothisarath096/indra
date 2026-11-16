@@ -82,6 +82,10 @@ pub struct MetricsState {
     pub rpc_invalid_governance_structural_total: Arc<AtomicU64>,
     /// Authoritatively rejected governance submissions.
     pub rpc_invalid_governance_validation_total: Arc<AtomicU64>,
+    /// Verified provisional responses discarded because the provisional slot was gone.
+    pub stale_sync_qc_responses_total: Arc<AtomicU64>,
+    /// Verified provisional certificates whose slot disappeared before promotion.
+    pub stale_sync_certificate_responses_total: Arc<AtomicU64>,
     /// Node process start time.
     pub started_at: Instant,
     /// Panic counts for isolated handlers, keyed by stable component name.
@@ -130,6 +134,8 @@ impl MetricsState {
             rpc_invalid_staking_validation_total: Arc::new(AtomicU64::new(0)),
             rpc_invalid_governance_structural_total: Arc::new(AtomicU64::new(0)),
             rpc_invalid_governance_validation_total: Arc::new(AtomicU64::new(0)),
+            stale_sync_qc_responses_total: Arc::new(AtomicU64::new(0)),
+            stale_sync_certificate_responses_total: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             handler_panics_total: Mutex::new(BTreeMap::new()),
         }
@@ -162,6 +168,20 @@ impl MetricsState {
         if let Ok(mut counts) = self.handler_panics_total.lock() {
             let count = counts.entry(component.to_string()).or_default();
             *count = count.saturating_add(1);
+        }
+    }
+
+    /// Count a verified sync response that arrived after its provisional slot was cleared.
+    pub fn record_stale_sync_response(&self, kind: &str) {
+        match kind {
+            "qc_response" => {
+                self.stale_sync_qc_responses_total.fetch_add(1, Ordering::Relaxed);
+            }
+            "certificate" => {
+                self.stale_sync_certificate_responses_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 }
@@ -749,6 +769,16 @@ fn render_snapshot(
             .rpc_invalid_governance_validation_total
             .load(Ordering::Relaxed),
     );
+    let _ = writeln!(
+        buf,
+        "# HELP indra_stale_sync_responses Verified sync responses discarded after their provisional slot was cleared\n# TYPE indra_stale_sync_responses counter\nindra_stale_sync_responses_total{{kind=\"qc_response\"}} {}\nindra_stale_sync_responses_total{{kind=\"certificate\"}} {}",
+        metrics_state
+            .stale_sync_qc_responses_total
+            .load(Ordering::Relaxed),
+        metrics_state
+            .stale_sync_certificate_responses_total
+            .load(Ordering::Relaxed),
+    );
     gauge(
         &mut buf,
         "indra_validator_count",
@@ -930,6 +960,14 @@ mod tests {
             buf,
             "# HELP indra_events Example counter\n# TYPE indra_events counter\nindra_events_total 9\n"
         );
+    }
+
+    #[test]
+    fn stale_qc_response_is_counted_without_supervisor_report() {
+        let metrics = MetricsState::new();
+        metrics.record_stale_sync_response("qc_response");
+        assert_eq!(metrics.stale_sync_qc_responses_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.stale_sync_certificate_responses_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]

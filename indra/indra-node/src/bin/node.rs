@@ -1,3 +1,4 @@
+#![deny(unused_must_use)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -555,7 +556,7 @@ impl NetworkBridge {
     }
 
     fn disconnect_invalid_consensus_peer(&self, addr: &SocketAddr, reason: String) {
-        if let Some(validator_id) = self.validator_for_addr(addr) {
+        if let Ok(Some(validator_id)) = self.validator_for_addr(addr) {
             let _ = self
                 .handle
                 .send_blocking(NetworkCommand::DisconnectInvalidConsensusPeer {
@@ -608,8 +609,10 @@ impl NetworkBridge {
         Ok(peers)
     }
 
-    fn validator_for_addr(&self, addr: &SocketAddr) -> Option<indra_core::Bytes32> {
-        self.addr_validators.lock().unwrap().get(addr).copied()
+    fn validator_for_addr(&self, addr: &SocketAddr) -> indra_node::NodeResult<Option<indra_core::Bytes32>> {
+        Ok(locks::lock(&self.addr_validators, "network.addr_validators")?
+            .get(addr)
+            .copied())
     }
 }
 
@@ -705,8 +708,8 @@ fn rebroadcast_inbound_accepted_op(
 fn has_connected_ip(
     connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
     addr: &SocketAddr,
-) -> bool {
-    connected_addrs.lock().unwrap().contains_key(&addr.ip())
+) -> indra_node::NodeResult<bool> {
+    Ok(locks::lock(connected_addrs, "network.connected_addrs")?.contains_key(&addr.ip()))
 }
 
 fn has_connected_ip_from_socket_addrs(connected_addrs: &[SocketAddr], addr: &SocketAddr) -> bool {
@@ -812,11 +815,11 @@ fn reserve_inbound_connection(
     inbound_count: &AtomicU64,
     inbound_by_ip: &Mutex<HashMap<IpAddr, u8>>,
     ip: IpAddr,
-) -> bool {
+) -> indra_node::NodeResult<bool> {
     let mut total = inbound_count.load(Ordering::Relaxed);
     loop {
         if total >= MAX_INBOUND_PEERS as u64 {
-            return false;
+            return Ok(false);
         }
         match inbound_count.compare_exchange_weak(
             total,
@@ -829,23 +832,23 @@ fn reserve_inbound_connection(
         }
     }
 
-    let mut by_ip = inbound_by_ip.lock().unwrap();
+    let mut by_ip = locks::lock(inbound_by_ip, "network.inbound_by_ip")?;
     let count = by_ip.entry(ip).or_insert(0);
     if *count >= MAX_INBOUND_PER_IP {
         inbound_count.fetch_sub(1, Ordering::Relaxed);
-        return false;
+        return Ok(false);
     }
     *count += 1;
-    true
+    Ok(true)
 }
 
 fn release_inbound_connection(
     inbound_count: &AtomicU64,
     inbound_by_ip: &Mutex<HashMap<IpAddr, u8>>,
     ip: IpAddr,
-) {
+) -> indra_node::NodeResult<()> {
     inbound_count.fetch_sub(1, Ordering::Relaxed);
-    let mut by_ip = inbound_by_ip.lock().unwrap();
+    let mut by_ip = locks::lock(inbound_by_ip, "network.inbound_by_ip")?;
     if let Some(count) = by_ip.get_mut(&ip) {
         if *count <= 1 {
             by_ip.remove(&ip);
@@ -853,6 +856,7 @@ fn release_inbound_connection(
             *count -= 1;
         }
     }
+    Ok(())
 }
 
 fn should_skip_dial_for_connected_validator(
@@ -971,54 +975,43 @@ fn record_peer_connected_event(
     genesis_peer_addrs: &HashSet<String>,
     outbound_cooldowns: &Arc<Mutex<CooldownTracker<OutboundCooldownKey>>>,
     failure_counts: &Arc<Mutex<HashMap<String, u32>>>,
-) -> bool {
+) -> indra_node::NodeResult<bool> {
     if validator_id == local_validator_id {
         eprintln!(
             "[p2p] WARNING: rejected self-connection from {} (own validator_id), not adding to peer table",
             addr
         );
-        discovered_peers.lock().unwrap().remove(&addr.to_string());
-        authenticated_peer_addrs
-            .lock()
-            .unwrap()
+        locks::lock(discovered_peers, "network.discovered_peers")?.remove(&addr.to_string());
+        locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?
             .remove(&addr.to_string());
-        authenticated_addr_validators
-            .lock()
-            .unwrap()
+        locks::lock(authenticated_addr_validators, "network.authenticated_addr_validators")?
             .remove(&addr.to_string());
-        outbound_cooldowns
-            .lock()
-            .unwrap()
+        locks::lock(outbound_cooldowns, "network.outbound_cooldowns")?
             .reset(&OutboundCooldownKey::Address(addr.to_string()));
-        failure_counts.lock().unwrap().remove(&addr.to_string());
-        return false;
+        locks::lock(failure_counts, "network.failure_counts")?.remove(&addr.to_string());
+        return Ok(false);
     }
 
-    *connected_addrs
-        .lock()
-        .unwrap()
+    *locks::lock(connected_addrs, "network.connected_addrs")?
         .entry(addr.ip())
         .or_insert(0) += 1;
-    addr_validators.lock().unwrap().insert(addr, validator_id);
-    connected_validator_ids.lock().unwrap().insert(validator_id);
+    locks::lock(addr_validators, "network.addr_validators")?.insert(addr, validator_id);
+    locks::lock(connected_validator_ids, "network.connected_validator_ids")?.insert(validator_id);
 
     // Only outbound connection addresses are dial targets. Inbound accepted
     // socket source addresses frequently contain ephemeral ports; they remain
     // live endpoints for routing/accounting via `addr_validators`, but must
     // never pollute discovery, PeerList gossip, or persisted peers.
     if is_outbound {
-        peer_addrs.lock().unwrap().insert(validator_id, addr);
-        authenticated_peer_addrs
-            .lock()
-            .unwrap()
+        locks::lock(peer_addrs, "network.peer_addrs")?.insert(validator_id, addr);
+        locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?
             .insert(addr.to_string());
-        authenticated_addr_validators
-            .lock()
-            .unwrap()
+        locks::lock(authenticated_addr_validators, "network.authenticated_addr_validators")?
             .insert(addr.to_string(), validator_id);
-        let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+        let authenticated = locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?.clone();
+        let mut discovered = locks::lock(discovered_peers, "network.discovered_peers")?;
         insert_discovered_peer_bounded(
-            &mut discovered_peers.lock().unwrap(),
+            &mut discovered,
             &authenticated,
             bootstrap_peer_addrs,
             genesis_peer_addrs,
@@ -1026,14 +1019,15 @@ fn record_peer_connected_event(
         );
     }
 
-    let mut cooldowns = outbound_cooldowns.lock().unwrap();
+    let mut cooldowns = locks::lock(outbound_cooldowns, "network.outbound_cooldowns")?;
     cooldowns.reset(&OutboundCooldownKey::Address(addr.to_string()));
     cooldowns.reset(&OutboundCooldownKey::Validator(validator_id));
     drop(cooldowns);
     if is_outbound {
-        clear_dial_failure(&addr.to_string(), &mut failure_counts.lock().unwrap());
+        let mut failures = locks::lock(failure_counts, "network.failure_counts")?;
+        clear_dial_failure(&addr.to_string(), &mut failures);
     }
-    true
+    Ok(true)
 }
 
 fn peer_addresses_to_persist(
@@ -1184,26 +1178,29 @@ fn refresh_handshake_and_relay_config(
     engine: &NodeEngine,
     config: &Arc<RwLock<HandshakeConfig>>,
     gossip: &Arc<NetworkBridge>,
-) {
+) -> indra_node::NodeResult<()> {
     match build_handshake_config(engine) {
         Ok(Some(new_config)) => {
-            *config.write().unwrap() = new_config;
-            gossip.update_relay_validator_keys(&config.read().unwrap());
+            *locks::write(config, "network.handshake_config")? = new_config;
+            let current = locks::read(config, "network.handshake_config")?;
+            gossip.update_relay_validator_keys(&current);
         }
         Ok(None) => {}
         Err(error) => {
             // Snapshot lookup is authoritative post-gate. Clear remote
             // authorization rather than retaining stale or live-state keys.
-            let mut current = config.write().unwrap();
+            let mut current = locks::write(config, "network.handshake_config")?;
             current.known_validators.clear();
             current.relay_validator_keys.clear();
             drop(current);
-            gossip.update_relay_validator_keys(&config.read().unwrap());
+            let current = locks::read(config, "network.handshake_config")?;
+            gossip.update_relay_validator_keys(&current);
             eprintln!(
                 "[p2p] failed to resolve snapshot networking authority; remote authentication and consensus relay disabled: {error}"
             );
         }
     }
+    Ok(())
 }
 
 fn start_network_runtime(
@@ -1333,7 +1330,7 @@ fn start_network_runtime(
                                 } => {
                                     let local_id =
                                         handshake_config.read().unwrap().my_validator_id;
-                                    if !record_peer_connected_event(
+                                    let accepted = match record_peer_connected_event(
                                         local_id,
                                         *validator_id,
                                         *addr,
@@ -1350,6 +1347,14 @@ fn start_network_runtime(
                                         &outbound_cooldowns,
                                         &failure_counts,
                                     ) {
+                                        Ok(accepted) => accepted,
+                                        Err(error) => {
+                                            eprintln!("[p2p] peer-event lock failure: {error}");
+                                            indra_node::supervisor::report_unexpected("network-peer-event", error.to_string());
+                                            return;
+                                        }
+                                    };
+                                    if !accepted {
                                         continue;
                                     }
                                     if !is_outbound {
@@ -1446,7 +1451,16 @@ fn start_network_runtime(
                                 drop(stream);
                                 continue;
                             }
-                            if !reserve_inbound_connection(&inbound_count, &inbound_by_ip, addr.ip())
+                            let reserved = match reserve_inbound_connection(&inbound_count, &inbound_by_ip, addr.ip()) {
+                                Ok(reserved) => reserved,
+                                Err(error) => {
+                                    eprintln!("[listener] inbound admission lock failure: {error}");
+                                    indra_node::supervisor::report_unexpected("network-listener", error.to_string());
+                                    drop(stream);
+                                    return;
+                                }
+                            };
+                            if !reserved
                             {
                                 eprintln!(
                                     "[p2p] dropping inbound connection from {}: at capacity",
@@ -1459,11 +1473,14 @@ fn start_network_runtime(
                                 Ok(permit) => permit,
                                 Err(_) => {
                                     eprintln!("[p2p] handshake limit reached, rejecting connection from {}", addr);
-                                    release_inbound_connection(
+                                    if let Err(error) = release_inbound_connection(
                                         &inbound_count,
                                         &inbound_by_ip,
                                         addr.ip(),
-                                    );
+                                    ) {
+                                        eprintln!("[listener] inbound release lock failure: {error}");
+                                        indra_node::supervisor::report_unexpected("network-listener", error.to_string());
+                                    }
                                     drop(stream);
                                     continue;
                                 }
@@ -1502,11 +1519,14 @@ fn start_network_runtime(
                                             .record_failure_at(pre_auth_key, Instant::now());
                                     }
                                 }
-                                release_inbound_connection(
+                                if let Err(error) = release_inbound_connection(
                                     &inbound_count,
                                     &inbound_by_ip,
                                     addr.ip(),
-                                );
+                                ) {
+                                    eprintln!("[listener] inbound release lock failure: {error}");
+                                    indra_node::supervisor::report_unexpected("network-inbound", error.to_string());
+                                }
                             });
                         }
                     }
@@ -1657,7 +1677,7 @@ fn start_network_runtime(
                                     return false;
                                 };
                                 if is_configured_self_addr(&addr, &p2p_addr_for_port)
-                                    || has_connected_ip(&connected_addrs, &addr)
+                                    || has_connected_ip(&connected_addrs, &addr).unwrap_or(false)
                                     || should_skip_dial_for_connected_validator(
                                         peer,
                                         &authenticated_addr_validators.lock().unwrap(),
@@ -1705,7 +1725,7 @@ fn start_network_runtime(
                                     );
                                     continue;
                                 }
-                                if has_connected_ip(&connected_addrs, &addr) {
+                                if has_connected_ip(&connected_addrs, &addr).unwrap_or(false) {
                                     outbound_cooldowns.lock().unwrap().reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
@@ -1935,12 +1955,12 @@ fn start_observer_runtime(
 async fn observer_block_poller(
     driver: Arc<Mutex<ConsensusDriver>>,
     block_tx: tokio::sync::broadcast::Sender<indra_core::types::block::BlockProposalVNext>,
-) {
-    let mut last_height = driver.lock().unwrap().height();
+) -> indra_node::NodeResult<()> {
+    let mut last_height = locks::lock(&driver, "observer.driver")?.height();
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let (current_height, blocks) = {
-            let mut d = driver.lock().unwrap();
+            let mut d = locks::lock(&driver, "observer.driver")?;
             let current_height = d.height();
             let mut blocks = Vec::new();
             if current_height > last_height {
@@ -1968,7 +1988,9 @@ async fn handle_observer_connection(
 ) -> indra_network::NetworkResult<()> {
     let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL).await?;
     let mut stream = result.stream;
-    let status = current_status_message(&driver);
+    let status = current_status_message(&driver).map_err(|error| indra_network::NetworkError::DecodeFailed {
+        reason: error.to_string(),
+    })?;
     write_message_plain(&mut stream, &status).await?;
 
     if observer_count.load(Ordering::Relaxed) >= MAX_OBSERVER_CONNECTIONS {
@@ -2017,7 +2039,9 @@ async fn handle_observer_connection(
                             continue;
                         }
                         let (blocks, lowest_available, highest_available) =
-                            observer_blocks_for_range(&driver, from_height, to_height);
+                            observer_blocks_for_range(&driver, from_height, to_height).map_err(|error| indra_network::NetworkError::DecodeFailed {
+                                reason: error.to_string(),
+                            })?;
                         let _ = write_tx
                             .send(Message::BlockResponse {
                                 blocks,
@@ -2076,26 +2100,26 @@ fn observer_request_blocks_allowed(limiter: &mut TokenBucket) -> bool {
     limiter.try_consume(1)
 }
 
-fn current_status_message(driver: &Arc<Mutex<ConsensusDriver>>) -> Message {
-    let d = driver.lock().unwrap();
-    Message::Status {
+fn current_status_message(driver: &Arc<Mutex<ConsensusDriver>>) -> indra_node::NodeResult<Message> {
+    let d = locks::lock(driver, "observer.driver")?;
+    Ok(Message::Status {
         height: d.height(),
         tip_hash: d.engine.state.tip_hash,
         round: d.current_round(),
-    }
+    })
 }
 
 fn observer_blocks_for_range(
     driver: &Arc<Mutex<ConsensusDriver>>,
     from_height: u64,
     to_height: u64,
-) -> (
+) -> indra_node::NodeResult<(
     Vec<indra_core::types::block::BlockProposalVNext>,
     Option<u64>,
     Option<u64>,
-) {
-    let mut d = driver.lock().unwrap();
-    blocks_for_range_with_availability(&mut d.engine.block_store, from_height, to_height)
+)> {
+    let mut d = locks::lock(driver, "observer.driver")?;
+    Ok(blocks_for_range_with_availability(&mut d.engine.block_store, from_height, to_height))
 }
 
 fn blocks_for_range_with_availability(
@@ -2660,7 +2684,7 @@ fn main() {
                         if !known_addrs.is_empty() {
                             gossip.send_to_validator(validator_id, &Message::PeerList(known_addrs));
                         }
-                        announce_status_and_recovery(
+                        if let Err(error) = announce_status_and_recovery(
                             &driver,
                             &gossip,
                             &height_tx,
@@ -2668,7 +2692,14 @@ fn main() {
                             validator_id,
                             &metrics_state,
                             &last_block_timestamp,
-                        );
+                        ) {
+                            eprintln!("[network] CRITICAL: status announcement failed: {error}");
+                            indra_node::supervisor::report_unexpected(
+                                "authenticated-network-events",
+                                error.to_string(),
+                            );
+                            return;
+                        }
                     }
                     NetworkEvent::PeerDisconnected {
                         validator_id, addr, ..
@@ -2733,10 +2764,10 @@ fn main() {
                                     Ok(()) => {
                                         let mut d = driver.lock().unwrap();
                                         let Some(finalized) = d.sync_mut().take_provisional() else {
-                                            indra_node::supervisor::report_unexpected(
-                                                "network-event-loop",
-                                                "verified provisional was missing during finalization",
+                                            eprintln!(
+                                                "[sync] verified provisional was already cleared; dropping stale QC response"
                                             );
+                                            metrics_state.record_stale_sync_response("qc_response");
                                             continue;
                                         };
                                         match d.engine.commit_prepared_sync_block(
@@ -2785,7 +2816,14 @@ fn main() {
                                             }
                                         }
                                         drop(d);
-                                        broadcast_status(&driver, &gossip);
+                                        if let Err(error) = broadcast_status(&driver, &gossip) {
+                                            eprintln!("[sync] CRITICAL: status broadcast failed: {error}");
+                                            indra_node::supervisor::report_unexpected(
+                                                "authenticated-network-events",
+                                                error.to_string(),
+                                            );
+                                            return;
+                                        }
                                     }
                                     Err(error) => {
                                         eprintln!(
@@ -3165,11 +3203,14 @@ fn main() {
                                                     let Some(finalized) =
                                                         d.sync_mut().take_provisional()
                                                     else {
-                                                        indra_node::supervisor::report_unexpected(
-                                                            "network-event-loop",
-                                                            "provisional certificate was missing during finalization",
+                                                        eprintln!(
+                                                            "[sync] CRITICAL: provisional certificate was already cleared after verification"
                                                         );
-                                                        continue;
+                                                        indra_node::supervisor::report_unexpected(
+                                                            "authenticated-network-events",
+                                                            "verified provisional certificate was cleared before promotion",
+                                                        );
+                                                        return;
                                                     };
                                                     if let Err(error) =
                                                         d.engine.commit_prepared_sync_block(
@@ -3382,7 +3423,7 @@ fn main() {
                                         from_height,
                                         to_height,
                                     };
-                                    if let Some(peer_validator_id) =
+                                    if let Ok(Some(peer_validator_id)) =
                                         gossip.validator_for_addr(&peer)
                                     {
                                         gossip.send_to_validator(peer_validator_id, &req);
@@ -3392,11 +3433,18 @@ fn main() {
                                     if driver.lock().unwrap().height() > 0 {
                                         record_block_commit(&metrics_state, &last_block_timestamp);
                                         let _ = height_tx.send(());
-                                        broadcast_status(&driver, &gossip);
+                                        if let Err(error) = broadcast_status(&driver, &gossip) {
+                                            eprintln!("[sync] CRITICAL: status broadcast failed: {error}");
+                                            indra_node::supervisor::report_unexpected(
+                                                "authenticated-network-events",
+                                                error.to_string(),
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                                 if !qc_recovery_actions.is_empty() {
-                                    process_driver_actions(
+                                    if let Err(error) = process_driver_actions(
                                         &driver,
                                         &gossip,
                                         &height_tx,
@@ -3405,7 +3453,14 @@ fn main() {
                                         qc_recovery_actions,
                                         &metrics_state,
                                         &last_block_timestamp,
-                                    );
+                                    ) {
+                                        eprintln!("[sync] CRITICAL: driver action processing failed: {error}");
+                                        indra_node::supervisor::report_unexpected(
+                                            "authenticated-network-events",
+                                            error.to_string(),
+                                        );
+                                        return;
+                                    }
                                 }
                                 if let Some(height) = caught_up_height {
                                     eprintln!(
@@ -3436,7 +3491,7 @@ fn main() {
                         if let Some(event) = message_to_event(msg, addr, validator_id) {
                             let previous_height = driver.lock().unwrap().height();
                             let actions = driver.lock().unwrap().process(event);
-                            process_driver_actions(
+                            if let Err(error) = process_driver_actions(
                                 &driver,
                                 &gossip,
                                 &height_tx,
@@ -3445,16 +3500,37 @@ fn main() {
                                 actions,
                                 &metrics_state,
                                 &last_block_timestamp,
-                            );
+                            ) {
+                                eprintln!("[network] CRITICAL: driver action processing failed: {error}");
+                                indra_node::supervisor::report_unexpected(
+                                    "authenticated-network-events",
+                                    error.to_string(),
+                                );
+                                return;
+                            }
                             let new_height = driver.lock().unwrap().height();
                             if new_height > previous_height {
-                                refresh_handshake_and_relay_config(
+                                if let Err(error) = refresh_handshake_and_relay_config(
                                     &driver.lock().unwrap().engine,
                                     &handshake_config,
                                     &gossip,
-                                );
+                                ) {
+                                    eprintln!("[network] CRITICAL: handshake refresh failed: {error}");
+                                    indra_node::supervisor::report_unexpected(
+                                        "authenticated-network-events",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                                 let _ = height_tx.send(());
-                                broadcast_status(&driver, &gossip);
+                                if let Err(error) = broadcast_status(&driver, &gossip) {
+                                    eprintln!("[network] CRITICAL: status broadcast failed: {error}");
+                                    indra_node::supervisor::report_unexpected(
+                                        "authenticated-network-events",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
@@ -3508,7 +3584,7 @@ fn main() {
                 if last_qc_bytes_empty && round % 10 == 0 {
                     let actions = driver.lock().unwrap().request_qc_if_needed();
                     if !actions.is_empty() {
-                        process_driver_actions(
+                        if let Err(error) = process_driver_actions(
                             &driver,
                             &gossip,
                             &height_tx,
@@ -3517,7 +3593,14 @@ fn main() {
                             actions,
                             &metrics_state,
                             &last_block_timestamp,
-                        );
+                        ) {
+                            eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
+                            indra_node::supervisor::report_unexpected(
+                                "consensus-driver",
+                                error.to_string(),
+                            );
+                            return;
+                        }
                     }
                 }
 
@@ -3748,7 +3831,7 @@ fn main() {
                                         block.block.header.height,
                                         block.block.header.proposer_round,
                                     ));
-                                    process_driver_actions(
+                                    if let Err(error) = process_driver_actions(
                                         &driver,
                                         &gossip,
                                         &height_tx,
@@ -3757,13 +3840,20 @@ fn main() {
                                         actions,
                                         &metrics_state,
                                         &last_block_timestamp,
-                                    );
+                                    ) {
+                                        eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
+                                        indra_node::supervisor::report_unexpected(
+                                            "consensus-driver",
+                                            error.to_string(),
+                                        );
+                                        return;
+                                    }
                                 }
                             }
 
                             if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_propose_timeout();
-                                process_driver_actions(
+                                if let Err(error) = process_driver_actions(
                                     &driver,
                                     &gossip,
                                     &height_tx,
@@ -3772,14 +3862,21 @@ fn main() {
                                     actions,
                                     &metrics_state,
                                     &last_block_timestamp,
-                                );
+                                ) {
+                                    eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
+                                    indra_node::supervisor::report_unexpected(
+                                        "consensus-driver",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                                 phase_started_at = Instant::now();
                             }
                         }
                         RoundPhase::Prevote => {
                             if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
                                 let actions = driver.lock().unwrap().on_prevote_timeout();
-                                process_driver_actions(
+                                if let Err(error) = process_driver_actions(
                                     &driver,
                                     &gossip,
                                     &height_tx,
@@ -3788,14 +3885,21 @@ fn main() {
                                     actions,
                                     &metrics_state,
                                     &last_block_timestamp,
-                                );
+                                ) {
+                                    eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
+                                    indra_node::supervisor::report_unexpected(
+                                        "consensus-driver",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                                 phase_started_at = Instant::now();
                             }
                         }
                         RoundPhase::Precommit => {
                             let actions = driver.lock().unwrap().retry_precommit_if_waiting();
                             if !actions.is_empty() {
-                                process_driver_actions(
+                                if let Err(error) = process_driver_actions(
                                     &driver,
                                     &gossip,
                                     &height_tx,
@@ -3804,7 +3908,14 @@ fn main() {
                                     actions,
                                     &metrics_state,
                                     &last_block_timestamp,
-                                );
+                                ) {
+                                    eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
+                                    indra_node::supervisor::report_unexpected(
+                                        "consensus-driver",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                             }
                             if phase_started_at.elapsed() >= PRECOMMIT_TIMEOUT {
                                 let (old_round, height_before) = {
@@ -3847,7 +3958,7 @@ fn main() {
 
     if !startup_qc_request.is_empty() {
         let current_height = driver.lock().unwrap().height();
-        process_driver_actions(
+        if let Err(error) = process_driver_actions(
             &driver,
             &gossip,
             &height_tx,
@@ -3856,7 +3967,10 @@ fn main() {
             startup_qc_request,
             &metrics_state,
             &last_block_timestamp,
-        );
+        ) {
+            eprintln!("ERROR: startup driver action processing failed: {error}");
+            std::process::exit(1);
+        }
     }
 
     // ── Thread 5: RPC server ────────────────────────────────────────────────
@@ -4076,20 +4190,20 @@ fn process_driver_actions(
     actions: Vec<DriverAction>,
     metrics_state: &Arc<MetricsState>,
     last_block_timestamp: &Arc<AtomicU64>,
-) {
+) -> indra_node::NodeResult<()> {
     let mut recorded_commit = false;
     for action in actions {
         if let DriverAction::Fatal(error) = &action {
             eprintln!("[consensus] FATAL: {error}");
             indra_node::supervisor::report_unexpected("consensus-driver", error.to_string());
-            return;
+            return Ok(());
         }
         if let DriverAction::RequestQC { height } = &action {
             let peers: Vec<SocketAddr> = match gossip.connected_addrs() {
                 Ok(peers) => peers,
                 Err(error) => {
                     indra_node::supervisor::report_unexpected("consensus-driver", error.to_string());
-                    return;
+                    return Err(error);
                 }
             };
             eprintln!(
@@ -4099,7 +4213,7 @@ fn process_driver_actions(
             );
             let msg = Message::RequestQC { height: *height };
             for peer in &peers {
-                if let Some(peer_validator_id) = gossip.validator_for_addr(peer) {
+                if let Some(peer_validator_id) = gossip.validator_for_addr(peer)? {
                     gossip.send_to_validator(peer_validator_id, &msg);
                 }
             }
@@ -4115,7 +4229,7 @@ fn process_driver_actions(
                 vote_1: slash_evidence.vote_a.clone(),
                 vote_2: slash_evidence.vote_b.clone(),
             };
-            let mut d = driver.lock().unwrap();
+            let mut d = locks::lock(driver, "consensus.driver")?;
             match d.engine.add_slash_evidence(wire_evidence) {
                 Ok(()) => eprintln!(
                     "[slash] equivocation detected from validator {} — evidence queued",
@@ -4143,7 +4257,7 @@ fn process_driver_actions(
         }
 
         if let DriverAction::ScorePeer { from, event } = &action {
-            if let Some(validator_id) = gossip.validator_for_addr(from) {
+            if let Some(validator_id) = gossip.validator_for_addr(from)? {
                 gossip.score_peer(validator_id, *event);
             }
             continue;
@@ -4177,7 +4291,7 @@ fn process_driver_actions(
                 from_height: *from_height,
                 to_height: *to_height,
             };
-            if let Some(peer_validator_id) = gossip.validator_for_addr(from) {
+            if let Some(peer_validator_id) = gossip.validator_for_addr(from)? {
                 gossip.send_to_validator(peer_validator_id, &req);
             }
         }
@@ -4194,7 +4308,7 @@ fn process_driver_actions(
                 round: *round,
                 hash: *hash,
             };
-            if let Some(peer_validator_id) = gossip.validator_for_addr(from) {
+            if let Some(peer_validator_id) = gossip.validator_for_addr(from)? {
                 gossip.send_to_validator(peer_validator_id, &req);
             }
         }
@@ -4209,17 +4323,18 @@ fn process_driver_actions(
                 height: *height,
                 qc_bytes: qc_bytes.clone(),
             };
-            if let Some(peer_validator_id) = gossip.validator_for_addr(to) {
+            if let Some(peer_validator_id) = gossip.validator_for_addr(to)? {
                 gossip.send_to_validator(peer_validator_id, &msg);
             }
         }
 
-        let new_height = driver.lock().unwrap().height();
+        let new_height = locks::lock(driver, "consensus.driver")?.height();
         if new_height > previous_height && !recorded_commit {
             record_block_commit(metrics_state, last_block_timestamp);
             recorded_commit = true;
         }
     }
+    Ok(())
 }
 
 fn announce_status_and_recovery(
@@ -4230,17 +4345,17 @@ fn announce_status_and_recovery(
     validator_id: indra_core::Bytes32,
     metrics_state: &Arc<MetricsState>,
     last_block_timestamp: &Arc<AtomicU64>,
-) {
+) -> indra_node::NodeResult<()> {
     let (height, tip_hash) = {
-        let d = driver.lock().unwrap();
+        let d = locks::lock(driver, "consensus.driver")?;
         (d.height(), d.engine.state.tip_hash)
     };
     let [status, ping] = startup_peer_messages(height, tip_hash);
     gossip.send_to_validator(validator_id, &status);
     gossip.send_to_validator(validator_id, &ping);
-    broadcast_status(driver, gossip);
+    broadcast_status(driver, gossip)?;
 
-    let actions = driver.lock().unwrap().request_qc_if_needed();
+    let actions = locks::lock(driver, "consensus.driver")?.request_qc_if_needed();
     process_driver_actions(
         driver,
         gossip,
@@ -4250,7 +4365,8 @@ fn announce_status_and_recovery(
         actions,
         metrics_state,
         last_block_timestamp,
-    );
+    )?;
+    Ok(())
 }
 
 fn startup_peer_messages(height: u64, tip_hash: indra_core::Bytes32) -> [Message; 2] {
@@ -4275,9 +4391,9 @@ fn should_log_sync_height(height: u64) -> bool {
     height <= 5 || height.is_multiple_of(100)
 }
 
-fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBridge>) {
+fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBridge>) -> indra_node::NodeResult<()> {
     let (height, tip_hash, round) = {
-        let d = driver.lock().unwrap();
+        let d = locks::lock(driver, "consensus.driver")?;
         (d.height(), d.engine.state.tip_hash, d.current_round())
     };
     let status = Message::Status {
@@ -4286,6 +4402,7 @@ fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBr
         round,
     };
     gossip.broadcast(&status);
+    Ok(())
 }
 
 fn check_disk_space(data_dir: &Path) -> u64 {
@@ -5488,7 +5605,14 @@ fn handle_rpc(
         }
     };
     let connected_validator_peer_count = gossip.connection_count();
-    let discovered_count = discovered_peers.lock().unwrap().len();
+    let discovered_count = match locks::lock(discovered_peers, "rpc.discovered_peers") {
+        Ok(peers) => peers.len(),
+        Err(error) => {
+            eprintln!("[rpc] discovered-peer lock failure: {error}");
+            indra_node::supervisor::report_unexpected("rpc-handler", error.to_string());
+            return;
+        }
+    };
     let observer_count_val = observer_count.load(Ordering::Relaxed);
 
     if let Some(result) = dispatch_public_light_method(
@@ -7071,7 +7195,7 @@ mod tests {
             &failure_counts,
         );
 
-        assert!(!accepted);
+        assert!(!accepted.unwrap());
         assert!(connected_addrs.lock().unwrap().is_empty());
         assert!(peer_addrs.lock().unwrap().is_empty());
         assert!(addr_validators.lock().unwrap().is_empty());
@@ -7139,7 +7263,7 @@ mod tests {
                 &self.genesis_peer_addrs,
                 &self.outbound_cooldowns,
                 &self.failure_counts,
-            )
+            ).unwrap()
         }
 
         fn gossip_payload(&self) -> Vec<PeerListEntry> {
@@ -7361,7 +7485,7 @@ mod tests {
                 &inbound_count,
                 &inbound_by_ip,
                 ip
-            ));
+            ).unwrap());
             reserved_ips.push(ip);
         }
 
@@ -7369,10 +7493,10 @@ mod tests {
             &inbound_count,
             &inbound_by_ip,
             IpAddr::from([203, 0, 113, 250])
-        ));
+        ).unwrap());
 
         for ip in reserved_ips {
-            release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
+            release_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap();
         }
         assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
     }
@@ -7388,16 +7512,16 @@ mod tests {
                 &inbound_count,
                 &inbound_by_ip,
                 ip
-            ));
+            ).unwrap());
         }
         assert!(!reserve_inbound_connection(
             &inbound_count,
             &inbound_by_ip,
             ip
-        ));
+        ).unwrap());
 
         for _ in 0..MAX_INBOUND_PER_IP {
-            release_inbound_connection(&inbound_count, &inbound_by_ip, ip);
+            release_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap();
         }
         assert_eq!(inbound_count.load(Ordering::Relaxed), 0);
     }
@@ -8195,7 +8319,7 @@ mod tests {
             &genesis_peer_addrs,
             &outbound_cooldowns,
             &failure_counts,
-        ));
+        ).unwrap());
 
         assert!(!failure_counts
             .lock()

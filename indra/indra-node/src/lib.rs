@@ -23,6 +23,7 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![deny(unused_must_use)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
