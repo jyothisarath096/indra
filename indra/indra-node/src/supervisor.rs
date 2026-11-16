@@ -4,6 +4,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::sync::OnceLock;
 
+use futures_util::FutureExt;
+
+use crate::NodeResult;
+
 static GLOBAL_REPORTER: OnceLock<Sender<CriticalTaskOutcome>> = OnceLock::new();
 
 /// Outcome reported when a critical task stops.
@@ -139,6 +143,65 @@ pub fn report_unexpected(name: &str, reason: impl Into<String>) {
     }
 }
 
+/// Spawn a Tokio task whose termination is always reported to the node
+/// supervisor. These tasks are expected to live for the process lifetime.
+pub fn spawn_critical<F>(name: &'static str, task: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = NodeResult<()>> + Send + 'static,
+{
+    let reporter = GLOBAL_REPORTER.get().cloned();
+    tokio::spawn(async move {
+        let joined = tokio::spawn(task).await;
+        let reason = match joined {
+            Ok(Ok(())) => "returned".to_string(),
+            Ok(Err(error)) => error.to_string(),
+            Err(error) if error.is_cancelled() => "cancelled".to_string(),
+            Err(error) => format!("panic: {error}"),
+        };
+        if let Some(reporter) = reporter {
+            if let Err(error) = reporter.send(critical_task_decision(false, name, reason)) {
+                eprintln!("[supervisor] failed to report critical task exit: {error}");
+            }
+        } else {
+            eprintln!("[supervisor] CRITICAL: task {name} exited unexpectedly: {reason}");
+        }
+    })
+}
+
+#[cfg(test)]
+fn spawn_critical_with_reporter<F>(
+    name: &'static str,
+    task: F,
+    reporter: Sender<CriticalTaskOutcome>,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = NodeResult<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let joined = tokio::spawn(task).await;
+        let reason = match joined {
+            Ok(Ok(())) => "returned".to_string(),
+            Ok(Err(error)) => error.to_string(),
+            Err(error) if error.is_cancelled() => "cancelled".to_string(),
+            Err(error) => format!("panic: {error}"),
+        };
+        reporter.send(critical_task_decision(false, name, reason)).unwrap();
+    })
+}
+
+/// Spawn a per-connection task and isolate its panic from the node runtime.
+pub fn spawn_connection<F>(component: &'static str, metrics: std::sync::Arc<crate::metrics::MetricsState>, task: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            eprintln!("[{component}] handler panicked: {}", panic_reason(payload));
+            metrics.record_handler_panic(component);
+        }
+    })
+}
+
 fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -196,5 +259,33 @@ mod tests {
                 reason: "returned".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn critical_task_return_is_reported_once() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_critical_with_reporter("returning", async { Ok(()) }, tx);
+        handle.await.unwrap();
+        assert_eq!(rx.try_iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn critical_task_panic_is_reported_once() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_critical_with_reporter("panicking", async {
+            panic!("test panic");
+        }, tx);
+        handle.await.unwrap();
+        assert_eq!(rx.try_iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_task_panic_is_counted_without_stopping_runtime() {
+        let metrics = std::sync::Arc::new(crate::metrics::MetricsState::new());
+        let handle = spawn_connection("test-connection", std::sync::Arc::clone(&metrics), async {
+            panic!("test connection panic");
+        });
+        handle.await.unwrap();
+        assert_eq!(metrics.handler_panics_total.lock().unwrap().get("test-connection"), Some(&1));
     }
 }

@@ -1215,6 +1215,7 @@ fn start_network_runtime(
     dns_seed_signed_public_key: Option<Vec<u8>>,
     signed_dns_replay_state_path: PathBuf,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
+    metrics: Arc<MetricsState>,
     critical_tasks: &mut indra_node::supervisor::CriticalTasks,
 ) -> indra_node::NodeResult<(
     Arc<NetworkBridge>,
@@ -1223,6 +1224,30 @@ fn start_network_runtime(
     Arc<Mutex<HashMap<String, PeerSource>>>,
     std::sync::mpsc::Receiver<NetworkEvent>,
 )> {
+    macro_rules! fatal_lock {
+        ($mutex:expr, $name:literal) => {{
+            match locks::lock(&$mutex, $name) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("[p2p] lock failure ({}) : {}", $name, error);
+                    indra_node::supervisor::report_unexpected("p2p-runtime", error.to_string());
+                    std::process::exit(1);
+                }
+            }
+        }};
+    }
+    macro_rules! fatal_read {
+        ($rwlock:expr, $name:literal) => {{
+            match locks::read(&$rwlock, $name) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("[p2p] lock failure ({}) : {}", $name, error);
+                    indra_node::supervisor::report_unexpected("p2p-runtime", error.to_string());
+                    std::process::exit(1);
+                }
+            }
+        }};
+    }
     let ban_store_path = signed_dns_replay_state_path.with_file_name("peer_bans");
     let connected_addrs = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
     let peer_addrs = Arc::new(Mutex::new(HashMap::new()));
@@ -1230,7 +1255,7 @@ fn start_network_runtime(
     let discovered_peers = Arc::new(Mutex::new(HashSet::<String>::new()));
     let peer_sources = Arc::new(Mutex::new(HashMap::<String, PeerSource>::new()));
     {
-        let mut sources = peer_sources.lock().unwrap();
+        let mut sources = locks::lock(&peer_sources, "network.peer_sources.initial")?;
         for peer in &bootstrap_peers {
             sources.insert(peer.clone(), PeerSource::Bootstrap);
         }
@@ -1289,11 +1314,12 @@ fn start_network_runtime(
         let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
         let failure_counts = Arc::clone(&failure_counts);
         let inbound_cooldowns = Arc::clone(&inbound_cooldowns);
+        let metrics = Arc::clone(&metrics);
         let ban_store_path = ban_store_path.clone();
         move || {
             runtime.block_on(async move {
                 let (async_event_tx, mut async_event_rx) = tokio_mpsc::channel::<NetworkEvent>(1024);
-                let initial_handshake_config = handshake_config.read().unwrap().clone();
+                let initial_handshake_config = fatal_read!(handshake_config, "network.handshake_config.initial").clone();
                 let peer_manager = spawn_peer_manager(PeerManagerConfig {
                     local_validator_id: initial_handshake_config.my_validator_id,
                     chain_id: initial_handshake_config.chain_id,
@@ -1306,7 +1332,7 @@ fn start_network_runtime(
 
                 let network_bridge = PeerManagerHandle::clone(&peer_manager);
 
-                tokio::spawn({
+                indra_node::supervisor::spawn_critical("network-event-forwarder", {
                     let connected_addrs = Arc::clone(&connected_addrs);
                     let peer_addrs = Arc::clone(&peer_addrs);
                     let addr_validators = Arc::clone(&addr_validators);
@@ -1329,7 +1355,7 @@ fn start_network_runtime(
                                     is_outbound,
                                 } => {
                                     let local_id =
-                                        handshake_config.read().unwrap().my_validator_id;
+                                        fatal_read!(handshake_config, "network.handshake_config.peer_event").my_validator_id;
                                     let accepted = match record_peer_connected_event(
                                         local_id,
                                         *validator_id,
@@ -1350,15 +1376,14 @@ fn start_network_runtime(
                                         Ok(accepted) => accepted,
                                         Err(error) => {
                                             eprintln!("[p2p] peer-event lock failure: {error}");
-                                            indra_node::supervisor::report_unexpected("network-peer-event", error.to_string());
-                                            return;
+                                            return Err(error);
                                         }
                                     };
                                     if !accepted {
                                         continue;
                                     }
                                     if !is_outbound {
-                                        let mut cooldowns = inbound_cooldowns.lock().unwrap();
+                                        let mut cooldowns = fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.connected");
                                         cooldowns.pre_auth.reset(&PreAuthInboundKey {
                                             group: NetworkGroup::from_ip(addr.ip()),
                                             ip: addr.ip(),
@@ -1371,9 +1396,7 @@ fn start_network_runtime(
                                 }
                                 NetworkEvent::PeerDisconnected { validator_id, addr, is_outbound } => {
                                     if !is_outbound {
-                                        inbound_cooldowns
-                                            .lock()
-                                            .unwrap()
+                                        fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.disconnected")
                                             .post_auth
                                             .record_failure_at(
                                                 PostAuthInboundKey {
@@ -1384,14 +1407,12 @@ fn start_network_runtime(
                                             );
                                     }
                                     {
-                                        let mut ca = connected_addrs.lock().unwrap();
+                                        let mut ca = fatal_lock!(connected_addrs, "network.connected_addrs.disconnected");
                                         let count = ca.entry(addr.ip()).or_insert(0);
                                         if *count <= 1 {
                                             ca.remove(&addr.ip());
                                             if *is_outbound {
-                                                outbound_cooldowns
-                                                    .lock()
-                                                    .unwrap()
+                                                fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.disconnected")
                                                     .record_failure_at(
                                                         OutboundCooldownKey::Validator(
                                                             *validator_id,
@@ -1403,9 +1424,9 @@ fn start_network_runtime(
                                             *count -= 1;
                                         }
                                     }
-                                    peer_addrs.lock().unwrap().remove(validator_id);
-                                    addr_validators.lock().unwrap().remove(addr);
-                                    connected_validator_ids.lock().unwrap().remove(validator_id);
+                                    fatal_lock!(peer_addrs, "network.peer_addrs.disconnected").remove(validator_id);
+                                    fatal_lock!(addr_validators, "network.addr_validators.disconnected").remove(addr);
+                                    fatal_lock!(connected_validator_ids, "network.connected_validator_ids.disconnected").remove(validator_id);
                                 }
                                 NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
@@ -1413,10 +1434,11 @@ fn start_network_runtime(
                                 break;
                             }
                         }
+                        Ok::<(), indra_node::NodeError>(())
                     }
                 });
 
-                tokio::spawn({
+                indra_node::supervisor::spawn_critical("network-listener", {
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
                     let handshake_sem = Arc::clone(&handshake_sem);
@@ -1424,12 +1446,15 @@ fn start_network_runtime(
                     let inbound_by_ip = Arc::clone(&inbound_by_ip);
                     let inbound_cooldowns = Arc::clone(&inbound_cooldowns);
                     let listener_addr = p2p_addr.clone();
+                    let metrics = Arc::clone(&metrics);
                     async move {
                         let listener = match tokio::net::TcpListener::bind(&listener_addr).await {
                             Ok(listener) => listener,
                             Err(e) => {
                                 eprintln!("[listener] bind failed: {}", e);
-                                return;
+                                return Err(indra_node::NodeError::InvalidConfiguration {
+                                    detail: format!("listener bind failed: {e}"),
+                                });
                             }
                         };
                         eprintln!("[p2p] listening on {}", listener_addr);
@@ -1442,9 +1467,7 @@ fn start_network_runtime(
                                 group: NetworkGroup::from_ip(addr.ip()),
                                 ip: addr.ip(),
                             };
-                            if inbound_cooldowns
-                                .lock()
-                                .unwrap()
+                            if fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.admission")
                                 .pre_auth
                                 .blocked_at(&pre_auth_key, Instant::now())
                             {
@@ -1455,9 +1478,8 @@ fn start_network_runtime(
                                 Ok(reserved) => reserved,
                                 Err(error) => {
                                     eprintln!("[listener] inbound admission lock failure: {error}");
-                                    indra_node::supervisor::report_unexpected("network-listener", error.to_string());
                                     drop(stream);
-                                    return;
+                                    return Err(error);
                                 }
                             };
                             if !reserved
@@ -1490,18 +1512,17 @@ fn start_network_runtime(
                             let inbound_count = Arc::clone(&inbound_count);
                             let inbound_by_ip = Arc::clone(&inbound_by_ip);
                             let inbound_cooldowns = Arc::clone(&inbound_cooldowns);
-                            tokio::spawn(async move {
+                            let metrics = Arc::clone(&metrics);
+                            indra_node::supervisor::spawn_connection("network-inbound", metrics, async move {
                                 let _permit = permit;
-                                let config = handshake_config.read().unwrap().clone();
+                                let config = fatal_read!(handshake_config, "network.handshake_config.inbound").clone();
                                 match perform_handshake_responder(stream, &config).await {
                                     Ok(handshake) => {
                                         let post_auth_key = PostAuthInboundKey {
                                             validator_id: handshake.peer_validator_id,
                                             ip: addr.ip(),
                                         };
-                                        if inbound_cooldowns
-                                            .lock()
-                                            .unwrap()
+                                        if fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.inbound_post_auth")
                                             .post_auth
                                             .blocked_at(&post_auth_key, Instant::now())
                                         {
@@ -1512,9 +1533,7 @@ fn start_network_runtime(
                                     }
                                     Err(e) => {
                                         eprintln!("[p2p] inbound handshake failed from {}: {}", addr, e);
-                                        inbound_cooldowns
-                                            .lock()
-                                            .unwrap()
+                                        fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.inbound_failure")
                                             .pre_auth
                                             .record_failure_at(pre_auth_key, Instant::now());
                                     }
@@ -1532,7 +1551,7 @@ fn start_network_runtime(
                     }
                 });
 
-                tokio::spawn({
+                indra_node::supervisor::spawn_critical("network-dialer", {
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
                     let connected_addrs = Arc::clone(&connected_addrs);
@@ -1551,6 +1570,7 @@ fn start_network_runtime(
                     let dns_seed_signed_public_key = dns_seed_signed_public_key.clone();
                     let p2p_addr_for_port = p2p_addr.clone();
                     let signed_dns_replay_state = signed_dns_replay_state_path.clone();
+                    let metrics = Arc::clone(&metrics);
                     async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         let p2p_port = p2p_addr_for_port
@@ -1570,8 +1590,8 @@ fn start_network_runtime(
                             save_peers(&peers_file_path, &persisted);
                         }
                         {
-                            let mut dp = discovered_peers.lock().unwrap();
-                            let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+                            let mut dp = fatal_lock!(discovered_peers, "network.discovered_peers.persisted");
+                            let authenticated = fatal_lock!(authenticated_peer_addrs, "network.authenticated_peer_addrs.persisted").clone();
                             for addr in &persisted {
                                 insert_discovered_peer_if_not_self(
                                     &mut dp,
@@ -1624,8 +1644,8 @@ fn start_network_runtime(
                             Vec::new()
                         };
                         {
-                            let mut dp = discovered_peers.lock().unwrap();
-                            let authenticated = authenticated_peer_addrs.lock().unwrap().clone();
+                            let mut dp = fatal_lock!(discovered_peers, "network.discovered_peers.dns");
+                            let authenticated = fatal_lock!(authenticated_peer_addrs, "network.authenticated_peer_addrs.dns").clone();
                             for addr in &dns_peers {
                                 insert_discovered_peer_if_not_self(
                                     &mut dp,
@@ -1635,10 +1655,7 @@ fn start_network_runtime(
                                     &p2p_addr_for_port,
                                     addr.to_string(),
                                 );
-                                peer_sources
-                                    .lock()
-                                    .unwrap()
-                                    .insert(
+                                fatal_lock!(peer_sources, "network.peer_sources.dns").insert(
                                         addr.to_string(),
                                         if dns_seed_signed_validation
                                             == SignedDnsSeedValidationMode::Require
@@ -1657,13 +1674,11 @@ fn start_network_runtime(
                             let deficit = TARGET_OUTBOUND_PEERS.saturating_sub(
                                 network_bridge.connected_outbound_peer_count(),
                             );
-                            let mut candidates: Vec<(String, PeerSource)> = peer_sources
-                                .lock()
-                                .unwrap()
+                            let mut candidates: Vec<(String, PeerSource)> = fatal_lock!(peer_sources, "network.peer_sources.candidates")
                                 .iter()
                                 .map(|(address, source)| (address.clone(), *source))
                                 .collect();
-                            for peer in discovered_peers.lock().unwrap().iter() {
+                            for peer in fatal_lock!(discovered_peers, "network.discovered_peers.candidates").iter() {
                                 if !candidates.iter().any(|(address, _)| address == peer) {
                                     candidates.push((peer.clone(), PeerSource::PeerExchange));
                                 }
@@ -1680,24 +1695,20 @@ fn start_network_runtime(
                                     || has_connected_ip(&connected_addrs, &addr).unwrap_or(false)
                                     || should_skip_dial_for_connected_validator(
                                         peer,
-                                        &authenticated_addr_validators.lock().unwrap(),
-                                        &connected_validator_ids.lock().unwrap(),
+                                        &*fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.eligibility"),
+                                        &*fatal_lock!(connected_validator_ids, "network.connected_validator_ids.eligibility"),
                                     )
                                 {
                                     return false;
                                 }
-                                let cooldown_key = authenticated_addr_validators
-                                    .lock()
-                                    .unwrap()
+                                let cooldown_key = fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.cooldown")
                                     .get(peer)
                                     .copied()
                                     .map(OutboundCooldownKey::Validator)
                                     .unwrap_or_else(|| {
                                         OutboundCooldownKey::Address(peer.clone())
                                     });
-                                !outbound_cooldowns
-                                    .lock()
-                                    .unwrap()
+                                !fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.eligibility")
                                     .blocked_at(&cooldown_key, eligibility_now)
                             });
                             let mut rng = rand::rngs::OsRng;
@@ -1719,38 +1730,34 @@ fn start_network_runtime(
                                     continue;
                                 };
                                 if is_configured_self_addr(&addr, &p2p_addr_for_port) {
-                                    discovered_peers.lock().unwrap().remove(peer_addr_str);
-                                    outbound_cooldowns.lock().unwrap().reset(
+                                    fatal_lock!(discovered_peers, "network.discovered_peers.self").remove(peer_addr_str);
+                                    fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.self").reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
                                     continue;
                                 }
                                 if has_connected_ip(&connected_addrs, &addr).unwrap_or(false) {
-                                    outbound_cooldowns.lock().unwrap().reset(
+                                    fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connected_ip").reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
                                     continue;
                                 }
                                 if should_skip_dial_for_connected_validator(
                                     peer_addr_str,
-                                    &authenticated_addr_validators.lock().unwrap(),
-                                    &connected_validator_ids.lock().unwrap(),
+                                    &*fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.connected"),
+                                    &*fatal_lock!(connected_validator_ids, "network.connected_validator_ids.connected"),
                                 ) {
-                                    outbound_cooldowns.lock().unwrap().reset(
+                                    fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connected_validator").reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
                                     continue;
                                 }
-                                let cooldown_key = authenticated_addr_validators
-                                    .lock()
-                                    .unwrap()
+                                let cooldown_key = fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.dial")
                                     .get(peer_addr_str)
                                     .copied()
                                     .map(OutboundCooldownKey::Validator)
                                     .unwrap_or_else(|| OutboundCooldownKey::Address(peer_addr_str.clone()));
-                                if outbound_cooldowns
-                                    .lock()
-                                    .unwrap()
+                                if fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.dial")
                                     .blocked_at(&cooldown_key, Instant::now())
                                 {
                                     continue;
@@ -1761,7 +1768,7 @@ fn start_network_runtime(
                                             Ok(permit) => permit,
                                             Err(_) => {
                                                 eprintln!("[p2p] handshake limit reached, deferring outbound connection to {}", addr);
-                                                outbound_cooldowns.lock().unwrap().record_failure_at(
+                                                fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.permit").record_failure_at(
                                                     cooldown_key.clone(),
                                                     Instant::now(),
                                                 );
@@ -1776,24 +1783,25 @@ fn start_network_runtime(
                                             let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                                             let peer_key = peer_addr_str.clone();
                                             let cooldown_key = cooldown_key.clone();
-                                        tokio::spawn(async move {
+                                        let metrics = Arc::clone(&metrics);
+                                        indra_node::supervisor::spawn_connection("network-outbound", metrics, async move {
                                             let _permit = permit;
-                                            let config = handshake_config.read().unwrap().clone();
+                                            let config = fatal_read!(handshake_config, "network.handshake_config.outbound").clone();
                                             match perform_handshake_initiator(stream, &config).await {
                                                 Ok(handshake) => {
                                                     let _ = peer_manager.register_peer(addr, handshake).await;
                                                 }
                                                 Err(e) => {
                                                     eprintln!("[dialer] handshake failed with {}: {}", addr, e);
-                                                    outbound_cooldowns.lock().unwrap().record_failure_at(
+                                                    fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.handshake").record_failure_at(
                                                         cooldown_key,
                                                         Instant::now(),
                                                     );
                                                     if record_dial_failure(
                                                         &peer_key,
-                                                        &mut discovered_peers.lock().unwrap(),
-                                                        &mut outbound_cooldowns.lock().unwrap(),
-                                                        &mut failure_counts.lock().unwrap(),
+                                                        &mut *fatal_lock!(discovered_peers, "network.discovered_peers.handshake_failure"),
+                                                        &mut *fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.handshake_failure"),
+                                                        &mut *fatal_lock!(failure_counts, "network.failure_counts.handshake_failure"),
                                                         &bootstrap_peer_addrs,
                                                     ) {
                                                         eprintln!(
@@ -1808,15 +1816,15 @@ fn start_network_runtime(
                                     }
                                     Err(e) => {
                                         eprintln!("[dialer] failed to connect to {}: {}", addr, e);
-                                        outbound_cooldowns.lock().unwrap().record_failure_at(
+                                        fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connect_failure").record_failure_at(
                                             cooldown_key,
                                             Instant::now(),
                                         );
                                         if record_dial_failure(
                                             peer_addr_str,
-                                            &mut discovered_peers.lock().unwrap(),
-                                            &mut outbound_cooldowns.lock().unwrap(),
-                                            &mut failure_counts.lock().unwrap(),
+                                            &mut *fatal_lock!(discovered_peers, "network.discovered_peers.connect_failure"),
+                                            &mut *fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connect_failure_bookkeeping"),
+                                            &mut *fatal_lock!(failure_counts, "network.failure_counts.connect_failure"),
                                             &bootstrap_peer_addrs,
                                         ) {
                                             eprintln!(
@@ -1830,8 +1838,8 @@ fn start_network_runtime(
                             }
                             if last_peer_save.elapsed().as_secs() >= PEER_TABLE_SAVE_INTERVAL_SECS {
                                 let peers_to_save = peer_addresses_to_persist(
-                                    &discovered_peers.lock().unwrap(),
-                                    &peer_addrs.lock().unwrap(),
+                                    &*fatal_lock!(discovered_peers, "network.discovered_peers.persist"),
+                                    &*fatal_lock!(peer_addrs, "network.peer_addrs.persist"),
                                     &p2p_addr_for_port,
                                 );
                                 save_peers(&peers_file_path, &peers_to_save);
@@ -1842,7 +1850,7 @@ fn start_network_runtime(
                     }
                 });
 
-                tokio::spawn({
+                indra_node::supervisor::spawn_critical("network-shutdown-watcher", {
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let peer_addrs = Arc::clone(&peer_addrs);
                     let peers_file_path = peers_file_path.clone();
@@ -1850,8 +1858,8 @@ fn start_network_runtime(
                     async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
                             let peers_to_save = peer_addresses_to_persist(
-                                &discovered_peers.lock().unwrap(),
-                                &peer_addrs.lock().unwrap(),
+                                &*fatal_lock!(discovered_peers, "network.discovered_peers.shutdown"),
+                                &*fatal_lock!(peer_addrs, "network.peer_addrs.shutdown"),
                                 &local_p2p_addr,
                             );
                             save_peers(&peers_file_path, &peers_to_save);
@@ -1861,6 +1869,7 @@ fn start_network_runtime(
                             );
                             std::process::exit(0);
                         }
+                        Ok::<(), indra_node::NodeError>(())
                     }
                 });
 
@@ -2573,6 +2582,7 @@ fn main() {
             dns_seed_signed_public_key.clone(),
             signed_dns_replay_state_path(Path::new(&data_dir)),
             Arc::clone(&handshake_config),
+            Arc::clone(&metrics_state),
             &mut critical_tasks,
         ) {
             Ok(runtime) => runtime,
