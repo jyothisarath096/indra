@@ -4109,27 +4109,31 @@ fn run() -> indra_node::NodeResult<()> {
             .or_else(|| cfg_file.rpc_addr.clone())
             .unwrap_or_else(|| "127.0.0.1:8545".to_string());
         let handle = spawn_rpc_listener(
-            "rpc",
-            rpc_addr,
-            indra_rpc::handlers::RpcMode::Full,
-            RpcListenerPolicy::full(&cfg_file),
-            Arc::clone(&driver),
-            rpc_snapshot.clone(),
-            rpc_storage.clone(),
-            Arc::clone(&gossip),
-            Arc::clone(&discovered_peers),
-            Arc::clone(&op_relay_seen),
-            Arc::clone(&observer_count),
-            cfg_file.rpc_cors_origins.clone(),
-            cfg_file
-                .rpc_admin_token
-                .clone()
-                .filter(|token| !token.trim().is_empty()),
-            cfg_file
-                .rpc_access_token
-                .clone()
-                .filter(|token| !token.trim().is_empty()),
-            Arc::clone(&metrics_state),
+            RpcListenerConfig {
+                label: "rpc",
+                rpc_addr,
+                mode: indra_rpc::handlers::RpcMode::Full,
+                policy: RpcListenerPolicy::full(&cfg_file),
+                cors_origins: cfg_file.rpc_cors_origins.clone(),
+                admin_token: cfg_file
+                    .rpc_admin_token
+                    .clone()
+                    .filter(|token| !token.trim().is_empty()),
+                access_token: cfg_file
+                    .rpc_access_token
+                    .clone()
+                    .filter(|token| !token.trim().is_empty()),
+            },
+            RpcListenerState {
+                driver: Arc::clone(&driver),
+                rpc_snapshot: rpc_snapshot.clone(),
+                rpc_storage: rpc_storage.clone(),
+                gossip: Arc::clone(&gossip),
+                discovered_peers: Arc::clone(&discovered_peers),
+                op_relay_seen: Arc::clone(&op_relay_seen),
+                observer_count: Arc::clone(&observer_count),
+                metrics: Arc::clone(&metrics_state),
+            },
         )?;
         critical_tasks.adopt("full-rpc-listener", handle);
     } else {
@@ -4143,21 +4147,25 @@ fn run() -> indra_node::NodeResult<()> {
             .filter(|addr| !addr.trim().is_empty())
             .unwrap_or_else(|| "127.0.0.1:8547".to_string());
         let handle = spawn_rpc_listener(
-            "rpc-public",
-            rpc_public_addr,
-            indra_rpc::handlers::RpcMode::ReadOnly,
-            RpcListenerPolicy::public_from_config(&cfg_file),
-            Arc::clone(&driver),
-            rpc_snapshot.clone(),
-            rpc_storage.clone(),
-            Arc::clone(&gossip),
-            Arc::clone(&discovered_peers),
-            Arc::clone(&op_relay_seen),
-            Arc::clone(&observer_count),
-            cfg_file.rpc_public_cors_origins.clone(),
-            None,
-            None,
-            Arc::clone(&metrics_state),
+            RpcListenerConfig {
+                label: "rpc-public",
+                rpc_addr: rpc_public_addr,
+                mode: indra_rpc::handlers::RpcMode::ReadOnly,
+                policy: RpcListenerPolicy::public_from_config(&cfg_file),
+                cors_origins: cfg_file.rpc_public_cors_origins.clone(),
+                admin_token: None,
+                access_token: None,
+            },
+            RpcListenerState {
+                driver: Arc::clone(&driver),
+                rpc_snapshot: rpc_snapshot.clone(),
+                rpc_storage: rpc_storage.clone(),
+                gossip: Arc::clone(&gossip),
+                discovered_peers: Arc::clone(&discovered_peers),
+                op_relay_seen: Arc::clone(&op_relay_seen),
+                observer_count: Arc::clone(&observer_count),
+                metrics: Arc::clone(&metrics_state),
+            },
         )?;
         critical_tasks.adopt("public-rpc-listener", handle);
     }
@@ -4894,11 +4902,17 @@ fn rpc_public_should_start(enabled: Option<bool>) -> bool {
     enabled.unwrap_or(false)
 }
 
-fn spawn_rpc_listener(
+struct RpcListenerConfig {
     label: &'static str,
     rpc_addr: String,
     mode: indra_rpc::handlers::RpcMode,
     policy: RpcListenerPolicy,
+    cors_origins: Vec<String>,
+    admin_token: Option<String>,
+    access_token: Option<String>,
+}
+
+struct RpcListenerState {
     driver: Arc<Mutex<indra_node::driver::ConsensusDriver>>,
     rpc_snapshot: indra_node::rpc_snapshot::RpcSnapshotPublisher,
     rpc_storage: indra_node::rpc_snapshot::RpcStorageReadHandles,
@@ -4906,11 +4920,32 @@ fn spawn_rpc_listener(
     discovered_peers: Arc<Mutex<HashSet<String>>>,
     op_relay_seen: Arc<Mutex<InboundDedupCaches>>,
     observer_count: Arc<AtomicUsize>,
-    cors_origins: Vec<String>,
-    admin_token: Option<String>,
-    access_token: Option<String>,
     metrics: Arc<MetricsState>,
+}
+
+fn spawn_rpc_listener(
+    config: RpcListenerConfig,
+    state: RpcListenerState,
 ) -> indra_node::NodeResult<std::thread::JoinHandle<()>> {
+    let RpcListenerConfig {
+        label,
+        rpc_addr,
+        mode,
+        policy,
+        cors_origins,
+        admin_token,
+        access_token,
+    } = config;
+    let RpcListenerState {
+        driver,
+        rpc_snapshot,
+        rpc_storage,
+        gossip,
+        discovered_peers,
+        op_relay_seen,
+        observer_count,
+        metrics,
+    } = state;
     let rpc_cors_origins = Arc::new(cors_origins);
     let admin_token = Arc::new(admin_token);
     let access_token = Arc::new(access_token);
@@ -4974,8 +5009,8 @@ fn spawn_rpc_listener(
                         .rpc_active_connections
                         .fetch_add(1, Ordering::Relaxed);
                     let driver_rpc = Arc::clone(&driver);
-                    let rpc_snapshot = rpc_snapshot.clone();
-                    let rpc_storage = rpc_storage.clone();
+                    let rpc_snapshot_rpc = rpc_snapshot.clone();
+                    let rpc_storage_rpc = rpc_storage.clone();
                     let gossip_rpc = Arc::clone(&gossip);
                     let discovered_peers_rpc = Arc::clone(&discovered_peers);
                     let op_relay_seen_rpc = Arc::clone(&op_relay_seen);
@@ -4996,30 +5031,34 @@ fn spawn_rpc_listener(
                     let policy = Arc::clone(&policy);
                     std::thread::spawn(move || {
                         let completed = run_isolated_handler(label, &metrics, || {
-                            handle_rpc(
-                                stream,
-                                &driver_rpc,
-                                &rpc_snapshot,
-                                &rpc_storage,
-                                &gossip_rpc,
-                                &discovered_peers_rpc,
-                                &op_relay_seen_rpc,
-                                &observer_count_rpc,
+                            let node = RpcHandlerNode {
+                                driver: &driver_rpc,
+                                rpc_snapshot: &rpc_snapshot_rpc,
+                                rpc_storage: &rpc_storage_rpc,
+                                gossip: &gossip_rpc,
+                                discovered_peers: &discovered_peers_rpc,
+                                op_relay_seen: &op_relay_seen_rpc,
+                                observer_count: &observer_count_rpc,
+                                metrics: &metrics,
+                            };
+                            let limits = RpcHandlerLimits {
                                 peer_ip,
-                                &rpc_rate_limiter,
-                                rpc_global_rate_limiter.as_deref(),
-                                &expensive_limiter,
-                                &expensive_global_limiter,
-                                &expensive_semaphore,
-                                &rejection_counters,
-                                &rpc_cors_origins,
-                                mode,
-                                &policy,
-                                admin_token.as_ref().as_deref(),
-                                access_token.as_ref().as_deref(),
-                                &metrics,
-                                &limiter_telemetry,
-                            );
+                                rate_limiter: &rpc_rate_limiter,
+                                global_rate_limiter: rpc_global_rate_limiter.as_deref(),
+                                expensive_limiter: &expensive_limiter,
+                                expensive_global_limiter: &expensive_global_limiter,
+                                expensive_semaphore: &expensive_semaphore,
+                                rejection_counters: &rejection_counters,
+                                policy: &policy,
+                                limiter_telemetry: &limiter_telemetry,
+                            };
+                            let auth = RpcHandlerAuth {
+                                cors_origins: &rpc_cors_origins,
+                                rpc_mode: mode,
+                                configured_admin_token: admin_token.as_ref().as_deref(),
+                                configured_access_token: access_token.as_ref().as_deref(),
+                            };
+                            handle_rpc(stream, node, limits, auth);
                         });
                         if !completed {
                             eprintln!("[{label}] handler panicked for {:?}", peer_ip);
@@ -5295,17 +5334,29 @@ fn provenance_requested_block_height(
         .map(|entry| entry.created_height)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_public_light_method(
-    method: &str,
-    publisher: &indra_node::rpc_snapshot::RpcSnapshotPublisher,
+struct RpcPublicLightContext<'a> {
+    publisher: &'a indra_node::rpc_snapshot::RpcSnapshotPublisher,
     connected_validator_peer_count: usize,
     discovered_count: usize,
-    observer_count_val: usize,
+    observer_count: usize,
     rpc_mode: indra_rpc::handlers::RpcMode,
     admin_token_configured: bool,
-    rejection_counters: &RpcRejectionCounters,
+    rejection_counters: &'a RpcRejectionCounters,
+}
+
+fn dispatch_public_light_method(
+    method: &str,
+    context: RpcPublicLightContext<'_>,
 ) -> Option<indra_rpc::RpcResult<String>> {
+    let RpcPublicLightContext {
+        publisher,
+        connected_validator_peer_count,
+        discovered_count,
+        observer_count,
+        rpc_mode,
+        admin_token_configured,
+        rejection_counters,
+    } = context;
     if rpc_mode != indra_rpc::handlers::RpcMode::ReadOnly {
         return None;
     }
@@ -5343,7 +5394,7 @@ fn dispatch_public_light_method(
             connected_validator_peer_count,
             indra_core::types::primitives::TARGET_OUTBOUND_PEERS,
             discovered_count,
-            observer_count_val,
+            observer_count,
         ))),
         "indra_getRpcPolicy" => Some(Ok(public_rpc_policy_json(
             admin_token_configured,
@@ -5410,30 +5461,69 @@ fn public_expensive_method_allowed(
 /// Reads one HTTP request, dispatches to the appropriate chain query,
 /// and writes the JSON response. Locks the driver only for the duration
 /// of the state read — not while writing the HTTP response.
+struct RpcHandlerNode<'a> {
+    driver: &'a Arc<Mutex<indra_node::driver::ConsensusDriver>>,
+    rpc_snapshot: &'a indra_node::rpc_snapshot::RpcSnapshotPublisher,
+    rpc_storage: &'a indra_node::rpc_snapshot::RpcStorageReadHandles,
+    gossip: &'a Arc<NetworkBridge>,
+    discovered_peers: &'a Arc<Mutex<HashSet<String>>>,
+    op_relay_seen: &'a Arc<Mutex<InboundDedupCaches>>,
+    observer_count: &'a Arc<AtomicUsize>,
+    metrics: &'a MetricsState,
+}
+
+struct RpcHandlerLimits<'a> {
+    peer_ip: Option<IpAddr>,
+    rate_limiter: &'a indra_rpc::server::RpcRateLimiter,
+    global_rate_limiter: Option<&'a indra_rpc::server::RpcGlobalRateLimiter>,
+    expensive_limiter: &'a indra_rpc::server::RpcWindowRateLimiter,
+    expensive_global_limiter: &'a indra_rpc::server::RpcGlobalWindowRateLimiter,
+    expensive_semaphore: &'a RpcSemaphore,
+    rejection_counters: &'a RpcRejectionCounters,
+    policy: &'a RpcListenerPolicy,
+    limiter_telemetry: &'a RpcLimiterTelemetry,
+}
+
+struct RpcHandlerAuth<'a> {
+    cors_origins: &'a [String],
+    rpc_mode: indra_rpc::handlers::RpcMode,
+    configured_admin_token: Option<&'a str>,
+    configured_access_token: Option<&'a str>,
+}
+
 fn handle_rpc(
     stream: std::net::TcpStream,
-    driver: &Arc<Mutex<indra_node::driver::ConsensusDriver>>,
-    rpc_snapshot: &indra_node::rpc_snapshot::RpcSnapshotPublisher,
-    rpc_storage: &indra_node::rpc_snapshot::RpcStorageReadHandles,
-    gossip: &Arc<NetworkBridge>,
-    discovered_peers: &Arc<Mutex<HashSet<String>>>,
-    op_relay_seen: &Arc<Mutex<InboundDedupCaches>>,
-    observer_count: &Arc<AtomicUsize>,
-    peer_ip: Option<IpAddr>,
-    rate_limiter: &indra_rpc::server::RpcRateLimiter,
-    global_rate_limiter: Option<&indra_rpc::server::RpcGlobalRateLimiter>,
-    expensive_limiter: &indra_rpc::server::RpcWindowRateLimiter,
-    expensive_global_limiter: &indra_rpc::server::RpcGlobalWindowRateLimiter,
-    expensive_semaphore: &RpcSemaphore,
-    rejection_counters: &RpcRejectionCounters,
-    cors_origins: &[String],
-    rpc_mode: indra_rpc::handlers::RpcMode,
-    policy: &RpcListenerPolicy,
-    configured_admin_token: Option<&str>,
-    configured_access_token: Option<&str>,
-    metrics: &MetricsState,
-    limiter_telemetry: &RpcLimiterTelemetry,
+    node: RpcHandlerNode<'_>,
+    limits: RpcHandlerLimits<'_>,
+    auth: RpcHandlerAuth<'_>,
 ) {
+    let RpcHandlerNode {
+        driver,
+        rpc_snapshot,
+        rpc_storage,
+        gossip,
+        discovered_peers,
+        op_relay_seen,
+        observer_count,
+        metrics,
+    } = node;
+    let RpcHandlerLimits {
+        peer_ip,
+        rate_limiter,
+        global_rate_limiter,
+        expensive_limiter,
+        expensive_global_limiter,
+        expensive_semaphore,
+        rejection_counters,
+        policy,
+        limiter_telemetry,
+    } = limits;
+    let RpcHandlerAuth {
+        cors_origins,
+        rpc_mode,
+        configured_admin_token,
+        configured_access_token,
+    } = auth;
     use indra_rpc::handlers::{
         check_rpc_method_allowed_with_admin, dispatch_with_admin, DispatchResult, NodeState,
     };
@@ -5779,13 +5869,15 @@ fn handle_rpc(
 
     if let Some(result) = dispatch_public_light_method(
         &req.method,
-        rpc_snapshot,
-        connected_validator_peer_count,
-        discovered_count,
-        observer_count_val,
-        rpc_mode,
-        admin_token_configured,
-        rejection_counters,
+        RpcPublicLightContext {
+            publisher: rpc_snapshot,
+            connected_validator_peer_count,
+            discovered_count,
+            observer_count: observer_count_val,
+            rpc_mode,
+            admin_token_configured,
+            rejection_counters,
+        },
     ) {
         match result {
             Ok(result) => {
@@ -7946,29 +8038,44 @@ mod tests {
 
         let metrics = MetricsState::new();
         let telemetry = RpcLimiterTelemetry::default();
+        let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
+        let op_relay_seen = Arc::new(Mutex::new(InboundDedupCaches::new()));
+        let observer_count = Arc::new(AtomicUsize::new(0));
+        let rate_limiter = indra_rpc::server::RpcRateLimiter::new();
+        let expensive_limiter = indra_rpc::server::RpcWindowRateLimiter::new();
+        let expensive_global_limiter = indra_rpc::server::RpcGlobalWindowRateLimiter::new();
+        let semaphore = RpcSemaphore::new(1);
+        let rejection_counters = RpcRejectionCounters::default();
+        let policy = RpcListenerPolicy::public_from_config(&NodeConfigFile::default());
         handle_rpc(
             server,
-            &driver,
-            &snapshot,
-            &storage,
-            &gossip,
-            &Arc::new(Mutex::new(HashSet::new())),
-            &Arc::new(Mutex::new(InboundDedupCaches::new())),
-            &Arc::new(AtomicUsize::new(0)),
-            None,
-            &indra_rpc::server::RpcRateLimiter::new(),
-            None,
-            &indra_rpc::server::RpcWindowRateLimiter::new(),
-            &indra_rpc::server::RpcGlobalWindowRateLimiter::new(),
-            &RpcSemaphore::new(1),
-            &RpcRejectionCounters::default(),
-            &[],
-            indra_rpc::handlers::RpcMode::ReadOnly,
-            &RpcListenerPolicy::public_from_config(&NodeConfigFile::default()),
-            None,
-            None,
-            &metrics,
-            &telemetry,
+            RpcHandlerNode {
+                driver: &driver,
+                rpc_snapshot: &snapshot,
+                rpc_storage: &storage,
+                gossip: &gossip,
+                discovered_peers: &discovered_peers,
+                op_relay_seen: &op_relay_seen,
+                observer_count: &observer_count,
+                metrics: &metrics,
+            },
+            RpcHandlerLimits {
+                peer_ip: None,
+                rate_limiter: &rate_limiter,
+                global_rate_limiter: None,
+                expensive_limiter: &expensive_limiter,
+                expensive_global_limiter: &expensive_global_limiter,
+                expensive_semaphore: &semaphore,
+                rejection_counters: &rejection_counters,
+                policy: &policy,
+                limiter_telemetry: &telemetry,
+            },
+            RpcHandlerAuth {
+                cors_origins: &[],
+                rpc_mode: indra_rpc::handlers::RpcMode::ReadOnly,
+                configured_admin_token: None,
+                configured_access_token: None,
+            },
         );
 
         let mut response = String::new();
