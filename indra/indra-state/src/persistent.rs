@@ -14,6 +14,7 @@ use crate::smt::{
     AuthTreeProof, CompressedAuthTree, CompressedChildKind, CompressedProof, CompressedProofChild,
     CompressedProofStep, MerkleProof, ProofTerminal, SMT_DEPTH,
 };
+use crate::error::{StateError, StateResult};
 
 /// Immutable, path-copying ordered map.
 #[derive(Debug, Clone, Default)]
@@ -323,7 +324,7 @@ fn node_len<K, V>(node: &Option<Arc<MapNode<K, V>>>) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PersistentSparseNodeLoc {
-    depth: u16,
+    depth: usize,
     prefix: [u8; 32],
 }
 
@@ -366,8 +367,8 @@ impl PersistentSparseMerkleTree {
     {
         let mut sorted: Vec<_> = pairs.into_iter().collect();
         sorted.sort_by_key(|(key, _)| *key);
-        for window in sorted.windows(2) {
-            if window[0].0 == window[1].0 {
+        for (first, second) in sorted.iter().zip(sorted.iter().skip(1)) {
+            if first.0 == second.0 {
                 return Err("duplicate persistent sparse Merkle tree key".to_string());
             }
         }
@@ -559,8 +560,8 @@ fn sparse_empty_hashes() -> Vec<[u8; 32]> {
     hashes
 }
 
-fn sparse_depth_from_bit(bit_index: usize) -> u16 {
-    u16::try_from(bit_index).unwrap_or(0)
+fn sparse_depth_from_bit(bit_index: usize) -> usize {
+    bit_index
 }
 
 fn sparse_hash_leaf(key: &[u8; 32], value: &[u8; 32]) -> [u8; 32] {
@@ -581,7 +582,7 @@ fn sparse_hash_internal(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 
 fn sparse_bit_at(key: &[u8; 32], bit_index: usize) -> bool {
     let byte_index = bit_index / 8;
-    let bit_offset = 7u8.saturating_sub(u8::try_from(bit_index % 8).unwrap_or(0));
+    let bit_offset = 7usize - (bit_index % 8);
     match key.get(byte_index) {
         Some(byte) => (byte & (1u8 << bit_offset)) != 0,
         None => false,
@@ -607,7 +608,7 @@ fn sparse_sibling_prefix(key: [u8; 32], bit_index: usize) -> [u8; 32] {
 
 fn sparse_set_bit(bytes: &mut [u8; 32], bit_index: usize, value: bool) {
     let byte_index = bit_index / 8;
-    let bit_offset = 7u8.saturating_sub(u8::try_from(bit_index % 8).unwrap_or(0));
+    let bit_offset = 7usize - (bit_index % 8);
     if let Some(byte) = bytes.get_mut(byte_index) {
         if value {
             *byte |= 1u8 << bit_offset;
@@ -772,17 +773,19 @@ where
     K: Clone,
     V: Clone,
 {
-    if node.left.is_none() {
-        return (node.right.clone(), node.clone());
+    match node.left.as_ref() {
+        None => (node.right.clone(), node.clone()),
+        Some(left_node) => {
+            let (left, min) = remove_min(left_node);
+            let next = make_map_node(
+                node.key.clone(),
+                node.value.clone(),
+                left,
+                node.right.clone(),
+            );
+            (Some(rebalance(next)), min)
+        }
     }
-    let (left, min) = remove_min(node.left.as_ref().expect("checked"));
-    let next = make_map_node(
-        node.key.clone(),
-        node.value.clone(),
-        left,
-        node.right.clone(),
-    );
-    (Some(rebalance(next)), min)
 }
 
 fn remove_node<K, V>(
@@ -886,8 +889,8 @@ impl PersistentAuthTree {
     {
         let mut sorted: Vec<_> = pairs.into_iter().collect();
         sorted.sort_by_key(|(key, _)| *key);
-        for window in sorted.windows(2) {
-            if window[0].0 == window[1].0 {
+        for (first, second) in sorted.iter().zip(sorted.iter().skip(1)) {
+            if first.0 == second.0 {
                 return Err("duplicate persistent authenticated tree key".to_string());
             }
         }
@@ -897,7 +900,7 @@ impl PersistentAuthTree {
         }
         Ok(Self {
             leaves,
-            root: build_persistent_subtree(&sorted, 0),
+            root: build_persistent_subtree(&sorted, 0).map_err(|err| err.to_string())?,
         })
     }
 
@@ -922,19 +925,19 @@ impl PersistentAuthTree {
     }
 
     /// Insert or replace a leaf.
-    pub fn insert(&mut self, key: [u8; 32], value_hash: [u8; 32]) -> Option<[u8; 32]> {
+    pub fn insert(&mut self, key: [u8; 32], value_hash: [u8; 32]) -> StateResult<Option<[u8; 32]>> {
         let old = self.leaves.insert(key, value_hash);
-        self.root = persistent_insert(&self.root, key, value_hash);
-        old
+        self.root = persistent_insert(&self.root, key, value_hash)?;
+        Ok(old)
     }
 
     /// Delete a leaf.
-    pub fn delete(&mut self, key: [u8; 32]) -> Option<[u8; 32]> {
+    pub fn delete(&mut self, key: [u8; 32]) -> StateResult<Option<[u8; 32]>> {
         let old = self.leaves.remove(&key);
         if old.is_some() {
-            self.root = persistent_delete(&self.root, key);
+            self.root = persistent_delete(&self.root, key)?;
         }
-        old
+        Ok(old)
     }
 
     /// Build an inclusion/non-membership proof.
@@ -980,35 +983,61 @@ impl PersistentAuthNode {
 fn build_persistent_subtree(
     pairs: &[([u8; 32], [u8; 32])],
     start_nibble: usize,
-) -> Arc<PersistentAuthNode> {
+) -> StateResult<Arc<PersistentAuthNode>> {
     match pairs.len() {
-        0 => Arc::new(PersistentAuthNode::Empty),
+        0 => Ok(Arc::new(PersistentAuthNode::Empty)),
         1 => {
-            let (key, value_hash) = pairs[0];
-            Arc::new(PersistentAuthNode::Leaf {
-                key,
-                value_hash,
-                hash: hash_compressed_leaf(&key, &value_hash),
-            })
+            let [(key, value_hash)] = pairs else {
+                return Err(StateError::InternalInvariant {
+                    site: "persistent::build_persistent_subtree singleton",
+                });
+            };
+            Ok(Arc::new(PersistentAuthNode::Leaf {
+                key: *key,
+                value_hash: *value_hash,
+                hash: hash_compressed_leaf(key, value_hash),
+            }))
         }
         _ => {
-            let prefix = longest_common_prefix_for_pairs(pairs, start_nibble);
+            let prefix = longest_common_prefix_for_pairs(pairs, start_nibble)?;
             let mut children = BTreeMap::new();
             let mut index = 0usize;
             while index < pairs.len() {
-                let nibbles = key_to_nibbles(&pairs[index].0);
-                let child_nibble = nibbles.get(prefix.len()).copied().unwrap_or(0);
+                let (key, _) = pairs.get(index).ok_or(StateError::InternalInvariant {
+                    site: "persistent::build_persistent_subtree index",
+                })?;
+                let nibbles = key_to_nibbles(key);
+                let child_nibble = nibbles
+                    .iter()
+                    .copied()
+                    .nth(prefix.len())
+                    .ok_or(StateError::InternalInvariant {
+                        site: "persistent::build_persistent_subtree child nibble",
+                    })?;
                 let mut end = index + 1;
                 while end < pairs.len() {
-                    let other = key_to_nibbles(&pairs[end].0);
-                    if other.get(prefix.len()).copied().unwrap_or(0) != child_nibble {
+                    let (other_key, _) = pairs.get(end).ok_or(StateError::InternalInvariant {
+                        site: "persistent::build_persistent_subtree end",
+                    })?;
+                    let other = key_to_nibbles(other_key);
+                    let other_nibble = other
+                        .iter()
+                        .copied()
+                        .nth(prefix.len())
+                        .ok_or(StateError::InternalInvariant {
+                            site: "persistent::build_persistent_subtree other nibble",
+                        })?;
+                    if other_nibble != child_nibble {
                         break;
                     }
                     end += 1;
                 }
+                let group = pairs.get(index..end).ok_or(StateError::InternalInvariant {
+                    site: "persistent::build_persistent_subtree group",
+                })?;
                 children.insert(
                     child_nibble,
-                    build_persistent_subtree(&pairs[index..end], prefix.len() + 1),
+                    build_persistent_subtree(group, prefix.len() + 1)?,
                 );
                 index = end;
             }
@@ -1021,32 +1050,42 @@ fn persistent_insert(
     node: &Arc<PersistentAuthNode>,
     key: [u8; 32],
     value_hash: [u8; 32],
-) -> Arc<PersistentAuthNode> {
+) -> StateResult<Arc<PersistentAuthNode>> {
     match node.as_ref() {
-        PersistentAuthNode::Empty => Arc::new(PersistentAuthNode::Leaf {
+        PersistentAuthNode::Empty => Ok(Arc::new(PersistentAuthNode::Leaf {
             key,
             value_hash,
             hash: hash_compressed_leaf(&key, &value_hash),
-        }),
+        })),
         PersistentAuthNode::Leaf {
             key: existing_key,
             value_hash: existing_value,
             ..
         } => {
             if existing_key == &key {
-                Arc::new(PersistentAuthNode::Leaf {
+                Ok(Arc::new(PersistentAuthNode::Leaf {
                     key,
                     value_hash,
                     hash: hash_compressed_leaf(&key, &value_hash),
-                })
+                }))
             } else {
                 let existing_nibbles = key_to_nibbles(existing_key);
                 let key_nibbles = key_to_nibbles(&key);
                 let prefix_len = common_nibble_prefix_len(&existing_nibbles, &key_nibbles, 0);
-                let prefix = key_nibbles[..prefix_len].to_vec();
+                let prefix = key_nibbles.iter().take(prefix_len).copied().collect();
                 let mut children = BTreeMap::new();
+                let existing_nibble = existing_nibbles.iter().copied().nth(prefix_len).ok_or(
+                    StateError::InternalInvariant {
+                        site: "persistent::persistent_insert existing nibble",
+                    },
+                )?;
+                let new_nibble = key_nibbles.iter().copied().nth(prefix_len).ok_or(
+                    StateError::InternalInvariant {
+                        site: "persistent::persistent_insert new nibble",
+                    },
+                )?;
                 children.insert(
-                    existing_nibbles[prefix_len],
+                    existing_nibble,
                     Arc::new(PersistentAuthNode::Leaf {
                         key: *existing_key,
                         value_hash: *existing_value,
@@ -1054,7 +1093,7 @@ fn persistent_insert(
                     }),
                 );
                 children.insert(
-                    key_nibbles[prefix_len],
+                    new_nibble,
                     Arc::new(PersistentAuthNode::Leaf {
                         key,
                         value_hash,
@@ -1070,12 +1109,20 @@ fn persistent_insert(
             let key_nibbles = key_to_nibbles(&key);
             let shared = common_nibble_prefix_len(prefix, &key_nibbles, 0);
             if shared < prefix.len() {
-                let old_nibble = prefix[shared];
-                let new_nibble = key_nibbles[shared];
+                let old_nibble = prefix.iter().copied().nth(shared).ok_or(
+                    StateError::InternalInvariant {
+                        site: "persistent::persistent_insert old nibble",
+                    },
+                )?;
+                let new_nibble = key_nibbles.iter().copied().nth(shared).ok_or(
+                    StateError::InternalInvariant {
+                        site: "persistent::persistent_insert new split nibble",
+                    },
+                )?;
                 let mut split_children = BTreeMap::new();
                 split_children.insert(
                     old_nibble,
-                    make_persistent_branch(prefix.clone(), children.clone()),
+                    make_persistent_branch(prefix.clone(), children.clone())?,
                 );
                 split_children.insert(
                     new_nibble,
@@ -1085,33 +1132,41 @@ fn persistent_insert(
                         hash: hash_compressed_leaf(&key, &value_hash),
                     }),
                 );
-                return make_persistent_branch(key_nibbles[..shared].to_vec(), split_children);
+                return make_persistent_branch(
+                    key_nibbles.iter().take(shared).copied().collect(),
+                    split_children,
+                );
             }
 
-            let Some(child_nibble) = key_nibbles.get(prefix.len()).copied() else {
-                return make_persistent_branch(prefix.clone(), children.clone());
-            };
+            let child_nibble = key_nibbles.iter().copied().nth(prefix.len()).ok_or(
+                StateError::InternalInvariant {
+                    site: "persistent::persistent_insert child nibble",
+                },
+            )?;
             let mut updated_children = children.clone();
             let child = updated_children
                 .get(&child_nibble)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(PersistentAuthNode::Empty));
-            updated_children.insert(child_nibble, persistent_insert(&child, key, value_hash));
+            updated_children.insert(child_nibble, persistent_insert(&child, key, value_hash)?);
             make_persistent_branch(prefix.clone(), updated_children)
         }
     }
 }
 
-fn persistent_delete(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> Arc<PersistentAuthNode> {
+fn persistent_delete(
+    node: &Arc<PersistentAuthNode>,
+    key: [u8; 32],
+) -> StateResult<Arc<PersistentAuthNode>> {
     match node.as_ref() {
-        PersistentAuthNode::Empty => Arc::new(PersistentAuthNode::Empty),
+        PersistentAuthNode::Empty => Ok(Arc::new(PersistentAuthNode::Empty)),
         PersistentAuthNode::Leaf {
             key: existing_key, ..
         } => {
             if existing_key == &key {
-                Arc::new(PersistentAuthNode::Empty)
+                Ok(Arc::new(PersistentAuthNode::Empty))
             } else {
-                node.clone()
+                Ok(node.clone())
             }
         }
         PersistentAuthNode::Branch {
@@ -1121,11 +1176,15 @@ fn persistent_delete(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> Arc<Persi
             if !starts_with_nibbles(&key_nibbles, prefix) || prefix.len() >= key_nibbles.len() {
                 return make_persistent_branch(prefix.clone(), children.clone());
             }
-            let child_nibble = key_nibbles[prefix.len()];
+            let child_nibble = key_nibbles.iter().copied().nth(prefix.len()).ok_or(
+                StateError::InternalInvariant {
+                    site: "persistent::persistent_delete child nibble",
+                },
+            )?;
             let Some(child) = children.get(&child_nibble) else {
                 return make_persistent_branch(prefix.clone(), children.clone());
             };
-            let updated_child = persistent_delete(child, key);
+            let updated_child = persistent_delete(child, key)?;
             let mut updated_children = children.clone();
             if matches!(updated_child.as_ref(), PersistentAuthNode::Empty) {
                 updated_children.remove(&child_nibble);
@@ -1140,10 +1199,15 @@ fn persistent_delete(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> Arc<Persi
 fn collapse_or_persistent_branch(
     prefix: Vec<u8>,
     mut children: BTreeMap<u8, Arc<PersistentAuthNode>>,
-) -> Arc<PersistentAuthNode> {
+) -> StateResult<Arc<PersistentAuthNode>> {
     match children.len() {
-        0 => Arc::new(PersistentAuthNode::Empty),
-        1 => children.pop_first().expect("len checked").1,
+        0 => Ok(Arc::new(PersistentAuthNode::Empty)),
+        1 => match children.pop_first() {
+            Some((_, child)) => Ok(child),
+            None => Err(StateError::InternalInvariant {
+                site: "persistent::collapse_or_branch child",
+            }),
+        },
         _ => make_persistent_branch(prefix, children),
     }
 }
@@ -1151,7 +1215,7 @@ fn collapse_or_persistent_branch(
 fn make_persistent_branch(
     prefix: Vec<u8>,
     children: BTreeMap<u8, Arc<PersistentAuthNode>>,
-) -> Arc<PersistentAuthNode> {
+) -> StateResult<Arc<PersistentAuthNode>> {
     let mut proof_children = Vec::with_capacity(children.len());
     for (nibble, child) in &children {
         if matches!(child.as_ref(), PersistentAuthNode::Empty) {
@@ -1164,15 +1228,18 @@ fn make_persistent_branch(
         });
     }
     if proof_children.is_empty() {
-        return Arc::new(PersistentAuthNode::Empty);
+        return Ok(Arc::new(PersistentAuthNode::Empty));
     }
-    let hash = hash_branch_from_children(&prefix, &proof_children)
-        .unwrap_or_else(|_| compressed_empty_hash());
-    Arc::new(PersistentAuthNode::Branch {
+    let hash = hash_branch_from_children(&prefix, &proof_children).map_err(|_| {
+        StateError::InternalInvariant {
+            site: "persistent::make_persistent_branch proof children",
+        }
+    })?;
+    Ok(Arc::new(PersistentAuthNode::Branch {
         prefix,
         children,
         hash,
-    })
+    }))
 }
 
 fn persistent_prove(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> CompressedProof {
@@ -1222,11 +1289,22 @@ fn persistent_prove(node: &Arc<PersistentAuthNode>, key: [u8; 32]) -> Compressed
                     steps: Vec::new(),
                 };
             }
-            let target = key_nibbles[prefix.len()];
+            let mut target_iter = key_nibbles.iter().copied().skip(prefix.len());
+            let Some(target) = target_iter.next() else {
+                return CompressedProof {
+                    key,
+                    value: None,
+                    terminal: ProofTerminal::PrefixMismatch {
+                        branch_prefix: prefix.clone(),
+                        children: proof_children_from_map(children, None),
+                    },
+                    steps: Vec::new(),
+                };
+            };
             let step = CompressedProofStep {
                 branch_prefix: prefix.clone(),
                 target_nibble: target,
-                child_bitmap: child_bitmap(&proof_children_from_map(children, None)).unwrap_or(0),
+                child_bitmap: child_bitmap_from_map(&proof_children_from_map(children, None)),
                 siblings: proof_children_from_map(children, Some(target)),
             };
             if let Some(child) = children.get(&target) {
@@ -1262,45 +1340,60 @@ fn proof_children_from_map(
         .collect()
 }
 
-fn longest_common_prefix_for_pairs(pairs: &[([u8; 32], [u8; 32])], start_nibble: usize) -> Vec<u8> {
-    let first = key_to_nibbles(&pairs[0].0);
+fn longest_common_prefix_for_pairs(
+    pairs: &[([u8; 32], [u8; 32])],
+    start_nibble: usize,
+) -> StateResult<Vec<u8>> {
+    let Some((first_key, _)) = pairs.first() else {
+        return Err(StateError::InternalInvariant {
+            site: "persistent::longest_common_prefix empty pairs",
+        });
+    };
+    let first = key_to_nibbles(first_key);
     let mut len = start_nibble;
     while len < first.len() {
-        let nibble = first[len];
+        let Some(nibble) = first.iter().copied().nth(len) else {
+            return Err(StateError::InternalInvariant {
+                site: "persistent::longest_common_prefix index",
+            });
+        };
         if pairs
             .iter()
             .skip(1)
-            .all(|(key, _)| key_to_nibbles(key).get(len).copied() == Some(nibble))
+            .all(|(key, _)| key_to_nibbles(key).iter().copied().nth(len) == Some(nibble))
         {
             len += 1;
         } else {
             break;
         }
     }
-    first[..len].to_vec()
+    Ok(first.iter().take(len).copied().collect())
 }
 
 fn common_nibble_prefix_len(a: &[u8], b: &[u8], start: usize) -> usize {
     let mut index = start;
-    while index < a.len() && index < b.len() && a[index] == b[index] {
+    while index < a.len() && index < b.len() && a.get(index) == b.get(index) {
         index += 1;
     }
     index
 }
 
 fn starts_with_nibbles(key: &[u8], prefix: &[u8]) -> bool {
-    key.len() >= prefix.len() && key[..prefix.len()] == *prefix
+    key.get(..prefix.len()) == Some(prefix)
 }
 
 fn valid_nibble_path(path: &[u8]) -> bool {
     path.iter().all(|nibble| *nibble <= 0x0F) && path.len() <= 64
 }
 
-fn key_to_nibbles(key: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
-    for byte in key {
-        out.push(byte >> 4);
-        out.push(byte & 0x0F);
+fn key_to_nibbles(key: &[u8; 32]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for (byte, slots) in key.iter().copied().zip(out.chunks_exact_mut(2)) {
+        let mut slots = slots.iter_mut();
+        if let (Some(high), Some(low)) = (slots.next(), slots.next()) {
+            *high = byte >> 4;
+            *low = byte & 0x0F;
+        }
     }
     out
 }
@@ -1310,10 +1403,15 @@ fn pack_nibbles(nibbles: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(nibbles.len().div_ceil(2));
-    for chunk in nibbles.chunks(2) {
-        let high = chunk[0] << 4;
-        let low = chunk.get(1).copied().unwrap_or(0);
-        out.push(high | low);
+    for chunk in nibbles.chunks_exact(2) {
+        let mut values = chunk.iter().copied();
+        match (values.next(), values.next()) {
+            (Some(high), Some(low)) => out.push((high << 4) | low),
+            _ => return None,
+        }
+    }
+    if let Some(&last) = nibbles.chunks_exact(2).remainder().first() {
+        out.push(last << 4);
     }
     Some(out)
 }
@@ -1329,6 +1427,12 @@ fn child_bitmap(children: &[CompressedProofChild]) -> Option<u16> {
         previous = Some(child.nibble);
     }
     Some(bitmap)
+}
+
+fn child_bitmap_from_map(children: &[CompressedProofChild]) -> u16 {
+    children
+        .iter()
+        .fold(0u16, |bitmap, child| bitmap | (1u16 << child.nibble))
 }
 
 fn compressed_empty_hash() -> [u8; 32] {
@@ -1730,16 +1834,26 @@ mod tests {
         assert!(tree.is_empty());
         let k1 = key(0x11);
         let k2 = key(0x22);
-        assert_eq!(tree.insert(k1, value(0xAA)), None);
-        assert_eq!(tree.insert(k2, value(0xBB)), None);
-        assert_eq!(tree.insert(k1, value(0xCC)), Some(value(0xAA)));
+        assert_eq!(tree.insert(k1, value(0xAA)), Ok(None));
+        assert_eq!(tree.insert(k2, value(0xBB)), Ok(None));
+        assert_eq!(tree.insert(k1, value(0xCC)), Ok(Some(value(0xAA))));
         assert_eq!(tree.get(&k1), Some(&value(0xCC)));
         let proof = tree.prove(k1);
         assert!(PersistentAuthTree::verify_proof(tree.root(), k1, &proof));
-        assert_eq!(tree.delete(k2), Some(value(0xBB)));
+        assert_eq!(tree.delete(k2), Ok(Some(value(0xBB))));
         assert_eq!(tree.get(&k2), None);
         let missing = tree.prove(k2);
         assert!(PersistentAuthTree::verify_proof(tree.root(), k2, &missing));
+    }
+
+    #[test]
+    fn empty_persistent_prefix_input_returns_typed_invariant_error() {
+        assert_eq!(
+            longest_common_prefix_for_pairs(&[], 0),
+            Err(StateError::InternalInvariant {
+                site: "persistent::longest_common_prefix empty pairs",
+            })
+        );
     }
 
     #[test]
@@ -1747,11 +1861,11 @@ mod tests {
         let mut original = PersistentAuthTree::from_pairs(pairs(128)).unwrap();
         let original_root = original.root();
         let mut clone = original.clone();
-        clone.insert(key(0xFE), value(0xFE));
-        clone.delete(pairs(128)[0].0);
+        clone.insert(key(0xFE), value(0xFE)).unwrap();
+        clone.delete(pairs(128)[0].0).unwrap();
         assert_eq!(original.root(), original_root);
         assert_ne!(clone.root(), original.root());
-        original.insert(key(0xFD), value(0xFD));
+        original.insert(key(0xFD), value(0xFD)).unwrap();
         assert_ne!(clone.root(), original.root());
     }
 
@@ -1765,7 +1879,7 @@ mod tests {
         ];
         let original = PersistentAuthTree::from_pairs(entries).unwrap();
         let mut clone = original.clone();
-        clone.insert(keyed(&[0xF0], 0x03), value(5));
+        clone.insert(keyed(&[0xF0], 0x03), value(5)).unwrap();
         let original_root = original.root_arc();
         let clone_root = clone.root_arc();
         let PersistentAuthNode::Branch {
@@ -1802,8 +1916,8 @@ mod tests {
             .take(entries.len())
             .copied()
         {
-            incremental.insert(key, value);
-            oracle.insert(key, value);
+            incremental.insert(key, value).unwrap();
+            oracle.insert(key, value).unwrap();
         }
         assert_eq!(forward.root(), reverse.root());
         assert_eq!(forward.root(), incremental.root());
@@ -1815,17 +1929,17 @@ mod tests {
         let entries = pairs(64);
         let mut base = PersistentAuthTree::from_pairs(entries.clone()).unwrap();
         let root = base.root();
-        assert_eq!(base.insert(entries[0].0, entries[0].1), Some(entries[0].1));
+        assert_eq!(base.insert(entries[0].0, entries[0].1), Ok(Some(entries[0].1)));
         assert_eq!(base.root(), root, "same key/value replacement is stable");
-        assert_eq!(base.delete(entries[0].0), Some(entries[0].1));
+        assert_eq!(base.delete(entries[0].0), Ok(Some(entries[0].1)));
         assert_ne!(base.root(), root);
-        assert_eq!(base.insert(entries[0].0, entries[0].1), None);
+        assert_eq!(base.insert(entries[0].0, entries[0].1), Ok(None));
         assert_eq!(base.root(), root);
 
         let mut a = base.clone();
         let mut b = base.clone();
-        a.insert(key(0xA1), value(0xA1));
-        b.insert(key(0xB1), value(0xB1));
+        a.insert(key(0xA1), value(0xA1)).unwrap();
+        b.insert(key(0xB1), value(0xB1)).unwrap();
         assert_eq!(base.get(&key(0xA1)), None);
         assert_eq!(base.get(&key(0xB1)), None);
         assert_ne!(a.root(), b.root());
@@ -1863,8 +1977,8 @@ mod tests {
             let mut incremental = PersistentAuthTree::new();
             let mut oracle_incremental = CompressedAuthTree::new();
             for (key, value) in entries.iter().rev().copied() {
-                incremental.insert(key, value);
-                oracle_incremental.insert(key, value);
+                incremental.insert(key, value).unwrap();
+                oracle_incremental.insert(key, value).unwrap();
             }
             assert_eq!(
                 incremental.root(),

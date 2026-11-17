@@ -999,7 +999,7 @@ impl NodeEngine {
     /// Select all candidate block contents against one evolving detached state.
     /// Pool order is preserved for staking, governance, and slashing; transaction
     /// ordering remains the mempool's age/fee/tx-id policy.
-    fn select_block_contents(&mut self) -> SelectedBlockContents {
+    fn select_block_contents(&mut self) -> NodeResult<SelectedBlockContents> {
         self.ensure_pending_indexes();
         let height = self.state.height.saturating_add(1);
         let current_epoch = epoch_for_height(height);
@@ -1029,7 +1029,7 @@ impl NodeEngine {
                 Ok(()) => transactions.push(tx),
                 Err(error) => {
                     eprintln!("[mempool] evicting conflicting candidate {tx_id}: {error}");
-                    self.mempool.evict(&tx_id);
+                    self.mempool.evict(&tx_id).map_err(NodeError::Consensus)?;
                 }
             }
         }
@@ -1131,12 +1131,12 @@ impl NodeEngine {
         self.pending_slashes = retained_slashes;
         self.debug_assert_pending_indexes();
 
-        SelectedBlockContents {
+        Ok(SelectedBlockContents {
             transactions,
             staking_ops,
             governance_ops,
             slash_evidence,
-        }
+        })
     }
 
     /// Remove staking operations included in a committed block.
@@ -1294,7 +1294,7 @@ impl NodeEngine {
                 height: proposal_height,
             })?
             .clone();
-        let contents = self.select_block_contents();
+        let contents = self.select_block_contents()?;
         let template = BlockTemplate {
             proposer_vrf_keypair: vrf_keypair,
             prev_qc_bytes,
@@ -3205,7 +3205,7 @@ mod tests {
             proof_carrying_slash(&engine, &second),
         ];
 
-        let selected = engine.select_block_contents().slash_evidence;
+        let selected = engine.select_block_contents().unwrap().slash_evidence;
         assert_eq!(selected.len(), 1);
         assert_eq!(engine.pending_slashes.len(), 1);
         engine.evict_committed_slashes(&selected);
@@ -3233,7 +3233,7 @@ mod tests {
         assert_eq!(engine.pending_slashes.len(), 1);
 
         engine.state.consensus_snapshots.clear();
-        let selected = engine.select_block_contents().slash_evidence;
+        let selected = engine.select_block_contents().unwrap().slash_evidence;
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], engine.pending_slashes[0]);
 
@@ -3461,7 +3461,7 @@ mod tests {
                 base_fee_changed: true,
                 ..Default::default()
             },
-        );
+        ).unwrap();
         let transaction_full_pool_cycle = full_cycle_started.elapsed();
         assert_eq!(engine.mempool.len(), 5_000);
 
@@ -4733,7 +4733,7 @@ mod tests {
         // where both were independently valid against the same pre-state.
         engine.staking_mempool = vec![first.clone(), second];
 
-        let selected = engine.select_block_contents().staking_ops;
+        let selected = engine.select_block_contents().unwrap().staking_ops;
         assert_eq!(selected, vec![first]);
         assert_eq!(engine.staking_mempool.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4847,7 +4847,7 @@ mod tests {
         let mut engine = NodeEngine::init(config).unwrap();
         let original_state = engine.state.clone();
 
-        let selected = engine.select_block_contents().governance_ops;
+        let selected = engine.select_block_contents().unwrap().governance_ops;
 
         assert!(selected.is_empty());
         assert!(engine.governance_mempool.is_empty());
@@ -4866,7 +4866,7 @@ mod tests {
         let op = valid_cold_governance_propose_op(&mut engine, &keypair, &cold, 1);
         engine.governance_mempool.push(op.clone());
 
-        let selected = engine.select_block_contents().governance_ops;
+        let selected = engine.select_block_contents().unwrap().governance_ops;
 
         assert_eq!(selected, vec![op.clone()]);
         assert_eq!(engine.governance_mempool, vec![op]);
@@ -4928,7 +4928,7 @@ mod tests {
         engine.staking_mempool = vec![staking.clone()];
         engine.governance_mempool = vec![governance];
 
-        let selected = engine.select_block_contents();
+        let selected = engine.select_block_contents().unwrap();
         assert_eq!(selected.staking_ops, vec![staking]);
         assert!(selected.governance_ops.is_empty());
         assert!(engine.governance_mempool.is_empty());
@@ -4962,7 +4962,7 @@ mod tests {
             .submit_validated(staking_tx.clone(), &engine.state)
             .unwrap();
         engine.staking_mempool = vec![staking];
-        let selected = engine.select_block_contents();
+        let selected = engine.select_block_contents().unwrap();
         assert_eq!(selected.transactions, vec![staking_tx]);
         assert!(selected.staking_ops.is_empty());
         assert!(engine.staking_mempool.is_empty());
@@ -4983,7 +4983,7 @@ mod tests {
             .submit_validated(governance_tx.clone(), &engine.state)
             .unwrap();
         engine.governance_mempool = vec![governance];
-        let selected = engine.select_block_contents();
+        let selected = engine.select_block_contents().unwrap();
         assert_eq!(selected.transactions, vec![governance_tx]);
         assert!(selected.governance_ops.is_empty());
         assert!(engine.governance_mempool.is_empty());
@@ -5018,8 +5018,8 @@ mod tests {
         };
         let tx_a = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x71);
         let tx_b = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x72);
-        engine.mempool.insert_unchecked_for_test(tx_a.clone(), 0);
-        engine.mempool.insert_unchecked_for_test(tx_b.clone(), 0);
+        engine.mempool.insert_unchecked_for_test(tx_a.clone(), 0).unwrap();
+        engine.mempool.insert_unchecked_for_test(tx_b.clone(), 0).unwrap();
         let expected_tx = engine.mempool.select_for_block(1, 0)[0].tx.clone();
 
         // Duplicate staking candidates are individually valid against pre-state.
@@ -5064,7 +5064,7 @@ mod tests {
         ];
         account_fixture_claims(&mut engine.state);
 
-        let contents = engine.select_block_contents();
+        let contents = engine.select_block_contents().unwrap();
         assert_eq!(contents.transactions, vec![expected_tx.clone()]);
         assert_eq!(contents.staking_ops, vec![staking.clone()]);
         assert_eq!(contents.governance_ops, vec![governance.clone()]);

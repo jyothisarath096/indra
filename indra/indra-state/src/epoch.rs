@@ -1237,7 +1237,7 @@ fn credit_position_reward(
     position.rewards_last_epoch = current_epoch;
     state.stake_positions.insert(position_id, position.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_stake_position(&position);
+        commitment.put_stake_position(&position)?;
     }
     crate::txn::complex_mutation_checkpoint()?;
     Ok(())

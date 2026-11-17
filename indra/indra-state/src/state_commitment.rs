@@ -146,75 +146,85 @@ impl StateCommitmentV2 {
     }
 
     /// Insert or replace a validator leaf.
-    pub fn put_validator(&mut self, validator: &ValidatorEntry, height: u64) {
+    pub fn put_validator(&mut self, validator: &ValidatorEntry, height: u64) -> StateResult<()> {
         self.tree.insert(
             validator_key(&validator.validator_id),
             validator_value_hash(validator, height),
-        );
+        )?;
+        Ok(())
     }
 
     /// Insert or replace a staking nonce leaf.
-    pub fn put_staking_nonce(&mut self, signer_id: &Bytes32, nonce: u64) {
+    pub fn put_staking_nonce(&mut self, signer_id: &Bytes32, nonce: u64) -> StateResult<()> {
         self.tree.insert(
             staking_nonce_key(signer_id),
             staking_nonce_value_hash(signer_id, nonce),
-        );
+        )?;
+        Ok(())
     }
 
     /// Insert or replace a canonical stake-position leaf.
-    pub fn put_stake_position(&mut self, position: &StakePositionV1) {
+    pub fn put_stake_position(&mut self, position: &StakePositionV1) -> StateResult<()> {
         let (key, value) = stake_position_commitment_leaf(position);
-        self.tree.insert(key, value);
+        self.tree.insert(key, value)?;
+        Ok(())
     }
 
     /// Delete a canonical stake-position leaf.
-    pub fn delete_stake_position(&mut self, position_id: &Bytes32) {
+    pub fn delete_stake_position(&mut self, position_id: &Bytes32) -> StateResult<()> {
         self.tree
-            .delete(derive_key(DOMAIN_STAKE_POSITION, &position_id.0));
+            .delete(derive_key(DOMAIN_STAKE_POSITION, &position_id.0))?;
+        Ok(())
     }
 
     /// Insert or replace a canonical unbonding-tranche leaf.
-    pub fn put_unbonding_tranche(&mut self, tranche: &UnbondingTrancheV1) {
+    pub fn put_unbonding_tranche(&mut self, tranche: &UnbondingTrancheV1) -> StateResult<()> {
         let (key, value) = unbonding_tranche_commitment_leaf(tranche);
-        self.tree.insert(key, value);
+        self.tree.insert(key, value)?;
+        Ok(())
     }
 
     /// Delete a canonical unbonding-tranche leaf.
-    pub fn delete_unbonding_tranche(&mut self, tranche_id: &Bytes32) {
+    pub fn delete_unbonding_tranche(&mut self, tranche_id: &Bytes32) -> StateResult<()> {
         self.tree
-            .delete(derive_key(DOMAIN_UNBONDING_TRANCHE, &tranche_id.0));
+            .delete(derive_key(DOMAIN_UNBONDING_TRANCHE, &tranche_id.0))?;
+        Ok(())
     }
 
     /// Insert a slash-evidence hash leaf.
 
     /// Insert or replace a delegator identity-registry leaf.
-    pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) {
+    pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) -> StateResult<()> {
         self.tree.insert(
             delegator_identity_key(delegator_id),
             delegator_identity_value_hash(delegator_id, pubkey),
-        );
+        )?;
+        Ok(())
     }
 
     /// Permanently commit one retired cold public-key component.
-    pub fn put_retired_cold_component(&mut self, kind: u8, component: &[u8]) {
+    pub fn put_retired_cold_component(&mut self, kind: u8, component: &[u8]) -> StateResult<()> {
         self.tree.insert(
             retired_cold_component_key(kind, component),
             retired_cold_component_value_hash(kind, component),
-        );
+        )?;
+        Ok(())
     }
 
     /// Insert or replace an evicted-validator tombstone leaf.
-    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV2) {
+    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV2) -> StateResult<()> {
         self.tree.insert(
             evicted_validator_tombstone_key(&tombstone.validator_id),
             evicted_validator_tombstone_value_hash(tombstone),
-        );
+        )?;
+        Ok(())
     }
 
     /// Delete an evicted-validator tombstone leaf.
-    pub fn delete_evicted_validator_tombstone(&mut self, validator_id: &Bytes32) {
+    pub fn delete_evicted_validator_tombstone(&mut self, validator_id: &Bytes32) -> StateResult<()> {
         self.tree
-            .delete(evicted_validator_tombstone_key(validator_id));
+            .delete(evicted_validator_tombstone_key(validator_id))?;
+        Ok(())
     }
 }
 
@@ -738,7 +748,7 @@ mod tests {
             state
                 .delegator_identities
                 .insert(delegator_id, identity.clone());
-            incremental.put_delegator_identity(&delegator_id, &identity);
+            incremental.put_delegator_identity(&delegator_id, &identity).unwrap();
         }
 
         assert_eq!(
@@ -767,7 +777,7 @@ mod tests {
             .state_commitment_v2
             .as_mut()
             .unwrap()
-            .put_delegator_identity(&delegator_id, &identity);
+            .put_delegator_identity(&delegator_id, &identity).unwrap();
         let inserted_root = state.state_commitment_v2_root(height);
         assert_ne!(empty_root, inserted_root);
 
@@ -779,7 +789,7 @@ mod tests {
             .state_commitment_v2
             .as_mut()
             .unwrap()
-            .put_delegator_identity(&delegator_id, &updated_identity);
+            .put_delegator_identity(&delegator_id, &updated_identity).unwrap();
         assert_ne!(inserted_root, state.state_commitment_v2_root(height));
 
         let identity_key = delegator_identity_key(&delegator_id);
@@ -812,7 +822,7 @@ mod tests {
                 .state_commitment_v2
                 .as_mut()
                 .unwrap()
-                .put_delegator_identity(&transient_id, &transient_identity);
+                .put_delegator_identity(&transient_id, &transient_identity).unwrap();
             assert_ne!(txn.state().state_commitment_v2_root(height), baseline_root);
         }
 
@@ -938,9 +948,9 @@ mod tests {
         assert_ne!(rebuilt, baseline);
 
         let mut incremental = StateCommitmentV2::from_state(&ChainState::new_genesis(TEST_CHAIN_ID), height).unwrap();
-        incremental.put_evicted_validator_tombstone(&tombstone);
+        incremental.put_evicted_validator_tombstone(&tombstone).unwrap();
         assert_eq!(incremental.root(), rebuilt);
-        incremental.delete_evicted_validator_tombstone(&validator_id);
+        incremental.delete_evicted_validator_tombstone(&validator_id).unwrap();
         assert_eq!(incremental.root(), baseline);
     }
 

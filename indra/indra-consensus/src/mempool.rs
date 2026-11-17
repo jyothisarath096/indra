@@ -294,8 +294,20 @@ impl Mempool {
             });
         }
 
+        let evicted_bytes = evict_ids.iter().try_fold(0usize, |total, id| {
+            self.entries
+                .get(id)
+                .and_then(|entry| total.checked_add(entry.encoded_size))
+        });
+        let new_total_encoded_bytes = evicted_bytes
+            .and_then(|bytes| self.total_encoded_bytes.checked_sub(bytes))
+            .and_then(|bytes| bytes.checked_add(encoded_size))
+            .ok_or(ConsensusError::InternalInvariant {
+                detail: "mempool byte accounting overflow or underflow",
+            })?;
+
         for evict_id in evict_ids {
-            self.remove_entry(&evict_id);
+            self.remove_entry(&evict_id)?;
         }
 
         self.entries.insert(
@@ -310,10 +322,7 @@ impl Mempool {
             },
         );
         self.index_entry(tx_id);
-        self.total_encoded_bytes = self
-            .total_encoded_bytes
-            .checked_add(encoded_size)
-            .expect("mempool byte accounting overflow");
+        self.total_encoded_bytes = new_total_encoded_bytes;
         self.debug_assert_byte_accounting();
 
         Ok(tx_id)
@@ -358,9 +367,11 @@ impl Mempool {
     }
 
     /// Remove a transaction by ID (called after block inclusion).
-    pub fn evict(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
+    pub fn evict(&mut self, tx_id: &Bytes32) -> ConsensusResult<Option<MempoolEntry>> {
         let removed = self.remove_entry(tx_id);
-        self.debug_assert_byte_accounting();
+        if removed.is_ok() {
+            self.debug_assert_byte_accounting();
+        }
         removed
     }
 
@@ -369,7 +380,7 @@ impl Mempool {
         &mut self,
         state: &indra_state::ChainState,
         effects: &indra_state::CanonicalStateEffects,
-    ) {
+    ) -> ConsensusResult<()> {
         let mut affected = BTreeSet::new();
         for id in &effects.spent_utxos {
             affected.extend(self.by_utxo.get(id).into_iter().flatten().copied());
@@ -392,10 +403,11 @@ impl Mempool {
             });
             if !keep {
                 eprintln!("[mempool] evicting invalid tx {tx_id:?}");
-                self.remove_entry(&tx_id);
+                self.remove_entry(&tx_id)?;
             }
         }
         self.debug_assert_indexes();
+        Ok(())
     }
 
     /// Remove every pending transaction and reset byte accounting.
@@ -406,20 +418,24 @@ impl Mempool {
         self.debug_assert_byte_accounting();
     }
 
-    fn remove_entry(&mut self, tx_id: &Bytes32) -> Option<MempoolEntry> {
-        let removed = self.entries.remove(tx_id);
-        if let Some(entry) = &removed {
+    fn remove_entry(&mut self, tx_id: &Bytes32) -> ConsensusResult<Option<MempoolEntry>> {
+        let existing = self.entries.get(tx_id).cloned();
+        if let Some(entry) = &existing {
+            let new_total = self.total_encoded_bytes.checked_sub(entry.encoded_size).ok_or(
+                ConsensusError::InternalInvariant {
+                    detail: "mempool byte accounting underflow",
+                },
+            )?;
+            let removed = self.entries.remove(tx_id);
             Self::remove_index_memberships(
                 &mut self.by_utxo,
                 *tx_id,
                 entry.tx.inputs.iter().map(|i| i.utxo_id),
             );
-            self.total_encoded_bytes = self
-                .total_encoded_bytes
-                .checked_sub(entry.encoded_size)
-                .expect("mempool byte accounting underflow");
+            self.total_encoded_bytes = new_total;
+            return Ok(removed);
         }
-        removed
+        Ok(None)
     }
 
     fn index_entry(&mut self, tx_id: Bytes32) {
@@ -526,12 +542,16 @@ impl Mempool {
     /// Inject an entry for cross-crate adversarial tests that reproduce pools
     /// created by older software before conflict-aware admission existed.
     #[cfg(feature = "test-utils")]
-    pub fn insert_unchecked_for_test(&mut self, tx: TransactionV1, submitted_height: u64) {
+    pub fn insert_unchecked_for_test(
+        &mut self,
+        tx: TransactionV1,
+        submitted_height: u64,
+    ) -> ConsensusResult<()> {
         let tx_id = tx.tx_hash();
         let encoded_size = tx.encoded_len();
         let weight_kb = (encoded_size as u64).div_ceil(1024);
         let fee_rate = tx.fee_amount / weight_kb.max(1);
-        self.remove_entry(&tx_id);
+        self.remove_entry(&tx_id)?;
         self.entries.insert(
             tx_id,
             MempoolEntry {
@@ -544,11 +564,14 @@ impl Mempool {
             },
         );
         self.index_entry(tx_id);
-        self.total_encoded_bytes = self
-            .total_encoded_bytes
-            .checked_add(encoded_size)
-            .expect("mempool byte accounting overflow");
+        let new_total = self.total_encoded_bytes.checked_add(encoded_size).ok_or(
+            ConsensusError::InternalInvariant {
+                detail: "mempool byte accounting overflow",
+            },
+        )?;
+        self.total_encoded_bytes = new_total;
         self.debug_assert_byte_accounting();
+        Ok(())
     }
 }
 
@@ -794,7 +817,7 @@ mod tests {
         let mut mp = Mempool::default_config();
         let tx = dummy_tx(10_000, 0x01);
         let id = mp.submit(tx, 100, 1).unwrap();
-        mp.evict(&id);
+        mp.evict(&id).unwrap();
         assert!(!mp.contains(&id));
     }
 
@@ -890,6 +913,42 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_mempool_byte_total_returns_typed_overflow_error() {
+        let mut mempool = Mempool::new_with_byte_limit(MempoolConfig::default(), usize::MAX);
+        mempool.total_encoded_bytes = usize::MAX;
+        let result = mempool.submit(dummy_tx(1_000_000, 0x91), 100, 1);
+        assert!(matches!(
+            result,
+            Err(ConsensusError::InternalInvariant { detail })
+                if detail == "mempool byte accounting overflow or underflow"
+        ));
+    }
+
+    #[test]
+    fn inconsistent_mempool_byte_total_returns_typed_underflow_error() {
+        let mut mempool = Mempool::default_config();
+        let tx = dummy_tx(10_000, 0x92);
+        let tx_id = Mempool::tx_id(&tx);
+        mempool.entries.insert(
+            tx_id,
+            MempoolEntry {
+                encoded_size: tx.encoded_len(),
+                fee_rate: 10_000,
+                arrived_height: 1,
+                tx,
+                tx_id,
+                verified: None,
+            },
+        );
+        mempool.total_encoded_bytes = 0;
+        assert!(matches!(
+            mempool.evict(&tx_id),
+            Err(ConsensusError::InternalInvariant { detail })
+                if detail == "mempool byte accounting underflow"
+        ));
+    }
+
+    #[test]
     fn byte_accounting_tracks_commit_and_spent_evictions() {
         let mut mempool = Mempool::default_config();
         let committed = dummy_tx(10_000, 0x11);
@@ -900,12 +959,14 @@ mod tests {
         mempool.submit(retained, 100, 1).unwrap();
         assert_byte_accounting(&mempool);
 
-        mempool.evict(&committed_id);
+        mempool.evict(&committed_id).unwrap();
         assert_byte_accounting(&mempool);
 
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(spent.inputs[0].utxo_id);
-        mempool.apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects);
+        mempool
+            .apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects)
+            .unwrap();
         assert_eq!(mempool.len(), 1);
         assert_byte_accounting(&mempool);
     }
@@ -922,7 +983,9 @@ mod tests {
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(first.inputs[0].utxo_id);
         effects.spent_utxos.insert(second.inputs[0].utxo_id);
-        mempool.apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects);
+        mempool
+            .apply_canonical_effects(&ChainState::new_genesis(TEST_CHAIN_ID), &effects)
+            .unwrap();
         assert!(mempool.is_empty());
         assert_byte_accounting(&mempool);
 
@@ -955,7 +1018,7 @@ mod tests {
         assert_eq!(mempool.len(), 2);
         assert_byte_accounting(&mempool);
 
-        mempool.evict(&replacement_id);
+        mempool.evict(&replacement_id).unwrap();
         assert_byte_accounting(&mempool);
         mempool.submit(dummy_tx(60_000, 0x34), 100, 1).unwrap();
         assert_byte_accounting(&mempool);
@@ -1045,7 +1108,7 @@ mod tests {
         effects
             .spent_utxos
             .insert(mp.entries.get(&tx_id).unwrap().tx.inputs[0].utxo_id);
-        mp.apply_canonical_effects(&state, &effects);
+        mp.apply_canonical_effects(&state, &effects).unwrap();
 
         assert!(!mp.contains(&tx_id));
     }
@@ -1097,7 +1160,7 @@ mod tests {
             validators_changed: BTreeSet::from([Bytes32::from([0xEE; 32])]),
             ..Default::default()
         };
-        targeted.apply_canonical_effects(&state, &unrelated);
+        targeted.apply_canonical_effects(&state, &unrelated).unwrap();
         assert!(targeted.contains(&tx_id));
         let mut inputs = HashSet::new();
         assert!(indra_state::apply::validate_transaction(
@@ -1113,7 +1176,7 @@ mod tests {
         state.utxos.spend_at_height(&input.utxo_id, 1).unwrap();
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.spent_utxos.insert(input.utxo_id);
-        targeted.apply_canonical_effects(&state, &effects);
+        targeted.apply_canonical_effects(&state, &effects).unwrap();
 
         let mut inputs = HashSet::new();
         assert!(indra_state::apply::validate_transaction(

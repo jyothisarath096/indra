@@ -30,18 +30,25 @@
 //!   updates on error.
 
 #![forbid(unsafe_code)]
+#![deny(unused_must_use)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 #![deny(clippy::indexing_slicing)]
+#![deny(clippy::unreachable)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![cfg_attr(
     test,
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
     )
 )]
 

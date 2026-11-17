@@ -1685,20 +1685,21 @@ fn get_validator_self_stake(params: &[String], state: &NodeState<'_>) -> RpcResu
         .filter(|position| {
             position.validator_id == validator_id
                 && position.principal_owner_id == validator_id
-                && position.active.is_some()
         })
         .map(|position| {
-            let active = position.active.expect("filtered active position");
+            let active = position.active.as_ref().ok_or_else(|| {
+                RpcError::Internal("validator self-stake position is missing active state".into())
+            })?;
             total_spark = total_spark.saturating_add(active.principal_spark);
-            format!(
+            Ok(format!(
                 r#"{{"position_id":"{}","amount_spark":{},"first_contribution_height":{},"last_contribution_height":{}}}"#,
                 hex::encode(position.position_id.0),
                 active.principal_spark,
                 active.first_contribution_height,
                 active.last_contribution_height,
-            )
+            ))
         })
-        .collect();
+        .collect::<RpcResult<Vec<_>>>()?;
     Ok(format!(
         r#"{{"validator_id":"{}","total_spark":{},"bonds":[{}]}}"#,
         id_hex,
@@ -2898,6 +2899,29 @@ mod tests {
 
     fn make_state(_suffix: &str) -> ChainState {
         ChainState::new_genesis(TEST_CHAIN_ID)
+    }
+
+    #[test]
+    fn validator_self_stake_rejects_missing_active_state() {
+        let mut engine = make_state("missing-active");
+        let validator_id = Bytes32::from([0xA7; 32]);
+        let position = StakePositionV1::new(
+            validator_id,
+            validator_id,
+            PositionCustodyV1::ValidatorColdIdentity { validator_id },
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        engine.stake_positions.insert(position.position_id, position);
+
+        let result = get_validator_self_stake(&[hex::encode(validator_id.0)], &NodeState::read_only(&engine));
+        assert!(matches!(
+            result,
+            Err(RpcError::Internal(message))
+                if message == "validator self-stake position is missing active state"
+        ));
     }
 
     struct BlockBackedEngine {

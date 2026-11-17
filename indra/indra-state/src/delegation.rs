@@ -354,7 +354,11 @@ fn apply_staking_op_mode(
             | StakingOpBody::SelfStake { .. }
             | StakingOpBody::ExitStakePosition { .. }
             | StakingOpBody::SetAutoDelegate { .. } => {}
-            StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
+            StakingOpBody::RotateValidatorColdKey { .. } => {
+                return Err(StateError::InternalInvariant {
+                    site: "delegation::verify_staking_op rotation dispatch",
+                });
+            }
         }
     }
 
@@ -483,7 +487,11 @@ fn apply_staking_op_mode(
             current_height,
             Some(MAX_STAKE_POSITIONS_PER_VALIDATOR),
         ),
-        StakingOpBody::RotateValidatorColdKey { .. } => unreachable!("rotation returned above"),
+        StakingOpBody::RotateValidatorColdKey { .. } => {
+            return Err(StateError::InternalInvariant {
+                site: "delegation::apply_staking_op rotation dispatch",
+            });
+        }
     };
 
     result?;
@@ -500,12 +508,12 @@ fn apply_staking_op_mode(
             .ok_or(StateError::ValidatorNotFound)?;
         validator.cold_nonce = cold_nonce;
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_validator(validator, current_height);
+            commitment.put_validator(validator, current_height)?;
         }
     } else {
         state.staking_nonces.insert(signer_id, op.nonce);
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_staking_nonce(&signer_id, op.nonce);
+            commitment.put_staking_nonce(&signer_id, op.nonce)?;
         }
     }
     Ok(())
@@ -549,7 +557,9 @@ fn verify_and_apply_rotate_validator_cold_key(
         new_cold_signature,
     } = &op.body
     else {
-        unreachable!()
+        return Err(StateError::InternalInvariant {
+            site: "delegation::verify_and_apply_rotate_validator_cold_key body",
+        });
     };
     let current = state
         .validators
@@ -646,9 +656,9 @@ fn verify_and_apply_rotate_validator_cold_key(
     updated.cold_nonce = 0;
     state.validators.upsert(updated.clone())?;
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_retired_cold_component(0, &old_classical);
-        commitment.put_retired_cold_component(1, &retired_pq);
-        commitment.put_validator(&updated, current_height);
+        commitment.put_retired_cold_component(0, &old_classical)?;
+        commitment.put_retired_cold_component(1, &retired_pq)?;
+        commitment.put_validator(&updated, current_height)?;
     }
     Ok(())
 }
@@ -859,7 +869,7 @@ fn apply_register_validator(
     };
     state.validators.upsert(entry.clone())?;
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_validator(&entry, current_height);
+        commitment.put_validator(&entry, current_height)?;
     }
     crate::stake_positions::deposit_stake_position(
         state,
@@ -1151,7 +1161,7 @@ fn apply_delegate(
             .delegator_identities
             .insert(delegator_id, delegator_pubkey.clone());
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
+            commitment.put_delegator_identity(&delegator_id, delegator_pubkey)?;
         }
     }
 
@@ -1260,7 +1270,7 @@ fn apply_self_stake(
     if let (Some(commitment), Some(validator)) =
         (state.state_commitment_v2.as_mut(), updated_validator)
     {
-        commitment.put_validator(&validator, current_height);
+        commitment.put_validator(&validator, current_height)?;
     }
     Ok(())
 }
@@ -1278,7 +1288,7 @@ fn check_or_insert_validator_identity(
         .delegator_identities
         .insert(*validator_id, validator_pubkey.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_delegator_identity(validator_id, validator_pubkey);
+        commitment.put_delegator_identity(validator_id, validator_pubkey)?;
     }
     Ok(())
 }
@@ -1390,14 +1400,14 @@ fn apply_claim_rewards(
     position.pending_rewards_spark = 0;
     state.stake_positions.insert(position_id, position.clone());
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_stake_position(&position);
+        commitment.put_stake_position(&position)?;
     }
     if matches!(identity_outcome, IdentityCheckOutcome::NoPriorRecord) {
         state
             .delegator_identities
             .insert(delegator_id, delegator_pubkey.clone());
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator_identity(&delegator_id, delegator_pubkey);
+            commitment.put_delegator_identity(&delegator_id, delegator_pubkey)?;
         }
     }
 
@@ -1505,7 +1515,7 @@ fn apply_set_commission(
     validator.pending_commission_effective_epoch = Some(effective_epoch);
     let updated_validator = validator.clone();
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_validator(&updated_validator, current_height);
+        commitment.put_validator(&updated_validator, current_height)?;
     }
     eprintln!(
         "[staking] validator {} commission change staged: {}bps effective_epoch={}",
@@ -1543,7 +1553,7 @@ fn apply_set_auto_delegate(
         if let (Some(commitment), Some(validator)) =
             (state.state_commitment_v2.as_mut(), updated_validator)
         {
-            commitment.put_validator(&validator, current_height);
+            commitment.put_validator(&validator, current_height)?;
         }
         return Ok(());
     }
@@ -1562,7 +1572,7 @@ fn apply_set_auto_delegate(
         v.auto_delegate_to = Some(target_validator_id);
         let updated_validator = v.clone();
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_validator(&updated_validator, current_height);
+            commitment.put_validator(&updated_validator, current_height)?;
         }
     }
     Ok(())
@@ -1599,7 +1609,7 @@ fn apply_update_network_address(
     validator.network_addr_last_updated_epoch = Some(current_epoch);
     let updated_validator = validator.clone();
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
-        commitment.put_validator(&updated_validator, current_height);
+        commitment.put_validator(&updated_validator, current_height)?;
     }
     Ok(())
 }
@@ -1813,7 +1823,7 @@ mod tests {
             op.signature = wire_signature(&keypair.sign(&message).unwrap());
             let cold_sig = wire_signature(&cold_keypair.sign(&message).unwrap());
             let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body else {
-                unreachable!()
+                panic!("test fixture variant mismatch")
             };
             *cold_signature = cold_sig;
             return op;
@@ -1897,7 +1907,7 @@ mod tests {
             ..
         } = &mut op.body
         else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *slot = cold_signature;
         op
@@ -1924,7 +1934,7 @@ mod tests {
             ..
         } = &mut op.body
         else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *slot = cold_signature;
     }
@@ -1959,7 +1969,7 @@ mod tests {
             new_cold_signature, ..
         } = &mut op.body
         else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *new_cold_signature = Some(proposed_signature);
         op
@@ -3482,7 +3492,7 @@ mod tests {
         );
         let altered_vrf = indra_crypto::VrfKeypair::from_seed(&[0xDE; 32]);
         let StakingOpBody::RegisterValidator { vrf_pk, .. } = &mut op.body else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *vrf_pk = altered_vrf.public_key();
         let chain_id = state.chain_id.clone();
@@ -3544,7 +3554,7 @@ mod tests {
                 ..
             } = &mut op.body
             else {
-                unreachable!()
+                panic!("test fixture variant mismatch")
             };
             *vrf_possession_output = Bytes64(output.0);
             *vrf_possession_proof = VariableBytes::from_slice(&proof.0).unwrap();

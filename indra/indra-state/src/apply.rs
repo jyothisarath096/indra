@@ -248,7 +248,7 @@ fn apply_verified_slash_directive(
             .ok_or(StateError::ValueOverflow)?;
         state.stake_positions.insert(*position_id, position.clone());
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_stake_position(&position);
+            commitment.put_stake_position(&position)?;
         }
         crate::txn::complex_mutation_checkpoint()?;
     }
@@ -297,7 +297,7 @@ fn apply_verified_slash_directive(
     for (old_id, successor) in &tranche_successors {
         state.unbonding_tranches.remove(old_id);
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.delete_unbonding_tranche(old_id);
+            commitment.delete_unbonding_tranche(old_id)?;
         }
         crate::txn::complex_mutation_checkpoint()?;
         if let Some(successor) = successor {
@@ -305,7 +305,7 @@ fn apply_verified_slash_directive(
                 .unbonding_tranches
                 .insert(successor.tranche_id, successor.clone());
             if let Some(commitment) = state.state_commitment_v2.as_mut() {
-                commitment.put_unbonding_tranche(successor);
+                commitment.put_unbonding_tranche(successor)?;
             }
             crate::txn::complex_mutation_checkpoint()?;
         }
@@ -695,7 +695,7 @@ mod tests {
                 } => {
                     *cold_authorization = authorization;
                 }
-                _ => unreachable!(),
+                _ => panic!("test fixture payload variant mismatch"),
             }
             op.nonce = 0;
             let bytes = op
@@ -975,7 +975,7 @@ mod tests {
         };
         let cold_sig = cold_keypair.sign(&message).unwrap();
         let StakingOpBody::RegisterValidator { cold_signature, .. } = &mut op.body else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *cold_signature = HybridSignature {
             classical_sig: VariableBytes::from_slice(&cold_sig.classical.0).unwrap(),
@@ -2151,6 +2151,68 @@ mod tests {
     }
 
     #[test]
+    fn rollback_matches_clone_reference_across_deterministic_mixed_sequence() {
+        let (mut actual, utxo_id, keypair, fixture_tag, value) = state_with_utxo();
+        let mut reference = actual.clone();
+
+        for step in 0..200u64 {
+            let (actual_result, reference_result) = if step % 10 == 0 {
+                // The first transaction spends the only fixture UTXO and the
+                // second repeats it, forcing a failure after mutation.
+                let tx = make_tx(&actual, &keypair, utxo_id, value, fixture_tag);
+                let block = make_block(&actual, vec![tx.clone(), tx]);
+                let actual_result = apply_block(&mut actual, &block, step);
+                let reference_result =
+                    clone_atomic_reference_apply_block(&reference, &block, step)
+                        .map(|outcome| outcome.state);
+                (actual_result.map(|_| ()), reference_result.map(|_| ()))
+            } else if step % 10 == 5 {
+                // A wrong parent fails before commitment and exercises a
+                // rejected block after earlier successful blocks.
+                let mut block = empty_block_at(&actual, actual.height + 1, step);
+                block.header.prev_hash = Bytes32::from([0xEE; 32]);
+                let actual_result = apply_block(&mut actual, &block, step);
+                let reference_result =
+                    clone_atomic_reference_apply_block(&reference, &block, step)
+                        .map(|outcome| outcome.state);
+                (actual_result.map(|_| ()), reference_result.map(|_| ()))
+            } else {
+                let block = empty_block_at(&actual, actual.height + 1, step);
+                let actual_result = apply_block(&mut actual, &block, step);
+                let reference_outcome =
+                    clone_atomic_reference_apply_block(&reference, &block, step);
+                if let Ok(outcome) = &reference_outcome {
+                    reference = outcome.state.clone();
+                }
+                (actual_result.map(|_| ()), reference_outcome.map(|_| ()))
+            };
+
+            assert_eq!(
+                actual_result.is_ok(),
+                reference_result.is_ok(),
+                "step {step} result mismatch: actual={actual_result:?} reference={reference_result:?}"
+            );
+            assert_same_consensus_state(&actual, &reference);
+            assert_eq!(
+                actual.utxos.root_at_height(actual.height),
+                reference.utxos.root_at_height(reference.height),
+                "step {step} UTXO root mismatch"
+            );
+            for sample in 0..20u8 {
+                let key = Bytes32::from([sample; 32]);
+                assert_eq!(
+                    actual.utxos.prove_at_height(&key, actual.height),
+                    reference.utxos.prove_at_height(&key, reference.height),
+                    "step {step} proof mismatch for sample {sample}"
+                );
+            }
+            assert_eq!(actual.total_supply, reference.total_supply);
+            assert_eq!(actual.base_fee, reference.base_fee);
+            assert_eq!(actual.validators, reference.validators);
+        }
+    }
+
+    #[test]
     fn committed_effect_journal_covers_transaction_validity_state_diff() {
         let (mut state, utxo_id, keypair, blinding, value) = state_with_utxo();
         let tx = make_tx(&state, &keypair, utxo_id, value, blinding);
@@ -2654,7 +2716,7 @@ mod tests {
     fn apply_transaction_fails_loudly_if_utxo_already_spent() {
         let (mut state, utxo_id, keypair, input_blinding, input_value) = state_with_utxo();
         let tx = make_tx(&state, &keypair, utxo_id, input_value, input_blinding);
-        assert!(state.utxos.spend(&utxo_id).is_some());
+        assert!(state.utxos.spend(&utxo_id).unwrap().is_some());
 
         let mut txn = StateTxn::begin(&mut state, 1);
         assert_eq!(
@@ -4185,7 +4247,7 @@ fn apply_slash_common(
             .evicted_validator_tombstones
             .insert(validator_id, tombstone.clone());
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_evicted_validator_tombstone(&tombstone);
+            commitment.put_evicted_validator_tombstone(&tombstone)?;
         }
         crate::txn::complex_mutation_checkpoint()?;
     }
@@ -4208,7 +4270,7 @@ fn apply_slash_common(
     if let (Some(commitment), Some(validator)) =
         (state.state_commitment_v2.as_mut(), updated_validator)
     {
-        commitment.put_validator(&validator, height);
+        commitment.put_validator(&validator, height)?;
     }
 
     let reporter_reward = if potential_reporter_reward >= DUST_LIMIT_SPARK {
@@ -5008,7 +5070,7 @@ fn update_last_active_epoch_from_block_qc(
     if let Some(commitment) = state.state_commitment_v2.as_mut() {
         for validator_id in changed {
             if let Some(validator) = state.validators.get(&validator_id) {
-                commitment.put_validator(validator, block.header.height);
+                commitment.put_validator(validator, block.header.height)?;
             }
         }
     }

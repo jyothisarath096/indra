@@ -304,7 +304,7 @@ impl UtxoSet {
             .map(Self::leaf_value)
             .unwrap_or([0u8; 32]);
         let _ = height;
-        self.compressed.insert(id.0, smt_value);
+        self.compressed.insert(id.0, smt_value)?;
         Ok(id)
     }
 
@@ -316,34 +316,28 @@ impl UtxoSet {
     /// Remove a UTXO from the set (mark as spent).
     ///
     /// Returns the entry if it existed, None if it was already absent.
-    pub fn spend(&mut self, id: &Bytes32) -> Option<UtxoEntry> {
+    pub fn spend(&mut self, id: &Bytes32) -> StateResult<Option<UtxoEntry>> {
         self.spend_at_height(id, 0)
     }
 
     /// Remove a UTXO from the set at a specific resulting block height.
-    pub fn spend_at_height(&mut self, id: &Bytes32, height: u64) -> Option<UtxoEntry> {
+    pub fn spend_at_height(&mut self, id: &Bytes32, height: u64) -> StateResult<Option<UtxoEntry>> {
         let removed = self.entries.remove(id);
         if removed.is_some() {
             let _ = height;
-            self.compressed.delete(id.0);
+            self.compressed.delete(id.0)?;
         }
-        removed
+        Ok(removed)
     }
 
-    pub(crate) fn remove_for_rollback_at_height(
-        &mut self,
-        id: &Bytes32,
-        height: u64,
-    ) -> Option<UtxoEntry> {
-        self.spend_at_height(id, height)
-    }
-
-    pub(crate) fn restore_for_rollback_at_height(&mut self, entry: UtxoEntry, height: u64) {
+    #[cfg(test)]
+    pub(crate) fn restore_for_rollback_at_height(&mut self, entry: UtxoEntry, height: u64) -> StateResult<()> {
         let id = entry.utxo_id;
         let value = Self::leaf_value(&entry);
         self.entries.insert(id, entry);
         let _ = height;
-        self.compressed.insert(id.0, value);
+        self.compressed.insert(id.0, value)?;
+        Ok(())
     }
 
     /// Check whether a UTXO exists (is unspent).
@@ -520,14 +514,14 @@ mod tests {
             tranche_refund: None,
         };
         let mut first = UtxoSet::new();
-        first.restore_for_rollback_at_height(a.clone(), 1);
-        first.restore_for_rollback_at_height(b.clone(), 1);
+        first.restore_for_rollback_at_height(a.clone(), 1).unwrap();
+        first.restore_for_rollback_at_height(b.clone(), 1).unwrap();
         let mut second = UtxoSet::new();
-        second.restore_for_rollback_at_height(b, 1);
-        second.restore_for_rollback_at_height(a.clone(), 1);
+        second.restore_for_rollback_at_height(b, 1).unwrap();
+        second.restore_for_rollback_at_height(a.clone(), 1).unwrap();
         assert_eq!(first.root_at_height(1), second.root_at_height(1));
-        assert_eq!(first.spend_at_height(&a.utxo_id, 1), Some(a.clone()));
-        first.restore_for_rollback_at_height(a, 1);
+        assert_eq!(first.spend_at_height(&a.utxo_id, 1), Ok(Some(a.clone())));
+        first.restore_for_rollback_at_height(a, 1).unwrap();
         assert_eq!(first.root_at_height(1), second.root_at_height(1));
     }
 
@@ -563,7 +557,7 @@ mod tests {
 
         let removed = set.spend_at_height(&refund_utxo_id, 301).unwrap();
         assert!(set.get(&refund_utxo_id).is_none());
-        set.restore_for_rollback_at_height(removed, 301);
+        set.restore_for_rollback_at_height(removed.unwrap(), 301).unwrap();
         assert!(set.get(&refund_utxo_id).unwrap().tranche_refund.is_some());
     }
 }

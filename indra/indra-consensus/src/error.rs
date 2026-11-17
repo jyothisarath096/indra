@@ -17,6 +17,13 @@ pub enum ConsensusError {
         reason: &'static str,
     },
 
+    /// An internal mempool accounting invariant was violated.
+    #[error("mempool internal invariant violated: {detail}")]
+    InternalInvariant {
+        /// Stable diagnostic identifying the invariant.
+        detail: &'static str,
+    },
+
     /// Mempool is at capacity.
     #[error("mempool full: {capacity} transactions")]
     MempoolFull {

@@ -26,6 +26,12 @@ pub enum ConsensusSnapshotLookupError {
 /// All errors that can occur during state transitions.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StateError {
+    /// An internal canonical-state invariant was violated.
+    #[error("internal state invariant violated at {site}")]
+    InternalInvariant {
+        /// Stable source location for the invariant.
+        site: &'static str,
+    },
     // ── Block-level errors ─────────────────────────────────────────────────
     /// A canonical staking position or tranche capacity invariant would fail.
     #[error("staking position capacity exceeded: {reason}")]

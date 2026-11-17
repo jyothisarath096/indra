@@ -233,7 +233,7 @@ pub fn exit_stake_position(
     if let Some(validator) = updated_validator {
         txn.state_mut().validators.upsert(validator.clone())?;
         if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
-            commitment.put_validator(&validator, current_height);
+            commitment.put_validator(&validator, current_height)?;
         }
     }
     txn.commit();
@@ -365,7 +365,7 @@ pub fn release_matured_position_tranches(
                 .evicted_validator_tombstones
                 .insert(validator_id, tombstone.clone());
             if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
-                commitment.put_evicted_validator_tombstone(&tombstone);
+                commitment.put_evicted_validator_tombstone(&tombstone)?;
             }
         }
         if remove_position {
@@ -387,7 +387,7 @@ pub fn release_matured_position_tranches(
             .evicted_validator_tombstones
             .remove(&validator_id);
         if let Some(commitment) = txn.state_mut().state_commitment_v2.as_mut() {
-            commitment.delete_evicted_validator_tombstone(&validator_id);
+            commitment.delete_evicted_validator_tombstone(&validator_id)?;
         }
     }
     txn.commit();

@@ -50,6 +50,7 @@
 //! | Mempool select (200) | < 10 ms     |
 
 #![forbid(unsafe_code)]
+#![deny(unused_must_use)]
 #![allow(missing_docs)] // benchmarks don't need doc comments
 
 pub mod codec_bench;

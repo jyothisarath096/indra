@@ -126,7 +126,9 @@ impl VoteCollector {
             .voters
             .iter()
             .find(|v| v.validator_id == vote.validator_id)
-            .expect("membership checked above");
+            .ok_or(ConsensusError::InternalInvariant {
+                detail: "verified vote missing from collector membership",
+            })?;
         let stake = voter.stake;
         self.received.insert(vote.validator_id, (vote, stake));
 
@@ -565,6 +567,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(collector.add_vote(vote), Err(ConsensusError::UnknownVoter));
+    }
+
+    #[test]
+    fn verified_unknown_voter_rejected_by_same_snapshot_membership() {
+        let (v, _kp) = voter(0x01, 10_000);
+        let (stranger, stranger_kp) = voter(0x99, 10_000);
+        let mut collector = VoteCollector::new(
+            1,
+            0,
+            VoteStep::Prevote,
+            TEST_CHAIN_ID.to_string(),
+            TEST_SNAPSHOT_ROOT,
+            vec![v],
+        );
+        let vote = produce_vote(
+            1,
+            0,
+            VoteStep::Prevote,
+            Bytes32::from([0xBB; 32]),
+            stranger.validator_id,
+            TEST_SNAPSHOT_ROOT,
+            TEST_CHAIN_ID,
+            &stranger_kp,
+        )
+        .unwrap();
+
+        assert_eq!(
+            collector.add_verified_vote(vote),
+            Err(ConsensusError::UnknownVoter)
+        );
     }
 
     #[test]

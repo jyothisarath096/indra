@@ -234,7 +234,7 @@ fn apply_propose(
 
     state
         .utxos
-        .spend_at_height(deposit_utxo_id, current_height)
+        .spend_at_height(deposit_utxo_id, current_height)?
         .ok_or(StateError::InvariantViolation {
             message: "validated governance deposit disappeared before spend",
         })?;
@@ -472,7 +472,7 @@ fn apply_redelegate(
             .delegator_identities
             .insert(op.signer_id, pubkey.clone());
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_delegator_identity(&op.signer_id, &pubkey);
+            commitment.put_delegator_identity(&op.signer_id, &pubkey)?;
         }
     }
     Ok(())
@@ -606,7 +606,7 @@ fn apply_governance_nonce(
             .ok_or(StateError::ValidatorNotFound)?;
         validator.cold_nonce = cold_nonce;
         if let Some(commitment) = state.state_commitment_v2.as_mut() {
-            commitment.put_validator(validator, current_height);
+            commitment.put_validator(validator, current_height)?;
         }
         return Ok(());
     }
@@ -1128,7 +1128,7 @@ mod tests {
             new_cold_signature, ..
         } = &mut op.body
         else {
-            unreachable!()
+            panic!("test fixture variant mismatch")
         };
         *new_cold_signature = Some(HybridSignature {
             classical_sig: VariableBytes::from_slice(&proposed_signature.classical.0).unwrap(),

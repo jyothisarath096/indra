@@ -39,10 +39,12 @@
 //! - All operations are deterministic given the same inputs.
 
 #![forbid(unsafe_code)]
+#![deny(unused_must_use)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
+#![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
 #![deny(clippy::indexing_slicing)]
 #![cfg_attr(
     test,
@@ -50,7 +52,10 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
     )
 )]
 

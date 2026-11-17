@@ -296,7 +296,10 @@ impl BlockStore {
             std::fs::remove_file(segment_path(&self.dir, start))?;
             let end = start
                 .checked_add(BLOCKS_PER_SEGMENT)
-                .expect("prunable segment end was checked during discovery");
+                .ok_or_else(|| StorageError::Corruption {
+                    height: start,
+                    detail: "prunable segment end overflows u64".into(),
+                })?;
             let heights: Vec<u64> = index.range(start..end).map(|(height, _)| *height).collect();
             for height in heights {
                 index.remove(&height);

@@ -767,7 +767,7 @@ where
     let epoch_record = projection.epoch_record;
     let effects = projection.effects;
     *state = projection.state;
-    publish_committed_effects(state, mempool, &effects);
+    publish_committed_effects(state, mempool, &effects)?;
 
     Ok(indra_state::AppliedBlockOutcome {
         epoch_record,
@@ -802,7 +802,7 @@ fn publish_committed_effects(
     state: &ChainState,
     mempool: &mut Mempool,
     effects: &CanonicalStateEffects,
-) {
+) -> NodeResult<()> {
     for event in &effects.slash_events {
         eprintln!(
             "[slash] validator {} slashed {}bps — burned={} self_bond_slashed={} reporter_reward={}",
@@ -815,7 +815,8 @@ fn publish_committed_effects(
     }
     // Evict spent transactions from mempool after the verified projection has
     // become the real state.
-    mempool.apply_canonical_effects(state, effects);
+    mempool.apply_canonical_effects(state, effects)?;
+    Ok(())
 }
 
 /// Verify proposer authorization and eligibility against the governing snapshot.
@@ -1618,7 +1619,7 @@ mod tests {
             }
         })?;
         let _state_root = compute_state_root(state);
-        mempool.apply_canonical_effects(state, &outcome.effects);
+        mempool.apply_canonical_effects(state, &outcome.effects)?;
         Ok(outcome.epoch_record)
     }
 
@@ -1700,7 +1701,8 @@ mod tests {
             let actual = validate_imported_block(&block, &actual_state, 1_900_000_000).unwrap();
             let actual_record = actual.epoch_record.clone();
             actual_state = actual.state;
-            publish_committed_effects(&actual_state, &mut actual_mempool, &actual.effects);
+            publish_committed_effects(&actual_state, &mut actual_mempool, &actual.effects)
+                .unwrap();
 
             assert_eq!(reference_record, actual_record);
             assert_import_state_equivalent(&reference_state, &actual_state, &block);
@@ -1853,7 +1855,7 @@ mod tests {
             .clone()
             .expect("height 300 must produce an epoch record");
         state = projection.state;
-        publish_committed_effects(&state, &mut mempool, &projection.effects);
+        publish_committed_effects(&state, &mut mempool, &projection.effects).unwrap();
 
         assert_eq!(block.header.height, EPOCH_DURATION_BLOCKS);
         assert_eq!(record.epoch, 0);

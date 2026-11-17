@@ -48,8 +48,6 @@ struct ScalarSnapshot {
 
 enum UndoEntry {
     Scalars(ScalarSnapshot),
-    UtxoSpent(UtxoEntry),
-    UtxoInserted(Bytes32),
     Validators(ValidatorSet),
     PositionState {
         positions: PersistentOrdMap<Bytes32, StakePositionV1>,
@@ -174,11 +172,6 @@ impl<'a> StateTxn<'a> {
                         / indra_core::types::primitives::EPOCH_DURATION_BLOCKS
                         != state.height / indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
                 }
-                UndoEntry::UtxoSpent(entry) => {
-                    effects.spent_utxos.insert(entry.utxo_id);
-                    effects.utxo_set_changed = true;
-                }
-                UndoEntry::UtxoInserted(_) => effects.utxo_set_changed = true,
                 UndoEntry::Validators(before) => {
                     let old: BTreeMap<_, _> = before
                         .all_validators()
@@ -463,11 +456,11 @@ impl<'a> StateTxn<'a> {
 
     /// Spend a UTXO with precise rollback.
     pub(crate) fn spend_utxo(&mut self, id: &Bytes32) -> StateResult<Option<UtxoEntry>> {
-        let removed = self.state.utxos.spend_at_height(id, self.height);
+        self.snapshot_utxos();
+        let removed = self.state.utxos.spend_at_height(id, self.height)?;
         if let Some(entry) = &removed {
             self.effects.spent_utxos.insert(entry.utxo_id);
-            let entry = measure_undo_recording(|| entry.clone());
-            self.undo.push(UndoEntry::UtxoSpent(entry));
+            self.effects.utxo_set_changed = true;
         }
         self.after_mutation()?;
         Ok(removed)
@@ -481,11 +474,12 @@ impl<'a> StateTxn<'a> {
         tx_index: u32,
         output_index: u32,
     ) -> StateResult<Bytes32> {
+        self.snapshot_utxos();
         let id = self
             .state
             .utxos
             .insert(output, height, tx_index, output_index)?;
-        measure_undo_recording(|| self.undo.push(UndoEntry::UtxoInserted(id)));
+        self.effects.utxo_set_changed = true;
         self.after_mutation()?;
         Ok(id)
     }
@@ -500,6 +494,7 @@ impl<'a> StateTxn<'a> {
         output_index: u32,
         event: TrancheRefundEventV1,
     ) -> StateResult<Bytes32> {
+        self.snapshot_utxos();
         let id = self.state.utxos.insert_with_tranche_refund(
             output,
             height,
@@ -507,7 +502,7 @@ impl<'a> StateTxn<'a> {
             output_index,
             Some(event),
         )?;
-        measure_undo_recording(|| self.undo.push(UndoEntry::UtxoInserted(id)));
+        self.effects.utxo_set_changed = true;
         self.after_mutation()?;
         Ok(id)
     }
@@ -516,7 +511,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn put_stake_position(&mut self, position: StakePositionV1) -> StateResult<()> {
         self.snapshot_position_state();
         if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
-            commitment.put_stake_position(&position);
+            commitment.put_stake_position(&position)?;
         }
         self.state
             .stake_positions
@@ -528,7 +523,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn delete_stake_position(&mut self, position_id: &Bytes32) -> StateResult<()> {
         self.snapshot_position_state();
         if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
-            commitment.delete_stake_position(position_id);
+            commitment.delete_stake_position(position_id)?;
         }
         self.state.stake_positions.remove(position_id);
         self.state.position_tranche_index.remove(position_id);
@@ -539,7 +534,7 @@ impl<'a> StateTxn<'a> {
     pub(crate) fn put_unbonding_tranche(&mut self, tranche: UnbondingTrancheV1) -> StateResult<()> {
         self.snapshot_position_state();
         if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
-            commitment.put_unbonding_tranche(&tranche);
+            commitment.put_unbonding_tranche(&tranche)?;
         }
         self.state
             .unbonding_tranches
@@ -565,7 +560,7 @@ impl<'a> StateTxn<'a> {
             .get(tranche_id)
             .map(|tranche| tranche.position_id);
         if let Some(commitment) = self.state.state_commitment_v2.as_mut() {
-            commitment.delete_unbonding_tranche(tranche_id);
+            commitment.delete_unbonding_tranche(tranche_id)?;
         }
         self.state.unbonding_tranches.remove(tranche_id);
         if let Some(position_id) = position_id {
@@ -791,16 +786,6 @@ impl<'a> StateTxn<'a> {
                     self.state.election_seed = snapshot.election_seed;
                     self.state.election_seed_height = snapshot.election_seed_height;
                 }
-                UndoEntry::UtxoSpent(entry) => self
-                    .state
-                    .utxos
-                    .restore_for_rollback_at_height(entry, self.height),
-                UndoEntry::UtxoInserted(id) => {
-                    let _ = self
-                        .state
-                        .utxos
-                        .remove_for_rollback_at_height(&id, self.height);
-                }
                 UndoEntry::Validators(validators) => self.state.validators = validators,
                 UndoEntry::PositionState {
                     positions,
@@ -984,6 +969,34 @@ mod tests {
 
         assert_eq!(state.slash_membership_roots, vec![original_record]);
         assert_eq!(state.state_commitment_v2_root(height), root_before);
+    }
+
+    #[test]
+    fn rollback_restores_utxo_root_and_proof_after_mutation_and_error() {
+        let height = 1;
+        let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
+        let original_id = state
+            .utxos
+            .insert(test_output(0xA1), height, 0, 0)
+            .unwrap();
+        let root_before = state.utxos.root_at_height(height);
+        let proof_before = state.utxos.prove_at_height(&original_id, height);
+
+        {
+            let mut txn = StateTxn::begin(&mut state, height);
+            txn.insert_utxo(test_output(0xA2), height, 1, 0).unwrap();
+        }
+        assert_eq!(state.utxos.root_at_height(height), root_before);
+        assert_eq!(state.utxos.prove_at_height(&original_id, height), proof_before);
+
+        set_fail_after_mutation(Some(1));
+        {
+            let mut txn = StateTxn::begin(&mut state, height);
+            assert!(txn.insert_utxo(test_output(0xA3), height, 2, 0).is_err());
+        }
+        set_fail_after_mutation(None);
+        assert_eq!(state.utxos.root_at_height(height), root_before);
+        assert_eq!(state.utxos.prove_at_height(&original_id, height), proof_before);
     }
 
     #[test]
