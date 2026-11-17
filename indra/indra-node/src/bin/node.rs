@@ -1002,23 +1002,50 @@ fn proposal_matches_request(
         && proposal.block.header.block_hash() == *hash
 }
 
-fn record_peer_connected_event(
+struct PeerConnectionEvent {
     local_validator_id: indra_core::Bytes32,
     validator_id: indra_core::Bytes32,
     addr: SocketAddr,
     is_outbound: bool,
-    connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
-    peer_addrs: &Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
-    addr_validators: &Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
-    discovered_peers: &Arc<Mutex<HashSet<String>>>,
-    authenticated_peer_addrs: &Arc<Mutex<HashSet<String>>>,
-    authenticated_addr_validators: &Arc<Mutex<HashMap<String, indra_core::Bytes32>>>,
-    connected_validator_ids: &Arc<Mutex<HashSet<indra_core::Bytes32>>>,
-    bootstrap_peer_addrs: &HashSet<String>,
-    genesis_peer_addrs: &HashSet<String>,
-    outbound_cooldowns: &Arc<Mutex<CooldownTracker<OutboundCooldownKey>>>,
-    failure_counts: &Arc<Mutex<HashMap<String, u32>>>,
+}
+
+struct PeerConnectionState<'a> {
+    connected_addrs: &'a Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer_addrs: &'a Arc<Mutex<HashMap<indra_core::Bytes32, SocketAddr>>>,
+    addr_validators: &'a Arc<Mutex<HashMap<SocketAddr, indra_core::Bytes32>>>,
+    discovered_peers: &'a Arc<Mutex<HashSet<String>>>,
+    authenticated_peer_addrs: &'a Arc<Mutex<HashSet<String>>>,
+    authenticated_addr_validators: &'a Arc<Mutex<HashMap<String, indra_core::Bytes32>>>,
+    connected_validator_ids: &'a Arc<Mutex<HashSet<indra_core::Bytes32>>>,
+    bootstrap_peer_addrs: &'a HashSet<String>,
+    genesis_peer_addrs: &'a HashSet<String>,
+    outbound_cooldowns: &'a Arc<Mutex<CooldownTracker<OutboundCooldownKey>>>,
+    failure_counts: &'a Arc<Mutex<HashMap<String, u32>>>,
+}
+
+fn record_peer_connected_event(
+    event: PeerConnectionEvent,
+    state: PeerConnectionState<'_>,
 ) -> indra_node::NodeResult<bool> {
+    let PeerConnectionEvent {
+        local_validator_id,
+        validator_id,
+        addr,
+        is_outbound,
+    } = event;
+    let PeerConnectionState {
+        connected_addrs,
+        peer_addrs,
+        addr_validators,
+        discovered_peers,
+        authenticated_peer_addrs,
+        authenticated_addr_validators,
+        connected_validator_ids,
+        bootstrap_peer_addrs,
+        genesis_peer_addrs,
+        outbound_cooldowns,
+        failure_counts,
+    } = state;
     if validator_id == local_validator_id {
         eprintln!(
             "[p2p] WARNING: rejected self-connection from {} (own validator_id), not adding to peer table",
@@ -1090,16 +1117,29 @@ fn peer_addresses_to_persist(
     peers_to_save
 }
 
-fn insert_on_chain_validator_network_addrs(
-    discovered_peers: &mut HashSet<String>,
-    authenticated_peer_addrs: &HashSet<String>,
-    bootstrap_peers: &HashSet<String>,
-    genesis_peer_addrs: &HashSet<String>,
-    local_p2p_addr: &str,
+struct OnChainAddressContext<'a> {
+    discovered_peers: &'a mut HashSet<String>,
+    authenticated_peer_addrs: &'a HashSet<String>,
+    bootstrap_peers: &'a HashSet<String>,
+    genesis_peer_addrs: &'a HashSet<String>,
+    local_p2p_addr: &'a str,
     local_validator_id: indra_core::Bytes32,
-    connected_addrs: &[SocketAddr],
+    connected_addrs: &'a [SocketAddr],
+}
+
+fn insert_on_chain_validator_network_addrs(
+    context: OnChainAddressContext<'_>,
     addrs: impl IntoIterator<Item = String>,
 ) -> usize {
+    let OnChainAddressContext {
+        discovered_peers,
+        authenticated_peer_addrs,
+        bootstrap_peers,
+        genesis_peer_addrs,
+        local_p2p_addr,
+        local_validator_id,
+        connected_addrs,
+    } = context;
     let mut accepted = 0usize;
     for raw in addrs {
         let Some(addr) = resolve_peer_addr(&raw) else {
@@ -1246,7 +1286,7 @@ fn refresh_handshake_and_relay_config(
     Ok(())
 }
 
-fn start_network_runtime(
+struct NetworkRuntimeConfig {
     p2p_addr: String,
     bootstrap_peers: Vec<String>,
     initial_discovered_peers: Vec<String>,
@@ -1259,14 +1299,34 @@ fn start_network_runtime(
     signed_dns_replay_state_path: PathBuf,
     handshake_config: Arc<RwLock<HandshakeConfig>>,
     metrics: Arc<MetricsState>,
+}
+
+struct NetworkRuntime {
+    gossip: Arc<NetworkBridge>,
+    discovered_peers: Arc<Mutex<HashSet<String>>>,
+    authenticated_peer_addrs: Arc<Mutex<HashSet<String>>>,
+    peer_sources: Arc<Mutex<HashMap<String, PeerSource>>>,
+    network_events: std::sync::mpsc::Receiver<NetworkEvent>,
+}
+
+fn start_network_runtime(
+    config: NetworkRuntimeConfig,
     critical_tasks: &mut indra_node::supervisor::CriticalTasks,
-) -> indra_node::NodeResult<(
-    Arc<NetworkBridge>,
-    Arc<Mutex<HashSet<String>>>,
-    Arc<Mutex<HashSet<String>>>,
-    Arc<Mutex<HashMap<String, PeerSource>>>,
-    std::sync::mpsc::Receiver<NetworkEvent>,
-)> {
+) -> indra_node::NodeResult<NetworkRuntime> {
+    let NetworkRuntimeConfig {
+        p2p_addr,
+        bootstrap_peers,
+        initial_discovered_peers,
+        peers_file_path,
+        dns_discovery_enabled,
+        dns_seed_host,
+        dns_seed_validation,
+        dns_seed_signed_validation,
+        dns_seed_signed_public_key,
+        signed_dns_replay_state_path,
+        handshake_config,
+        metrics,
+    } = config;
     macro_rules! fatal_lock {
         ($mutex:expr, $name:literal) => {{
             match locks::lock(&$mutex, $name) {
@@ -1398,21 +1458,25 @@ fn start_network_runtime(
                                     let local_id =
                                         fatal_read!(handshake_config, "network.handshake_config.peer_event").my_validator_id;
                                     let accepted = match record_peer_connected_event(
-                                        local_id,
-                                        *validator_id,
-                                        *addr,
-                                        *is_outbound,
-                                        &connected_addrs,
-                                        &peer_addrs,
-                                        &addr_validators,
-                                        &discovered_peers,
-                                        &authenticated_peer_addrs,
-                                        &authenticated_addr_validators,
-                                        &connected_validator_ids,
-                                        &bootstrap_peer_addrs,
-                                        &genesis_peer_addrs,
-                                        &outbound_cooldowns,
-                                        &failure_counts,
+                                        PeerConnectionEvent {
+                                            local_validator_id: local_id,
+                                            validator_id: *validator_id,
+                                            addr: *addr,
+                                            is_outbound: *is_outbound,
+                                        },
+                                        PeerConnectionState {
+                                            connected_addrs: &connected_addrs,
+                                            peer_addrs: &peer_addrs,
+                                            addr_validators: &addr_validators,
+                                            discovered_peers: &discovered_peers,
+                                            authenticated_peer_addrs: &authenticated_peer_addrs,
+                                            authenticated_addr_validators: &authenticated_addr_validators,
+                                            connected_validator_ids: &connected_validator_ids,
+                                            bootstrap_peer_addrs: &bootstrap_peer_addrs,
+                                            genesis_peer_addrs: &genesis_peer_addrs,
+                                            outbound_cooldowns: &outbound_cooldowns,
+                                            failure_counts: &failure_counts,
+                                        },
                                     ) {
                                         Ok(accepted) => accepted,
                                         Err(error) => {
@@ -1931,13 +1995,13 @@ fn start_network_runtime(
         addr_validators,
     ));
 
-    Ok((
-        bridge,
+    Ok(NetworkRuntime {
+        gossip: bridge,
         discovered_peers,
         authenticated_peer_addrs,
         peer_sources,
-        event_rx,
-    ))
+        network_events: event_rx,
+    })
 }
 
 fn start_observer_runtime(
@@ -2642,28 +2706,35 @@ fn run() -> indra_node::NodeResult<()> {
     {
         critical_tasks.adopt("network-qc-verifier", handle);
     }
-    let (gossip, discovered_peers, authenticated_peer_addrs, peer_sources, network_events) =
-        match start_network_runtime(
-            p2p_addr.clone(),
-            bootstrap_peers.clone(),
-            genesis_seed_peers.clone(),
-            peers_file.clone(),
+    let NetworkRuntime {
+        gossip,
+        discovered_peers,
+        authenticated_peer_addrs,
+        peer_sources,
+        network_events,
+    } = match start_network_runtime(
+        NetworkRuntimeConfig {
+            p2p_addr: p2p_addr.clone(),
+            bootstrap_peers: bootstrap_peers.clone(),
+            initial_discovered_peers: genesis_seed_peers.clone(),
+            peers_file_path: peers_file.clone(),
             dns_discovery_enabled,
-            dns_seed_host.clone(),
+            dns_seed_host: dns_seed_host.clone(),
             dns_seed_validation,
             dns_seed_signed_validation,
-            dns_seed_signed_public_key.clone(),
-            signed_dns_replay_state_path(Path::new(&data_dir)),
-            Arc::clone(&handshake_config),
-            Arc::clone(&metrics_state),
-            &mut critical_tasks,
-        ) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                eprintln!("ERROR: network runtime startup failed: {error}");
-                std::process::exit(1);
-            }
-        };
+            dns_seed_signed_public_key: dns_seed_signed_public_key.clone(),
+            signed_dns_replay_state_path: signed_dns_replay_state_path(Path::new(&data_dir)),
+            handshake_config: Arc::clone(&handshake_config),
+            metrics: Arc::clone(&metrics_state),
+        },
+        &mut critical_tasks,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ERROR: network runtime startup failed: {error}");
+            std::process::exit(1);
+        }
+    };
     if let Some(addr) = observer_addr {
         let handle = match start_observer_runtime(
             addr,
@@ -3489,15 +3560,17 @@ fn run() -> indra_node::NodeResult<()> {
                                     }
                                 if !qc_recovery_actions.is_empty() {
                                     if let Err(error) = process_driver_actions(
-                                        &driver,
-                                        &gossip,
-                                        &height_tx,
-                                        &handshake_config,
-                                        caught_up_height.unwrap_or_default(),
-                                        qc_recovery_actions,
-                                        &metrics_state,
-                                        &last_block_timestamp,
-                                    ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: caught_up_height.unwrap_or_default(),
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    qc_recovery_actions,
+) {
                                         eprintln!("[sync] CRITICAL: driver action processing failed: {error}");
                                         indra_node::supervisor::report_unexpected(
                                             "authenticated-network-events",
@@ -3536,15 +3609,17 @@ fn run() -> indra_node::NodeResult<()> {
                             let previous_height = supervised_lock!(driver, "network.driver.previous_height").height();
                             let actions = supervised_lock!(driver, "network.driver.process").process(event);
                             if let Err(error) = process_driver_actions(
-                                &driver,
-                                &gossip,
-                                &height_tx,
-                                &handshake_config,
-                                previous_height,
-                                actions,
-                                &metrics_state,
-                                &last_block_timestamp,
-                            ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                                 eprintln!("[network] CRITICAL: driver action processing failed: {error}");
                                 indra_node::supervisor::report_unexpected(
                                     "authenticated-network-events",
@@ -3629,15 +3704,17 @@ fn run() -> indra_node::NodeResult<()> {
                     let actions = supervised_lock!(driver, "consensus.driver.request_qc").request_qc_if_needed();
                     if !actions.is_empty() {
                         if let Err(error) = process_driver_actions(
-                            &driver,
-                            &gossip,
-                            &height_tx,
-                            &handshake_config,
-                            height,
-                            actions,
-                            &metrics_state,
-                            &last_block_timestamp,
-                        ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                             eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
                             indra_node::supervisor::report_unexpected(
                                 "consensus-driver",
@@ -3867,15 +3944,17 @@ fn run() -> indra_node::NodeResult<()> {
                                         block.block.header.proposer_round,
                                     ));
                                     if let Err(error) = process_driver_actions(
-                                        &driver,
-                                        &gossip,
-                                        &height_tx,
-                                        &handshake_config,
-                                        height,
-                                        actions,
-                                        &metrics_state,
-                                        &last_block_timestamp,
-                                    ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                                         eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
                                         indra_node::supervisor::report_unexpected(
                                             "consensus-driver",
@@ -3889,15 +3968,17 @@ fn run() -> indra_node::NodeResult<()> {
                             if phase_started_at.elapsed() >= PROPOSE_TIMEOUT {
                                 let actions = supervised_lock!(driver, "consensus.driver.propose_timeout").on_propose_timeout();
                                 if let Err(error) = process_driver_actions(
-                                    &driver,
-                                    &gossip,
-                                    &height_tx,
-                                    &handshake_config,
-                                    height,
-                                    actions,
-                                    &metrics_state,
-                                    &last_block_timestamp,
-                                ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                                     eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
                                     indra_node::supervisor::report_unexpected(
                                         "consensus-driver",
@@ -3912,15 +3993,17 @@ fn run() -> indra_node::NodeResult<()> {
                             if phase_started_at.elapsed() >= PREVOTE_TIMEOUT {
                                 let actions = supervised_lock!(driver, "consensus.driver.prevote_timeout").on_prevote_timeout();
                                 if let Err(error) = process_driver_actions(
-                                    &driver,
-                                    &gossip,
-                                    &height_tx,
-                                    &handshake_config,
-                                    height,
-                                    actions,
-                                    &metrics_state,
-                                    &last_block_timestamp,
-                                ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                                     eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
                                     indra_node::supervisor::report_unexpected(
                                         "consensus-driver",
@@ -3935,15 +4018,17 @@ fn run() -> indra_node::NodeResult<()> {
                             let actions = supervised_lock!(driver, "consensus.driver.precommit_retry").retry_precommit_if_waiting();
                             if !actions.is_empty() {
                                 if let Err(error) = process_driver_actions(
-                                    &driver,
-                                    &gossip,
-                                    &height_tx,
-                                    &handshake_config,
-                                    height,
-                                    actions,
-                                    &metrics_state,
-                                    &last_block_timestamp,
-                                ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    actions,
+) {
                                     eprintln!("[consensus] CRITICAL: driver action processing failed: {error}");
                                     indra_node::supervisor::report_unexpected(
                                         "consensus-driver",
@@ -3991,15 +4076,17 @@ fn run() -> indra_node::NodeResult<()> {
     if !startup_qc_request.is_empty() {
         let current_height = locks::lock(&driver, "main.driver.startup_height")?.height();
         if let Err(error) = process_driver_actions(
-            &driver,
-            &gossip,
-            &height_tx,
-            &handshake_config,
-            current_height,
-            startup_qc_request,
-            &metrics_state,
-            &last_block_timestamp,
-        ) {
+    DriverActionContext {
+        driver: &driver,
+        gossip: &gossip,
+        height_tx: &height_tx,
+        handshake_config: &handshake_config,
+        previous_height: current_height,
+        metrics_state: &metrics_state,
+        last_block_timestamp: &last_block_timestamp,
+    },
+    startup_qc_request,
+) {
             eprintln!("ERROR: startup driver action processing failed: {error}");
             std::process::exit(1);
         }
@@ -4151,13 +4238,15 @@ fn run() -> indra_node::NodeResult<()> {
                 let authenticated = locks::lock(&authenticated_peer_addrs, "main.authenticated_peer_addrs")?.clone();
                 let mut discovered_guard = locks::lock(&discovered_peers, "main.discovered_peers")?;
                 let accepted = insert_on_chain_validator_network_addrs(
-                    &mut discovered_guard,
-                    &authenticated,
-                    &bootstrap_peer_addrs_main,
-                    &genesis_peer_addrs_main,
-                    &p2p_addr,
-                    local_validator_id,
-                    &connected,
+                    OnChainAddressContext {
+                        discovered_peers: &mut discovered_guard,
+                        authenticated_peer_addrs: &authenticated,
+                        bootstrap_peers: &bootstrap_peer_addrs_main,
+                        genesis_peer_addrs: &genesis_peer_addrs_main,
+                        local_p2p_addr: &p2p_addr,
+                        local_validator_id,
+                        connected_addrs: &connected,
+                    },
                     on_chain_addrs,
                 );
                 let discovered = locks::lock(&discovered_peers, "main.discovered_peers_sources")?;
@@ -4218,16 +4307,29 @@ fn broadcast_driver_message(gossip: &Arc<NetworkBridge>, _action: &DriverAction,
     gossip.broadcast(msg);
 }
 
-fn process_driver_actions(
-    driver: &Arc<Mutex<ConsensusDriver>>,
-    gossip: &Arc<NetworkBridge>,
-    _height_tx: &std::sync::mpsc::Sender<()>,
-    _handshake_config: &Arc<RwLock<HandshakeConfig>>,
+struct DriverActionContext<'a> {
+    driver: &'a Arc<Mutex<ConsensusDriver>>,
+    gossip: &'a Arc<NetworkBridge>,
+    height_tx: &'a std::sync::mpsc::Sender<()>,
+    handshake_config: &'a Arc<RwLock<HandshakeConfig>>,
     previous_height: u64,
+    metrics_state: &'a Arc<MetricsState>,
+    last_block_timestamp: &'a Arc<AtomicU64>,
+}
+
+fn process_driver_actions(
+    context: DriverActionContext<'_>,
     actions: Vec<DriverAction>,
-    metrics_state: &Arc<MetricsState>,
-    last_block_timestamp: &Arc<AtomicU64>,
 ) -> indra_node::NodeResult<()> {
+    let DriverActionContext {
+        driver,
+        gossip,
+        height_tx: _height_tx,
+        handshake_config: _handshake_config,
+        previous_height,
+        metrics_state,
+        last_block_timestamp,
+    } = context;
     let mut recorded_commit = false;
     for action in actions {
         if let DriverAction::Fatal(error) = &action {
@@ -4394,14 +4496,16 @@ fn announce_status_and_recovery(
 
     let actions = locks::lock(driver, "consensus.driver")?.request_qc_if_needed();
     process_driver_actions(
-        driver,
-        gossip,
-        height_tx,
-        handshake_config,
-        height,
+        DriverActionContext {
+            driver,
+            gossip,
+            height_tx,
+            handshake_config,
+            previous_height: height,
+            metrics_state,
+            last_block_timestamp,
+        },
         actions,
-        metrics_state,
-        last_block_timestamp,
     )?;
     Ok(())
 }
@@ -7249,21 +7353,20 @@ mod tests {
         let failure_counts = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 
         let accepted = record_peer_connected_event(
-            local,
-            local,
-            addr,
-            true,
-            &connected_addrs,
-            &peer_addrs,
-            &addr_validators,
-            &discovered_peers,
-            &authenticated_peer_addrs,
-            &authenticated_addr_validators,
-            &connected_validator_ids,
-            &bootstrap_peer_addrs,
-            &genesis_peer_addrs,
-            &outbound_cooldowns,
-            &failure_counts,
+            PeerConnectionEvent { local_validator_id: local, validator_id: local, addr, is_outbound: true },
+            PeerConnectionState {
+                connected_addrs: &connected_addrs,
+                peer_addrs: &peer_addrs,
+                addr_validators: &addr_validators,
+                discovered_peers: &discovered_peers,
+                authenticated_peer_addrs: &authenticated_peer_addrs,
+                authenticated_addr_validators: &authenticated_addr_validators,
+                connected_validator_ids: &connected_validator_ids,
+                bootstrap_peer_addrs: &bootstrap_peer_addrs,
+                genesis_peer_addrs: &genesis_peer_addrs,
+                outbound_cooldowns: &outbound_cooldowns,
+                failure_counts: &failure_counts,
+            },
         );
 
         assert!(!accepted.unwrap());
@@ -7319,21 +7422,20 @@ mod tests {
             is_outbound: bool,
         ) -> bool {
             record_peer_connected_event(
-                local,
-                validator,
-                addr,
-                is_outbound,
-                &self.connected_addrs,
-                &self.peer_addrs,
-                &self.addr_validators,
-                &self.discovered_peers,
-                &self.authenticated_peer_addrs,
-                &self.authenticated_addr_validators,
-                &self.connected_validator_ids,
-                &self.bootstrap_peer_addrs,
-                &self.genesis_peer_addrs,
-                &self.outbound_cooldowns,
-                &self.failure_counts,
+                PeerConnectionEvent { local_validator_id: local, validator_id: validator, addr, is_outbound },
+                PeerConnectionState {
+                    connected_addrs: &self.connected_addrs,
+                    peer_addrs: &self.peer_addrs,
+                    addr_validators: &self.addr_validators,
+                    discovered_peers: &self.discovered_peers,
+                    authenticated_peer_addrs: &self.authenticated_peer_addrs,
+                    authenticated_addr_validators: &self.authenticated_addr_validators,
+                    connected_validator_ids: &self.connected_validator_ids,
+                    bootstrap_peer_addrs: &self.bootstrap_peer_addrs,
+                    genesis_peer_addrs: &self.genesis_peer_addrs,
+                    outbound_cooldowns: &self.outbound_cooldowns,
+                    failure_counts: &self.failure_counts,
+                },
             ).unwrap()
         }
 
@@ -8247,13 +8349,15 @@ mod tests {
         let local_p2p_addr = "198.51.100.10:30303";
         let mut discovered_peers = HashSet::new();
         let accepted = insert_on_chain_validator_network_addrs(
-            &mut discovered_peers,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            local_p2p_addr,
-            indra_core::Bytes32::from([0x01; 32]),
-            &[],
+            OnChainAddressContext {
+                discovered_peers: &mut discovered_peers,
+                authenticated_peer_addrs: &HashSet::new(),
+                bootstrap_peers: &HashSet::new(),
+                genesis_peer_addrs: &HashSet::new(),
+                local_p2p_addr,
+                local_validator_id: indra_core::Bytes32::from([0x01; 32]),
+                connected_addrs: &[],
+            },
             [
                 "203.0.113.60:30303".to_string(),
                 local_p2p_addr.to_string(),
@@ -8376,21 +8480,20 @@ mod tests {
         let failure_counts = Arc::new(Mutex::new(HashMap::from([(addr.to_string(), 7)])));
 
         assert!(record_peer_connected_event(
-            local,
-            validator,
-            addr,
-            true,
-            &connected_addrs,
-            &peer_addrs,
-            &addr_validators,
-            &discovered_peers,
-            &authenticated_peer_addrs,
-            &authenticated_addr_validators,
-            &connected_validator_ids,
-            &bootstrap_peer_addrs,
-            &genesis_peer_addrs,
-            &outbound_cooldowns,
-            &failure_counts,
+            PeerConnectionEvent { local_validator_id: local, validator_id: validator, addr, is_outbound: true },
+            PeerConnectionState {
+                connected_addrs: &connected_addrs,
+                peer_addrs: &peer_addrs,
+                addr_validators: &addr_validators,
+                discovered_peers: &discovered_peers,
+                authenticated_peer_addrs: &authenticated_peer_addrs,
+                authenticated_addr_validators: &authenticated_addr_validators,
+                connected_validator_ids: &connected_validator_ids,
+                bootstrap_peer_addrs: &bootstrap_peer_addrs,
+                genesis_peer_addrs: &genesis_peer_addrs,
+                outbound_cooldowns: &outbound_cooldowns,
+                failure_counts: &failure_counts,
+            },
         ).unwrap());
 
         assert!(!failure_counts

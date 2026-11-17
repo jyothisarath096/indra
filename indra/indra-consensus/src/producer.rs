@@ -319,16 +319,7 @@ mod tests {
         );
         let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
         let entry = &snapshot.entries()[0];
-        let vote = crate::vote::produce_vote(
-            state.height,
-            0,
-            indra_core::types::vote::VoteStep::Precommit,
-            state.tip_hash,
-            entry.validator_id,
-            snapshot.snapshot_root,
-            &state.chain_id,
-            &hot,
-        )
+        let vote = crate::vote::produce_vote(crate::vote::VoteRequest { height: state.height, round: 0, step: indra_core::types::vote::VoteStep::Precommit, block_hash: state.tip_hash, validator_id: entry.validator_id, snapshot_root: snapshot.snapshot_root, chain_id: &state.chain_id }, &hot)
         .unwrap();
         crate::qc::build_qc(
             state.height,

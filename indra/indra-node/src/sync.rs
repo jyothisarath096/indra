@@ -1471,16 +1471,7 @@ mod tests {
             stake,
             snapshot_root,
         } = fixture;
-        let vote = produce_vote(
-            height,
-            round,
-            VoteStep::Precommit,
-            value_hash,
-            validator_id,
-            snapshot_root,
-            TEST_CHAIN_ID,
-            hybrid,
-        )
+        let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: value_hash, validator_id, snapshot_root, chain_id: TEST_CHAIN_ID }, hybrid)
         .unwrap();
         let qc = build_qc(
             height,
@@ -1515,16 +1506,7 @@ mod tests {
                     &signer.public_key().classical.0,
                     &signer.public_key().pq.0,
                 );
-                produce_vote(
-                    height,
-                    0,
-                    VoteStep::Precommit,
-                    block_hash,
-                    validator_id,
-                    snapshot.snapshot_root,
-                    TEST_CHAIN_ID,
-                    signer,
-                )
+                produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
                 .unwrap()
             })
             .collect();
@@ -3183,31 +3165,13 @@ mod tests {
             snapshot.snapshot_root,
             voters,
         );
-        let a_vote = produce_vote(
-            u64::MAX,
-            0,
-            VoteStep::Precommit,
-            block_h_hash,
-            a_id,
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &a,
-        )
+        let a_vote = produce_vote(indra_consensus::vote::VoteRequest { height: u64::MAX, round: 0, step: VoteStep::Precommit, block_hash: block_h_hash, validator_id: a_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &a)
         .unwrap();
         let b_id = indra_core::types::crypto::hybrid_identity_id(
             &b.public_key().classical.0,
             &b.public_key().pq.0,
         );
-        let b_vote = produce_vote(
-            u64::MAX,
-            0,
-            VoteStep::Precommit,
-            block_h_hash,
-            b_id,
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &b,
-        )
+        let b_vote = produce_vote(indra_consensus::vote::VoteRequest { height: u64::MAX, round: 0, step: VoteStep::Precommit, block_hash: block_h_hash, validator_id: b_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &b)
         .unwrap();
         assert!(matches!(
             collector.add_vote(a_vote.clone()).unwrap(),

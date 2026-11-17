@@ -132,16 +132,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &signer.public_key().classical.0,
             &signer.public_key().pq.0,
         );
-        let vote = indra_consensus::vote::produce_vote(
-            height,
-            0,
-            VoteStep::Precommit,
-            block_hash,
-            validator_id,
-            snapshot_root,
-            TEST_CHAIN_ID,
-            signer,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
         .unwrap();
         build_qc(
             height,
@@ -176,16 +167,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     &signer.public_key().classical.0,
                     &signer.public_key().pq.0,
                 );
-                indra_consensus::vote::produce_vote(
-                    height,
-                    round,
-                    VoteStep::Precommit,
-                    block_hash,
-                    validator_id,
-                    snapshot_root,
-                    TEST_CHAIN_ID,
-                    signer,
-                )
+                indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
                 .unwrap()
             })
             .collect();
@@ -1029,7 +1011,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15000".parse().unwrap(), vote: prevotes[0].clone() });
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15002".parse().unwrap(), vote: precommits[2].1.clone() });
         let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&fixture.materials[3].seed), fixture.materials[3].pq.clone());
-        let conflicting = indra_consensus::vote::produce_vote(1, 0, VoteStep::Precommit, Bytes32([9u8;32]), ids[3], governing_snapshot_root(&fixture.drivers[0], 1), TEST_CHAIN_ID, &signer).unwrap();
+        let conflicting = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash: Bytes32([9u8;32]), validator_id: ids[3], snapshot_root: governing_snapshot_root(&fixture.drivers[0], 1), chain_id: TEST_CHAIN_ID }, &signer).unwrap();
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15003".parse().unwrap(), vote: conflicting });
         let after = (fixture.drivers[0].engine.state.height, fixture.drivers[0].engine.state.tip_hash, fixture.drivers[0].last_qc_bytes(), fixture.drivers[0].last_qc_height(), fixture.drivers[0].current_round(), fixture.drivers[0].current_phase(), fixture.drivers[0].vote_admission_metrics.qc_formations);
         assert_eq!(after, baseline);
@@ -1857,27 +1839,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ClassicalKeypair::from_seed(&fixture.materials[3].seed),
             fixture.materials[3].pq.clone(),
         );
-        let d_prevote_proposal = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Prevote,
-            proposal_hash,
-            ids[3],
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &byzantine_signer,
-        )
+        let d_prevote_proposal = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash: proposal_hash, validator_id: ids[3], snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &byzantine_signer)
         .unwrap();
-        let d_prevote_conflict = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Prevote,
-            conflicting_hash,
-            ids[3],
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &byzantine_signer,
-        )
+        let d_prevote_conflict = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash: conflicting_hash, validator_id: ids[3], snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &byzantine_signer)
         .unwrap();
         assert_ne!(d_prevote_proposal.block_hash, d_prevote_conflict.block_hash);
 
@@ -2006,16 +1970,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             from: "127.0.0.1:26110".parse().unwrap(),
             vote: honest_prevotes[0].clone(),
         });
-        let d_later_round_conflict = indra_consensus::vote::produce_vote(
-            1,
-            round + 1,
-            VoteStep::Prevote,
-            conflicting_hash,
-            ids[3],
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &byzantine_signer,
-        )
+        let d_later_round_conflict = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: round + 1, step: VoteStep::Prevote, block_hash: conflicting_hash, validator_id: ids[3], snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &byzantine_signer)
         .unwrap();
         fixture.drivers[2].process(DriverEvent::InboundVote {
             from: "127.0.0.1:26123".parse().unwrap(),
@@ -2037,27 +1992,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             .collect();
         assert_eq!(locks_before_conflict, locks_after_conflict);
 
-        let d_precommit_proposal = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Precommit,
-            proposal_hash,
-            ids[3],
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &byzantine_signer,
-        )
+        let d_precommit_proposal = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Precommit, block_hash: proposal_hash, validator_id: ids[3], snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &byzantine_signer)
         .unwrap();
-        let d_precommit_conflict = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Precommit,
-            conflicting_hash,
-            ids[3],
-            snapshot.snapshot_root,
-            TEST_CHAIN_ID,
-            &byzantine_signer,
-        )
+        let d_precommit_conflict = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Precommit, block_hash: conflicting_hash, validator_id: ids[3], snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &byzantine_signer)
         .unwrap();
 
         // Deliver conflict first so D cannot contribute to P at A. The second
@@ -4278,16 +4215,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             assert_eq!(observer.current_round(), expected_round);
             assert_eq!(observer.current_phase(), RoundPhase::Propose);
 
-            let remote_prevote = indra_consensus::vote::produce_vote(
-                1,
-                expected_round,
-                VoteStep::Prevote,
-                Bytes32::ZERO,
-                remote_validator_id,
-                snapshot_root,
-                &chain_id,
-                &remote_signer,
-            )
+            let remote_prevote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: expected_round, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_validator_id, snapshot_root, chain_id: &chain_id }, &remote_signer)
             .unwrap();
             observer.process(DriverEvent::InboundVote {
                 from: "127.0.0.1:29990".parse().unwrap(),
@@ -4391,16 +4319,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 ClassicalKeypair::from_seed(&fixture.materials[signer_index].seed),
                 fixture.materials[signer_index].pq.clone(),
             );
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                target_round,
-                VoteStep::Prevote,
-                Bytes32::ZERO,
-                Bytes32::from(fixture.materials[signer_index].validator_id),
-                snapshot_root,
-                &chain_id,
-                &signer,
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: target_round, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: Bytes32::from(fixture.materials[signer_index].validator_id), snapshot_root, chain_id: &chain_id }, &signer)
             .unwrap();
             observer.process(DriverEvent::InboundVote {
                 from: format!("127.0.0.1:{}", 29991 + signer_index)
@@ -4463,7 +4382,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         assert!(fixture.driver_a.collector_has_vote_from(h, r, VoteStep::Prevote, b_id));
         let c = test_validator_material([0xC3; 32]);
         let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&c.seed), c.pq);
-        let vc = indra_consensus::vote::produce_vote(h, r, VoteStep::Prevote, Bytes32::ZERO, Bytes32::from(c.validator_id), governing_snapshot_root(&fixture.driver_a, h), TEST_CHAIN_ID, &signer).unwrap();
+        let vc = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: h, round: r, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: Bytes32::from(c.validator_id), snapshot_root: governing_snapshot_root(&fixture.driver_a, h), chain_id: TEST_CHAIN_ID }, &signer).unwrap();
         queue.push_back(vc);
         let vc = queue.pop_front().unwrap();
         let c_actions = fixture.driver_a.process(DriverEvent::InboundVote { from: "127.0.0.1:11003".parse().unwrap(), vote: vc });
@@ -4673,16 +4592,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                         .iter()
                         .filter(|(id, _, _)| snapshot.entry_with_position(id).is_some())
                         .map(|(id, _, signer)| {
-                            indra_consensus::vote::produce_vote(
-                                *height,
-                                0,
-                                VoteStep::Precommit,
-                                block_hash,
-                                *id,
-                                snapshot.snapshot_root,
-                                TEST_CHAIN_ID,
-                                signer,
-                            )
+                            indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: *height, round: 0, step: VoteStep::Precommit, block_hash, validator_id: *id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
                             .unwrap()
                         })
                         .collect::<Vec<_>>();
@@ -4803,16 +4713,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let signers = [&a, &b, &c, &d];
 
         for idx in 0..2 {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                0,
-                VoteStep::Prevote,
-                hash_a,
-                signer_ids[idx],
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signers[idx],
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: hash_a, validator_id: signer_ids[idx], snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signers[idx])
             .unwrap();
             assert!(matches!(
                 collector.add_vote(vote).unwrap(),
@@ -4820,16 +4721,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ));
         }
         for idx in 2..4 {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                0,
-                VoteStep::Prevote,
-                hash_b,
-                signer_ids[idx],
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signers[idx],
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: hash_b, validator_id: signer_ids[idx], snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signers[idx])
             .unwrap();
             assert!(matches!(
                 collector.add_vote(vote).unwrap(),
@@ -4837,16 +4729,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ));
         }
 
-        let equivocation = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            hash_a,
-            signer_ids[2],
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            signers[2],
-        )
+        let equivocation = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: hash_a, validator_id: signer_ids[2], snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signers[2])
         .unwrap();
         assert!(
             collector.add_vote(equivocation).is_err(),
@@ -4878,49 +4761,13 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &remote_b.public_key().pq.0,
         );
 
-        let prevote_a = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Prevote,
-            block_hash,
-            remote_a_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote_a,
-        )
+        let prevote_a = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash, validator_id: remote_a_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote_a)
         .unwrap();
-        let prevote_b = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Prevote,
-            block_hash,
-            remote_b_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote_b,
-        )
+        let prevote_b = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash, validator_id: remote_b_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote_b)
         .unwrap();
-        let precommit_a = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Precommit,
-            block_hash,
-            remote_a_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote_a,
-        )
+        let precommit_a = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Precommit, block_hash, validator_id: remote_a_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote_a)
         .unwrap();
-        let precommit_b = indra_consensus::vote::produce_vote(
-            1,
-            round,
-            VoteStep::Precommit,
-            block_hash,
-            remote_b_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote_b,
-        )
+        let precommit_b = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Precommit, block_hash, validator_id: remote_b_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote_b)
         .unwrap();
 
         let peer_a: SocketAddr = "127.0.0.1:9101".parse().unwrap();
@@ -5231,16 +5078,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 if vote.round == target_round && vote.step == VoteStep::Prevote && vote.block_hash == block_hash
         )));
 
-        let vote = indra_consensus::vote::produce_vote(
-            1,
-            target_round,
-            VoteStep::Prevote,
-            block_hash,
-            validator_id_for(&signer),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &signer,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: target_round, step: VoteStep::Prevote, block_hash, validator_id: validator_id_for(&signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &signer)
         .unwrap();
         let actions = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9202".parse().unwrap(),
@@ -5399,16 +5237,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let (mut driver, dir) = local_driver([0x49u8; 32], "high_round_vote");
         let signer = install_active_validator(&mut driver, [0x49u8; 32], "local");
         driver.refresh_registered_voters();
-        let mut vote = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            validator_id_for(&signer),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &signer,
-        )
+        let mut vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: validator_id_for(&signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &signer)
         .unwrap();
         vote.round = MAX_ROUNDS_PER_HEIGHT;
         let before = (
@@ -5482,20 +5311,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         );
 
         for (index, signer) in signers.iter().enumerate() {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                4,
-                if index == 1 {
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 4, step: if index == 1 {
                     VoteStep::Precommit
                 } else {
                     VoteStep::Prevote
-                },
-                Bytes32::ZERO,
-                validator_id_for(signer),
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signer,
-            )
+                }, block_hash: Bytes32::ZERO, validator_id: validator_id_for(signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signer)
             .unwrap();
             driver.process(DriverEvent::InboundVote {
                 from: format!("127.0.0.1:{}", 9500 + index).parse().unwrap(),
@@ -5866,32 +5686,14 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             HybridKeypair::new(ClassicalKeypair::from_seed(&[0x04; 32]), PqKeypair::from_seed(&[0x04; 32]).unwrap()),
         ];
         for (index, signer) in remote_signers.iter().enumerate() {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                driver.current_round,
-                VoteStep::Prevote,
-                block_hash,
-                validator_id_for(signer),
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signer,
-            ).unwrap();
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: driver.current_round, step: VoteStep::Prevote, block_hash, validator_id: validator_id_for(signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signer).unwrap();
             actions.extend(driver.process(DriverEvent::InboundVote {
                 from: SocketAddr::from(([127, 0, 0, 1], 9800 + index as u16)),
                 vote,
             }));
         }
         for (index, signer) in remote_signers.iter().take(2).enumerate() {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                driver.current_round,
-                VoteStep::Precommit,
-                block_hash,
-                validator_id_for(signer),
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signer,
-            ).unwrap();
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: driver.current_round, step: VoteStep::Precommit, block_hash, validator_id: validator_id_for(signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signer).unwrap();
             actions.extend(driver.process(DriverEvent::InboundVote {
                 from: SocketAddr::from(([127, 0, 0, 1], 9810 + index as u16)),
                 vote,
@@ -5980,16 +5782,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.refresh_registered_voters();
         let proposal = make_strict_block(&driver, seed, 0, vec![]);
         let block_hash = proposal.header.block_hash();
-        let prevote = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            block_hash,
-            validator_id_for(&local),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let prevote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: validator_id_for(&local), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let lock = PersistedConsensusLock {
             height: 2,
@@ -6079,16 +5872,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let block_a = make_strict_block(&driver, seed, 0, vec![]);
         let hash_a = block_a.header.block_hash();
         let value_a = block_a.header.value_hash;
-        let prevote_a = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            hash_a,
-            validator_id_for(&local),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let prevote_a = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: hash_a, validator_id: validator_id_for(&local), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let durable_lock = PersistedConsensusLock {
             height: 1,
@@ -6151,16 +5935,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let mut proposal = make_strict_block(&driver, seed, 0, vec![]);
         let block_hash = proposal.header.block_hash();
         let value_hash = proposal.header.value_hash;
-        let prevote = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            block_hash,
-            validator_id_for(&local),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let prevote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: validator_id_for(&local), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let mut bad_pq = proposal.proposer_authorization.pq_sig.as_slice().to_vec();
         bad_pq[0] ^= 0x01;
@@ -6204,16 +5979,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.refresh_registered_voters();
         let proposal = make_strict_block(&driver, seed, 0, vec![]);
         let block_hash = proposal.header.block_hash();
-        let prevote = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            block_hash,
-            validator_id_for(&local),
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let prevote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: validator_id_for(&local), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let lock = PersistedConsensusLock {
             height: 1,
@@ -6248,16 +6014,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let hash = block.header.block_hash();
         let _ = process_single_validator_proposal(&mut driver, block);
         for (port, signer) in [(9711, &remote_a), (9712, &remote_b)] {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                round,
-                VoteStep::Prevote,
-                hash,
-                validator_id_for(signer),
-                governing_snapshot_root(&driver, 1),
-                TEST_CHAIN_ID,
-                signer,
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash: hash, validator_id: validator_id_for(signer), snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, signer)
             .unwrap();
             let actions = driver.process(DriverEvent::InboundVote {
                 from: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -6292,16 +6049,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let remote = install_active_validator(&mut driver, [0x41u8; 32], "remote");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
-        let vote = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            validator_id_for(&remote),
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: validator_id_for(&remote), snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
         let phase_before = driver.current_phase();
 
@@ -6345,16 +6093,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let remote = install_active_validator(&mut driver, [0x43u8; 32], "remote");
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
-        let valid = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            validator_id_for(&remote),
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let valid = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: validator_id_for(&remote), snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
         let slot = (valid.validator_id, valid.height, valid.round, valid.step);
         let mut invalid = valid.clone();
@@ -6406,16 +6145,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.refresh_registered_voters();
         driver.sync.mark_caught_up(driver.height());
         let remote_id = validator_id_for(&remote);
-        let accepted = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            remote_id,
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let accepted = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
         let _ = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9295".parse().unwrap(),
@@ -6423,16 +6153,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         });
         let before = driver.vote_admission_metrics;
         let wrong_root = Bytes32::from([0xA6; 32]);
-        let wrong = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            remote_id,
-            wrong_root,
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let wrong = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: wrong_root, chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
 
         let rejected = driver.process(DriverEvent::InboundVote {
@@ -6470,38 +6191,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let root = governing_snapshot_root(&driver, height);
         let remote_id = validator_id_for(&remote);
         let votes = [
-            indra_consensus::vote::produce_vote(
-                height,
-                0,
-                VoteStep::Prevote,
-                Bytes32::ZERO,
-                remote_id,
-                root,
-                TEST_CHAIN_ID,
-                &remote,
-            )
+            indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: root, chain_id: TEST_CHAIN_ID }, &remote)
             .unwrap(),
-            indra_consensus::vote::produce_vote(
-                height,
-                0,
-                VoteStep::Precommit,
-                Bytes32::ZERO,
-                remote_id,
-                root,
-                TEST_CHAIN_ID,
-                &remote,
-            )
+            indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Precommit, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: root, chain_id: TEST_CHAIN_ID }, &remote)
             .unwrap(),
-            indra_consensus::vote::produce_vote(
-                height,
-                1,
-                VoteStep::Prevote,
-                Bytes32::ZERO,
-                remote_id,
-                root,
-                TEST_CHAIN_ID,
-                &remote,
-            )
+            indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: 1, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: root, chain_id: TEST_CHAIN_ID }, &remote)
             .unwrap(),
         ];
         for (index, vote) in votes.iter().cloned().enumerate() {
@@ -6541,16 +6235,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ClassicalKeypair::from_seed(&seed),
             PqKeypair::from_seed(&seed).unwrap(),
         );
-        let vote = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            validator_id_for(&signer),
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &signer,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: validator_id_for(&signer), snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &signer)
         .unwrap();
         let _ = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9304".parse().unwrap(),
@@ -6585,27 +6270,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &remote.public_key().classical.0,
             &remote.public_key().pq.0,
         );
-        let vote_a = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Precommit,
-            Bytes32::from([0xAAu8; 32]),
-            remote_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let vote_a = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash: Bytes32::from([0xAAu8; 32]), validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
-        let vote_b = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Precommit,
-            Bytes32::from([0xBBu8; 32]),
-            remote_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let vote_b = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash: Bytes32::from([0xBBu8; 32]), validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
 
         let peer: SocketAddr = "127.0.0.1:9301".parse().unwrap();
@@ -6636,16 +6303,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             driver.sync.mark_caught_up(driver.height());
             let remote_id = validator_id_for(&remote);
             let make_vote = |hash| {
-                indra_consensus::vote::produce_vote(
-                    driver.next_height(),
-                    0,
-                    VoteStep::Precommit,
-                    hash,
-                    remote_id,
-                    governing_snapshot_root(&driver, driver.next_height()),
-                    TEST_CHAIN_ID,
-                    &remote,
-                )
+                indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Precommit, block_hash: hash, validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &remote)
                 .unwrap()
             };
             let a = make_vote(Bytes32::from([0xAA; 32]));
@@ -6692,16 +6350,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &real.public_key().pq.0,
         );
         let slot = (real_id, driver.next_height(), 0, VoteStep::Prevote);
-        let forged = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            real_id,
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &attacker,
-        )
+        let forged = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: real_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &attacker)
         .unwrap();
         let forged_actions = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9302".parse().unwrap(),
@@ -6712,16 +6361,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
         assert!(!driver.seen_round_votes.contains_key(&slot));
 
-        let legitimate = indra_consensus::vote::produce_vote(
-            driver.next_height(),
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            real_id,
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &real,
-        )
+        let legitimate = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: real_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &real)
         .unwrap();
         let legitimate_actions = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9303".parse().unwrap(),
@@ -6749,18 +6389,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &remote.public_key().classical.0,
             &remote.public_key().pq.0,
         );
-        let vote = indra_consensus::vote::produce_vote(
-            driver.next_height().saturating_add(100),
-            driver
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height().saturating_add(100), round: driver
                 .current_round
-                .saturating_add(MAX_ACCEPTED_ROUND_JUMP + 1),
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-            remote_id,
-            governing_snapshot_root(&driver, driver.next_height()),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+                .saturating_add(MAX_ACCEPTED_ROUND_JUMP + 1), step: VoteStep::Prevote, block_hash: Bytes32::ZERO, validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
         let _ = driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:9304".parse().unwrap(),
@@ -6781,16 +6412,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &real.public_key().pq.0,
         );
         for hash in [Bytes32::from([0xAA; 32]), Bytes32::from([0xBB; 32])] {
-            let forged = indra_consensus::vote::produce_vote(
-                driver.next_height(),
-                0,
-                VoteStep::Precommit,
-                hash,
-                real_id,
-                governing_snapshot_root(&driver, driver.next_height()),
-                TEST_CHAIN_ID,
-                &attacker,
-            )
+            let forged = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: driver.next_height(), round: 0, step: VoteStep::Precommit, block_hash: hash, validator_id: real_id, snapshot_root: governing_snapshot_root(&driver, driver.next_height()), chain_id: TEST_CHAIN_ID }, &attacker)
             .unwrap();
             let actions = driver.process(DriverEvent::InboundVote {
                 from: "127.0.0.1:9305".parse().unwrap(),
@@ -6929,16 +6551,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         ));
 
         let source_validator_id = validator_id_for(&source_local);
-        let qc_vote = indra_consensus::vote::produce_vote(
-            2,
-            block2.header.proposer_round,
-            VoteStep::Precommit,
-            block2.header.block_hash(),
-            source_validator_id,
-            governing_snapshot_root(&driver, 2),
-            TEST_CHAIN_ID,
-            &source_local,
-        )
+        let qc_vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 2, round: block2.header.proposer_round, step: VoteStep::Precommit, block_hash: block2.header.block_hash(), validator_id: source_validator_id, snapshot_root: governing_snapshot_root(&driver, 2), chain_id: TEST_CHAIN_ID }, &source_local)
         .unwrap();
         let qc = indra_consensus::build_qc(
             2,
@@ -7018,16 +6631,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let block2 = make_strict_block(&driver, [0xC1u8; 32], 0, driver.last_qc_bytes());
         let validator_id = validator_id_for(&local);
-        let qc_vote = indra_consensus::vote::produce_vote(
-            2,
-            block2.header.proposer_round,
-            VoteStep::Precommit,
-            block2.header.block_hash(),
-            validator_id,
-            governing_snapshot_root(&driver, 2),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let qc_vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 2, round: block2.header.proposer_round, step: VoteStep::Precommit, block_hash: block2.header.block_hash(), validator_id, snapshot_root: governing_snapshot_root(&driver, 2), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let qc_for_height_2 = indra_consensus::build_qc(
             2,
@@ -7439,16 +7043,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &local.public_key().pq.0,
         );
         let value_hash = Bytes32::from([0x44u8; 32]);
-        let vote = indra_consensus::vote::produce_vote(
-            7,
-            0,
-            VoteStep::Precommit,
-            value_hash,
-            validator_id,
-            governing_snapshot_root(&driver, 7),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 7, round: 0, step: VoteStep::Precommit, block_hash: value_hash, validator_id, snapshot_root: governing_snapshot_root(&driver, 7), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let validators = driver.engine.qc_validators();
         let qc = indra_consensus::build_qc(
@@ -7492,16 +7087,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &local.public_key().pq.0,
         );
         let value_hash = Bytes32::from([0x45u8; 32]);
-        let vote = indra_consensus::vote::produce_vote(
-            7,
-            0,
-            VoteStep::Precommit,
-            value_hash,
-            validator_id,
-            governing_snapshot_root(&driver, 7),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 7, round: 0, step: VoteStep::Precommit, block_hash: value_hash, validator_id, snapshot_root: governing_snapshot_root(&driver, 7), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let validators = driver.engine.qc_validators();
         let qc = indra_consensus::build_qc(
@@ -7547,16 +7133,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &local.public_key().pq.0,
         );
         let value_hash = Bytes32::from([0x46u8; 32]);
-        let vote = indra_consensus::vote::produce_vote(
-            7,
-            0,
-            VoteStep::Precommit,
-            value_hash,
-            validator_id,
-            governing_snapshot_root(&driver, 7),
-            TEST_CHAIN_ID,
-            &local,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 7, round: 0, step: VoteStep::Precommit, block_hash: value_hash, validator_id, snapshot_root: governing_snapshot_root(&driver, 7), chain_id: TEST_CHAIN_ID }, &local)
         .unwrap();
         let validators = driver.engine.qc_validators();
         let mut qc_bytes = indra_consensus::build_qc(
@@ -7695,27 +7272,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &remote_b.public_key().classical.0,
             &remote_b.public_key().pq.0,
         );
-        let prevote_a = indra_consensus::vote::produce_vote(
-            height,
-            original_round,
-            VoteStep::Prevote,
-            original_hash,
-            remote_a_id,
-            governing_snapshot_root(&driver, height),
-            TEST_CHAIN_ID,
-            &remote_a,
-        )
+        let prevote_a = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: original_round, step: VoteStep::Prevote, block_hash: original_hash, validator_id: remote_a_id, snapshot_root: governing_snapshot_root(&driver, height), chain_id: TEST_CHAIN_ID }, &remote_a)
         .unwrap();
-        let prevote_b = indra_consensus::vote::produce_vote(
-            height,
-            original_round,
-            VoteStep::Prevote,
-            original_hash,
-            remote_b_id,
-            governing_snapshot_root(&driver, height),
-            TEST_CHAIN_ID,
-            &remote_b,
-        )
+        let prevote_b = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height, round: original_round, step: VoteStep::Prevote, block_hash: original_hash, validator_id: remote_b_id, snapshot_root: governing_snapshot_root(&driver, height), chain_id: TEST_CHAIN_ID }, &remote_b)
         .unwrap();
 
         let _ = driver.process(DriverEvent::InboundVote {
@@ -8072,16 +7631,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ("127.0.0.1:9803", c_id, &c),
             ("127.0.0.1:9804", d_id, &d),
         ] {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                original_round,
-                VoteStep::Prevote,
-                block_x_hash,
-                validator_id,
-                governing_snapshot_root(driver_b, 1),
-                TEST_CHAIN_ID,
-                signer,
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: original_round, step: VoteStep::Prevote, block_hash: block_x_hash, validator_id, snapshot_root: governing_snapshot_root(driver_b, 1), chain_id: TEST_CHAIN_ID }, signer)
             .unwrap();
             let _ = driver_b.process(DriverEvent::InboundVote {
                 from: peer.parse().unwrap(),
@@ -8147,16 +7697,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ("127.0.0.1:9812", c_id, &c),
             ("127.0.0.1:9813", d_id, &d),
         ] {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                reproposal_round,
-                VoteStep::Prevote,
-                block_y_hash,
-                validator_id,
-                governing_snapshot_root(driver_b, 1),
-                TEST_CHAIN_ID,
-                signer,
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: reproposal_round, step: VoteStep::Prevote, block_hash: block_y_hash, validator_id, snapshot_root: governing_snapshot_root(driver_b, 1), chain_id: TEST_CHAIN_ID }, signer)
             .unwrap();
             let _ = driver_b.process(DriverEvent::InboundVote {
                 from: peer.parse().unwrap(),
@@ -8169,16 +7710,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             ("127.0.0.1:9822", c_id, &c),
             ("127.0.0.1:9823", d_id, &d),
         ] {
-            let vote = indra_consensus::vote::produce_vote(
-                1,
-                reproposal_round,
-                VoteStep::Precommit,
-                block_y_hash,
-                validator_id,
-                governing_snapshot_root(driver_b, 1),
-                TEST_CHAIN_ID,
-                signer,
-            )
+            let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: reproposal_round, step: VoteStep::Precommit, block_hash: block_y_hash, validator_id, snapshot_root: governing_snapshot_root(driver_b, 1), chain_id: TEST_CHAIN_ID }, signer)
             .unwrap();
             let _ = driver_b.process(DriverEvent::InboundVote {
                 from: peer.parse().unwrap(),
@@ -8243,16 +7775,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             &remote.public_key().classical.0,
             &remote.public_key().pq.0,
         );
-        let vote = indra_consensus::vote::produce_vote(
-            1,
-            0,
-            VoteStep::Prevote,
-            Bytes32::from([0xABu8; 32]),
-            remote_id,
-            governing_snapshot_root(&driver, 1),
-            TEST_CHAIN_ID,
-            &remote,
-        )
+        let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::from([0xABu8; 32]), validator_id: remote_id, snapshot_root: governing_snapshot_root(&driver, 1), chain_id: TEST_CHAIN_ID }, &remote)
         .unwrap();
 
         let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });

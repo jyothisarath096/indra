@@ -386,7 +386,7 @@ fn build_single_validator_qc_bytes(
         .map(|signer| {
             let public = signer.public_key();
             let validator_id = indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
-            produce_vote(height, round, VoteStep::Precommit, block_hash, validator_id, snapshot.snapshot_root, &state.chain_id, signer).unwrap()
+            produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root: snapshot.snapshot_root, chain_id: &state.chain_id }, signer).unwrap()
         })
         .collect();
     let validators: Vec<_> = snapshot
@@ -989,21 +989,12 @@ fn node_syncs_before_joining_consensus() {
         &remote.public_key().classical.0,
         &remote.public_key().pq.0,
     );
-    let vote = indra_consensus::vote::produce_vote(
-        1,
-        0,
-        VoteStep::Prevote,
-        Bytes32::from([0xCCu8; 32]),
-        remote_id,
-        driver
+    let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::from([0xCCu8; 32]), validator_id: remote_id, snapshot_root: driver
             .engine
             .state
             .snapshot_for_consensus_height(1)
             .unwrap()
-            .snapshot_root,
-        TEST_CHAIN_ID,
-        &remote,
-    )
+            .snapshot_root, chain_id: TEST_CHAIN_ID }, &remote)
     .unwrap();
 
     let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });

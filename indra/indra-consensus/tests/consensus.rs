@@ -281,16 +281,7 @@ fn full_consensus_round() {
     );
 
     for v in &validators {
-        let vote = produce_vote(
-            height,
-            round,
-            VoteStep::Precommit,
-            block_hash,
-            v.id,
-            Bytes32::ZERO,
-            TEST_CHAIN_ID,
-            &v.hybrid_kp,
-        )
+        let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id: v.id, snapshot_root: Bytes32::ZERO, chain_id: TEST_CHAIN_ID }, &v.hybrid_kp)
         .unwrap();
         collector.add_vote(vote).unwrap();
     }
@@ -391,16 +382,7 @@ fn qc_builder_quorum_detection() {
     assert_eq!(builder.current_stake_bps(), 0);
 
     // v1 votes (70%) → quorum reached (need > 2/3)
-    let vote1 = produce_vote(
-        1,
-        0,
-        VoteStep::Precommit,
-        block_hash,
-        v1.id,
-        Bytes32::ZERO,
-        TEST_CHAIN_ID,
-        &v1.hybrid_kp,
-    )
+    let vote1 = produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v1.id, snapshot_root: Bytes32::ZERO, chain_id: TEST_CHAIN_ID }, &v1.hybrid_kp)
     .unwrap();
     builder.add_precommit(vote1);
     assert!(builder.current_stake_bps() >= 6_667);
@@ -434,16 +416,7 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         .enumerate()
         .for_each(|(position, validator)| {
             signer_bitfield[position / 8] |= 1 << (position % 8);
-            let vote = produce_vote(
-                height,
-                round,
-                VoteStep::Precommit,
-                block_hash,
-                validator.id,
-                snapshot_root,
-                TEST_CHAIN_ID,
-                &validator.hybrid_kp,
-            )
+            let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id: validator.id, snapshot_root, chain_id: TEST_CHAIN_ID }, &validator.hybrid_kp)
             .unwrap();
             pq_signatures.push(PQVoteSig {
                 validator_id: validator.id,
