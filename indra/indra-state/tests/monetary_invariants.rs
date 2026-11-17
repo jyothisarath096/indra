@@ -109,8 +109,8 @@ fn signed_tx(
         signature_module_id: 1,
         inputs: inputs
             .into_iter()
-            .enumerate()
-            .map(|(_, utxo_id)| InputV1 { utxo_id })
+            
+            .map(|utxo_id| InputV1 { utxo_id })
             .collect(),
         outputs,
         fee_amount,

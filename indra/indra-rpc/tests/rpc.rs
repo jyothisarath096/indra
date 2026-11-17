@@ -444,11 +444,8 @@ fn test_all_methods_reachable_via_dispatch() {
             RPC_METHODS.iter().any(|(name, _)| *name == method),
             "{method} must be explicitly classified for public read-only gating"
         );
-        match dispatch(method, &params, &state) {
-            DispatchResult::Ready(Err(indra_rpc::RpcError::MethodNotFound(_))) => {
-                panic!("{method} was not reachable through dispatch")
-            }
-            _ => {}
+        if let DispatchResult::Ready(Err(indra_rpc::RpcError::MethodNotFound(_))) = dispatch(method, &params, &state) {
+            panic!("{method} was not reachable through dispatch")
         }
     }
 }

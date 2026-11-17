@@ -333,7 +333,7 @@ impl PostAuthCooldowns {
     fn reset(&mut self, key: &PostAuthInboundKey) {
         if let Some(tracker) = self.by_validator.get_mut(&key.validator_id) {
             tracker.reset(&key.ip);
-            if tracker.len() == 0 {
+            if tracker.is_empty() {
                 self.by_validator.remove(&key.validator_id);
             }
         }
@@ -2121,7 +2121,7 @@ async fn handle_observer_connection(
             block = block_rx.recv() => {
                 match block {
                     Ok(block) => {
-                        let _ = write_tx.send(Message::Block(block)).await;
+                        let _ = write_tx.send(Message::Block(Box::new(block))).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -2804,6 +2804,7 @@ fn run() -> indra_node::NodeResult<()> {
                         eprintln!("[p2p] peer disconnected: {}", addr);
                     }
                     NetworkEvent::SlashDetected(evidence) => {
+                        let evidence = *evidence;
                         metrics_state
                             .slash_events_total
                             .fetch_add(1, Ordering::Relaxed);
@@ -2817,7 +2818,7 @@ fn run() -> indra_node::NodeResult<()> {
                         validator_id,
                         msg,
                     } => {
-                        match &msg {
+                        match &*msg {
                             Message::Status { .. } => {
                                 if sync_cooldowns.blocked_at(&validator_id, Instant::now()) {
                                     continue;
@@ -2955,7 +2956,7 @@ fn run() -> indra_node::NodeResult<()> {
                                         &gossip,
                                         &op_relay_seen,
                                         validator_id,
-                                        msg.clone(),
+                                        msg.as_ref().clone(),
                                     );
                                 } else if let Some(event) =
                                     admission_score_event(InboundAdmissionKind::Staking, false)
@@ -2986,7 +2987,7 @@ fn run() -> indra_node::NodeResult<()> {
                                         &gossip,
                                         &op_relay_seen,
                                         validator_id,
-                                        msg.clone(),
+                                        msg.as_ref().clone(),
                                     );
                                 } else if let Some(event) =
                                     admission_score_event(InboundAdmissionKind::Governance, false)
@@ -3103,8 +3104,8 @@ fn run() -> indra_node::NodeResult<()> {
                                         local_validator_id,
                                         &local_p2p_addr,
                                         &connected,
-                                    ) {
-                                        if insert_discovered_peer_if_not_self(
+                                    )
+                                        && insert_discovered_peer_if_not_self(
                                             &mut new_peers,
                                             &authenticated,
                                             &bootstrap_peer_addrs,
@@ -3117,7 +3118,6 @@ fn run() -> indra_node::NodeResult<()> {
                                                 .or_insert(PeerSource::PeerExchange);
                                             accepted = accepted.saturating_add(1);
                                         }
-                                    }
                                 }
                                 eprintln!(
                                     "[discovery] received {} peer addresses from {} (accepted {})",
@@ -3168,7 +3168,7 @@ fn run() -> indra_node::NodeResult<()> {
                                         })
                                 };
                                 if let Some(block) = proposal {
-                                    gossip.send_to_validator(validator_id, &Message::Block(block));
+                                    gossip.send_to_validator(validator_id, &Message::Block(Box::new(block)));
                                 }
                                 continue;
                             }
@@ -3240,7 +3240,7 @@ fn run() -> indra_node::NodeResult<()> {
                                         if let Some(pending) = d.sync().provisional().cloned() {
                                             match indra_node::sync::verify_network_provisional_certificate(
                                                 &pending.block,
-                                                &block,
+                                                block,
                                                 &d.engine.state,
                                                 d.engine.network_qc_verifier(),
                                             ) {
@@ -3392,7 +3392,7 @@ fn run() -> indra_node::NodeResult<()> {
                                             break;
                                         }
                                         match indra_node::sync::verify_network_sync_candidate(
-                                            &block,
+                                            block,
                                             &d.engine.state,
                                             unix_timestamp_secs(),
                                             d.engine.network_qc_verifier(),
@@ -3474,8 +3474,8 @@ fn run() -> indra_node::NodeResult<()> {
                                         gossip.send_to_validator(peer_validator_id, &req);
                                     }
                                 }
-                                if imported_any {
-                                    if supervised_lock!(driver, "network.driver.height").height() > 0 {
+                                if imported_any
+                                    && supervised_lock!(driver, "network.driver.height").height() > 0 {
                                         record_block_commit(&metrics_state, &last_block_timestamp);
                                         let _ = height_tx.send(());
                                         if let Err(error) = broadcast_status(&driver, &gossip) {
@@ -3487,7 +3487,6 @@ fn run() -> indra_node::NodeResult<()> {
                                             return;
                                         }
                                     }
-                                }
                                 if !qc_recovery_actions.is_empty() {
                                     if let Err(error) = process_driver_actions(
                                         &driver,
@@ -3533,7 +3532,7 @@ fn run() -> indra_node::NodeResult<()> {
                             _ => {}
                         }
 
-                        if let Some(event) = message_to_event(msg, addr, validator_id) {
+                        if let Some(event) = message_to_event(*msg, addr, validator_id) {
                             let previous_height = supervised_lock!(driver, "network.driver.previous_height").height();
                             let actions = supervised_lock!(driver, "network.driver.process").process(event);
                             if let Err(error) = process_driver_actions(
@@ -3680,12 +3679,9 @@ fn run() -> indra_node::NodeResult<()> {
                 }
 
                 if !sync_caught_up {
-                    match height_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(()) => {
-                            phase_started_at = Instant::now();
-                            proposed_at_slot = None;
-                        }
-                        Err(_) => {}
+                    if let Ok(()) = height_rx.recv_timeout(Duration::from_millis(100)) {
+                        phase_started_at = Instant::now();
+                        proposed_at_slot = None;
                     }
                     continue;
                 }
@@ -3747,13 +3743,10 @@ fn run() -> indra_node::NodeResult<()> {
                                     next_height,
                                     proposal_round,
                                 ) {
-                                    match height_rx.recv_timeout(Duration::from_millis(100)) {
-                                        Ok(()) => {
-                                            phase_started_at = Instant::now();
-                                            proposed_at_slot = None;
-                                            failed_proposal_at_slot = None;
-                                        }
-                                        Err(_) => {}
+                                    if let Ok(()) = height_rx.recv_timeout(Duration::from_millis(100)) {
+                                        phase_started_at = Instant::now();
+                                        proposed_at_slot = None;
+                                        failed_proposal_at_slot = None;
                                     }
                                     continue;
                                 }
@@ -3767,12 +3760,9 @@ fn run() -> indra_node::NodeResult<()> {
                                     && time_since_last_commit
                                         < Duration::from_secs(MIN_BLOCK_INTERVAL_SECS * 2)
                                 {
-                                    match height_rx.recv_timeout(Duration::from_millis(100)) {
-                                        Ok(()) => {
-                                            phase_started_at = Instant::now();
-                                            proposed_at_slot = None;
-                                        }
-                                        Err(_) => {}
+                                    if let Ok(()) = height_rx.recv_timeout(Duration::from_millis(100)) {
+                                        phase_started_at = Instant::now();
+                                        proposed_at_slot = None;
                                     }
                                     continue;
                                 }
@@ -3847,7 +3837,7 @@ fn run() -> indra_node::NodeResult<()> {
                                                     let actions =
                                                         d.process(DriverEvent::InboundBlock {
                                                             from: None,
-                                                            proposal: proposal.clone(),
+                                                            proposal: Box::new(proposal.clone()),
                                                         });
                                                     Some((proposal, actions))
                                                 }
@@ -3990,12 +3980,9 @@ fn run() -> indra_node::NodeResult<()> {
                     }
                 }
 
-                match height_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(()) => {
-                        phase_started_at = Instant::now();
-                        proposed_at_slot = None;
-                    }
-                    Err(_) => {}
+                if let Ok(()) = height_rx.recv_timeout(Duration::from_millis(100)) {
+                    phase_started_at = Instant::now();
+                    proposed_at_slot = None;
                 }
             }
         });
@@ -5897,7 +5884,7 @@ fn handle_rpc(
                             });
                         match submit_result {
                             Ok(tx_id) => {
-                                let mut cache = match indra_node::locks::lock(&op_relay_seen, "rpc.op_relay_seen") {
+                                let mut cache = match indra_node::locks::lock(op_relay_seen, "rpc.op_relay_seen") {
                                     Ok(cache) => cache,
                                     Err(_) => {
                                         return send_http(

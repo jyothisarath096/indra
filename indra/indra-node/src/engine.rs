@@ -2645,7 +2645,7 @@ mod tests {
                     value_hash,
                     *validator_id,
                     snapshot_root,
-                    &TEST_CHAIN_ID,
+                    TEST_CHAIN_ID,
                     signer,
                 )
                 .unwrap()

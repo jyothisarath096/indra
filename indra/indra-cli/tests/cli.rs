@@ -21,7 +21,7 @@ use indra_core::{
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair};
 use indra_node::{NodeConfig, NodeEngine};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,7 +63,7 @@ fn temp_dir(suffix: &str) -> PathBuf {
     p
 }
 
-fn write_valid_cli_inputs(dir: &PathBuf) -> (PathBuf, PathBuf, PathBuf, String) {
+fn write_valid_cli_inputs(dir: &Path) -> (PathBuf, PathBuf, PathBuf, String) {
     let keys = generate_from_master_seed("chain-id-test".to_string(), [0xA1; 32]).unwrap();
     let keys_path = dir.join("keys.json");
     let password_path = dir.join("keys.password");
@@ -97,7 +97,7 @@ fn build_test_genesis(
     build_genesis_config(chain_id, 1_700_000_000, validators).unwrap()
 }
 
-fn write_build_entries(dir: &PathBuf, chain_id: &str) -> Vec<PathBuf> {
+fn write_build_entries(dir: &Path, chain_id: &str) -> Vec<PathBuf> {
     (0..4u8)
         .map(|i| {
             let keys = generate_from_master_seed(format!("build-{i}"), [i + 11; 32]).unwrap();
@@ -119,7 +119,7 @@ fn build_command_args(
     chain_id: &str,
     timestamp: u64,
     entries: &[PathBuf],
-    output: &PathBuf,
+    output: &Path,
 ) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
@@ -1219,8 +1219,7 @@ fn test_build_and_decode_all_staking_ops() {
         classical_pk: Bytes32::from(public.classical.0),
         pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
     };
-    let built = vec![
-        build_register_validator_op_with_cold(
+    let built = [build_register_validator_op_with_cold(
             1_000,
             deposit_utxo_id,
             &keypair,
@@ -1266,8 +1265,7 @@ fn test_build_and_decode_all_staking_ops() {
             7,
             chain_id,
         )
-        .unwrap(),
-    ];
+        .unwrap()];
 
     for (idx, op) in built.iter().enumerate() {
         let bytes = hex::decode(&op.op_hex).unwrap();

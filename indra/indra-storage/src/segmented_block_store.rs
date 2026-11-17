@@ -277,29 +277,23 @@ impl BlockStore {
         let Some(first_retained) = first_retained else {
             return Ok(());
         };
-        let mut starts = Vec::new();
+        let mut segments = Vec::new();
         let mut start = segment_start(first_retained);
         while let Some(end) = start.checked_add(BLOCKS_PER_SEGMENT) {
             if end > prune_below {
                 break;
             }
-            starts.push(start);
+            segments.push((start, end));
             start = end;
         }
-        if starts.is_empty() {
+        if segments.is_empty() {
             return Ok(());
         }
         let mut index = self.index.write().map_err(|_| StorageError::LockPoisoned {
             component: "segmented block index",
         })?;
-        for start in starts {
+        for (start, end) in segments {
             std::fs::remove_file(segment_path(&self.dir, start))?;
-            let end = start
-                .checked_add(BLOCKS_PER_SEGMENT)
-                .ok_or_else(|| StorageError::Corruption {
-                    height: start,
-                    detail: "prunable segment end overflows u64".into(),
-                })?;
             let heights: Vec<u64> = index.range(start..end).map(|(height, _)| *height).collect();
             for height in heights {
                 index.remove(&height);

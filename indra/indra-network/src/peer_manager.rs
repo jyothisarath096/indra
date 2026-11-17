@@ -77,7 +77,7 @@ enum PeerManagerMessage {
     InboundMessage {
         validator_id: Bytes32,
         addr: SocketAddr,
-        msg: Message,
+        msg: Box<Message>,
         msg_size: usize,
     },
 }
@@ -678,7 +678,7 @@ impl PeerManagerActor {
                     };
                     let _ = self
                         .event_tx
-                        .send(NetworkEvent::SlashDetected(wire_evidence))
+                        .send(NetworkEvent::SlashDetected(Box::new(wire_evidence)))
                         .await;
                 }
             }
@@ -983,7 +983,7 @@ impl PeerManagerActor {
                 // Exact QC repeats are harmlessly coalesced before consuming
                 // the sender's finite identity budget. Distinct variants have
                 // distinct hashes and remain governed by the rate limiter.
-                let qc_response_key = if matches!(msg, Message::QCResponse { .. }) {
+                let qc_response_key = if matches!(*msg, Message::QCResponse { .. }) {
                     let Ok(wire) = msg.encode_wire() else {
                         return;
                     };
@@ -1141,7 +1141,7 @@ impl PeerManagerActor {
                     .send(PeerManagerMessage::InboundMessage {
                         validator_id: peer_validator_id,
                         addr,
-                        msg,
+                        msg: Box::new(msg),
                         msg_size,
                     })
                     .await
@@ -1378,8 +1378,10 @@ impl PeerManagerHandle {
     pub fn send_blocking(
         &self,
         command: NetworkCommand,
-    ) -> Result<(), mpsc::error::SendError<NetworkCommand>> {
-        self.command_tx.blocking_send(command)
+    ) -> Result<(), Box<mpsc::error::SendError<NetworkCommand>>> {
+        self.command_tx
+            .blocking_send(command)
+            .map_err(Box::new)
     }
 
     /// Register a fully handshaked peer with the actor.
@@ -2005,7 +2007,7 @@ mod tests {
                 .handle_control(PeerManagerMessage::InboundMessage {
                     validator_id: validator,
                     addr,
-                    msg: msg.clone(),
+                    msg: Box::new(msg.clone()),
                     msg_size: 128,
                 })
                 .await;
@@ -2013,9 +2015,9 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(NetworkEvent::Message {
-                msg: Message::QCResponse { .. },
+                msg,
                 ..
-            })
+            }) if matches!(*msg, Message::QCResponse { .. })
         ));
         assert!(event_rx.try_recv().is_err());
         assert_eq!(actor.qc_response_seen.len(), 1);
@@ -2049,7 +2051,7 @@ mod tests {
                 .handle_control(PeerManagerMessage::InboundMessage {
                     validator_id: validator,
                     addr,
-                    msg,
+                    msg: Box::new(msg),
                     msg_size: 5_000,
                 })
                 .await;
@@ -2079,7 +2081,7 @@ mod tests {
                     .handle_control(PeerManagerMessage::InboundMessage {
                         validator_id: validator,
                         addr,
-                        msg: Message::Vote(VoteV1 {
+                        msg: Box::new(Message::Vote(VoteV1 {
                             height: 1,
                             round: 0,
                             step: VoteStep::Prevote,
@@ -2087,7 +2089,7 @@ mod tests {
                             validator_id: validator,
                             snapshot_root: Bytes32::ZERO,
                             signature: dummy_signature(),
-                        }),
+                        })),
                         msg_size: 5_000,
                     })
                     .await;
@@ -2127,7 +2129,7 @@ mod tests {
                 .handle_control(PeerManagerMessage::InboundMessage {
                     validator_id: validator,
                     addr,
-                    msg: vote(index),
+                    msg: Box::new(vote(index)),
                     msg_size: 5_000,
                 })
                 .await;
@@ -2137,7 +2139,7 @@ mod tests {
             .handle_control(PeerManagerMessage::InboundMessage {
                 validator_id: validator,
                 addr,
-                msg: vote(80),
+                msg: Box::new(vote(80)),
                 msg_size: 5_000,
             })
             .await;
@@ -2618,7 +2620,7 @@ mod tests {
         install_relay_keys(&mut actor, vec![key]);
         let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34101);
 
-        let block_a = Message::Block(relay_test_block(
+        let block_a = Message::Block(Box::new(relay_test_block(
             validator_id,
             &vrf,
             &keypair,
@@ -2626,8 +2628,8 @@ mod tests {
             2,
             prev_hash,
             Bytes32::from([0x01; 32]),
-        ));
-        let block_b = Message::Block(relay_test_block(
+        )));
+        let block_b = Message::Block(Box::new(relay_test_block(
             validator_id,
             &vrf,
             &keypair,
@@ -2635,7 +2637,7 @@ mod tests {
             2,
             prev_hash,
             Bytes32::from([0x02; 32]),
-        ));
+        )));
         actor.relay_if_eligible(validator_id, &block_a).await;
         actor.relay_if_eligible(validator_id, &block_b).await;
 
@@ -2665,7 +2667,7 @@ mod tests {
         install_relay_keys(&mut actor, vec![key]);
         let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34111);
 
-        let block_round_2 = Message::Block(relay_test_block(
+        let block_round_2 = Message::Block(Box::new(relay_test_block(
             validator_id,
             &vrf,
             &keypair,
@@ -2673,8 +2675,8 @@ mod tests {
             2,
             prev_hash,
             Bytes32::from([0x03; 32]),
-        ));
-        let block_round_3 = Message::Block(relay_test_block(
+        )));
+        let block_round_3 = Message::Block(Box::new(relay_test_block(
             validator_id,
             &vrf,
             &keypair,
@@ -2682,7 +2684,7 @@ mod tests {
             3,
             prev_hash,
             Bytes32::from([0x04; 32]),
-        ));
+        )));
         actor.relay_if_eligible(validator_id, &block_round_2).await;
         actor.relay_if_eligible(validator_id, &block_round_3).await;
 
@@ -2706,7 +2708,7 @@ mod tests {
         install_relay_keys(&mut actor, vec![key]);
         let mut receiver_rx = add_test_peer_large(&mut actor, receiver, 34121);
 
-        let block = Message::Block(relay_test_block(
+        let block = Message::Block(Box::new(relay_test_block(
             validator_id,
             &vrf,
             &keypair,
@@ -2714,7 +2716,7 @@ mod tests {
             0,
             prev_hash,
             Bytes32::from([0x05; 32]),
-        ));
+        )));
         actor.relay_if_eligible(validator_id, &block).await;
 
         assert!(matches!(

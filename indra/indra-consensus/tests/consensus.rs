@@ -413,11 +413,9 @@ fn strict_qc_verification_accepts_hybrid_qc() {
     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
     use indra_core::types::qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
 
-    let validators = vec![
-        TestValidator::new(0x21, 3_400),
+    let validators = [TestValidator::new(0x21, 3_400),
         TestValidator::new(0x22, 3_300),
-        TestValidator::new(0x23, 3_300),
-    ];
+        TestValidator::new(0x23, 3_300)];
     let qc_validators: Vec<QcValidator> = validators
         .iter()
         .enumerate()

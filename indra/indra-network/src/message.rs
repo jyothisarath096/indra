@@ -136,7 +136,7 @@ impl PeerListEntry {
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A complete block for validation and inclusion.
-    Block(BlockProposalVNext),
+    Block(Box<BlockProposalVNext>),
     /// A prevote or precommit vote.
     Vote(VoteV1),
     /// A pending transaction for the mempool.
@@ -453,7 +453,7 @@ impl Message {
                     }
                 })?;
                 require_exact_proposal_signatures(&block)?;
-                Ok(Self::Block(block))
+                Ok(Self::Block(Box::new(block)))
             }
             MessageType::Vote => {
                 let vote =
@@ -996,7 +996,7 @@ mod tests {
         governance.signature = signature.clone();
 
         vec![
-            Message::Block(proposal.clone()),
+            Message::Block(Box::new(proposal.clone())),
             Message::BlockResponse {
                 blocks: vec![proposal],
                 lowest_available: None,
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn block_wire_decoding_rejects_trailing_bytes() {
-        let mut encoded = Message::Block(test_proposal(1)).encode_wire().unwrap()[4..].to_vec();
+        let mut encoded = Message::Block(Box::new(test_proposal(1))).encode_wire().unwrap()[4..].to_vec();
         encoded.push(0xA5);
         assert!(Message::decode_wire(&encoded).is_err());
     }

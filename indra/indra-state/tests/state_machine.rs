@@ -917,7 +917,7 @@ fn test_auto_delegate_full_lifecycle() {
             },
         },
         1,
-        &inactive_keypair,
+        inactive_keypair,
         &chain_id,
     );
     let mut set_block = make_block(&state, vec![]);
@@ -952,7 +952,7 @@ fn test_auto_delegate_full_lifecycle() {
             cold_authorization: None,
         },
         2,
-        &inactive_keypair,
+        inactive_keypair,
         &chain_id,
     );
     let mut claim_block = make_block(&state, vec![]);

@@ -797,7 +797,7 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
     fn test_validate_invalid_dns_seed_validation_mode() {
         let mut cfg = minimal();
         cfg.dns_seed_validation = Some("maybe".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("dns_seed_validation")));
     }
 
@@ -806,7 +806,7 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
         let mut cfg = minimal();
         cfg.dns_seed_signed_validation = Some("maybe".to_string());
         cfg.dns_seed_signed_public_key = Some("abcd".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("dns_seed_signed_validation")));
         assert!(err.iter().any(|e| e.contains("dns_seed_signed_public_key")));
     }
@@ -815,7 +815,7 @@ bootstrap_peers = ["a.example:30303", "b.example:30303"]
     fn test_validate_signed_dns_seed_requires_public_key() {
         let mut cfg = minimal();
         cfg.dns_seed_signed_validation = Some("warn".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err
             .iter()
             .any(|e| e.contains("dns_seed_signed_public_key is required")));
@@ -904,7 +904,7 @@ genesis = "/tmp/indra/genesis.toml"
         let err = NodeConfigFile::default()
             .validate()
             .err()
-            .unwrap_or_else(|| vec![]);
+            .unwrap_or_else(std::vec::Vec::new);
         assert!(err.iter().any(|e| e.contains("data_dir")));
     }
 
@@ -912,7 +912,7 @@ genesis = "/tmp/indra/genesis.toml"
     fn test_validate_invalid_p2p_addr() {
         let mut cfg = minimal();
         cfg.p2p_addr = Some("bad-address".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("p2p_addr")));
     }
 
@@ -920,7 +920,7 @@ genesis = "/tmp/indra/genesis.toml"
     fn test_validate_invalid_port_zero() {
         let mut cfg = minimal();
         cfg.p2p_addr = Some("127.0.0.1:0".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("port")));
     }
 
@@ -928,7 +928,7 @@ genesis = "/tmp/indra/genesis.toml"
     fn test_validate_invalid_rpc_public_addr() {
         let mut cfg = minimal();
         cfg.rpc_public_addr = Some("bad-public-rpc".to_string());
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("rpc_public.addr")));
     }
 
@@ -974,7 +974,7 @@ genesis = "/tmp/indra/genesis.toml"
             metrics_addr: Some("also-nope".to_string()),
             ..Default::default()
         };
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("data_dir")));
         assert!(err.iter().any(|e| e.contains("p2p_addr")));
     }
@@ -994,7 +994,7 @@ genesis = "/tmp/indra/genesis.toml"
     fn test_validate_prune_keep_below_minimum() {
         let mut cfg = minimal();
         cfg.prune_keep_blocks = Some(MIN_PRUNE_KEEP_BLOCKS.saturating_sub(1));
-        let err = cfg.validate().err().unwrap_or_else(|| vec![]);
+        let err = cfg.validate().err().unwrap_or_default();
         assert!(err.iter().any(|e| e.contains("prune_keep_blocks")));
     }
 

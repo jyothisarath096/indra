@@ -510,7 +510,7 @@ mod tests {
                             .to_string()
                     } else {
                         canonical_response(
-                            &[genesis.clone()],
+                            std::slice::from_ref(&genesis),
                             Some(1),
                             later_blocks.last().map_or(0, |block| block.header.height),
                         )
@@ -570,7 +570,7 @@ mod tests {
         };
         let mut wallet = Wallet::new();
         assert_eq!(
-            scan_tranche_refund(&mut wallet, &entry, &[owner_pubkey.clone()]).unwrap(),
+            scan_tranche_refund(&mut wallet, &entry, std::slice::from_ref(&owner_pubkey)).unwrap(),
             1
         );
         assert_eq!(wallet.balance_owned_by(&owner_pubkey), principal_spark);
@@ -607,7 +607,7 @@ mod tests {
             scan_canonical_blocks(
                 &node,
                 &mut wallet,
-                &[owner.clone()],
+                std::slice::from_ref(&owner),
                 genesis.header.block_hash(),
             )
             .unwrap();
@@ -707,7 +707,7 @@ mod tests {
                 }),
             );
             if height > 0 {
-                scan_canonical_block(&mut wallet, &block, &[owner.clone()]).unwrap();
+                scan_canonical_block(&mut wallet, &block, std::slice::from_ref(&owner)).unwrap();
             }
             previous = block.header.block_hash();
         }

@@ -78,7 +78,8 @@ fn store_has_committed_data(data_dir: &Path) -> StorageResult<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
-    for (name, empty_header_len) in [("epochs.log", 16)] {
+    {
+        let (name, empty_header_len) = ("epochs.log", 16);
         let path = data_dir.join(name);
         match std::fs::metadata(path) {
             Ok(metadata) if metadata.len() > empty_header_len => return Ok(true),

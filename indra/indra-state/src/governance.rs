@@ -1055,9 +1055,7 @@ fn decode_proposal_map(r: &mut ByteReader<'_>) -> IndraResult<BTreeMap<Bytes32, 
 }
 
 fn proposal_map_len(map: &BTreeMap<Bytes32, ProposalRecord>) -> usize {
-    4 + map
-        .iter()
-        .map(|(_, proposal)| 32 + proposal.encoded_len())
+    4 + map.values().map(|proposal| 32 + proposal.encoded_len())
         .sum::<usize>()
 }
 

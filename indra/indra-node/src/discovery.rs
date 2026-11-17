@@ -736,9 +736,8 @@ pub async fn resolve_dns_seeds_with_policies_and_replay_store(
         };
         if !signed.is_empty() || signed_mode == SignedDnsSeedValidationMode::Require {
             eprintln!(
-                "[discovery] signed DNS discovery final outcome: {} peer(s), fallback={}",
-                signed.len(),
-                false
+                "[discovery] signed DNS discovery final outcome: {} peer(s), fallback=false",
+                signed.len()
             );
             return signed;
         }
@@ -792,8 +791,7 @@ async fn resolve_seed_with_hickory_dnssec_async(
         opts.try_tcp_on_error = true;
     }
     let resolver = builder.build().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("DNS resolver build failed: {e}"),
         )
     })?;
@@ -922,8 +920,7 @@ async fn resolve_txt_records_dnssec(
         .lookup(dns_query_name(name).as_str(), RecordType::TXT)
         .await
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("TXT lookup for {name} failed: {e}"),
             )
         })?;
@@ -976,8 +973,7 @@ async fn resolve_signed_seed_with_hickory_dnssec_async(
         opts.try_tcp_on_error = true;
     }
     let resolver = builder.build().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("DNS resolver build failed: {e}"),
         )
     })?;
@@ -1782,7 +1778,7 @@ mod tests {
 
         let mut first_start_store = SignedDnsSeqStore::load(&state_path).unwrap();
         let newer_resolved = resolve_signed_dns_seed_hosts_with_async(
-            &[host.clone()],
+            std::slice::from_ref(&host),
             SignedDnsSeedValidationMode::Warn,
             Some(&key.public_key()),
             Some(&mut first_start_store),
@@ -1818,7 +1814,7 @@ mod tests {
         let mut restarted_store = persisted_after_restart;
 
         let older_resolved = resolve_signed_dns_seed_hosts_with_async(
-            &[host.clone()],
+            std::slice::from_ref(&host),
             SignedDnsSeedValidationMode::Warn,
             Some(&key.public_key()),
             Some(&mut restarted_store),
@@ -1850,7 +1846,7 @@ mod tests {
         );
 
         let equal_resolved = resolve_signed_dns_seed_hosts_with_async(
-            &[host.clone()],
+            std::slice::from_ref(&host),
             SignedDnsSeedValidationMode::Warn,
             Some(&key.public_key()),
             Some(&mut restarted_store),

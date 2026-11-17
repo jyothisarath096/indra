@@ -19,7 +19,7 @@ pub fn message_to_event(
     match msg {
         Message::Block(proposal) => Some(DriverEvent::InboundBlock {
             from: Some(from),
-            proposal,
+            proposal: Box::new(*proposal),
         }),
         Message::Vote(vote) => Some(DriverEvent::InboundVote { from, vote }),
         // Transactions use the node's single authoritative path, which wraps
@@ -49,7 +49,7 @@ pub fn message_to_event(
 /// Convert a DriverAction into a network Message (if broadcastable).
 pub fn action_to_message(action: &DriverAction) -> Option<Message> {
     match action {
-        DriverAction::BroadcastBlock(block) => Some(Message::Block(block.clone())),
+        DriverAction::BroadcastBlock(block) => Some(Message::Block(Box::new(*block.clone()))),
         DriverAction::BroadcastVote(vote) => Some(Message::Vote(vote.clone())),
         DriverAction::RequestQC { .. } => None,
         _ => None,

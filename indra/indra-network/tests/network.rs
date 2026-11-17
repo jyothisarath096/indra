@@ -139,7 +139,7 @@ fn two_nodes_exchange_status() {
     .unwrap();
 
     let received_by_server = handle.join().unwrap();
-    match received_by_server {
+    match *received_by_server {
         Message::Status { height, .. } => assert_eq!(height, 50),
         _ => panic!("wrong message type"),
     }
@@ -148,7 +148,7 @@ fn two_nodes_exchange_status() {
         RecvStatus::Message(msg) => msg,
         _ => panic!("unexpected recv status"),
     };
-    match response {
+    match *response {
         Message::Status { height, .. } => assert_eq!(height, 100),
         _ => panic!("wrong response type"),
     }

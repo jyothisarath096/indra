@@ -2832,7 +2832,7 @@ mod tests {
             let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
             state.chain_id = chain_id.clone();
             let (validator_id, keypair) = make_active_validator(&mut state, 0xA7);
-            state.validators.get_mut(&validator_id).unwrap().status = status.clone();
+            state.validators.get_mut(&validator_id).unwrap().status = status;
             let op = signed_op(
                 StakingOpBody::UpdateNetworkAddress {
                     validator_id,

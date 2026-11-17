@@ -70,7 +70,7 @@ pub fn clear_pending_last_qc(state_dir: &Path) -> StorageResult<()> {
 }
 
 fn clear_qc_file(path: &Path) -> StorageResult<()> {
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(path) {
         Ok(()) => {
             if let Some(parent) = path.parent() {
                 crate::atomic::fsync_dir(parent)?;

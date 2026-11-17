@@ -183,6 +183,9 @@ impl IndraTxResultMetadata {
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `out_session` must be null or point to writable storage for one session handle.
 pub unsafe extern "C" fn indra_create_session(out_session: *mut IndraSessionHandle) -> i32 {
     if out_session.is_null() {
         return IndraError::NullPointer.code();
@@ -250,6 +253,10 @@ pub unsafe extern "C" fn indra_keygen_handle(
 /// Both seed inputs remain caller-owned and must each reference exactly 32
 /// readable bytes. Rust zeroizes its copies on every return path.
 #[no_mangle]
+/// # Safety
+///
+/// `classical_seed` and `pq_seed` must each point to 32 readable bytes; the
+/// output handle and public-key pointer must be writable and valid.
 pub unsafe extern "C" fn indra_cold_key_handle_from_seeds(
     session: IndraSessionHandle,
     classical_seed: *const u8,
@@ -377,6 +384,9 @@ pub unsafe extern "C" fn indra_key_handle_public(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `out_public` must point to writable storage for one cold public-key record.
 pub unsafe extern "C" fn indra_cold_key_handle_public(
     session: IndraSessionHandle,
     handle: IndraKeyHandle,
@@ -608,6 +618,10 @@ pub unsafe extern "C" fn indra_tx_to_hex(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `out` must point to writable storage for `out_len` bytes; the result handle
+/// must belong to `session` and remain alive for this call.
 pub unsafe extern "C" fn indra_result_copy_tx_bytes(
     session: IndraSessionHandle,
     result: IndraResultHandle,
@@ -634,6 +648,10 @@ pub unsafe extern "C" fn indra_result_copy_tx_bytes(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `out` must point to writable storage for `out_len` indices; the result handle
+/// must belong to `session` and remain alive for this call.
 pub unsafe extern "C" fn indra_result_copy_spent_indices(
     session: IndraSessionHandle,
     result: IndraResultHandle,

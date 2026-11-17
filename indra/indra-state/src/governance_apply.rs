@@ -655,7 +655,7 @@ fn verify_governance_sig(
             .get(&op.signer_id)
             .ok_or(StateError::ValidatorNotFound)?;
         if authorization.cold_key_version != validator.cold_key_version {
-            return invalid(&format!(
+            return invalid(format!(
                 "cold-key version mismatch: expected {}, got {}",
                 validator.cold_key_version, authorization.cold_key_version
             ));
@@ -1457,7 +1457,7 @@ mod tests {
         apply_governance_op(&mut state, &reveal, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
 
         assert_eq!(state.validators.get(&validator_id).unwrap().cold_nonce, 4);
-        assert!(state.governance.gov_nonces.get(&validator_id).is_none());
+        assert!(!state.governance.gov_nonces.contains_key(&validator_id));
         assert_eq!(
             state.governance.proposals[&proposal_id].phase,
             ProposalPhase::Cancelled
@@ -1893,8 +1893,8 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.validators.get(&active_id).unwrap().cold_nonce, 2);
-        assert!(first.governance.gov_nonces.get(&hot_id).is_none());
-        assert!(first.governance.gov_nonces.get(&active_id).is_none());
+        assert!(!first.governance.gov_nonces.contains_key(&hot_id));
+        assert!(!first.governance.gov_nonces.contains_key(&active_id));
     }
 
     #[test]

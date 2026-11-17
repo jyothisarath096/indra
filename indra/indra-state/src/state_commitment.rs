@@ -192,7 +192,6 @@ impl StateCommitmentV2 {
     }
 
     /// Insert a slash-evidence hash leaf.
-
     /// Insert or replace a delegator identity-registry leaf.
     pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) -> StateResult<()> {
         self.tree.insert(

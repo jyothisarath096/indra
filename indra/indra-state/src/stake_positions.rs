@@ -267,7 +267,7 @@ pub fn release_matured_position_tranches(
         let position = state
             .stake_positions
             .get(&tranche.position_id)
-            .ok_or_else(|| StateError::InvariantViolation {
+            .ok_or(StateError::InvariantViolation {
                 message: "mature tranche references missing position",
             })?;
         let owner = resolve_position_owner(state, position)?;
@@ -410,7 +410,7 @@ fn resolve_position_owner(
                     validator.cold_hybrid_classical_pk.ok_or_else(|| {
                         StateError::InvalidStakingOp("missing validator cold identity".to_string())
                     })?,
-                    validator.cold_hybrid_pq_pk.clone().ok_or_else(|| {
+                    validator.cold_hybrid_pq_pk.ok_or_else(|| {
                         StateError::InvalidStakingOp("missing validator cold identity".to_string())
                     })?,
                 )
@@ -490,19 +490,19 @@ fn preflight_deposit_capacity(
 
 fn preflight_deposit_usage(u: CapacityUsage) -> StateResult<()> {
     check_capacity(
-        u.positions_total + 1 <= MAX_STAKE_POSITIONS_TOTAL,
+        u.positions_total < MAX_STAKE_POSITIONS_TOTAL,
         "global position cap",
     )?;
     check_capacity(
-        u.positions_validator + 1 <= MAX_STAKE_POSITIONS_PER_VALIDATOR,
+        u.positions_validator < MAX_STAKE_POSITIONS_PER_VALIDATOR,
         "per-validator position cap",
     )?;
     check_capacity(
-        u.tranches_total + u.active_positions_total + 1 <= MAX_TRANCHES_TOTAL,
+        u.tranches_total + u.active_positions_total < MAX_TRANCHES_TOTAL,
         "global final-exit reservation",
     )?;
     check_capacity(
-        u.tranches_validator + u.active_positions_validator + 1 <= MAX_TRANCHES_PER_VALIDATOR,
+        u.tranches_validator + u.active_positions_validator < MAX_TRANCHES_PER_VALIDATOR,
         "per-validator final-exit reservation",
     )
 }
@@ -518,7 +518,7 @@ fn preflight_exit_capacity(
 
 fn preflight_exit_usage(u: CapacityUsage, full_exit: bool) -> StateResult<()> {
     check_capacity(
-        u.tranches_position + 1 <= MAX_TRANCHES_PER_POSITION,
+        u.tranches_position < MAX_TRANCHES_PER_POSITION,
         "per-position tranche cap",
     )?;
     check_capacity(
@@ -526,11 +526,11 @@ fn preflight_exit_usage(u: CapacityUsage, full_exit: bool) -> StateResult<()> {
         "per-position final-exit reservation",
     )?;
     check_capacity(
-        u.tranches_total + 1 <= MAX_TRANCHES_TOTAL,
+        u.tranches_total < MAX_TRANCHES_TOTAL,
         "global tranche cap",
     )?;
     check_capacity(
-        u.tranches_validator + 1 <= MAX_TRANCHES_PER_VALIDATOR,
+        u.tranches_validator < MAX_TRANCHES_PER_VALIDATOR,
         "per-validator tranche cap",
     )?;
     let active_delta = usize::from(!full_exit);

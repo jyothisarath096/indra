@@ -384,7 +384,7 @@ impl<'a> StateTxn<'a> {
             total_supply: self.state.total_supply,
             fee_reward_pool: self.state.fee_reward_pool,
             epoch_slash_event_count: self.state.epoch_slash_event_count,
-            monetary_ledger: self.state.monetary_ledger.clone(),
+            monetary_ledger: self.state.monetary_ledger,
             monetary_aggregates: self.state.monetary_aggregates,
             election_seed: self.state.election_seed,
             election_seed_height: self.state.election_seed_height,

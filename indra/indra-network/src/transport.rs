@@ -29,7 +29,7 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Result of polling a connection for one inbound message.
 pub enum RecvStatus {
     /// A full message was received.
-    Message(Message),
+    Message(Box<Message>),
     /// No message is available yet; the connection is still alive.
     NoData,
     /// The peer closed the connection cleanly.
@@ -153,7 +153,7 @@ impl Connection {
             Err(NetworkError::UnknownMessageType { .. }) => return Ok(RecvStatus::NoData),
             Err(error) => return Err(error),
         };
-        Ok(RecvStatus::Message(msg))
+        Ok(RecvStatus::Message(Box::new(msg)))
     }
 
     /// Close this connection.
@@ -268,7 +268,7 @@ mod tests {
         conn.send(&Message::Ping(12345)).unwrap();
 
         let received = handle.join().unwrap();
-        assert!(matches!(received, Message::Ping(12345)));
+        assert!(matches!(*received, Message::Ping(12345)));
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
         client.flush().unwrap();
 
         let received = handle.join().unwrap();
-        match received {
+        match *received {
             Message::Status { height, .. } => assert_eq!(height, 42),
             other => panic!("unexpected message: {:?}", other.message_type()),
         }
@@ -361,8 +361,8 @@ mod tests {
         client.flush().unwrap();
 
         let (first_msg, second_msg) = handle.join().unwrap();
-        assert!(matches!(first_msg, Message::Ping(1)));
-        assert!(matches!(second_msg, Message::Pong(2)));
+        assert!(matches!(*first_msg, Message::Ping(1)));
+        assert!(matches!(*second_msg, Message::Pong(2)));
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         client.flush().unwrap();
 
         let msg = handle.join().unwrap();
-        assert!(matches!(msg, Message::Ping(99)));
+        assert!(matches!(*msg, Message::Ping(99)));
     }
 
     #[test]

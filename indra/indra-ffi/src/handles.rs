@@ -139,12 +139,12 @@ impl StoredKeyMaterial {
                 classical_seed,
                 ml_dsa_seed,
                 vrf_seed,
-            } => Ok(SigningMaterial::Hot {
+            } => Ok(SigningMaterial::Hot(Box::new(HotSigningMaterial {
                 public: *public,
                 classical_seed: *classical_seed,
                 ml_dsa_seed: *ml_dsa_seed,
                 vrf_seed: *vrf_seed,
-            }),
+            }))),
             Self::Cold { .. } => Err(IndraError::WrongKeyRole),
         }
     }
@@ -155,10 +155,10 @@ impl StoredKeyMaterial {
                 classical_seed,
                 pq_seed,
                 ..
-            } => Ok(SigningMaterial::Cold {
+            } => Ok(SigningMaterial::Cold(Box::new(ColdSigningMaterial {
                 classical_seed: *classical_seed,
                 pq_seed: *pq_seed,
-            }),
+            }))),
             Self::Hot { .. } => Err(IndraError::WrongKeyRole),
         }
     }
@@ -189,30 +189,35 @@ impl Drop for StoredKeyMaterial {
     }
 }
 
+pub(crate) struct HotSigningMaterial {
+    public: IndraPublicKeyInfo,
+    classical_seed: [u8; CLASSICAL_SK_BYTES],
+    ml_dsa_seed: [u8; PQ_SK_BYTES],
+    vrf_seed: [u8; BYTES32_LEN],
+}
+
+pub(crate) struct ColdSigningMaterial {
+    classical_seed: [u8; CLASSICAL_SK_BYTES],
+    pq_seed: [u8; PQ_SK_BYTES],
+}
+
 pub(crate) enum SigningMaterial {
-    Hot {
-        public: IndraPublicKeyInfo,
-        classical_seed: [u8; CLASSICAL_SK_BYTES],
-        ml_dsa_seed: [u8; PQ_SK_BYTES],
-        vrf_seed: [u8; BYTES32_LEN],
-    },
-    Cold {
-        classical_seed: [u8; CLASSICAL_SK_BYTES],
-        pq_seed: [u8; PQ_SK_BYTES],
-    },
+    Hot(Box<HotSigningMaterial>),
+    Cold(Box<ColdSigningMaterial>),
 }
 
 impl SigningMaterial {
     pub(crate) fn keypair(&self) -> Result<HybridKeypair, IndraError> {
-        let Self::Hot {
+        let Self::Hot(material) = self
+        else {
+            return Err(IndraError::WrongKeyRole);
+        };
+        let HotSigningMaterial {
             public,
             classical_seed,
             ml_dsa_seed,
             ..
-        } = self
-        else {
-            return Err(IndraError::WrongKeyRole);
-        };
+        } = material.as_ref();
         let classical = ClassicalKeypair::from_seed(classical_seed);
         let pq = PqKeypair::from_bytes(&public.pq_pk, ml_dsa_seed)
             .map_err(|_| IndraError::KeygenFailed)?;
@@ -220,43 +225,44 @@ impl SigningMaterial {
     }
 
     pub(crate) fn cold_keypair(&self) -> Result<ColdHybridKeypair, IndraError> {
-        let Self::Cold {
-            classical_seed,
-            pq_seed,
-            ..
-        } = self
+        let Self::Cold(material) = self
         else {
             return Err(IndraError::WrongKeyRole);
         };
+        let ColdSigningMaterial {
+            classical_seed,
+            pq_seed,
+            ..
+        } = material.as_ref();
         ColdHybridKeypair::from_independent_seeds(*classical_seed, *pq_seed)
             .map_err(|_| IndraError::KeygenFailed)
     }
 
     pub(crate) fn hot_public(&self) -> Result<IndraPublicKeyInfo, IndraError> {
         match self {
-            Self::Hot { public, .. } => Ok(*public),
-            Self::Cold { .. } => Err(IndraError::WrongKeyRole),
+            Self::Hot(material) => Ok(material.public),
+            Self::Cold(_) => Err(IndraError::WrongKeyRole),
         }
     }
 
     pub(crate) fn vrf_keypair(&self) -> Result<indra_crypto::VrfKeypair, IndraError> {
         match self {
-            Self::Hot { vrf_seed, .. } => Ok(indra_crypto::VrfKeypair::from_seed(vrf_seed)),
-            Self::Cold { .. } => Err(IndraError::WrongKeyRole),
+            Self::Hot(material) => Ok(indra_crypto::VrfKeypair::from_seed(&material.vrf_seed)),
+            Self::Cold(_) => Err(IndraError::WrongKeyRole),
         }
     }
 
     pub(crate) fn classical_seed(&self) -> [u8; CLASSICAL_SK_BYTES] {
         match self {
-            Self::Hot { classical_seed, .. } => *classical_seed,
-            Self::Cold { classical_seed, .. } => *classical_seed,
+            Self::Hot(material) => material.classical_seed,
+            Self::Cold(material) => material.classical_seed,
         }
     }
 
     pub(crate) fn ml_dsa_seed(&self) -> [u8; PQ_SK_BYTES] {
         match self {
-            Self::Hot { ml_dsa_seed, .. } => *ml_dsa_seed,
-            Self::Cold { pq_seed, .. } => *pq_seed,
+            Self::Hot(material) => material.ml_dsa_seed,
+            Self::Cold(material) => material.pq_seed,
         }
     }
 }
@@ -264,23 +270,14 @@ impl SigningMaterial {
 impl Drop for SigningMaterial {
     fn drop(&mut self) {
         match self {
-            Self::Hot {
-                classical_seed,
-                ml_dsa_seed,
-                vrf_seed,
-                ..
-            } => {
-                classical_seed.zeroize();
-                ml_dsa_seed.zeroize();
-                vrf_seed.zeroize();
+            Self::Hot(material) => {
+                material.classical_seed.zeroize();
+                material.ml_dsa_seed.zeroize();
+                material.vrf_seed.zeroize();
             }
-            Self::Cold {
-                classical_seed,
-                pq_seed,
-                ..
-            } => {
-                classical_seed.zeroize();
-                pq_seed.zeroize();
+            Self::Cold(material) => {
+                material.classical_seed.zeroize();
+                material.pq_seed.zeroize();
             }
         }
     }

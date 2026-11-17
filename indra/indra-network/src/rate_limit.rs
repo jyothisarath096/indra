@@ -185,6 +185,12 @@ impl StrikeCounter {
     }
 }
 
+impl Default for StrikeCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-peer rate limiter.
 #[derive(Debug, Clone)]
 pub struct PeerRateLimiter {
@@ -304,6 +310,12 @@ impl PeerRateLimiter {
     }
 }
 
+impl Default for PeerRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Global large-payload limiter owned by the peer-manager actor.
 #[derive(Debug, Clone)]
 pub struct GlobalRateLimiter {
@@ -321,6 +333,12 @@ impl GlobalRateLimiter {
     /// Check a large payload against the shared byte budget.
     pub fn check_large_payload(&mut self, msg_size: usize) -> bool {
         self.large_payload_bucket.try_consume_bytes(msg_size as u64)
+    }
+}
+
+impl Default for GlobalRateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

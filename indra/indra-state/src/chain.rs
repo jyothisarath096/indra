@@ -899,7 +899,7 @@ impl ChainState {
         boundary_height: u64,
     ) -> crate::error::StateResult<()> {
         if boundary_height == 0
-            || boundary_height % EPOCH_DURATION_BLOCKS != 0
+            || !boundary_height.is_multiple_of(EPOCH_DURATION_BLOCKS)
             || self.height != boundary_height
         {
             return Err(crate::error::StateError::InvalidConsensusSnapshot(
@@ -1027,11 +1027,11 @@ impl ChainState {
             let successor_activation = self
                 .slash_membership_roots
                 .get(1)
-                .ok_or_else(|| crate::error::StateError::InvariantViolation {
+                .ok_or(crate::error::StateError::InvariantViolation {
                     message: "slash root successor disappeared during pruning",
                 })?
                 .activation_height;
-            let last_governed_height = successor_activation.checked_sub(1).ok_or_else(|| {
+            let last_governed_height = successor_activation.checked_sub(1).ok_or({
                 crate::error::StateError::InvariantViolation {
                     message: "slash root successor activation underflow",
                 }
@@ -2500,7 +2500,7 @@ mod tests {
         enum Event {
             Stake(u8, u64),
             Status(u8, crate::validator::ValidatorStatus),
-            Add(ValidatorEntry),
+            Add(Box<ValidatorEntry>),
             Boundary(u64),
         }
         let events = vec![
@@ -2508,7 +2508,7 @@ mod tests {
             Event::Boundary(300),
             Event::Stake(3, 14_000_000_000),
             Event::Status(2, crate::validator::ValidatorStatus::Registered),
-            Event::Add(snapshot_validator(4, 41, 5_000_000_000)),
+            Event::Add(Box::new(snapshot_validator(4, 41, 5_000_000_000))),
             Event::Boundary(600),
             Event::Stake(1, 20_000_000_000),
             Event::Status(3, crate::validator::ValidatorStatus::Registered),
@@ -2530,7 +2530,7 @@ mod tests {
                         .unwrap()
                         .status = status;
                 }
-                Event::Add(validator) => replayed.validators.upsert(validator).unwrap(),
+                Event::Add(validator) => replayed.validators.upsert(*validator).unwrap(),
                 Event::Boundary(height) => {
                     replayed
                         .rotate_consensus_snapshot_after_boundary(height)

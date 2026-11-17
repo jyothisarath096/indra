@@ -62,7 +62,7 @@ pub enum VoteSafetyLoadResult {
     NoRecord,
     /// A structurally valid canonical record was loaded. Cryptographic PoLC
     /// verification remains the consensus driver's responsibility.
-    Record(VoteSafetyRecord),
+    Record(Box<VoteSafetyRecord>),
     /// The file exists but is invalid/corrupt and voting must fail closed.
     Corrupt(String),
 }
@@ -174,7 +174,7 @@ impl VoteSafetyStore {
             return VoteSafetyLoadResult::Corrupt("CRC mismatch".into());
         }
         match decode_record(&bytes[..payload_len]) {
-            Ok(record) => VoteSafetyLoadResult::Record(record),
+            Ok(record) => VoteSafetyLoadResult::Record(Box::new(record)),
             Err(error) => VoteSafetyLoadResult::Corrupt(error),
         }
     }

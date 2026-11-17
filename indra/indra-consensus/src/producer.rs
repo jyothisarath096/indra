@@ -280,7 +280,7 @@ mod tests {
             round,
             candidates: vec![crate::proposer::ProposerCandidate {
                 validator_id,
-                vrf_pubkey: vrf_pubkey,
+                vrf_pubkey,
                 stake,
             }],
         }

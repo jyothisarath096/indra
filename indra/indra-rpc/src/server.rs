@@ -82,7 +82,6 @@ pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RPC_PUBLIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum public UTXO/balance scans per minute from one IP.
-
 /// Maximum expensive public read-only calls per minute from one IP.
 pub const RPC_PUBLIC_EXPENSIVE_RATE_PER_MIN: u64 = 30;
 

@@ -251,6 +251,11 @@ struct GovernanceHandleArgs {
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// All pointer arguments must be null only when their corresponding length is
+/// zero; otherwise they must reference readable buffers of those lengths.
+/// Output pointers must reference writable buffers of the supplied capacities.
 pub unsafe extern "C" fn indra_build_governance_propose_with_handle(
     session: IndraSessionHandle,
     title: *const c_char,
@@ -390,6 +395,10 @@ pub unsafe extern "C" fn indra_build_governance_commit_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `proposal_id` must reference 32 readable bytes. Output pointers must each
+/// reference writable 32-byte buffers.
 pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
     session: IndraSessionHandle,
     proposal_id: *const u8,
@@ -434,6 +443,10 @@ pub unsafe extern "C" fn indra_build_governance_reveal_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `proposal_id` and `from_validator_id` must reference 32 readable bytes.
+/// Output pointers must reference writable buffers of their declared lengths.
 pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
     session: IndraSessionHandle,
     proposal_id: *const u8,
@@ -472,6 +485,10 @@ pub unsafe extern "C" fn indra_build_governance_redelegate_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `proposal_id` must reference 32 readable bytes and all output buffers must
+/// be writable for their declared capacities.
 pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
     session: IndraSessionHandle,
     proposal_id: *const u8,
@@ -504,6 +521,10 @@ pub unsafe extern "C" fn indra_build_governance_execute_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `proposal_id` must reference 32 readable bytes and all output buffers must
+/// be writable for their declared capacities.
 pub unsafe extern "C" fn indra_build_governance_cancel_with_handle(
     session: IndraSessionHandle,
     proposal_id: *const u8,

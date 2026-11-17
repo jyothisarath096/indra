@@ -277,7 +277,6 @@ fn signer_validators<'a>(
 /// second QC arriving for an already-cached height if its round,
 /// or block_hash disagrees with what's cached
 /// (see driver.rs, "conflicting last_qc_bytes").
-
 pub fn verify_qc(
     qc: &QuorumCertificateV1,
     validators: &[QcValidator],
@@ -574,7 +573,7 @@ mod tests {
             block_hash,
             TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
-            &[v.clone()],
+            std::slice::from_ref(&v),
             vec![&vote],
         )
         .unwrap();
@@ -643,7 +642,7 @@ mod tests {
             block_hash,
             TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
-            &[v.clone()],
+            std::slice::from_ref(&v),
             vec![&vote],
         )
         .unwrap();
@@ -684,7 +683,7 @@ mod tests {
                     .unwrap(),
             }],
         };
-        assert!(verify_qc(&qc, &[v.clone()], 10_000, TEST_CHAIN_ID).is_ok());
+        assert!(verify_qc(&qc, std::slice::from_ref(&v), 10_000, TEST_CHAIN_ID).is_ok());
         assert!(verify_qc_strict(&qc, &[v], 10_000, TEST_CHAIN_ID).is_ok());
     }
 
@@ -709,7 +708,7 @@ mod tests {
             block_hash,
             TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
-            &[v.clone()],
+            std::slice::from_ref(&v),
             vec![&vote],
         )
         .unwrap();
@@ -745,7 +744,7 @@ mod tests {
             block_hash,
             TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
-            &[v.clone()],
+            std::slice::from_ref(&v),
             vec![&vote],
         )
         .unwrap();
@@ -774,7 +773,7 @@ mod tests {
             block_hash,
             TEST_CHAIN_ID,
             TEST_SNAPSHOT_ROOT,
-            &[v.clone()],
+            std::slice::from_ref(&v),
             vec![&vote],
         )
         .unwrap();

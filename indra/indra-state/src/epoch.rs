@@ -513,7 +513,7 @@ fn tally_proposal(state: &mut ChainState, proposal_id: Bytes32, height: u64) -> 
         proposal.yes_stake = yes;
         proposal.no_stake = no;
         proposal.abstain_stake = abstain;
-        let snap2 = proposal.snapshot2.as_ref().ok_or_else(|| {
+        let snap2 = proposal.snapshot2.as_ref().ok_or({
             crate::error::StateError::InvariantViolation {
                 message: "snapshot2 missing after tally",
             }
@@ -2798,8 +2798,8 @@ mod tests {
             params.slash_liveness_threshold_epochs,
             SLASH_LIVENESS_THRESHOLD_EPOCHS
         );
-        assert!(SLASH_LIVENESS_BPS > 0);
-        assert!(SLASH_LIVENESS_THRESHOLD_EPOCHS > 0);
+        const _: () = assert!(SLASH_LIVENESS_BPS > 0);
+        const _: () = assert!(SLASH_LIVENESS_THRESHOLD_EPOCHS > 0);
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub enum NetworkEvent {
         /// Authenticated validator identity of the peer.
         validator_id: Bytes32,
         /// Decoded application message.
-        msg: Message,
+        msg: Box<Message>,
     },
     /// A peer completed the authenticated transport handshake.
     PeerConnected {
@@ -56,7 +56,7 @@ pub enum NetworkEvent {
         is_outbound: bool,
     },
     /// Slash evidence detected by the transport before rate limiting.
-    SlashDetected(SlashEvidenceV1),
+    SlashDetected(Box<SlashEvidenceV1>),
 }
 
 /// Commands sent from the node to the async network layer.

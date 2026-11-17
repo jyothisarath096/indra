@@ -62,7 +62,6 @@ const MAX_STALLED_HEIGHT_ENTRIES: usize = 256;
 /// had a chance to answer. Remembering recent request keys prevents those
 /// paths from turning one missing artifact into a tight request/log loop
 /// while still allowing retry after a normal round-scale delay.
-
 /// Current Tendermint phase of the local round state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundPhase {
@@ -82,7 +81,7 @@ pub enum DriverEvent {
         /// The sender, or `None` when proposed locally.
         from: Option<SocketAddr>,
         /// The complete proposed envelope.
-        proposal: BlockProposalVNext,
+        proposal: Box<BlockProposalVNext>,
     },
     /// A consensus vote arrived from a peer.
     InboundVote {
@@ -126,7 +125,7 @@ pub enum DriverEvent {
 #[derive(Debug)]
 pub enum DriverAction {
     /// Broadcast this block to peers.
-    BroadcastBlock(BlockProposalVNext),
+    BroadcastBlock(Box<BlockProposalVNext>),
     /// Broadcast this vote to peers.
     BroadcastVote(VoteV1),
     /// Request a block range from a peer.
@@ -164,7 +163,7 @@ pub enum DriverAction {
         qc_bytes: Vec<u8>,
     },
     /// Slash evidence was detected.
-    SlashDetected(SlashEvidence),
+    SlashDetected(Box<SlashEvidence>),
     /// A connected peer sent a consensus message that passed cheap routing
     /// checks but failed cryptographic/protocol validation.
     DisconnectInvalidConsensusPeer {
@@ -745,7 +744,7 @@ impl ConsensusDriver {
     /// Process one inbound event and return the resulting driver actions.
     pub fn process(&mut self, event: DriverEvent) -> Vec<DriverAction> {
         match event {
-            DriverEvent::InboundBlock { from, proposal } => self.process_proposal(from, proposal),
+            DriverEvent::InboundBlock { from, proposal } => self.process_proposal(from, *proposal),
             DriverEvent::InboundVote { from, vote } => self.process_vote(from, vote),
             DriverEvent::PeerStatus {
                 from,
@@ -993,9 +992,7 @@ impl ConsensusDriver {
         let height = self.next_height();
         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
         let max_round = self
-            .current_round
-            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
-            .unwrap_or(u32::MAX)
+            .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
             .min(MAX_ROUNDS_PER_HEIGHT - 1);
         self.round_advance_evidence
             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
@@ -1529,7 +1526,7 @@ impl ConsensusDriver {
         // proposals remain staged until independently verified vote evidence
         // crosses strict >2/3 stake.
 
-        let mut actions = vec![DriverAction::BroadcastBlock(proposal.clone())];
+        let mut actions = vec![DriverAction::BroadcastBlock(Box::new(proposal.clone()))];
         if let Some(from) = from {
             actions.push(DriverAction::ScorePeer {
                 from,
@@ -1574,9 +1571,7 @@ impl ConsensusDriver {
         }
 
         let maximum_jump_round = self
-            .current_round
-            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
-            .unwrap_or(u32::MAX)
+            .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
             .min(MAX_ROUNDS_PER_HEIGHT - 1);
         if vote.height != self.next_height() || vote.round > maximum_jump_round {
             return actions;
@@ -1653,7 +1648,7 @@ impl ConsensusDriver {
         }
 
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
-            actions.push(DriverAction::SlashDetected(evidence));
+            actions.push(DriverAction::SlashDetected(Box::new(evidence)));
         }
 
         if let Some(existing) = self.seen_round_votes.get(&slot_key).copied() {
@@ -1732,9 +1727,7 @@ impl ConsensusDriver {
             || validate_consensus_round(target_round).is_err()
             || target_round
                 > self
-                    .current_round
-                    .checked_add(MAX_ACCEPTED_ROUND_JUMP)
-                    .unwrap_or(u32::MAX)
+                    .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
                     .min(MAX_ROUNDS_PER_HEIGHT - 1)
         {
             return Vec::new();
@@ -2132,7 +2125,7 @@ impl ConsensusDriver {
         match self.engine.commit_proposal(&block) {
             Ok(()) => {
                 self.pending_blocks.remove(&block_hash);
-                let mut actions = vec![DriverAction::BroadcastBlock(block)];
+                let mut actions = vec![DriverAction::BroadcastBlock(Box::new(block))];
                 eprintln!(
                     "[commit] finalizing {} at height={} round={}",
                     hex::encode(&block_hash.0[..4]),

@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn observer_frame_size_is_bounded_below_14mb() {
-        assert!(MAX_OBSERVER_FRAME_BYTES < MAX_MSG_BYTES);
+        const _: () = assert!(MAX_OBSERVER_FRAME_BYTES < MAX_MSG_BYTES);
     }
 
     #[tokio::test]

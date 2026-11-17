@@ -459,7 +459,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         }
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal,
+            proposal: Box::new(proposal),
         });
         actions.extend(driver.on_propose_timeout());
         actions
@@ -752,7 +752,6 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let b = test_validator_material([0xB2; 32]);
         let (driver_a, dir_a) = local_driver(a.seed, "shared_a_seed");
         let original = std::fs::read_to_string(dir_a.join("genesis.toml")).unwrap();
-        let original = original;
         drop(driver_a);
         let sealed = original + &render_test_validator_record("b", &b, 1_000_000)
             + &render_test_validator_record("c", &test_validator_material([0xC3; 32]), 1_000_000)
@@ -839,12 +838,12 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(proposal.clone());
         let local = queue.pop_front().unwrap();
-        fixture.drivers[proposer].process(DriverEvent::InboundBlock { from: None, proposal: local });
+        fixture.drivers[proposer].process(DriverEvent::InboundBlock { from: None, proposal: Box::new(local) });
         assert!(fixture.drivers[proposer].pending_proposal(&hash).is_some());
-        for i in 0..4 { if i != proposer { queue.push_back(proposal.clone()); let p = queue.pop_front().unwrap(); fixture.drivers[i].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: p }); assert!(fixture.drivers[i].pending_proposal(&hash).is_some()); } assert_eq!(fixture.drivers[i].engine.state.height, 0); }
+        for i in 0..4 { if i != proposer { queue.push_back(proposal.clone()); let p = queue.pop_front().unwrap(); fixture.drivers[i].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: Box::new(p) }); assert!(fixture.drivers[i].pending_proposal(&hash).is_some()); } assert_eq!(fixture.drivers[i].engine.state.height, 0); }
         assert_eq!(proposal.block.header.value_hash, value_hash); assert_eq!(proposal.block.header.proposer_id, proposer_id);
         let before = fixture.drivers[(proposer + 1) % 4].proposal_admission_metrics;
-        fixture.drivers[(proposer + 1) % 4].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: proposal.clone() });
+        fixture.drivers[(proposer + 1) % 4].process(DriverEvent::InboundBlock { from: Some("127.0.0.1:12000".parse().unwrap()), proposal: Box::new(proposal.clone()) });
         assert_eq!(fixture.drivers[(proposer + 1) % 4].proposal_admission_metrics, before);
         let dirs = fixture.dirs; drop(fixture.drivers); for dir in dirs { let _ = std::fs::remove_dir_all(dir); }
     }
@@ -859,11 +858,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let proposer = (0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap();
         let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
         let hash = proposal.block.header.block_hash();
-        for i in 0..4 { fixture.drivers[i].process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+        for i in 0..4 { fixture.drivers[i].process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
         let mut votes = Vec::new();
         let ids: Vec<_> = fixture.drivers.iter().map(|d| d.engine.validator_id().unwrap()).collect();
         assert_eq!(ids.len(), 4); assert!(ids.iter().enumerate().all(|(i,id)| ids.iter().skip(i+1).all(|other| id != other)));
-        for i in 0..3 { let actions = fixture.drivers[i].on_propose_timeout(); let vote = actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap(); assert_eq!(vote.validator_id, ids[i]); assert_eq!((vote.height,vote.round,vote.step,vote.block_hash),(1,0,VoteStep::Prevote,hash)); votes.push(vote); }
+        for (i, driver) in fixture.drivers.iter_mut().take(3).enumerate() { let actions = driver.on_propose_timeout(); let vote = actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap(); assert_eq!(vote.validator_id, ids[i]); assert_eq!((vote.height,vote.round,vote.step,vote.block_hash),(1,0,VoteStep::Prevote,hash)); votes.push(vote); }
         assert!(fixture.drivers[0].collector_has_vote_from(1,0,VoteStep::Prevote,ids[0]));
         assert_eq!(fixture.drivers[0].current_phase(), RoundPhase::Prevote);
         assert!(fixture.drivers[0].valid_round.is_none() && fixture.drivers[0].valid_value.is_none());
@@ -920,7 +919,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let proposer = (0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap();
         let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
         let hash = proposal.block.header.block_hash();
-        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
         let ids: Vec<_> = fixture.drivers.iter().map(|d| d.engine.validator_id().unwrap()).collect();
         let mut prevotes = Vec::new();
         for i in 0..3 {
@@ -928,10 +927,10 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             prevotes.push(actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap());
         }
         let mut precommits = Vec::new();
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, driver) in fixture.drivers.iter_mut().take(3).enumerate() {
+            for (j, vote) in prevotes.iter().take(3).enumerate() {
                 if i != j {
-                    let actions = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}", 14000+j).parse().unwrap(), vote: prevotes[j].clone() });
+                    let actions = driver.process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}", 14000+j).parse().unwrap(), vote: vote.clone() });
                     if let Some(v) = actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a { (v.step == VoteStep::Precommit).then_some(v) } else {None}) { precommits.push((i, v)); }
                 }
             }
@@ -1015,18 +1014,18 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let alternate = fixture.drivers[proposer].engine.propose(&election, 1_700_000_001, vec![], None).unwrap();
         let alternate_hash = alternate.block.header.block_hash();
         assert_ne!(alternate_hash, hash);
-        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
         let ids: Vec<_> = fixture.drivers.iter().map(|d| d.engine.validator_id().unwrap()).collect();
         let mut prevotes = Vec::new();
-        for i in 0..3 { prevotes.push(fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap()); }
+        for driver in fixture.drivers.iter_mut().take(3) { prevotes.push(driver.on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap()); }
         let mut precommits = Vec::new();
-        for i in 0..3 { for j in 0..3 { if i != j { let actions = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",15000+j).parse().unwrap(), vote: prevotes[j].clone() }); if let Some(v)=actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { precommits.push((i,v)); } } } }
+        for (i, driver) in fixture.drivers.iter_mut().take(3).enumerate() { for (j, vote) in prevotes.iter().take(3).enumerate() { if i != j { let actions = driver.process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",15000+j).parse().unwrap(), vote: vote.clone() }); if let Some(v)=actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { precommits.push((i,v)); } } } }
         precommits.sort_by_key(|(i,_)|*i);
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15001".parse().unwrap(), vote: precommits[1].1.clone() });
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15002".parse().unwrap(), vote: precommits[2].1.clone() });
         let baseline = (fixture.drivers[0].engine.state.height, fixture.drivers[0].engine.state.tip_hash, fixture.drivers[0].last_qc_bytes(), fixture.drivers[0].last_qc_height(), fixture.drivers[0].current_round(), fixture.drivers[0].current_phase(), fixture.drivers[0].vote_admission_metrics.qc_formations);
-        fixture.drivers[0].process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() });
-        fixture.drivers[0].process(DriverEvent::InboundBlock { from: None, proposal: alternate });
+        fixture.drivers[0].process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) });
+        fixture.drivers[0].process(DriverEvent::InboundBlock { from: None, proposal: Box::new(alternate) });
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15000".parse().unwrap(), vote: prevotes[0].clone() });
         fixture.drivers[0].process(DriverEvent::InboundVote { from: "127.0.0.1:15002".parse().unwrap(), vote: precommits[2].1.clone() });
         let signer = HybridKeypair::new(ClassicalKeypair::from_seed(&fixture.materials[3].seed), fixture.materials[3].pq.clone());
@@ -1088,13 +1087,13 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 let snap = fixture.drivers[0].engine.state.snapshot_for_consensus_height(1).unwrap().clone();
                 indra_core::types::qc::verify_qc_against_snapshot(&qc, &snap, TEST_CHAIN_ID).unwrap();
             }
-            for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+            for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
             let mut prevotes = Vec::new();
-            for i in 0..4 { prevotes.push(fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap()); }
+            for driver in fixture.drivers.iter_mut().take(4) { prevotes.push(driver.on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap()); }
             for v in &prevotes { assert_eq!((v.height,v.round,v.step,v.block_hash),(height,fixture.drivers[0].current_round(),VoteStep::Prevote,hash)); }
             if height == 1 { height1_prevote = Some(prevotes[0].clone()); }
             let mut precommits = Vec::new();
-            for i in 0..4 { for j in 0..4 { if i != j { let actions = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",16000+j).parse().unwrap(), vote: prevotes[j].clone() }); if let Some(v)=actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { precommits.push((i,v)); } } } }
+            for (i, driver) in fixture.drivers.iter_mut().take(4).enumerate() { for (j, vote) in prevotes.iter().take(4).enumerate() { if i != j { let actions = driver.process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",16000+j).parse().unwrap(), vote: vote.clone() }); if let Some(v)=actions.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { precommits.push((i,v)); } } } }
             precommits.sort_by_key(|(i,_)|*i);
             for (_, v) in &precommits { assert_eq!((v.height,v.round,v.step,v.block_hash),(height,fixture.drivers[0].current_round(),VoteStep::Precommit,hash)); }
             if height == 1 { height1_precommit = precommits.first().map(|(_,v)| v.clone()); }
@@ -1120,7 +1119,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let d0 = &mut fixture.drivers[0];
         let before_roots = test_state_roots(&d0.engine.state);
         let before = (d0.engine.state.height, d0.engine.state.tip_hash, before_roots.state_root, before_roots.validator_set_root, d0.last_qc_bytes(), d0.last_qc_height(), d0.current_round(), d0.current_phase(), d0.vote_admission_metrics.qc_formations);
-        d0.process(DriverEvent::InboundBlock { from: None, proposal: height1_proposal.unwrap() });
+        d0.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(height1_proposal.unwrap()) });
         d0.process(DriverEvent::InboundVote { from: "127.0.0.1:18000".parse().unwrap(), vote: height1_prevote.unwrap() });
         d0.process(DriverEvent::InboundVote { from: "127.0.0.1:18001".parse().unwrap(), vote: height1_precommit.unwrap() });
         let after_roots = test_state_roots(&d0.engine.state);
@@ -1142,11 +1141,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_000, vec![], None).unwrap();
         let hash = proposal.block.header.block_hash();
         let partition_round_1 = proposal.block.header.proposer_round;
-        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
         let mut votes = Vec::new();
         for i in 0..4 { let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap(); assert_eq!((v.height,v.round,v.step,v.block_hash),(1,partition_round_1,VoteStep::Prevote,hash)); votes.push(v); }
         let partition = |a: usize, b: usize| (a < 2) == (b < 2);
-        for to in 0..4 { for from in 0..4 { if from != to && partition(from,to) { fixture.drivers[to].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",19000+from).parse().unwrap(), vote: votes[from].clone() }); } } }
+        for (to, driver) in fixture.drivers.iter_mut().enumerate() { for (from, vote) in votes.iter().enumerate() { if from != to && partition(from,to) { driver.process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",19000+from).parse().unwrap(), vote: vote.clone() }); } } }
         for d in &fixture.drivers { assert_eq!(d.engine.state.height,0); assert_eq!(d.last_qc_height(),None); assert!(d.valid_round.is_none() && d.locked_round.is_none()); }
         let mut partition_nil_precommit = None;
         for d in &mut fixture.drivers { let acts = d.on_prevote_timeout(); if partition_nil_precommit.is_none() { partition_nil_precommit = acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}); } d.on_precommit_timeout().unwrap(); }
@@ -1159,7 +1158,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             let p = fixture.drivers[p2].engine.propose(&election2, 1_700_000_050, vec![], None).unwrap();
             let second_hash = p.block.header.block_hash();
             let side = p2 < 2;
-            for i in 0..4 { if (i < 2) == side { fixture.drivers[i].process(DriverEvent::InboundBlock { from: None, proposal: p.clone() }); } }
+            for i in 0..4 { if (i < 2) == side { fixture.drivers[i].process(DriverEvent::InboundBlock { from: None, proposal: Box::new(p.clone()) }); } }
             let members: Vec<_> = (0..4).filter(|i| (*i < 2) == side).collect();
             let mut side_votes = Vec::new();
             for i in &members { let v=fixture.drivers[*i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap(); assert_eq!((v.height,v.round,v.step,v.block_hash),(1,partition_round_2,VoteStep::Prevote,second_hash)); side_votes.push((*i,v)); }
@@ -1174,11 +1173,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let proposer = (0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap();
         let proposal = fixture.drivers[proposer].engine.propose(&election, 1_700_000_100 + round as u64, vec![], None).unwrap();
         let recovered_hash = proposal.block.header.block_hash();
-        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: proposal.clone() }); }
+        for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock { from: None, proposal: Box::new(proposal.clone()) }); }
         let mut pvs = Vec::new();
         for i in 0..4 { pvs.push(fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {Some(v)} else {None}).unwrap()); }
         let mut pcs = Vec::new();
-        for i in 0..4 { for j in 0..4 { if i != j { let acts = fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",20000+j).parse().unwrap(), vote: pvs[j].clone() }); if let Some(v)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { pcs.push((i,v)); } } } }
+        for (i, driver) in fixture.drivers.iter_mut().enumerate() { for (j, vote) in pvs.iter().enumerate() { if i != j { let acts = driver.process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",20000+j).parse().unwrap(), vote: vote.clone() }); if let Some(v)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)} else {None}) { pcs.push((i,v)); } } } }
         pcs.sort_by_key(|(i,_)|*i);
         for i in 0..4 { for (j,v) in &pcs { if *j != i { fixture.drivers[i].process(DriverEvent::InboundVote { from: format!("127.0.0.1:{}",21000+j).parse().unwrap(), vote: v.clone() }); } } }
         let roots = test_state_roots(&fixture.drivers[0].engine.state);
@@ -1200,16 +1199,16 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let election=fixture.drivers[0].proposer_election_for_height(1,round).unwrap(); let proposer=(0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&election)).unwrap(); let proposal=fixture.drivers[proposer].engine.propose(&election,1_700_000_000,vec![],None).unwrap(); let _initial_hash=proposal.block.header.block_hash();
         assert!(!post_gst);
         let delayed_proposal = proposal.clone();
-        for i in 0..2 { fixture.drivers[i].process(DriverEvent::InboundBlock{from:None,proposal:proposal.clone()}); }
+        for i in 0..2 { fixture.drivers[i].process(DriverEvent::InboundBlock{from:None,proposal:Box::new(proposal.clone())}); }
         let mut old_prevote=None; let mut old_precommit=None;
         for i in 0..4 { let p=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}); if old_prevote.is_none(){old_prevote=p;} let pc=fixture.drivers[i].on_prevote_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}); if old_precommit.is_none(){old_precommit=pc;} fixture.drivers[i].on_precommit_timeout().unwrap(); }
         assert!(fixture.drivers.iter().all(|d| d.engine.state.height==0 && d.engine.state.tip_hash==genesis_tip && d.last_qc_height().is_none()));
         let round2=fixture.drivers[0].current_round(); let e2=fixture.drivers[0].proposer_election_for_height(1,round2).unwrap();
-        if let Some(p2)=(0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&e2)){ let p=fixture.drivers[p2].engine.propose(&e2,1_700_000_050,vec![],None).unwrap(); let h=p.block.header.block_hash(); for i in 0..2{fixture.drivers[i].process(DriverEvent::InboundBlock{from:None,proposal:p.clone()}); let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a|if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}).unwrap(); assert_eq!((v.height,v.round,v.step,v.block_hash),(1,round2,VoteStep::Prevote,h));} }
+        if let Some(p2)=(0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&e2)){ let p=fixture.drivers[p2].engine.propose(&e2,1_700_000_050,vec![],None).unwrap(); let h=p.block.header.block_hash(); for i in 0..2{fixture.drivers[i].process(DriverEvent::InboundBlock{from:None,proposal:Box::new(p.clone())}); let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a|if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}).unwrap(); assert_eq!((v.height,v.round,v.step,v.block_hash),(1,round2,VoteStep::Prevote,h));} }
         for i in 0..4 { let _=fixture.drivers[i].on_propose_timeout(); let _=fixture.drivers[i].on_prevote_timeout(); fixture.drivers[i].on_precommit_timeout().unwrap(); }
         assert!(fixture.drivers.iter().all(|d| d.engine.state.height==0 && d.engine.state.tip_hash==genesis_tip && d.last_qc_height().is_none()));
         let stale_before=(fixture.drivers[3].engine.state.height,fixture.drivers[3].engine.state.tip_hash,fixture.drivers[3].current_round(),fixture.drivers[3].last_qc_height(),fixture.drivers[3].locked_round,fixture.drivers[3].locked_value,fixture.drivers[3].valid_round,fixture.drivers[3].valid_value);
-        fixture.drivers[3].process(DriverEvent::InboundBlock{from:None,proposal:delayed_proposal.clone()});
+        fixture.drivers[3].process(DriverEvent::InboundBlock{from:None,proposal:Box::new(delayed_proposal.clone())});
         let stale_after=(fixture.drivers[3].engine.state.height,fixture.drivers[3].engine.state.tip_hash,fixture.drivers[3].current_round(),fixture.drivers[3].last_qc_height(),fixture.drivers[3].locked_round,fixture.drivers[3].locked_value,fixture.drivers[3].valid_round,fixture.drivers[3].valid_value); assert_eq!(stale_before,stale_after);
         assert!(!post_gst); post_gst=true; assert!(post_gst); let mut delivery_step=0u64; let mut post_gst_emitted_messages=0usize; let mut post_gst_delivered_broadcasts=0usize;
         round = fixture.drivers[0].current_round();
@@ -1224,12 +1223,12 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let recovery_proposer=(0..4).find(|i| fixture.drivers[*i].engine.is_proposer(&recovery_election)).unwrap();
         let recovery_proposal=fixture.drivers[recovery_proposer].engine.propose(&recovery_election,1_700_000_100,vec![],None).unwrap();
         let hash=recovery_proposal.block.header.block_hash();
-        let emitted_step=delivery_step; post_gst_emitted_messages+=1; delivery_step+=1; assert!(delivery_step-emitted_step<=MAX_POST_GST_DELIVERY_STEPS); for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock{from:None,proposal:recovery_proposal.clone()}); } post_gst_delivered_broadcasts+=1;
+        let emitted_step=delivery_step; post_gst_emitted_messages+=1; delivery_step+=1; assert!(delivery_step-emitted_step<=MAX_POST_GST_DELIVERY_STEPS); for d in &mut fixture.drivers { d.process(DriverEvent::InboundBlock{from:None,proposal:Box::new(recovery_proposal.clone())}); } post_gst_delivered_broadcasts+=1;
         let mut votes=Vec::new(); for i in 0..4 { let v=fixture.drivers[i].on_propose_timeout().into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a{Some(v)}else{None}).unwrap(); post_gst_emitted_messages+=1; votes.push((i,v,delivery_step)); }
         let mut pcs=Vec::new(); let delivered_step=delivery_step+1; for (j,v,emitted) in &votes { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if i!=*j { let acts=fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",22000+j).parse().unwrap(),vote:v.clone()}); if let Some(pc)=acts.into_iter().find_map(|a| if let DriverAction::BroadcastVote(v)=a {(v.step==VoteStep::Precommit).then_some(v)}else{None}){post_gst_emitted_messages+=1; pcs.push((i,pc,delivered_step));} } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step;
         pcs.sort_by_key(|(i,_,_)|*i); let delivered_step=delivery_step+1; for (j,v,emitted) in &pcs { assert!(delivered_step-*emitted<=MAX_POST_GST_DELIVERY_STEPS); for i in 0..4 { if *j!=i { fixture.drivers[i].process(DriverEvent::InboundVote{from:format!("127.0.0.1:{}",23000+j).parse().unwrap(),vote:v.clone()}); } } post_gst_delivered_broadcasts+=1; } delivery_step=delivered_step; assert!(delivery_step > 0); assert_eq!(post_gst_emitted_messages,post_gst_delivered_broadcasts);
         let roots=test_state_roots(&fixture.drivers[0].engine.state); for d in &fixture.drivers { assert_eq!(d.engine.state.height,1); assert_eq!(d.engine.state.tip_hash,hash); assert_eq!(d.current_round(),0); assert_eq!(d.current_phase(),RoundPhase::Propose); assert_eq!(d.last_qc_height(),Some(1)); let r=test_state_roots(&d.engine.state); assert_eq!(r.state_root,roots.state_root); assert_eq!(r.validator_set_root,roots.validator_set_root); let qc=QuorumCertificateV1::decode_exact(&d.last_qc_bytes()).unwrap(); assert_eq!((qc.height,qc.round,qc.block_hash),(1,round,hash)); let s=d.engine.state.snapshot_for_consensus_height(1).unwrap().clone(); indra_core::types::qc::verify_qc_against_snapshot(&qc,&s,TEST_CHAIN_ID).unwrap(); }
-        let a=&mut fixture.drivers[0]; let rb=test_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,rb.state_root,rb.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundBlock{from:None,proposal:delayed_proposal}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24000".parse().unwrap(),vote:old_prevote.unwrap()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24001".parse().unwrap(),vote:old_precommit.unwrap()}); let ra=test_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,ra.state_root,ra.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after); assert!(a.pending_proposal(&_initial_hash).is_none()); assert!(a.locked_round.is_none()&&a.locked_value.is_none()&&a.valid_round.is_none()&&a.valid_value.is_none());
+        let a=&mut fixture.drivers[0]; let rb=test_state_roots(&a.engine.state); let before=(a.engine.state.height,a.engine.state.tip_hash,rb.state_root,rb.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); a.process(DriverEvent::InboundBlock{from:None,proposal:Box::new(delayed_proposal)}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24000".parse().unwrap(),vote:old_prevote.unwrap()}); a.process(DriverEvent::InboundVote{from:"127.0.0.1:24001".parse().unwrap(),vote:old_precommit.unwrap()}); let ra=test_state_roots(&a.engine.state); let after=(a.engine.state.height,a.engine.state.tip_hash,ra.state_root,ra.validator_set_root,a.last_qc_bytes(),a.last_qc_height(),a.current_round(),a.current_phase(),a.vote_admission_metrics.qc_formations); assert_eq!(before,after); assert!(a.pending_proposal(&_initial_hash).is_none()); assert!(a.locked_round.is_none()&&a.locked_value.is_none()&&a.valid_round.is_none()&&a.valid_value.is_none());
         let dirs=fixture.dirs; drop(fixture.drivers); for dir in dirs { let _=std::fs::remove_dir_all(dir); }
     }
 
@@ -1291,7 +1290,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for driver in &mut fixture.drivers {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: proposal.clone(),
+                proposal: Box::new(proposal.clone()),
             });
             assert!(driver.pending_proposal(&original_hash).is_some());
         }
@@ -1521,7 +1520,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for driver in &mut fixture.drivers {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: proposal.clone(),
+                proposal: Box::new(proposal.clone()),
             });
             for (source, vote) in original_prevotes.iter().take(3).enumerate() {
                 driver.process(DriverEvent::InboundVote {
@@ -1585,7 +1584,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for driver in &mut fixture.drivers {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: recovery_proposal.clone(),
+                proposal: Box::new(recovery_proposal.clone()),
             });
             assert!(driver.pending_proposal(&committed_hash).is_some());
         }
@@ -1607,8 +1606,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             recovery_prevotes.push(vote);
         }
         let mut recovery_precommits: Vec<Option<VoteV1>> = vec![None; 4];
-        for receiver in 0..4 {
-            for source in 0..4 {
+        let mut receiver = 0;
+        while receiver < fixture.drivers.len() {
+            for (source, vote) in recovery_prevotes.iter().enumerate() {
                 if source == receiver {
                     continue;
                 }
@@ -1616,7 +1616,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     from: format!("127.0.0.1:{}", 25300 + source)
                         .parse()
                         .unwrap(),
-                    vote: recovery_prevotes[source].clone(),
+                    vote: vote.clone(),
                 });
                 if let Some(precommit) = actions.into_iter().find_map(|action| match action {
                     DriverAction::BroadcastVote(vote) if vote.step == VoteStep::Precommit => {
@@ -1634,6 +1634,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 (vote.validator_id, vote.height, vote.round, vote.step, vote.block_hash),
                 (ids[receiver], 1, recovery_round, VoteStep::Precommit, committed_hash)
             );
+            receiver += 1;
         }
 
         // At local+one-remote precommit each observer has exactly 2/4 and must
@@ -1739,7 +1740,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         );
         driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal,
+            proposal: Box::new(proposal),
         });
         driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:25600".parse().unwrap(),
@@ -1830,14 +1831,14 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for driver in fixture.drivers.iter_mut().take(3) {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: proposal.clone(),
+                proposal: Box::new(proposal.clone()),
             });
             assert!(driver.pending_proposal(&proposal_hash).is_some());
         }
 
         let mut honest_prevotes = Vec::new();
-        for index in 0..3 {
-            let vote = fixture.drivers[index]
+        for (index, driver) in fixture.drivers.iter_mut().take(3).enumerate() {
+            let vote = driver
                 .on_propose_timeout()
                 .into_iter()
                 .find_map(|action| match action {
@@ -2115,8 +2116,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         // The next distinct honest identity crosses strict >2/3. D is absent
         // from every finalizing signer set.
         let second_and_third = [(1usize, 2usize), (0, 2), (0, 1)];
-        for receiver in 0..3 {
-            let (second, third) = second_and_third[receiver];
+        for (receiver, (second, third)) in second_and_third.iter().copied().enumerate() {
             fixture.drivers[receiver].process(DriverEvent::InboundVote {
                 from: format!("127.0.0.1:{}", 26300 + second)
                     .parse()
@@ -2189,7 +2189,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         });
         driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal,
+            proposal: Box::new(proposal),
         });
         let roots_after = test_state_roots(&driver.engine.state);
         let after = (
@@ -2217,7 +2217,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     fn audit_harness_four_validator_topology_churn_recovers() {
         #[derive(Clone)]
         enum TopologyMessage {
-            Proposal(BlockProposalVNext),
+            Proposal(Box<BlockProposalVNext>),
             Vote(VoteV1),
         }
 
@@ -2302,7 +2302,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         // currently permitted edge.
         fixture.drivers[proposer].process(DriverEvent::InboundBlock {
             from: None,
-            proposal: proposal.clone(),
+            proposal: Box::new(proposal.clone()),
         });
         let mut proposal_visible = [false; 4];
         proposal_visible[proposer] = true;
@@ -2323,7 +2323,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                         .parse()
                         .unwrap(),
                 ),
-                proposal: proposal.clone(),
+                proposal: Box::new(proposal.clone()),
             });
             proposal_visible[to] = true;
         }
@@ -2405,7 +2405,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         // Queue traffic emitted under T1 and release it only after switching
         // to T2. Every queued hop is validated against T2 at delivery time.
         let mut delayed = std::collections::VecDeque::new();
-        delayed.push_back((0usize, 2usize, TopologyMessage::Proposal(proposal.clone())));
+        delayed.push_back((0usize, 2usize, TopologyMessage::Proposal(Box::new(proposal.clone()))));
         delayed.push_back((0, 2, TopologyMessage::Vote(prevotes[0].clone())));
         delayed.push_back((2, 0, TopologyMessage::Vote(precommit_c.clone())));
         while let Some((from, to, message)) = delayed.pop_front() {
@@ -2418,7 +2418,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                                 .parse()
                                 .unwrap(),
                         ),
-                        proposal,
+                        proposal: proposal.clone(),
                     });
                 }
                 TopologyMessage::Vote(vote) => {
@@ -2607,7 +2607,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         );
         driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal,
+            proposal: Box::new(proposal),
         });
         driver.process(DriverEvent::InboundVote {
             from: "127.0.0.1:27600".parse().unwrap(),
@@ -2696,7 +2696,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for (index, driver) in fixture.drivers.iter_mut().enumerate() {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: initial_proposal.clone(),
+                proposal: Box::new(initial_proposal.clone()),
             });
             assert!(driver.pending_proposal(&initial_hash).is_some());
             let metrics_after_accept = driver.proposal_admission_metrics;
@@ -2707,7 +2707,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .parse()
                             .unwrap(),
                     ),
-                    proposal: initial_proposal.clone(),
+                    proposal: Box::new(initial_proposal.clone()),
                 });
             }
             assert_eq!(driver.proposal_admission_metrics, metrics_after_accept);
@@ -2798,7 +2798,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 .unwrap();
             fixture.drivers[0].process(DriverEvent::InboundBlock {
                 from: Some("127.0.0.1:28400".parse().unwrap()),
-                proposal,
+                proposal: Box::new(proposal),
             });
         }
         assert!(fixture.drivers[0].pending_blocks.len() >= 12);
@@ -2887,7 +2887,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .parse()
                             .unwrap(),
                     ),
-                    proposal: initial_proposal.clone(),
+                    proposal: Box::new(initial_proposal.clone()),
                 });
                 fixture.drivers[0].process(DriverEvent::InboundVote {
                     from: format!("127.0.0.1:{}", 28700 + replay)
@@ -2978,7 +2978,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         for driver in fixture.drivers.iter_mut().take(3) {
             driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal: recovery_proposal.clone(),
+                proposal: Box::new(recovery_proposal.clone()),
             });
         }
         let mut recovery_prevotes: Vec<Option<VoteV1>> = vec![None; 4];
@@ -3030,7 +3030,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         assert_eq!(fixture.drivers[3].requested_proposals.len(), 1);
         let proposal_actions = fixture.drivers[3].process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:29000".parse().unwrap()),
-            proposal: recovery_proposal.clone(),
+            proposal: Box::new(recovery_proposal.clone()),
         });
         assert!(proposal_actions
             .iter()
@@ -3085,8 +3085,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         // suppress the eventual valid quorum transition.
         let mut recovery_precommits: Vec<Option<VoteV1>> = vec![None; 4];
         recovery_precommits[3] = d_precommit;
-        for receiver in 0..4 {
-            for source in 0..4 {
+        let mut receiver = 0;
+        while receiver < fixture.drivers.len() {
+            for (source, vote) in recovery_prevotes.iter().enumerate() {
                 if source == receiver {
                     continue;
                 }
@@ -3094,7 +3095,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     from: format!("127.0.0.1:{}", 29200 + source)
                         .parse()
                         .unwrap(),
-                    vote: recovery_prevotes[source].clone().unwrap(),
+                    vote: vote.clone().unwrap(),
                 });
                 if let Some(precommit) = actions.into_iter().find_map(|action| match action {
                     DriverAction::BroadcastVote(vote) if vote.step == VoteStep::Precommit => {
@@ -3107,6 +3108,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             }
             assert!(recovery_precommits[receiver].is_some());
             assert_eq!(fixture.drivers[receiver].locked_value, Some(recovery_hash));
+            receiver += 1;
         }
 
         // These are production-path bounds, with no test-side pruning. Replay
@@ -3202,7 +3204,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                         .parse()
                         .unwrap(),
                 ),
-                proposal: initial_proposal.clone(),
+                proposal: Box::new(initial_proposal.clone()),
             });
             for vote in &initial_prevotes {
                 driver.process(DriverEvent::InboundVote {
@@ -3364,7 +3366,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             // schedules keep a deterministic 2+2 partition for two complete
             // rounds; odd schedules model a changing 3+1 isolation and relay
             // topology for one round. No side receives three value identities.
-            let disturbed_rounds = if seed % 2 == 0 && height == 1 { 2 } else { 1 };
+            let disturbed_rounds = if seed.is_multiple_of(2) && height == 1 { 2 } else { 1 };
             for disturbance in 0..disturbed_rounds {
                 let round = fixture.drivers[0].current_round();
                 assert!(fixture.drivers.iter().all(|driver| {
@@ -3413,7 +3415,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                                     .parse()
                                     .unwrap(),
                             ),
-                            proposal: proposal.clone(),
+                            proposal: Box::new(proposal.clone()),
                         });
                         assert_multiseed_chaos_safety(&fixture.drivers);
                     }
@@ -3474,7 +3476,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .unwrap(),
                         vote: prevotes[source].clone(),
                     });
-                    if (seed + height + disturbance) % 2 == 0 {
+                    if (seed + height + disturbance).is_multiple_of(2) {
                         for duplicate in 0..2 {
                             fixture.drivers[receiver].process(DriverEvent::InboundVote {
                                 from: format!(
@@ -3611,7 +3613,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 for driver in &mut fixture.drivers {
                     driver.process(DriverEvent::InboundBlock {
                         from: None,
-                        proposal: proposal.clone(),
+                        proposal: Box::new(proposal.clone()),
                     });
                 }
                 let prevotes: Vec<_> = fixture
@@ -3629,8 +3631,9 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     })
                     .collect();
                 let mut precommits: Vec<Option<VoteV1>> = vec![None; 4];
-                for receiver in 0..4 {
-                    for source in 0..4 {
+                let mut receiver = 0;
+                while receiver < fixture.drivers.len() {
+                    for (source, vote) in prevotes.iter().enumerate() {
                         if source == receiver {
                             continue;
                         }
@@ -3638,7 +3641,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             from: format!("127.0.0.1:{}", 30_400 + source * 10 + receiver)
                                 .parse()
                                 .unwrap(),
-                            vote: prevotes[source].clone(),
+                            vote: vote.clone(),
                         });
                         if let Some(vote) = actions.into_iter().find_map(|action| match action {
                             DriverAction::BroadcastVote(vote)
@@ -3650,6 +3653,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     }
                     assert_eq!(fixture.drivers[receiver].locked_value, Some(hash));
                     assert!(precommits[receiver].is_some());
+                    receiver += 1;
                 }
                 let restart_index =
                     (multiseed_chaos_next(&mut schedule_state) as usize) % fixture.drivers.len();
@@ -3671,7 +3675,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 for driver in &mut fixture.drivers {
                     driver.process(DriverEvent::InboundBlock {
                         from: None,
-                        proposal: proposal.clone(),
+                        proposal: Box::new(proposal.clone()),
                     });
                     for (source, vote) in prevotes.iter().take(3).enumerate() {
                         driver.process(DriverEvent::InboundVote {
@@ -3724,14 +3728,14 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     })
                     .collect();
                 let mut nil_precommits: Vec<Option<VoteV1>> = vec![None; 4];
-                for receiver in 0..4 {
-                    for source in 0..4 {
+                for (receiver, driver) in fixture.drivers.iter_mut().enumerate() {
+                    for (source, vote) in nil_prevotes.iter().enumerate() {
                         if source != receiver {
-                            let actions = fixture.drivers[receiver].process(DriverEvent::InboundVote {
+                            let actions = driver.process(DriverEvent::InboundVote {
                                 from: format!("127.0.0.1:{}", 30_600 + source * 10 + receiver)
                                     .parse()
                                     .unwrap(),
-                                vote: nil_prevotes[source].clone(),
+                                vote: vote.clone(),
                             });
                             if let Some(vote) = actions.into_iter().find_map(|action| match action {
                                 DriverAction::BroadcastVote(vote)
@@ -3755,14 +3759,14 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                     }
                     assert!(nil_precommits[index].is_some());
                 }
-                for receiver in 0..4 {
-                    for source in 0..4 {
+                for (receiver, driver) in fixture.drivers.iter_mut().enumerate() {
+                    for (source, vote) in nil_precommits.iter().enumerate() {
                         if source != receiver {
-                            fixture.drivers[receiver].process(DriverEvent::InboundVote {
+                            driver.process(DriverEvent::InboundVote {
                                 from: format!("127.0.0.1:{}", 30_700 + source * 10 + receiver)
                                     .parse()
                                     .unwrap(),
-                                vote: nil_precommits[source].clone().unwrap(),
+                                vote: vote.clone().unwrap(),
                             });
                         }
                     }
@@ -3852,7 +3856,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .parse()
                             .unwrap(),
                     ),
-                    proposal: proposal.clone(),
+                    proposal: Box::new(proposal.clone()),
                 });
                 assert!(fixture.drivers[receiver]
                     .pending_proposal(&recovery_hash)
@@ -3905,14 +3909,14 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 .buffered_votes
                 .contains_key(&(height, recovery_round, recovery_hash)));
             delivered_step += 1;
-            assert!(1 <= MAX_POST_GST_DELIVERY_STEPS);
+            const _: () = assert!(1 <= MAX_POST_GST_DELIVERY_STEPS);
             fixture.drivers[vote_before_proposal].process(DriverEvent::InboundBlock {
                 from: Some(
                     format!("127.0.0.1:{}", 31_000 + proposer * 10 + vote_before_proposal)
                         .parse()
                         .unwrap(),
                 ),
-                proposal: proposal.clone(),
+                proposal: Box::new(proposal.clone()),
             });
             assert!(!fixture.drivers[vote_before_proposal]
                 .buffered_votes
@@ -3942,7 +3946,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .parse()
                             .unwrap(),
                     ),
-                    proposal: proposal.clone(),
+                    proposal: Box::new(proposal.clone()),
                 });
             }
             assert_eq!(
@@ -3975,7 +3979,8 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
             let mut precommits: Vec<Option<VoteV1>> = vec![None; 4];
             precommits[vote_before_proposal] = early_precommit;
-            for receiver in 0..4 {
+            let mut receiver = 0;
+            while receiver < fixture.drivers.len() {
                 let mut sources = [0usize, 1, 2, 3];
                 sources.rotate_left((receiver + seed as usize + height as usize) % 4);
                 for source in sources {
@@ -4003,6 +4008,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 }
                 assert_eq!(fixture.drivers[receiver].locked_value, Some(recovery_hash));
                 assert!(precommits[receiver].is_some());
+                receiver += 1;
             }
 
             // One local and one remote precommit is exactly 2/4 and cannot
@@ -4168,7 +4174,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                             .parse()
                             .unwrap(),
                     ),
-                    proposal: proposal.clone(),
+                    proposal: Box::new(proposal.clone()),
                 });
                 driver.process(DriverEvent::InboundVote {
                     from: format!("127.0.0.1:{}", 31_700 + replay * 100 + index)
@@ -4361,9 +4367,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let observer = &mut fixture.drivers[3];
         let pressure_round = observer.current_round();
         let minimum_retained_round = pressure_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
-        let maximum_retained_round = pressure_round
-            .checked_add(MAX_ACCEPTED_ROUND_JUMP)
-            .unwrap_or(u32::MAX)
+        let maximum_retained_round = pressure_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
             .min(MAX_ROUNDS_PER_HEIGHT - 1);
         assert!(observer.round_advance_evidence.keys().all(|(height, round)| {
             *height == 1
@@ -4633,12 +4637,10 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             .unwrap();
         driver.engine.state.consensus_snapshots = vec![at_601.clone(), at_901.clone()];
 
-        let signers = vec![
-            (local_id, local_seed, local),
+        let signers = [(local_id, local_seed, local),
             (b_id, b_seed, b),
             (c_id, c_seed, c),
-            (d_id, d_seed, d),
-        ];
+            (d_id, d_seed, d)];
         let snapshots = [(1, genesis), (301, at_301), (601, at_601), (901, at_901)];
         let run = || {
             snapshots
@@ -4938,7 +4940,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: Some(peer_a),
-            proposal: block,
+            proposal: Box::new(block),
         });
         actions.extend(driver.on_propose_timeout());
         actions.extend(driver.process(DriverEvent::InboundVote {
@@ -4981,7 +4983,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let block_hash = block.header.block_hash();
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9201".parse().unwrap()),
-            proposal: block,
+            proposal: Box::new(block),
         });
         actions.extend(driver.on_propose_timeout());
 
@@ -5006,7 +5008,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let phase_before = driver.current_phase();
         let first = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9202".parse().unwrap()),
-            proposal: proposal.clone(),
+            proposal: Box::new(proposal.clone()),
         });
         assert!(first
             .iter()
@@ -5026,7 +5028,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         // a reconnected peer. Driver-authoritative state is connection-agnostic.
         let replay = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9203".parse().unwrap()),
-            proposal,
+            proposal: Box::new(proposal),
         });
 
         assert!(replay
@@ -5054,7 +5056,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let rejected = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9204".parse().unwrap()),
-            proposal: invalid,
+            proposal: Box::new(invalid),
         });
         assert!(rejected
             .iter()
@@ -5065,7 +5067,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let accepted = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9205".parse().unwrap()),
-            proposal: valid,
+            proposal: Box::new(valid),
         });
         assert!(accepted
             .iter()
@@ -5091,7 +5093,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let before = driver.proposal_admission_metrics;
         let accepted = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9206".parse().unwrap()),
-            proposal: proposal.clone(),
+            proposal: Box::new(proposal.clone()),
         });
         assert!(accepted
             .iter()
@@ -5112,7 +5114,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let replay = driver.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9207".parse().unwrap()),
-            proposal,
+            proposal: Box::new(proposal),
         });
         assert!(replay
             .iter()
@@ -5149,7 +5151,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let b_vrf = VrfKeypair::from_seed(&[0x02; 32]);
         let round = (0..MAX_ROUNDS_PER_HEIGHT)
             .find(|round| {
-                let election = election_for_round(&driver, 1, *round);
+                let election = election_for_round(driver, 1, *round);
                 indra_consensus::proposer::compute_proposer_vrf(a_id, &a_vrf, &election)
                     .is_ok_and(|r| r.eligible)
                     && indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, &election)
@@ -5172,11 +5174,11 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let first = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: worse.clone(),
+            proposal: Box::new(worse.clone()),
         });
         let switched = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: better,
+            proposal: Box::new(better),
         });
         assert!(!first.iter().chain(&switched).any(|action| matches!(
             action,
@@ -5191,7 +5193,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let after_prevote = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: worse,
+            proposal: Box::new(worse),
         });
         assert!(!after_prevote.iter().any(|action| matches!(
             action,
@@ -5218,7 +5220,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let block_hash = block.header.block_hash();
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block,
+            proposal: Box::new(block),
         });
         actions.extend(driver.on_propose_timeout());
 
@@ -5265,7 +5267,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let block = make_strict_block(&driver, [0x50u8; 32], 3, vec![]);
         let _actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block,
+            proposal: Box::new(block),
         });
 
         assert_eq!(driver.current_round(), 10);
@@ -5282,7 +5284,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let block = make_strict_block(&driver, [0x51u8; 32], 5, vec![]);
         let actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block,
+            proposal: Box::new(block),
         });
 
         assert_eq!(driver.current_round(), 0);
@@ -5790,7 +5792,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
             );
             let actions = driver.process(DriverEvent::InboundBlock {
                 from: None,
-                proposal,
+                proposal: Box::new(proposal),
             });
             assert!(
                 actions
@@ -5855,7 +5857,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.current_round = block.header.proposer_round;
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block,
+            proposal: Box::new(block),
         });
         actions.extend(driver.on_propose_timeout());
         let remote_signers = [
@@ -7267,7 +7269,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let malformed_hash = malformed_block3.header.block_hash();
         let actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: malformed_block3,
+            proposal: Box::new(malformed_block3),
         });
 
         assert!(actions
@@ -7321,7 +7323,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let seed_at_height_two = driver.engine.state.election_seed;
         let _ = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block1,
+            proposal: Box::new(block1),
         });
         assert_eq!(driver.engine.state.election_seed, seed_at_height_two);
         assert!(!driver.last_qc_is_stale());
@@ -7678,7 +7680,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver.current_round = original_round;
         let mut actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block,
+            proposal: Box::new(block),
         });
         actions.extend(driver.on_propose_timeout());
         assert!(actions.iter().any(
@@ -7916,7 +7918,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         );
         let actions = driver.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: substituted,
+            proposal: Box::new(substituted),
         });
 
         assert!(actions
@@ -8034,7 +8036,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let a_vrf = VrfKeypair::from_seed(&[0x01; 32]);
         let election_round_zero = (0..MAX_ROUNDS_PER_HEIGHT)
-            .map(|round| election_for_round(&driver_a, 1, round))
+            .map(|round| election_for_round(driver_a, 1, round))
             .find(|election| {
                 indra_consensus::proposer::compute_proposer_vrf(a_id, &a_vrf, election)
                     .is_ok_and(|result| result.eligible)
@@ -8056,7 +8058,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver_b.current_round = original_round;
         let mut stage_actions = driver_b.process(DriverEvent::InboundBlock {
             from: Some("127.0.0.1:9801".parse().unwrap()),
-            proposal: block_x.clone(),
+            proposal: Box::new(block_x.clone()),
         });
         stage_actions.extend(driver_b.on_propose_timeout());
         assert!(stage_actions.iter().any(|action| matches!(
@@ -8076,7 +8078,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 VoteStep::Prevote,
                 block_x_hash,
                 validator_id,
-                governing_snapshot_root(&driver_b, 1),
+                governing_snapshot_root(driver_b, 1),
                 TEST_CHAIN_ID,
                 signer,
             )
@@ -8102,7 +8104,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         driver_b.on_precommit_timeout().unwrap();
         let b_vrf = VrfKeypair::from_seed(&[0x02; 32]);
         let election_round_one = (original_round + 1..MAX_ROUNDS_PER_HEIGHT)
-            .map(|round| election_for_round(&driver_b, 1, round))
+            .map(|round| election_for_round(driver_b, 1, round))
             .find(|election| {
                 indra_consensus::proposer::compute_proposer_vrf(b_id, &b_vrf, election)
                     .is_ok_and(|result| result.eligible)
@@ -8131,7 +8133,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
 
         let mut reproposal_actions = driver_b.process(DriverEvent::InboundBlock {
             from: None,
-            proposal: block_y.clone(),
+            proposal: Box::new(block_y.clone()),
         });
         reproposal_actions.extend(driver_b.on_propose_timeout());
         assert!(reproposal_actions.iter().any(|action| matches!(
@@ -8151,7 +8153,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 VoteStep::Prevote,
                 block_y_hash,
                 validator_id,
-                governing_snapshot_root(&driver_b, 1),
+                governing_snapshot_root(driver_b, 1),
                 TEST_CHAIN_ID,
                 signer,
             )
@@ -8173,7 +8175,7 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 VoteStep::Precommit,
                 block_y_hash,
                 validator_id,
-                governing_snapshot_root(&driver_b, 1),
+                governing_snapshot_root(driver_b, 1),
                 TEST_CHAIN_ID,
                 signer,
             )

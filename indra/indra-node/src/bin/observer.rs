@@ -361,7 +361,7 @@ async fn connect_and_sync(
                         }
                     }
                     Message::Block(block) => {
-                        import_observer_block(&engine, block, &metrics_state, &last_block_timestamp)?;
+                        import_observer_block(&engine, *block, &metrics_state, &last_block_timestamp)?;
                     }
                     Message::BlockResponse { blocks, .. } => {
                         for block in blocks {

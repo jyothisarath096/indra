@@ -125,7 +125,7 @@ fn transaction_max_inputs_and_outputs() {
     tx.inputs = (0..MAX_INPUTS as u8)
         .map(|i| input(i, i.wrapping_add(100)))
         .collect();
-    tx.outputs = (0..MAX_OUTPUTS as u8).map(|i| output(i)).collect();
+    tx.outputs = (0..MAX_OUTPUTS as u8).map(output).collect();
     assert_eq!(
         tx,
         TransactionV1::decode_exact(&tx.encode_to_vec()).unwrap()
@@ -255,24 +255,24 @@ fn truncated_bytes_rejected() {
 
 #[test]
 fn lifetime_supply_cap_is_exact() {
-    assert_eq!(LIFETIME_SUPPLY_CAP_SPARK, 100_000_000_000_000_000u64);
+    const _: () = assert!(LIFETIME_SUPPLY_CAP_SPARK == 100_000_000_000_000_000u64);
 }
 
 #[test]
 fn allocation_shares_sum_to_ten_thousand() {
-    assert_eq!(FEE_BURN_BPS + FEE_VALIDATOR_BPS, 10_000);
+    const _: () = assert!(FEE_BURN_BPS + FEE_VALIDATOR_BPS == 10_000);
 }
 
 #[test]
 fn dust_limit_is_nonzero() {
-    assert!(DUST_LIMIT_SPARK > 0);
+    const _: () = assert!(DUST_LIMIT_SPARK > 0);
 }
 
 #[test]
 fn signer_bitfield_covers_all_validators() {
     use indra_core::types::primitives::MAX_VALIDATORS;
     // Must have enough bits for all validator slots
-    assert!(SIGNER_BITFIELD_BYTES * 8 >= MAX_VALIDATORS);
+    const _: () = assert!(SIGNER_BITFIELD_BYTES * 8 >= MAX_VALIDATORS);
     // Must be the minimum needed (no excessive padding)
-    assert_eq!(SIGNER_BITFIELD_BYTES, (MAX_VALIDATORS + 7) / 8);
+    const _: () = assert!(SIGNER_BITFIELD_BYTES == MAX_VALIDATORS.div_ceil(8));
 }

@@ -155,6 +155,10 @@ struct StakingHandleArgs {
 /// Build and sign a RegisterValidator staking operation using an opaque handle.
 /// The VRF public key is derived from the handle's stored public metadata.
 #[no_mangle]
+/// # Safety
+///
+/// All raw pointers must reference readable buffers of the sizes implied by
+/// their parameters; output buffers must be writable and large enough.
 pub unsafe extern "C" fn indra_build_register_validator_with_handle(
     session: IndraSessionHandle,
     commission_bps: u32,
@@ -202,6 +206,10 @@ pub unsafe extern "C" fn indra_build_register_validator_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `deposit_utxo_id` must reference 32 readable bytes and output buffers must
+/// be writable for their declared capacities.
 pub unsafe extern "C" fn indra_build_self_stake_with_handle(
     session: IndraSessionHandle,
     deposit_utxo_id: *const u8,
@@ -245,6 +253,10 @@ pub unsafe extern "C" fn indra_build_self_stake_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `validator_id` and `deposit_utxo_id` must each reference 32 readable bytes;
+/// output buffers must be writable for their declared capacities.
 pub unsafe extern "C" fn indra_build_delegate_with_handle(
     session: IndraSessionHandle,
     validator_id: *const u8,
@@ -284,6 +296,10 @@ pub unsafe extern "C" fn indra_build_delegate_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `validator_id` must reference 32 readable bytes and output buffers must be
+/// writable for their declared capacities.
 pub unsafe extern "C" fn indra_build_delegator_claim_rewards_with_handle(
     session: IndraSessionHandle,
     validator_id: *const u8,
@@ -321,6 +337,10 @@ pub unsafe extern "C" fn indra_build_delegator_claim_rewards_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// Output buffers must be writable for their declared capacities; both handles
+/// must belong to `session` and remain valid for this call.
 pub unsafe extern "C" fn indra_build_validator_claim_rewards_with_handle(
     session: IndraSessionHandle,
     hot_handle: IndraKeyHandle,
@@ -360,6 +380,10 @@ pub unsafe extern "C" fn indra_build_validator_claim_rewards_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// Output buffers must be writable for their declared capacities; the hot
+/// handle must belong to `session` and remain valid for this call.
 pub unsafe extern "C" fn indra_build_set_commission_with_handle(
     session: IndraSessionHandle,
     new_commission_bps: u32,
@@ -403,6 +427,10 @@ pub unsafe extern "C" fn indra_build_set_commission_with_handle(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `target_validator_id` must reference 32 readable bytes; output buffers must
+/// be writable for their declared capacities and the hot handle must be valid.
 pub unsafe extern "C" fn indra_build_set_auto_delegate_with_handle(
     session: IndraSessionHandle,
     target_validator_id: *const u8,

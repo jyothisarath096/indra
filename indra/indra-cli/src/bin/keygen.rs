@@ -319,40 +319,6 @@ fn owner_details(
     Ok((owner_hex, address.to_text()))
 }
 
-#[cfg(test)]
-mod inspect_tests {
-    use super::*;
-    use indra_core::codec::Decode;
-
-    #[test]
-    fn inspect_owner_hex_and_payment_address_round_trip_for_hot_and_cold_keys() {
-        let chain_id = "inspect-test";
-        let hot = indra_cli::generate_from_master_seed("hot".to_string(), [7; 32]).unwrap();
-        let cold = indra_cli::ColdKeysFile::generate().unwrap();
-        for (classical, pq) in [
-            (
-                hot.public.hybrid_classical_pk,
-                hot.public.hybrid_pq_pk.clone(),
-            ),
-            (cold.classical_pk, cold.pq_pk.clone()),
-        ] {
-            let (owner_hex, address_text) = owner_details(classical, pq.clone(), chain_id).unwrap();
-            let decoded = HybridPubKey::decode_exact(&hex::decode(owner_hex).unwrap()).unwrap();
-            assert_eq!(decoded.classical_pk, Bytes32::from(classical));
-            assert_eq!(decoded.pq_pk.as_slice(), pq.as_slice());
-            let address = PaymentAddressV1::from_text(&address_text, chain_id.as_bytes()).unwrap();
-            assert_eq!(address.owner_pubkey().classical.0, classical);
-            assert_eq!(address.owner_pubkey().pq.0.as_slice(), pq.as_slice());
-            if classical == hot.public.hybrid_classical_pk {
-                assert_eq!(
-                    hot.payment_address(chain_id.as_bytes()).unwrap().to_text(),
-                    address_text
-                );
-            }
-        }
-    }
-}
-
 fn cmd_cold(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("ceremony") => return cmd_cold_ceremony(&args[1..]),
@@ -763,6 +729,40 @@ impl Drop for EchoGuard {
         if self.active {
             // SAFETY: `original` came from a successful tcgetattr call for stdin.
             let _ = unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.original) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::*;
+    use indra_core::codec::Decode;
+
+    #[test]
+    fn inspect_owner_hex_and_payment_address_round_trip_for_hot_and_cold_keys() {
+        let chain_id = "inspect-test";
+        let hot = indra_cli::generate_from_master_seed("hot".to_string(), [7; 32]).unwrap();
+        let cold = indra_cli::ColdKeysFile::generate().unwrap();
+        for (classical, pq) in [
+            (
+                hot.public.hybrid_classical_pk,
+                hot.public.hybrid_pq_pk.clone(),
+            ),
+            (cold.classical_pk, cold.pq_pk.clone()),
+        ] {
+            let (owner_hex, address_text) = owner_details(classical, pq.clone(), chain_id).unwrap();
+            let decoded = HybridPubKey::decode_exact(&hex::decode(owner_hex).unwrap()).unwrap();
+            assert_eq!(decoded.classical_pk, Bytes32::from(classical));
+            assert_eq!(decoded.pq_pk.as_slice(), pq.as_slice());
+            let address = PaymentAddressV1::from_text(&address_text, chain_id.as_bytes()).unwrap();
+            assert_eq!(address.owner_pubkey().classical.0, classical);
+            assert_eq!(address.owner_pubkey().pq.0.as_slice(), pq.as_slice());
+            if classical == hot.public.hybrid_classical_pk {
+                assert_eq!(
+                    hot.payment_address(chain_id.as_bytes()).unwrap().to_text(),
+                    address_text
+                );
+            }
         }
     }
 }

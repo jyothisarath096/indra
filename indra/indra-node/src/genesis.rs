@@ -282,7 +282,7 @@ fn decode_hex_len(value: &str, expected: usize, field: &str) -> Result<Vec<u8>, 
 }
 
 fn decode_hex_len_any(value: &str, field: &str) -> Result<Vec<u8>, String> {
-    if value.is_empty() || value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if value.is_empty() || !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
         return Err(format!("genesis {field} must be canonical lowercase hexadecimal"));
     }
     hex::decode(value).map_err(|_| format!("invalid hex in genesis {field}"))

@@ -1250,12 +1250,12 @@ fn retained_protocol_block(
     match retained_block(entry.created_height, state) {
         Ok(Some(block)) => Ok(block),
         Ok(None) => {
-            return Err(unrecoverable(
+            Err(unrecoverable(
                 "staking_protocol_output_unavailable",
                 retained_block_unavailable_reason(entry.created_height, state),
             ))
         }
-        Err(reason) => return Err(unrecoverable("staking_protocol_output_unavailable", reason)),
+        Err(reason) => Err(unrecoverable("staking_protocol_output_unavailable", reason)),
     }
 }
 
@@ -1769,7 +1769,7 @@ fn optional_id(params: &[String], index: usize, field: &str) -> RpcResult<Option
     if value.is_empty() || value == "null" {
         return Ok(None);
     }
-    parse_hex32_value(&value, field).map(Some)
+    parse_hex32_value(value, field).map(Some)
 }
 
 fn tombstone_retains_position(state: &ChainState, position_id: &Bytes32) -> bool {
