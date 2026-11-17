@@ -148,6 +148,9 @@ struct NodeLoc {
     prefix: [u8; 32],
 }
 
+#[cfg(test)]
+type ChildHashes = (Option<[u8; 32]>, Option<[u8; 32]>);
+
 /// Sparse Merkle Tree with a 256-bit key space.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SparseMerkleTree {
@@ -457,7 +460,7 @@ impl SparseMerkleTree {
             let Some(child_level) = levels.get(child_depth).cloned() else {
                 continue;
             };
-            let mut grouped: HashMap<NodeLoc, (Option<[u8; 32]>, Option<[u8; 32]>)> =
+            let mut grouped: HashMap<NodeLoc, ChildHashes> =
                 HashMap::new();
             for (loc, hash) in child_level {
                 let parent = NodeLoc {

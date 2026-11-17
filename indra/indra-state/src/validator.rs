@@ -502,13 +502,15 @@ pub fn validate_validator_cold_key(
         .ok_or_else(|| StateError::InvalidStakingOp("cold-key version overflow".to_string()))?;
     validate_cold_key_material(
         validators,
-        validator_id,
-        validator.hybrid_classical_pk,
-        validator.hybrid_pq_pk.as_deref(),
-        classical_bytes,
-        pq_bytes,
-        proposed_version,
-        expected_version,
+        ColdKeyValidationInput {
+            validator_id,
+            target_hot_classical_pk: validator.hybrid_classical_pk,
+            target_hot_pq_pk: validator.hybrid_pq_pk.as_deref(),
+            classical_bytes,
+            pq_bytes,
+            proposed_version,
+            expected_version,
+        },
     )
 }
 
@@ -527,26 +529,41 @@ pub fn validate_new_validator_cold_key(
     }
     validate_cold_key_material(
         validators,
-        validator_id,
-        Some(proposed_hot_classical_pk),
-        Some(proposed_hot_pq_pk),
-        classical_bytes,
-        pq_bytes,
-        proposed_version,
-        1,
+        ColdKeyValidationInput {
+            validator_id,
+            target_hot_classical_pk: Some(proposed_hot_classical_pk),
+            target_hot_pq_pk: Some(proposed_hot_pq_pk),
+            classical_bytes,
+            pq_bytes,
+            proposed_version,
+            expected_version: 1,
+        },
     )
+}
+
+struct ColdKeyValidationInput<'a> {
+    validator_id: &'a Bytes32,
+    target_hot_classical_pk: Option<[u8; 32]>,
+    target_hot_pq_pk: Option<&'a [u8]>,
+    classical_bytes: &'a [u8],
+    pq_bytes: &'a [u8],
+    proposed_version: u64,
+    expected_version: u64,
 }
 
 fn validate_cold_key_material(
     validators: &ValidatorSet,
-    validator_id: &Bytes32,
-    target_hot_classical_pk: Option<[u8; 32]>,
-    target_hot_pq_pk: Option<&[u8]>,
-    classical_bytes: &[u8],
-    pq_bytes: &[u8],
-    proposed_version: u64,
-    expected_version: u64,
+    input: ColdKeyValidationInput<'_>,
 ) -> StateResult<ValidatedColdKey> {
+    let ColdKeyValidationInput {
+        validator_id,
+        target_hot_classical_pk,
+        target_hot_pq_pk,
+        classical_bytes,
+        pq_bytes,
+        proposed_version,
+        expected_version,
+    } = input;
     if proposed_version == 0 || proposed_version != expected_version {
         return Err(StateError::InvalidStakingOp(format!(
             "cold-key version must be exactly {expected_version}, got {proposed_version}"

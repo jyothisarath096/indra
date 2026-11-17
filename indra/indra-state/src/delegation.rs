@@ -400,15 +400,17 @@ fn apply_staking_op_mode(
             ..
         } => apply_register_validator(
             state,
-            *commission_bps,
-            *deposit_utxo_id,
-            validator_pubkey,
-            *vrf_pk,
-            vrf_possession_output,
-            vrf_possession_proof,
-            cold_pubkey,
-            chain_id,
-            current_height,
+            RegisterValidatorInput {
+                commission_bps: *commission_bps,
+                deposit_utxo_id: *deposit_utxo_id,
+                validator_pubkey,
+                vrf_pk: *vrf_pk,
+                vrf_possession_output,
+                vrf_possession_proof,
+                cold_pubkey,
+                chain_id,
+                current_height,
+            },
         ),
         StakingOpBody::SetCommission {
             validator_id,
@@ -704,18 +706,33 @@ fn verify_staking_sig(
     })
 }
 
-fn apply_register_validator(
-    state: &mut ChainState,
+struct RegisterValidatorInput<'a> {
     commission_bps: u32,
     deposit_utxo_id: Bytes32,
-    validator_pubkey: &HybridPubKey,
+    validator_pubkey: &'a HybridPubKey,
     vrf_pk: [u8; 32],
-    vrf_possession_output: &Bytes64,
-    vrf_possession_proof: &VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
-    cold_pubkey: &ColdHybridPubKey,
-    chain_id: &str,
+    vrf_possession_output: &'a Bytes64,
+    vrf_possession_proof: &'a VariableBytes<MAX_STANDARD_VRF_PROOF_BYTES>,
+    cold_pubkey: &'a ColdHybridPubKey,
+    chain_id: &'a str,
     current_height: u64,
+}
+
+fn apply_register_validator(
+    state: &mut ChainState,
+    input: RegisterValidatorInput<'_>,
 ) -> StateResult<()> {
+    let RegisterValidatorInput {
+        commission_bps,
+        deposit_utxo_id,
+        validator_pubkey,
+        vrf_pk,
+        vrf_possession_output,
+        vrf_possession_proof,
+        cold_pubkey,
+        chain_id,
+        current_height,
+    } = input;
     if commission_bps < MIN_COMMISSION_BPS
         || commission_bps > state.governance.params.max_commission_bps
     {

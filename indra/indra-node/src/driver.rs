@@ -2240,13 +2240,16 @@ impl ConsensusDriver {
             .iter()
             .fold(0u64, |sum, voter| sum.saturating_add(voter.stake));
         match self.sync.observe_status(
-            validator_id,
-            from,
-            height,
-            tip_hash,
-            peer_stake,
-            total_active_stake,
-            our_height,
+            (
+                validator_id,
+                from,
+                height,
+                tip_hash,
+                peer_stake,
+                total_active_stake,
+                our_height,
+            )
+                .into(),
             Instant::now(),
         ) {
             Some((peer, from_height, to_height)) => vec![DriverAction::RequestBlocks {

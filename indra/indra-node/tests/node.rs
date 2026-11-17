@@ -48,13 +48,7 @@ fn observe_sync_status(
     let validator_id = Bytes32::from([0x13; 32]);
     sync.peer_connected(validator_id);
     sync.observe_status(
-        validator_id,
-        peer,
-        peer_height,
-        Bytes32::ZERO,
-        100,
-        100,
-        local_height,
+        (validator_id, peer, peer_height, Bytes32::ZERO, 100, 100, local_height).into(),
         Instant::now(),
     )
 }
@@ -977,13 +971,16 @@ fn node_syncs_before_joining_consensus() {
     let voter = driver.engine.registered_voters()[0].clone();
     driver.sync_mut().peer_connected(voter.validator_id);
     let _ = driver.sync_mut().observe_status(
-        voter.validator_id,
-        peer,
-        10,
-        Bytes32::ZERO,
-        voter.stake,
-        voter.stake,
-        local_height,
+        (
+            voter.validator_id,
+            peer,
+            10,
+            Bytes32::ZERO,
+            voter.stake,
+            voter.stake,
+            local_height,
+        )
+            .into(),
         Instant::now(),
     );
     assert!(!driver.sync().is_caught_up());

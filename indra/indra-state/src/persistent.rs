@@ -469,12 +469,7 @@ impl PersistentSparseMerkleTree {
     }
 
     #[cfg(test)]
-    fn root_arc_pair(
-        &self,
-    ) -> (
-        Option<Arc<MapNode<[u8; 32], [u8; 32]>>>,
-        Option<Arc<MapNode<PersistentSparseNodeLoc, [u8; 32]>>>,
-    ) {
+    fn root_arc_pair(&self) -> RootArcPair {
         (self.leaves.root_arc(), self.nodes.root_arc())
     }
 
@@ -530,6 +525,12 @@ impl PersistentSparseMerkleTree {
         self.root = acc;
     }
 }
+
+#[cfg(test)]
+type RootArcPair = (
+    Option<Arc<MapNode<[u8; 32], [u8; 32]>>>,
+    Option<Arc<MapNode<PersistentSparseNodeLoc, [u8; 32]>>>,
+);
 
 fn persistent_sparse_set_or_remove_node(
     nodes: &mut PersistentOrdMap<PersistentSparseNodeLoc, [u8; 32]>,
@@ -768,7 +769,9 @@ where
     }
 }
 
-fn remove_min<K, V>(node: &Arc<MapNode<K, V>>) -> (Option<Arc<MapNode<K, V>>>, Arc<MapNode<K, V>>)
+type RemoveMinResult<K, V> = (Option<Arc<MapNode<K, V>>>, Arc<MapNode<K, V>>);
+
+fn remove_min<K, V>(node: &Arc<MapNode<K, V>>) -> RemoveMinResult<K, V>
 where
     K: Clone,
     V: Clone,

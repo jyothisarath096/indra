@@ -50,6 +50,47 @@ struct HeightClaim {
     expires_at: Instant,
 }
 
+/// Authenticated status data received from a peer.
+pub struct PeerStatusObservation {
+    /// Validator identity.
+    pub validator_id: Bytes32,
+    /// Peer socket address.
+    pub peer: SocketAddr,
+    /// Peer chain height.
+    pub peer_height: u64,
+    /// Peer tip hash.
+    pub tip_hash: Bytes32,
+    /// Peer active stake.
+    pub peer_stake: u64,
+    /// Total active stake at the peer.
+    pub total_active_stake: u64,
+    /// Local chain height.
+    pub local_height: u64,
+}
+
+impl From<(Bytes32, SocketAddr, u64, Bytes32, u64, u64, u64)> for PeerStatusObservation {
+    fn from(value: (Bytes32, SocketAddr, u64, Bytes32, u64, u64, u64)) -> Self {
+        let (
+            validator_id,
+            peer,
+            peer_height,
+            tip_hash,
+            peer_stake,
+            total_active_stake,
+            local_height,
+        ) = value;
+        Self {
+            validator_id,
+            peer,
+            peer_height,
+            tip_hash,
+            peer_stake,
+            total_active_stake,
+            local_height,
+        }
+    }
+}
+
 /// One authenticated, locally-issued block-range request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutstandingSyncRequest {
@@ -282,15 +323,18 @@ impl SyncState {
     /// Observe an authenticated validator's expiring, stake-weighted status.
     pub fn observe_status(
         &mut self,
-        validator_id: Bytes32,
-        peer: SocketAddr,
-        peer_height: u64,
-        tip_hash: Bytes32,
-        peer_stake: u64,
-        total_active_stake: u64,
-        local_height: u64,
+        observation: PeerStatusObservation,
         now: Instant,
     ) -> Option<(SocketAddr, u64, u64)> {
+        let PeerStatusObservation {
+            validator_id,
+            peer,
+            peer_height,
+            tip_hash,
+            peer_stake,
+            total_active_stake,
+            local_height,
+        } = observation;
         self.received_peer_status = true;
         self.total_active_stake = total_active_stake;
         self.connected_peers.insert(validator_id);
@@ -1228,13 +1272,16 @@ mod tests {
         let identity = Bytes32::from([identity_byte; 32]);
         sync.peer_connected(identity);
         sync.observe_status(
-            identity,
-            peer,
-            peer_height,
-            Bytes32::from([identity_byte; 32]),
-            100,
-            100,
-            local_height,
+            (
+                identity,
+                peer,
+                peer_height,
+                Bytes32::from([identity_byte; 32]),
+                100,
+                100,
+                local_height,
+            )
+                .into(),
             Instant::now(),
         )
     }
@@ -1402,16 +1449,28 @@ mod tests {
         proposal
     }
 
-    fn build_qc_bytes(
+    struct QcFixture<'a> {
         height: u64,
         round: u32,
         value_hash: Bytes32,
         validator_id: Bytes32,
-        hybrid: &HybridKeypair,
+        hybrid: &'a HybridKeypair,
         pq_pk: Vec<u8>,
         stake: u64,
         snapshot_root: Bytes32,
-    ) -> Vec<u8> {
+    }
+
+    fn build_qc_bytes(fixture: QcFixture<'_>) -> Vec<u8> {
+        let QcFixture {
+            height,
+            round,
+            value_hash,
+            validator_id,
+            hybrid,
+            pq_pk,
+            stake,
+            snapshot_root,
+        } = fixture;
         let vote = produce_vote(
             height,
             round,
@@ -1709,19 +1768,19 @@ mod tests {
             assert_eq!(reference_mempool.len(), actual_mempool.len());
             assert_eq!(reference_mempool.is_empty(), actual_mempool.is_empty());
 
-            prev_qc = build_qc_bytes(
-                block.header.height,
-                block.header.proposer_round,
-                block.header.block_hash(),
+            prev_qc = build_qc_bytes(QcFixture {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                value_hash: block.header.block_hash(),
                 validator_id,
-                &hybrid,
-                hybrid.public_key().pq.0.to_vec(),
-                10_000,
-                actual_state
+                hybrid: &hybrid,
+                pq_pk: hybrid.public_key().pq.0.to_vec(),
+                stake: 10_000,
+                snapshot_root: actual_state
                     .snapshot_for_consensus_height(block.header.height)
                     .unwrap()
                     .snapshot_root,
-            );
+            });
         }
     }
 
@@ -1762,19 +1821,19 @@ mod tests {
                     .pending_rewards_spark
             );
             imported_state = imported.state;
-            previous_qc = build_qc_bytes(
-                block.header.height,
-                block.header.proposer_round,
-                block.header.block_hash(),
+            previous_qc = build_qc_bytes(QcFixture {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                value_hash: block.header.block_hash(),
                 validator_id,
-                &hybrid,
-                hybrid.public_key().pq.0.to_vec(),
-                10_000,
-                imported_state
+                hybrid: &hybrid,
+                pq_pk: hybrid.public_key().pq.0.to_vec(),
+                stake: 10_000,
+                snapshot_root: imported_state
                     .snapshot_for_consensus_height(block.header.height)
                     .unwrap()
                     .snapshot_root,
-            );
+            });
         }
     }
 
@@ -1809,19 +1868,19 @@ mod tests {
             );
 
             state = optimized.state;
-            prev_qc = build_qc_bytes(
-                block.header.height,
-                block.header.proposer_round,
-                block.header.block_hash(),
+            prev_qc = build_qc_bytes(QcFixture {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                value_hash: block.header.block_hash(),
                 validator_id,
-                &hybrid,
-                hybrid.public_key().pq.0.to_vec(),
-                10_000,
-                state
+                hybrid: &hybrid,
+                pq_pk: hybrid.public_key().pq.0.to_vec(),
+                stake: 10_000,
+                snapshot_root: state
                     .snapshot_for_consensus_height(block.header.height)
                     .unwrap()
                     .snapshot_root,
-            );
+            });
         }
     }
 
@@ -1832,19 +1891,19 @@ mod tests {
         advance_fixture_height_with_issuance(&mut state, EPOCH_DURATION_BLOCKS - 1);
         state.tip_hash = Bytes32::from([0xA5; 32]);
 
-        let parent_qc = build_qc_bytes(
-            state.height,
-            0,
-            state.tip_hash,
+        let parent_qc = build_qc_bytes(QcFixture {
+            height: state.height,
+            round: 0,
+            value_hash: state.tip_hash,
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(state.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut mempool = Mempool::default_config();
         let timestamp_secs = 1_999_999_999;
         let block = make_strict_block(&state, 0x62, 0, parent_qc);
@@ -2083,19 +2142,19 @@ mod tests {
                 0,
             )
             .unwrap();
-            prev_qc = build_qc_bytes(
-                block.header.height,
-                block.header.proposer_round,
-                block.header.block_hash(),
+            prev_qc = build_qc_bytes(QcFixture {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                value_hash: block.header.block_hash(),
                 validator_id,
-                &hybrid,
-                pq_pk.clone(),
-                10_000,
-                state
+                hybrid: &hybrid,
+                pq_pk: pq_pk.clone(),
+                stake: 10_000,
+                snapshot_root: state
                     .snapshot_for_consensus_height(block.header.height)
                     .unwrap()
                     .snapshot_root,
-            );
+            });
             assert_eq!(state.height, i);
         }
 
@@ -2176,12 +2235,12 @@ mod tests {
         sync.peer_connected(id_b);
 
         assert_eq!(
-            sync.observe_status(id_a, peer_a, 10_000, Bytes32::ZERO, 33, 100, 0, now),
+            sync.observe_status((id_a, peer_a, 10_000, Bytes32::ZERO, 33, 100, 0).into(), now),
             None,
             "one sub-one-third identity must not set a target"
         );
         assert_eq!(
-            sync.observe_status(id_b, peer_b, 10_000, Bytes32::ZERO, 1, 100, 0, now),
+            sync.observe_status((id_b, peer_b, 10_000, Bytes32::ZERO, 1, 100, 0).into(), now),
             Some((peer_a, 1, 51)),
             "two identities with combined stake strictly above one third corroborate"
         );
@@ -2195,11 +2254,11 @@ mod tests {
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
         assert_eq!(
-            sync.observe_status(id, peer, 9_000, Bytes32::ZERO, 33, 100, 0, now),
+            sync.observe_status((id, peer, 9_000, Bytes32::ZERO, 33, 100, 0).into(), now),
             None
         );
         assert_eq!(
-            sync.observe_status(id, peer, 9_000, Bytes32::ZERO, 34, 100, 0, now),
+            sync.observe_status((id, peer, 9_000, Bytes32::ZERO, 34, 100, 0).into(), now),
             Some((peer, 1, 51))
         );
     }
@@ -2212,7 +2271,7 @@ mod tests {
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
         assert!(sync
-            .observe_status(id, peer, 42, Bytes32::ZERO, 100, 100, 0, now)
+            .observe_status((id, peer, 42, Bytes32::ZERO, 100, 100, 0).into(), now)
             .is_some());
         assert!(sync
             .corroborated_target(0, now + SYNC_HEIGHT_CLAIM_TTL + Duration::from_millis(1))
@@ -2327,7 +2386,7 @@ mod tests {
         let mut sync = SyncState::follower(0);
         assert!(sync.accept_response(id, peer, &[]).is_err());
         sync.peer_connected(id);
-        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, Instant::now());
+        sync.observe_status((id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
         assert!(sync.accept_response(wrong_id, wrong_peer, &[]).is_err());
         let mut out_of_range = make_block(&crate::genesis::test_genesis_state());
         out_of_range.header.height = 99;
@@ -2375,7 +2434,7 @@ mod tests {
         let id = Bytes32::from([0xA7; 32]);
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
-        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, Instant::now());
+        sync.observe_status((id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
         sync.peer_disconnected(id, peer);
         assert!(matches!(sync.phase(), SyncPhase::AwaitingPeers));
         assert!(sync.accept_response(id, peer, &[]).is_err());
@@ -2388,7 +2447,7 @@ mod tests {
         let id = Bytes32::from([0xA8; 32]);
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
-        sync.observe_status(id, peer, 2, Bytes32::ZERO, 100, 100, 0, now);
+        sync.observe_status((id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(), now);
         assert!(sync.expire_outstanding(now).is_none());
         let expired = sync
             .expire_outstanding(now + SYNC_REQUEST_TIMEOUT + Duration::from_millis(1))
@@ -2436,19 +2495,19 @@ mod tests {
         );
         verify_sync_candidate(&unfinalized_fork, &state, 0).unwrap();
 
-        let qc = build_qc_bytes(
-            real.header.height,
-            real.header.proposer_round,
-            real.header.block_hash(),
+        let qc = build_qc_bytes(QcFixture {
+            height: real.header.height,
+            round: real.header.proposer_round,
+            value_hash: real.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(real.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut after_real = state.clone();
         apply_verified_test(&mut after_real, &real, 0).unwrap();
         let carrier = make_strict_block(&after_real, 0xB1, 0, qc);
@@ -2470,35 +2529,35 @@ mod tests {
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0xB2, 10_000, true, true);
         let block = make_strict_block(&state, 0xB2, 0, vec![]);
-        let mut qc = build_qc_bytes(
-            block.header.height,
-            block.header.proposer_round,
-            block.header.block_hash(),
+        let mut qc = build_qc_bytes(QcFixture {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            value_hash: block.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         *qc.last_mut().unwrap() ^= 0x01;
         let mut after_block = state.clone();
         apply_verified_test(&mut after_block, &block, 0).unwrap();
-        let valid_qc = build_qc_bytes(
-            block.header.height,
-            block.header.proposer_round,
-            block.header.block_hash(),
+        let valid_qc = build_qc_bytes(QcFixture {
+            height: block.header.height,
+            round: block.header.proposer_round,
+            value_hash: block.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut carrier = make_strict_block(&after_block, 0xB2, 0, valid_qc);
         replace_qc_and_reauthorize(&mut carrier, qc, 0xB2, after_block.chain_id.as_bytes());
 
@@ -2532,20 +2591,20 @@ mod tests {
             [0x42; 32],
         );
         source.commit_proposal(&block1).unwrap();
-        let qc1 = build_qc_bytes(
-            1,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let qc1 = build_qc_bytes(QcFixture {
+            height: 1,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
             stake,
-            source
+            snapshot_root: source
                 .state
                 .snapshot_for_consensus_height(1)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut block2 = make_strict_block(&source.state, 0x42, 0, qc1);
         authorize_test_proposal(
             &mut block2,
@@ -2554,20 +2613,20 @@ mod tests {
             [0x42; 32],
         );
         source.commit_proposal(&block2).unwrap();
-        let qc2 = build_qc_bytes(
-            2,
-            block2.header.proposer_round,
-            block2.header.block_hash(),
+        let qc2 = build_qc_bytes(QcFixture {
+            height: 2,
+            round: block2.header.proposer_round,
+            value_hash: block2.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
             stake,
-            source
+            snapshot_root: source
                 .state
                 .snapshot_for_consensus_height(2)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         indra_storage::save_last_qc(&source.config.state_dir(), &qc2).unwrap();
         let genesis_path = source_dir.join("genesis.toml");
         drop(source);
@@ -2604,19 +2663,19 @@ mod tests {
         let mut previous_qc = Vec::new();
         for _ in 0..=FINALIZED_BLOCKS {
             let block = make_strict_block(&builder, 0xC1, 0, previous_qc);
-            previous_qc = build_qc_bytes(
-                block.header.height,
-                block.header.proposer_round,
-                block.header.block_hash(),
+            previous_qc = build_qc_bytes(QcFixture {
+                height: block.header.height,
+                round: block.header.proposer_round,
+                value_hash: block.header.block_hash(),
                 validator_id,
-                &hybrid,
-                hybrid.public_key().pq.0.to_vec(),
-                10_000,
-                builder
+                hybrid: &hybrid,
+                pq_pk: hybrid.public_key().pq.0.to_vec(),
+                stake: 10_000,
+                snapshot_root: builder
                     .snapshot_for_consensus_height(block.header.height)
                     .unwrap()
                     .snapshot_root,
-            );
+            });
             apply_verified_test(&mut builder, &block, 0).unwrap();
             blocks.push(block);
         }
@@ -2820,19 +2879,19 @@ mod tests {
         let block1 = make_strict_block(&state, 0x12, 0, vec![]);
         apply_verified_test(&mut state, &block1, 0).unwrap();
 
-        let valid_qc = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let valid_qc = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut block2 = make_strict_block(&state, 0x12, 0, valid_qc);
         replace_qc_and_reauthorize(&mut block2, vec![], 0x12, state.chain_id.as_bytes());
         let err = verify_block_qc(&block2, &state).unwrap_err();
@@ -2852,32 +2911,32 @@ mod tests {
         let block1 = make_strict_block(&state, 0x14, 0, vec![]);
         apply_verified_test(&mut state, &block1, 0).unwrap();
 
-        let wrong_qc_bytes = build_qc_bytes(
-            3,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let wrong_qc_bytes = build_qc_bytes(QcFixture {
+            height: 3,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
-        let valid_qc = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        });
+        let valid_qc = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut block2 = make_strict_block(&state, 0x14, 0, valid_qc);
         replace_qc_and_reauthorize(&mut block2, wrong_qc_bytes, 0x14, state.chain_id.as_bytes());
 
@@ -2903,32 +2962,32 @@ mod tests {
         assert_ne!(wrong_parent_hash, block1.header.block_hash());
         apply_verified_test(&mut state, &block1, 0).unwrap();
 
-        let wrong_parent_qc_bytes = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            wrong_parent_hash,
+        let wrong_parent_qc_bytes = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: wrong_parent_hash,
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
-        let valid_qc = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        });
+        let valid_qc = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut block2 = make_strict_block(&state, 0x15, 0, valid_qc);
         replace_qc_and_reauthorize(
             &mut block2,
@@ -2957,19 +3016,19 @@ mod tests {
         let block1 = make_strict_block(&state, 0x16, 0, vec![]);
         apply_verified_test(&mut state, &block1, 0).unwrap();
 
-        let qc_bytes = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let qc_bytes = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let block2 = make_strict_block(&state, 0x16, 0, qc_bytes);
 
         assert!(verify_block_qc(&block2, &state).is_ok());
@@ -2980,19 +3039,19 @@ mod tests {
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (validator_id, hybrid) = install_active_validator(&mut state, 0x17, 10_000, true, true);
         let block1 = make_strict_block(&state, 0x17, 0, vec![]);
-        let valid_qc = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let valid_qc = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            state
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let mut qc_bytes = valid_qc.clone();
         qc_bytes.push(0xA5);
 
@@ -3024,16 +3083,16 @@ mod tests {
             .snapshot_for_consensus_height(u64::MAX)
             .unwrap()
             .clone();
-        let mut qc = QuorumCertificateV1::decode_exact(&build_qc_bytes(
-            u64::MAX,
-            0,
-            Bytes32::from([0x18; 32]),
+        let mut qc = QuorumCertificateV1::decode_exact(&build_qc_bytes(QcFixture {
+            height: u64::MAX,
+            round: 0,
+            value_hash: Bytes32::from([0x18; 32]),
             validator_id,
-            &hybrid,
-            hybrid.public_key().pq.0.to_vec(),
-            10_000,
-            snapshot.snapshot_root,
-        ))
+            hybrid: &hybrid,
+            pq_pk: hybrid.public_key().pq.0.to_vec(),
+            stake: 10_000,
+            snapshot_root: snapshot.snapshot_root,
+        }))
         .unwrap();
         qc.classical_signatures[0].classical_sig = VariableBytes::from_slice(&[0xEE; 64]).unwrap();
         let verifier = crate::qc_verification::NetworkQcVerifier::new();
@@ -3271,19 +3330,19 @@ mod tests {
         .unwrap();
 
         let pq_pk = hybrid.public_key().pq.0.to_vec();
-        let qc_bytes = build_qc_bytes(
-            block1.header.height,
-            block1.header.proposer_round,
-            block1.header.block_hash(),
+        let qc_bytes = build_qc_bytes(QcFixture {
+            height: block1.header.height,
+            round: block1.header.proposer_round,
+            value_hash: block1.header.block_hash(),
             validator_id,
-            &hybrid,
+            hybrid: &hybrid,
             pq_pk,
-            10_000,
-            state
+            stake: 10_000,
+            snapshot_root: state
                 .snapshot_for_consensus_height(block1.header.height)
                 .unwrap()
                 .snapshot_root,
-        );
+        });
         let block2 = make_strict_block(&state, 0x31, 0, qc_bytes);
 
         let _ = verify_test(&state, &block2);

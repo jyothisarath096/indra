@@ -206,16 +206,22 @@ fn make_output(byte: u8, owner_pubkey: HybridPubKey) -> OutputV1 {
     }
 }
 
-fn make_tx(
-    state: &ChainState,
-    keypair: &HybridKeypair,
+struct TxFixture<'a> {
+    state: &'a ChainState,
+    keypair: &'a HybridKeypair,
     owner_pubkey: HybridPubKey,
     utxo_id: Bytes32,
     input_value: u64,
-    _input_blinding: [u8; 32],
-    _input_tag: u8,
-    _out_byte: u8,
-) -> TransactionV1 {
+}
+
+fn make_tx(fixture: TxFixture<'_>) -> TransactionV1 {
+    let TxFixture {
+        state,
+        keypair,
+        owner_pubkey,
+        utxo_id,
+        input_value,
+    } = fixture;
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
     let output_value = input_value - fee;
     let mut tx = TransactionV1 {
@@ -709,16 +715,13 @@ fn utxo_lifecycle_across_blocks() {
 
     // Block 1: spend that UTXO, create a new one
     let block1_output_value = (TEST_INPUT_VALUE + 0x01u64) - (INITIAL_BASE_FEE_SPARK_PER_KB * 10);
-    let tx = make_tx(
-        &state,
-        &keypair,
-        owner_pubkey.clone(),
+    let tx = make_tx(TxFixture {
+        state: &state,
+        keypair: &keypair,
+        owner_pubkey: owner_pubkey.clone(),
         utxo_id,
-        TEST_INPUT_VALUE + 0x01u64,
-        [0x01; 32],
-        0xAA,
-        0x02,
-    );
+        input_value: TEST_INPUT_VALUE + 0x01u64,
+    });
     let block1 = make_block(&state, vec![tx]);
     apply_block(&mut state, &block1, 0).unwrap();
 
@@ -737,16 +740,13 @@ fn utxo_lifecycle_across_blocks() {
         0,
         0,
     );
-    let tx2 = make_tx(
-        &state,
-        &keypair,
+    let tx2 = make_tx(TxFixture {
+        state: &state,
+        keypair: &keypair,
         owner_pubkey,
-        new_utxo_id,
-        block1_output_value,
-        [0x02; 32],
-        0xBB,
-        0x03,
-    );
+        utxo_id: new_utxo_id,
+        input_value: block1_output_value,
+    });
     let block2 = make_block(&state, vec![tx2]);
     apply_block(&mut state, &block2, 0).unwrap();
 
@@ -838,16 +838,13 @@ fn fees_are_burned() {
     .unwrap();
 
     let fee = INITIAL_BASE_FEE_SPARK_PER_KB * 10;
-    let tx = make_tx(
-        &state,
-        &keypair,
+    let tx = make_tx(TxFixture {
+        state: &state,
+        keypair: &keypair,
         owner_pubkey,
         utxo_id,
-        TEST_INPUT_VALUE + 0x01u64,
-        [0x01; 32],
-        0xCC,
-        0x02,
-    );
+        input_value: TEST_INPUT_VALUE + 0x01u64,
+    });
     assert_eq!(tx.fee_amount, fee);
 
     let block = make_block(&state, vec![tx]);

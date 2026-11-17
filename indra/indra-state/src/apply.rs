@@ -472,16 +472,18 @@ fn apply_slash_v2_at_height_with_accounting_mode(
     apply_slash_common(
         state,
         &shared_shape,
-        offense_id,
-        Some((
-            evidence.membership_proof.entry.classical_vote_pk,
-            evidence.membership_proof.entry.pq_vote_pk.to_vec(),
-        )),
-        chain_id,
-        height,
-        reporter_pubkey,
-        synthetic_output_index,
-        crypto_mode,
+        SlashApplication {
+            evidence_hash: offense_id,
+            historical_keys: Some((
+                evidence.membership_proof.entry.classical_vote_pk,
+                evidence.membership_proof.entry.pq_vote_pk.to_vec(),
+            )),
+            chain_id,
+            height,
+            reporter_pubkey,
+            synthetic_output_index,
+            crypto_mode,
+        },
     )
 }
 
@@ -574,17 +576,30 @@ fn slash_membership_record_for_validation(
         })
 }
 
+struct SlashApplication<'a> {
+    evidence_hash: Bytes32,
+    historical_keys: Option<([u8; 32], Vec<u8>)>,
+    chain_id: &'a str,
+    height: u64,
+    reporter_pubkey: Option<&'a HybridPubKey>,
+    synthetic_output_index: u32,
+    crypto_mode: SlashCryptoMode<'a>,
+}
+
 fn apply_slash_common(
     state: &mut ChainState,
     evidence: &SlashEvidenceV1,
-    evidence_hash: Bytes32,
-    historical_keys: Option<([u8; 32], Vec<u8>)>,
-    chain_id: &str,
-    height: u64,
-    reporter_pubkey: Option<&HybridPubKey>,
-    synthetic_output_index: u32,
-    crypto_mode: SlashCryptoMode<'_>,
+    application: SlashApplication<'_>,
 ) -> StateResult<SlashAccounting> {
+    let SlashApplication {
+        evidence_hash,
+        historical_keys,
+        chain_id,
+        height,
+        reporter_pubkey,
+        synthetic_output_index,
+        crypto_mode,
+    } = application;
     use crate::ValidatorStatus;
     use indra_core::types::{
         primitives::{DUST_LIMIT_SPARK, SLASH_REPORTER_REWARD_BPS},

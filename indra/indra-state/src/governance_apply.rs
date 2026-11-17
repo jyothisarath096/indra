@@ -87,14 +87,16 @@ fn apply_governance_op_inner(
         } => apply_propose(
             state,
             op,
-            current_epoch,
-            chain_id,
-            action,
-            deposit_utxo_id,
-            proposer_pubkey,
-            title.as_slice(),
-            description.as_slice(),
-            current_height,
+            ProposalInput {
+                current_epoch,
+                chain_id,
+                action,
+                deposit_utxo_id,
+                proposer_pubkey,
+                title_bytes: title.as_slice(),
+                description_bytes: description.as_slice(),
+                current_height,
+            },
         ),
         GovernancePayload::Commit {
             proposal_id,
@@ -147,18 +149,32 @@ pub fn validate_governance_op(
     )
 }
 
+struct ProposalInput<'a> {
+    current_epoch: u64,
+    chain_id: &'a str,
+    action: &'a indra_core::types::governance::GovernableAction,
+    deposit_utxo_id: &'a Bytes32,
+    proposer_pubkey: &'a HybridPubKey,
+    title_bytes: &'a [u8],
+    description_bytes: &'a [u8],
+    current_height: u64,
+}
+
 fn apply_propose(
     state: &mut ChainState,
     op: &GovernanceOpV2,
-    current_epoch: u64,
-    chain_id: &str,
-    action: &indra_core::types::governance::GovernableAction,
-    deposit_utxo_id: &Bytes32,
-    proposer_pubkey: &HybridPubKey,
-    title_bytes: &[u8],
-    description_bytes: &[u8],
-    current_height: u64,
+    input: ProposalInput<'_>,
 ) -> StateResult<()> {
+    let ProposalInput {
+        current_epoch,
+        chain_id,
+        action,
+        deposit_utxo_id,
+        proposer_pubkey,
+        title_bytes,
+        description_bytes,
+        current_height,
+    } = input;
     let proposer = state
         .validators
         .get(&op.signer_id)
@@ -1980,14 +1996,16 @@ mod tests {
         let result = apply_propose(
             &mut state,
             &op,
-            0,
-            TEST_CHAIN_ID,
-            &action,
-            &attacker_deposit,
-            &mixed_pubkey,
-            b"test",
-            b"test proposal",
-            0,
+            ProposalInput {
+                current_epoch: 0,
+                chain_id: TEST_CHAIN_ID,
+                action: &action,
+                deposit_utxo_id: &attacker_deposit,
+                proposer_pubkey: &mixed_pubkey,
+                title_bytes: b"test",
+                description_bytes: b"test proposal",
+                current_height: 0,
+            },
         );
 
         assert!(matches!(

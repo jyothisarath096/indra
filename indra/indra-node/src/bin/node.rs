@@ -2680,16 +2680,16 @@ fn run() -> indra_node::NodeResult<()> {
         critical_tasks.adopt("observer-runtime", handle);
     }
     if let Some(addr) = metrics_addr {
-        let handle = indra_node::start_metrics_server(
+        let handle = indra_node::start_metrics_server(indra_node::MetricsServerConfig {
             addr,
-            Arc::clone(&driver),
-            Arc::clone(&observer_count),
-            Arc::clone(&metrics_state),
-            Arc::clone(&last_block_timestamp),
-            Arc::clone(&connected_validator_peers),
-            data_dir.clone(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        );
+            driver: Arc::clone(&driver),
+            observer_count: Arc::clone(&observer_count),
+            metrics_state: Arc::clone(&metrics_state),
+            last_block_timestamp: Arc::clone(&last_block_timestamp),
+            connected_validator_peers: Arc::clone(&connected_validator_peers),
+            data_dir: data_dir.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        });
         critical_tasks.adopt("metrics-listener", handle);
     }
 

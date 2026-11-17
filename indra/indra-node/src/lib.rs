@@ -74,7 +74,8 @@ pub use genesis::{
     validate_genesis_manifest, GenesisManifest, GenesisSeed, GenesisSettings, GenesisValidator,
 };
 pub use metrics::{
-    start_metrics_server, start_observer_metrics_server, MetricsState, RpcLimiterTelemetry,
+    start_metrics_server, start_observer_metrics_server, MetricsServerConfig, MetricsState,
+    RpcLimiterTelemetry,
 };
 pub use net_driver::{action_to_message, message_to_event};
 pub use slash::{SlashDetector, SlashEvidence, SlashOffence};

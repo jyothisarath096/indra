@@ -1777,12 +1777,12 @@ fn retired_cold_components_encoded_len(
     8 + classical.len() * 32 + pq.len() * indra_crypto::PQ_PK_BYTES
 }
 
-fn decode_retired_cold_components(
-    r: &mut ByteReader<'_>,
-) -> IndraResult<(
+type RetiredColdComponents = (
     PersistentOrdSet<[u8; 32]>,
     PersistentOrdSet<[u8; indra_crypto::PQ_PK_BYTES]>,
-)> {
+);
+
+fn decode_retired_cold_components(r: &mut ByteReader<'_>) -> IndraResult<RetiredColdComponents> {
     let classical_count = u32::decode(r)? as usize;
     if classical_count > MAX_RETIRED_COLD_CLASSICAL_COMPONENTS_DECODE {
         return Err(IndraError::LengthExceeded {

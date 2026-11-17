@@ -264,16 +264,38 @@ pub fn render_observer_metrics(
 }
 
 /// Start a Prometheus metrics server for validator/full nodes.
-pub fn start_metrics_server(
-    addr: String,
-    driver: Arc<Mutex<ConsensusDriver>>,
-    observer_count: Arc<AtomicUsize>,
-    metrics_state: Arc<MetricsState>,
-    last_block_timestamp: Arc<AtomicU64>,
-    connected_validator_peers: Arc<AtomicUsize>,
-    data_dir: String,
-    version: String,
-) -> JoinHandle<()> {
+/// Inputs for the validator metrics listener.
+pub struct MetricsServerConfig {
+    /// Listener address.
+    pub addr: String,
+    /// Consensus driver handle.
+    pub driver: Arc<Mutex<ConsensusDriver>>,
+    /// Number of observer clients.
+    pub observer_count: Arc<AtomicUsize>,
+    /// Shared metrics state.
+    pub metrics_state: Arc<MetricsState>,
+    /// Last committed block timestamp.
+    pub last_block_timestamp: Arc<AtomicU64>,
+    /// Number of connected validator peers.
+    pub connected_validator_peers: Arc<AtomicUsize>,
+    /// Node data directory.
+    pub data_dir: String,
+    /// Build version.
+    pub version: String,
+}
+
+/// Start a Prometheus metrics server for a validator/full node.
+pub fn start_metrics_server(config: MetricsServerConfig) -> JoinHandle<()> {
+    let MetricsServerConfig {
+        addr,
+        driver,
+        observer_count,
+        metrics_state,
+        last_block_timestamp,
+        connected_validator_peers,
+        data_dir,
+        version,
+    } = config;
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(listener) => listener,
@@ -1102,16 +1124,16 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
 
-        start_metrics_server(
-            addr.to_string(),
+        start_metrics_server(MetricsServerConfig {
+            addr: addr.to_string(),
             driver,
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(MetricsState::new()),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-            data_dir.path().to_string_lossy().into_owned(),
-            "0.1.0".to_string(),
-        );
+            observer_count: Arc::new(AtomicUsize::new(0)),
+            metrics_state: Arc::new(MetricsState::new()),
+            last_block_timestamp: Arc::new(AtomicU64::new(0)),
+            connected_validator_peers: Arc::new(AtomicUsize::new(0)),
+            data_dir: data_dir.path().to_string_lossy().into_owned(),
+            version: "0.1.0".to_string(),
+        });
 
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut response = String::new();

@@ -8205,13 +8205,8 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let local_height = driver.height();
         driver.sync.peer_connected(voter.validator_id);
         let _ = driver.sync.observe_status(
-            voter.validator_id,
-            peer,
-            10,
-            Bytes32::ZERO,
-            voter.stake,
-            voter.stake,
-            local_height,
+            (voter.validator_id, peer, 10, Bytes32::ZERO, voter.stake, voter.stake, local_height)
+                .into(),
             Instant::now(),
         );
         assert!(!driver.sync.is_caught_up());
@@ -8238,13 +8233,8 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         let local_height = driver.height();
         driver.sync.peer_connected(voter.validator_id);
         let _ = driver.sync.observe_status(
-            voter.validator_id,
-            peer,
-            10,
-            Bytes32::ZERO,
-            voter.stake,
-            voter.stake,
-            local_height,
+            (voter.validator_id, peer, 10, Bytes32::ZERO, voter.stake, voter.stake, local_height)
+                .into(),
             Instant::now(),
         );
         assert!(!driver.sync.is_caught_up());

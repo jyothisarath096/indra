@@ -602,9 +602,10 @@ pub(crate) fn destroy_result(
 }
 
 #[cfg(test)]
-static CHECKPOINT_HOOK: OnceLock<
-    Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
-> = OnceLock::new();
+type CheckpointHook = Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>;
+
+#[cfg(test)]
+static CHECKPOINT_HOOK: OnceLock<CheckpointHook> = OnceLock::new();
 
 #[cfg(test)]
 static REVOCATION_HOOK: OnceLock<Mutex<Option<Arc<std::sync::Barrier>>>> = OnceLock::new();
