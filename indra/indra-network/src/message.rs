@@ -346,7 +346,9 @@ impl Message {
                 ),
             });
         }
-        Self::decode_wire(&data[4..])
+        Self::decode_wire(data.get(4..).ok_or(NetworkError::DecodeFailed {
+            reason: "message payload truncated".to_string(),
+        })?)
     }
 
     /// Encode the payload (without length prefix or type byte).
@@ -735,7 +737,11 @@ impl Message {
                     })?;
                 let height = u64::from_le_bytes(height_bytes);
                 let round_bytes: [u8; 4] =
-                    payload[40..44]
+                    payload
+                        .get(40..44)
+                        .ok_or(NetworkError::DecodeFailed {
+                            reason: "invalid status round".to_string(),
+                        })?
                         .try_into()
                         .map_err(|_| NetworkError::DecodeFailed {
                             reason: "invalid status round".to_string(),

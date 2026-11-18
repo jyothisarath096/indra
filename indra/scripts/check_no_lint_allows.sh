@@ -1,49 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reviewed exceptions are kept at file granularity because generated/test-only
-# attributes are intentionally local to their target and this guard is meant to
-# catch newly introduced suppressions, not replace code review.
-allowed_files=(
-  indra-cli/src/bin/genesis.rs
-  indra-cli/src/bin/governance.rs
-  indra-cli/src/bin/keygen.rs
-  indra-cli/src/bin/send.rs
-  indra-cli/src/bin/stake.rs
-  indra-cli/src/bin/tx.rs
-  indra-cli/src/bin/wallet_scan.rs
-  indra-core/src/types/authorization.rs
-  indra-core/src/types/block.rs
-  indra-core/src/types/consensus_snapshot.rs
-  indra-node/src/bin/audit_block_log.rs
-  indra-node/src/bin/dns_seed_sign.rs
-  indra-node/src/bin/indra-sync-recover.rs
-  indra-node/src/bin/node.rs
-  indra-node/src/bin/observer.rs
-  indra-node/src/hardened_read_rpc.rs
-  indra-rpc/src/handlers.rs
-  indra-state/src/chain.rs
-  indra-state/src/effects.rs
-  indra-state/src/txn.rs
-)
+source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$source_root"
 
-is_allowed() {
-  local candidate=$1
-  for allowed in "${allowed_files[@]}"; do
-    [[ "$candidate" == "indra/$allowed" ]] && return 0
-  done
-  return 1
-}
+# This guard intentionally checks source locations rather than maintaining a
+# file allowlist. Macros can synthesize attributes and are a documented blind
+# spot; ordinary source attributes must remain in test-only code.
+if command -v rg >/dev/null 2>&1; then
+    matches=$(rg -n '#!?(\[allow|\[expect|\[cfg_attr\([^]]*allow)' \
+        --glob '*.rs' . --glob '!audit_evidence/**' || true)
+else
+    matches=$(grep -RInE '#!?\[(allow|expect|cfg_attr\([^]]*allow)' . \
+        --include='*.rs' --exclude-dir=audit_evidence || true)
+fi
 
 violations=0
-while IFS=: read -r file line _; do
-  [[ -z "$file" ]] && continue
-  if ! is_allowed "$file"; then
-    printf 'unreviewed lint suppression: %s:%s\n' "$file" "$line"
+while IFS= read -r match; do
+    [[ -z "$match" ]] && continue
+    file=${match%%:*}
+    rest=${match#*:}
+    line=${rest%%:*}
+    text=${rest#*:}
+    if [[ "$file" == *"/tests/"* || "$file" == *"/benches/"* ]]; then
+        continue
+    fi
+    if [[ "$text" == *'#![cfg_attr(test, allow('* ]]; then
+        continue
+    fi
+    printf 'unreviewed lint suppression: %s:%s:%s\n' "$file" "$line" "$text"
     violations=$((violations + 1))
-  fi
-done < <(rg -n '#!?\[(allow|expect|cfg_attr\([^]]*allow)' --glob '*.rs' indra --glob '!indra/audit_evidence/**' || true)
+done <<< "$matches"
 
 if ((violations != 0)); then
-  exit 1
+    exit 1
 fi

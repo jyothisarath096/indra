@@ -455,16 +455,18 @@ fn admin_method_reachable_only_with_valid_admin_policy() {
     let e = engine("rpc_admin_reachable");
     let state = NodeState::with_network_policy(
         &e,
-        vec!["203.0.113.10:30303".to_string()],
-        vec![PeerTopologyEntry {
-            validator_id: Some("aa".repeat(32)),
-            address: "203.0.113.10:30303".to_string(),
-        }],
-        1,
-        2,
-        3,
-        RpcMode::Full,
-        true,
+        indra_rpc::NetworkPolicyContext {
+            validator_peer_addrs: vec!["203.0.113.10:30303".to_string()],
+            validator_peer_topology: vec![PeerTopologyEntry {
+                validator_id: Some("aa".repeat(32)),
+                address: "203.0.113.10:30303".to_string(),
+            }],
+            connected_validator_peer_count: 1,
+            discovered_peer_count: 2,
+            observer_peer_count: 3,
+            rpc_mode: RpcMode::Full,
+            admin_token_configured: true,
+        },
     );
 
     match dispatch_with_admin(
@@ -487,8 +489,18 @@ fn admin_method_reachable_only_with_valid_admin_policy() {
 #[test]
 fn rpc_policy_reports_mode_and_token_presence_without_token_value() {
     let e = engine("rpc_policy");
-    let state =
-        NodeState::with_network_policy(&e, Vec::new(), Vec::new(), 0, 0, 0, RpcMode::Full, true);
+    let state = NodeState::with_network_policy(
+        &e,
+        indra_rpc::NetworkPolicyContext {
+            validator_peer_addrs: Vec::new(),
+            validator_peer_topology: Vec::new(),
+            connected_validator_peer_count: 0,
+            discovered_peer_count: 0,
+            observer_peer_count: 0,
+            rpc_mode: RpcMode::Full,
+            admin_token_configured: true,
+        },
+    );
 
     match dispatch_with_mode("indra_getRpcPolicy", &[], &state, RpcMode::Full) {
         DispatchResult::Ready(Ok(result)) => {

@@ -5965,13 +5965,15 @@ fn handle_rpc(
         };
         let state = NodeState::with_network_policy(
             &snapshot,
-            validator_peer_addrs,
-            validator_peer_topology,
-            connected_validator_peer_count,
-            discovered_count,
-            observer_count_val,
-            rpc_mode,
-            admin_token_configured,
+            indra_rpc::NetworkPolicyContext {
+                validator_peer_addrs,
+                validator_peer_topology,
+                connected_validator_peer_count,
+                discovered_peer_count: discovered_count,
+                observer_peer_count: observer_count_val,
+                rpc_mode,
+                admin_token_configured,
+            },
         )
         .with_execution_deadline(read_deadline);
         match dispatch_with_admin(

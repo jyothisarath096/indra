@@ -74,7 +74,6 @@ pub struct CanonicalStateEffects {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum CanonicalStateField {
     ChainId,
@@ -134,7 +133,6 @@ impl CanonicalStateEffects {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn covers_field(&self, field: CanonicalStateField) -> bool {
         use CanonicalStateField as F;
         match field {

@@ -147,16 +147,16 @@ impl ConsensusSnapshot {
         let sortition_log_lo = encode_q768(&log.lo)?;
         let sortition_log_hi = encode_q768(&log.hi)?;
         let total_weight_spark = recompute_total(&entries)?;
-        let snapshot_root = compute_snapshot_root(
-            CONSENSUS_SNAPSHOT_FORMAT_VERSION,
+        let snapshot_root = compute_snapshot_root(&SnapshotRootInput {
+            format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
             activation_height,
             source_boundary_height,
-            &entries,
+            entries: &entries,
             total_weight_spark,
             active_slot_coefficient_numerator,
             sortition_log_lo,
             sortition_log_hi,
-        );
+        });
         let snapshot = Self {
             format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
             activation_height,
@@ -238,16 +238,16 @@ impl ConsensusSnapshot {
         if self.total_weight_spark != recomputed_total {
             return invalid("stored total weight does not match recomputation");
         }
-        let recomputed_root = compute_snapshot_root(
-            self.format_version,
-            self.activation_height,
-            self.source_boundary_height,
-            &self.entries,
-            self.total_weight_spark,
-            self.active_slot_coefficient_numerator,
-            self.sortition_log_lo,
-            self.sortition_log_hi,
-        );
+        let recomputed_root = compute_snapshot_root(&SnapshotRootInput {
+            format_version: self.format_version,
+            activation_height: self.activation_height,
+            source_boundary_height: self.source_boundary_height,
+            entries: &self.entries,
+            total_weight_spark: self.total_weight_spark,
+            active_slot_coefficient_numerator: self.active_slot_coefficient_numerator,
+            sortition_log_lo: self.sortition_log_lo,
+            sortition_log_hi: self.sortition_log_hi,
+        });
         if self.snapshot_root != recomputed_root {
             return invalid("stored snapshot root does not match recomputation");
         }
@@ -314,29 +314,30 @@ fn recompute_total(entries: &[ConsensusSnapshotEntry]) -> IndraResult<u64> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_snapshot_root(
+struct SnapshotRootInput<'a> {
     format_version: u8,
     activation_height: u64,
     source_boundary_height: u64,
-    entries: &[ConsensusSnapshotEntry],
+    entries: &'a [ConsensusSnapshotEntry],
     total_weight_spark: u64,
     active_slot_coefficient_numerator: u64,
     sortition_log_lo: [u8; 128],
     sortition_log_hi: [u8; 128],
-) -> Bytes32 {
+}
+
+fn compute_snapshot_root(input: &SnapshotRootInput<'_>) -> Bytes32 {
     let mut material = Vec::with_capacity(
-        CONSENSUS_SNAPSHOT_ROOT_DOMAIN.len() + 1 + 8 + 8 + list_encoded_len(entries) + 8,
+        CONSENSUS_SNAPSHOT_ROOT_DOMAIN.len() + 1 + 8 + 8 + list_encoded_len(input.entries) + 8,
     );
     material.extend_from_slice(CONSENSUS_SNAPSHOT_ROOT_DOMAIN);
-    format_version.encode(&mut material);
-    activation_height.encode(&mut material);
-    source_boundary_height.encode(&mut material);
-    encode_list(entries, &mut material);
-    total_weight_spark.encode(&mut material);
-    active_slot_coefficient_numerator.encode(&mut material);
-    material.extend_from_slice(&sortition_log_lo);
-    material.extend_from_slice(&sortition_log_hi);
+    input.format_version.encode(&mut material);
+    input.activation_height.encode(&mut material);
+    input.source_boundary_height.encode(&mut material);
+    encode_list(input.entries, &mut material);
+    input.total_weight_spark.encode(&mut material);
+    input.active_slot_coefficient_numerator.encode(&mut material);
+    material.extend_from_slice(&input.sortition_log_lo);
+    material.extend_from_slice(&input.sortition_log_hi);
     Bytes32::from(sha256(&material))
 }
 
@@ -400,26 +401,26 @@ mod tests {
             .iter()
             .map(|entry| entry.consensus_weight_spark)
             .sum();
-        let snapshot_root = compute_snapshot_root(
-            CONSENSUS_SNAPSHOT_FORMAT_VERSION,
-            301,
-            300,
-            &entries,
+        let snapshot_root = compute_snapshot_root(&SnapshotRootInput {
+            format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
+            activation_height: 301,
+            source_boundary_height: 300,
+            entries: &entries,
             total_weight_spark,
-            MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
-            encode_q768(
+            active_slot_coefficient_numerator: MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+            sortition_log_lo: encode_q768(
                 &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
                     .unwrap()
                     .lo,
             )
             .unwrap(),
-            encode_q768(
+            sortition_log_hi: encode_q768(
                 &certified_log(MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR)
                     .unwrap()
                     .hi,
             )
             .unwrap(),
-        );
+        });
         ConsensusSnapshot {
             format_version: CONSENSUS_SNAPSHOT_FORMAT_VERSION,
             activation_height: 301,
@@ -476,16 +477,16 @@ mod tests {
             invalid.active_slot_coefficient_numerator = invalid_f;
             invalid.sortition_log_lo = encode_q768(&certificate.lo).unwrap();
             invalid.sortition_log_hi = encode_q768(&certificate.hi).unwrap();
-            invalid.snapshot_root = compute_snapshot_root(
-                invalid.format_version,
-                invalid.activation_height,
-                invalid.source_boundary_height,
-                invalid.entries(),
-                invalid.total_weight_spark,
-                invalid.active_slot_coefficient_numerator,
-                invalid.sortition_log_lo,
-                invalid.sortition_log_hi,
-            );
+            invalid.snapshot_root = compute_snapshot_root(&SnapshotRootInput {
+                format_version: invalid.format_version,
+                activation_height: invalid.activation_height,
+                source_boundary_height: invalid.source_boundary_height,
+                entries: invalid.entries(),
+                total_weight_spark: invalid.total_weight_spark,
+                active_slot_coefficient_numerator: invalid.active_slot_coefficient_numerator,
+                sortition_log_lo: invalid.sortition_log_lo,
+                sortition_log_hi: invalid.sortition_log_hi,
+            });
             assert!(
                 invalid.validate().is_err(),
                 "accepted non-mainnet F {invalid_f}"
@@ -498,16 +499,16 @@ mod tests {
     fn rejects_tampered_or_malformed_sortition_certificate() {
         let mut tampered = snapshot();
         tampered.sortition_log_lo[127] ^= 1;
-        tampered.snapshot_root = compute_snapshot_root(
-            tampered.format_version,
-            tampered.activation_height,
-            tampered.source_boundary_height,
-            tampered.entries(),
-            tampered.total_weight_spark,
-            tampered.active_slot_coefficient_numerator,
-            tampered.sortition_log_lo,
-            tampered.sortition_log_hi,
-        );
+        tampered.snapshot_root = compute_snapshot_root(&SnapshotRootInput {
+            format_version: tampered.format_version,
+            activation_height: tampered.activation_height,
+            source_boundary_height: tampered.source_boundary_height,
+            entries: tampered.entries(),
+            total_weight_spark: tampered.total_weight_spark,
+            active_slot_coefficient_numerator: tampered.active_slot_coefficient_numerator,
+            sortition_log_lo: tampered.sortition_log_lo,
+            sortition_log_hi: tampered.sortition_log_hi,
+        });
         assert!(tampered.validate().is_err());
         assert!(ConsensusSnapshot::decode_exact(&tampered.encode_to_vec()).is_err());
 
@@ -666,16 +667,16 @@ mod tests {
         let baseline = snapshot();
         let replacement_keys = entry(1, 1_000, 13);
         let mut roots = vec![baseline.snapshot_root];
-        roots.push(compute_snapshot_root(
-            3,
-            301,
-            300,
-            baseline.entries(),
-            3_000,
-            baseline.active_slot_coefficient_numerator,
-            baseline.sortition_log_lo,
-            baseline.sortition_log_hi,
-        ));
+        roots.push(compute_snapshot_root(&SnapshotRootInput {
+            format_version: 3,
+            activation_height: 301,
+            source_boundary_height: 300,
+            entries: baseline.entries(),
+            total_weight_spark: 3_000,
+            active_slot_coefficient_numerator: baseline.active_slot_coefficient_numerator,
+            sortition_log_lo: baseline.sortition_log_lo,
+            sortition_log_hi: baseline.sortition_log_hi,
+        }));
         roots.push(
             test_snapshot(601, 300, baseline.entries().to_vec())
                 .unwrap()

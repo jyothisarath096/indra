@@ -205,30 +205,41 @@ impl BlockHeaderVNext {
     }
 
     /// Compute the stable consensus value hash for a block.
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute_value_hash(
-        height: u64,
-        prev_hash: Bytes32,
-        timestamp: u64,
-        state_root: Bytes32,
-        validator_set_root: Bytes32,
-        mempool_set_root: Bytes32,
-        value_entropy: &ProposalEntropyV1,
-        base_fee: u64,
-        total_supply: u64,
-    ) -> Bytes32 {
+    pub fn compute_value_hash(input: &ValueHashInput<'_>) -> Bytes32 {
         let mut buf = Vec::with_capacity(8 + 32 + 8 + 32 + 32 + 32 + 32 + 8 + 8);
-        height.encode(&mut buf);
-        prev_hash.encode(&mut buf);
-        timestamp.encode(&mut buf);
-        state_root.encode(&mut buf);
-        validator_set_root.encode(&mut buf);
-        mempool_set_root.encode(&mut buf);
-        value_entropy.commitment().encode(&mut buf);
-        base_fee.encode(&mut buf);
-        total_supply.encode(&mut buf);
+        input.height.encode(&mut buf);
+        input.prev_hash.encode(&mut buf);
+        input.timestamp.encode(&mut buf);
+        input.state_root.encode(&mut buf);
+        input.validator_set_root.encode(&mut buf);
+        input.mempool_set_root.encode(&mut buf);
+        input.value_entropy.commitment().encode(&mut buf);
+        input.base_fee.encode(&mut buf);
+        input.total_supply.encode(&mut buf);
         Bytes32::from(sha256(&buf))
     }
+}
+
+/// Immutable fields used to compute a block value hash.
+pub struct ValueHashInput<'a> {
+    /// Block height.
+    pub height: u64,
+    /// Parent block hash.
+    pub prev_hash: Bytes32,
+    /// Block timestamp.
+    pub timestamp: u64,
+    /// Post-state root.
+    pub state_root: Bytes32,
+    /// Validator-set root.
+    pub validator_set_root: Bytes32,
+    /// Mempool-set root.
+    pub mempool_set_root: Bytes32,
+    /// Stable proposal entropy.
+    pub value_entropy: &'a ProposalEntropyV1,
+    /// Base fee.
+    pub base_fee: u64,
+    /// Post-state total supply.
+    pub total_supply: u64,
 }
 
 impl Encode for BlockHeaderVNext {
@@ -465,17 +476,17 @@ impl BlockVNext {
     /// Recompute this block's stable consensus value hash from its stable
     /// content fields and projected post-state total supply.
     pub fn compute_value_hash(&self, total_supply: u64) -> Bytes32 {
-        BlockHeaderVNext::compute_value_hash(
-            self.header.height,
-            self.header.prev_hash,
-            self.header.timestamp,
-            self.header.state_root,
-            self.header.validator_set_root,
-            self.header.mempool_set_root,
-            &self.header.value_entropy,
-            self.header.base_fee,
+        BlockHeaderVNext::compute_value_hash(&ValueHashInput {
+            height: self.header.height,
+            prev_hash: self.header.prev_hash,
+            timestamp: self.header.timestamp,
+            state_root: self.header.state_root,
+            validator_set_root: self.header.validator_set_root,
+            mempool_set_root: self.header.mempool_set_root,
+            value_entropy: &self.header.value_entropy,
+            base_fee: self.header.base_fee,
             total_supply,
-        )
+        })
     }
 }
 #[cfg(test)]
@@ -552,34 +563,34 @@ mod tests {
     #[test]
     fn value_hash_is_stable_across_round_metadata_changes() {
         let h = dummy_header();
-        let base = BlockHeaderVNext::compute_value_hash(
-            h.height,
-            h.prev_hash,
-            h.timestamp,
-            h.state_root,
-            h.validator_set_root,
-            h.mempool_set_root,
-            &h.value_entropy,
-            h.base_fee,
-            123,
-        );
+        let base = BlockHeaderVNext::compute_value_hash(&ValueHashInput {
+            height: h.height,
+            prev_hash: h.prev_hash,
+            timestamp: h.timestamp,
+            state_root: h.state_root,
+            validator_set_root: h.validator_set_root,
+            mempool_set_root: h.mempool_set_root,
+            value_entropy: &h.value_entropy,
+            base_fee: h.base_fee,
+            total_supply: 123,
+        });
 
         let mut changed = h.clone();
         changed.proposer_round = 7;
         changed.polc_round = Some(3);
         changed.proposer_vrf_output = VariableBytes::from_slice(&[0x55u8; 64]).unwrap();
 
-        let changed_hash = BlockHeaderVNext::compute_value_hash(
-            changed.height,
-            changed.prev_hash,
-            changed.timestamp,
-            changed.state_root,
-            changed.validator_set_root,
-            changed.mempool_set_root,
-            &changed.value_entropy,
-            changed.base_fee,
-            123,
-        );
+        let changed_hash = BlockHeaderVNext::compute_value_hash(&ValueHashInput {
+            height: changed.height,
+            prev_hash: changed.prev_hash,
+            timestamp: changed.timestamp,
+            state_root: changed.state_root,
+            validator_set_root: changed.validator_set_root,
+            mempool_set_root: changed.mempool_set_root,
+            value_entropy: &changed.value_entropy,
+            base_fee: changed.base_fee,
+            total_supply: 123,
+        });
 
         assert_eq!(base, changed_hash);
     }
@@ -588,17 +599,17 @@ mod tests {
     fn value_hash_commits_every_immutable_entropy_component() {
         let base = dummy_header();
         let hash = |entropy: &ProposalEntropyV1| {
-            BlockHeaderVNext::compute_value_hash(
-                base.height,
-                base.prev_hash,
-                base.timestamp,
-                base.state_root,
-                base.validator_set_root,
-                base.mempool_set_root,
-                entropy,
-                base.base_fee,
-                123,
-            )
+            BlockHeaderVNext::compute_value_hash(&ValueHashInput {
+                height: base.height,
+                prev_hash: base.prev_hash,
+                timestamp: base.timestamp,
+                state_root: base.state_root,
+                validator_set_root: base.validator_set_root,
+                mempool_set_root: base.mempool_set_root,
+                value_entropy: entropy,
+                base_fee: base.base_fee,
+                total_supply: 123,
+            })
         };
         let original = hash(&base.value_entropy);
 

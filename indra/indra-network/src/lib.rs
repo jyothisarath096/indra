@@ -54,9 +54,11 @@
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
-        clippy::unimplemented
+        clippy::unimplemented,
+        clippy::indexing_slicing
     )
 )]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 
 mod dandelion;
 pub mod error;

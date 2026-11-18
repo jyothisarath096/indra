@@ -243,15 +243,17 @@ pub fn start_hardened_observer_rpc(
                     handle(
                         stream,
                         ip,
-                        &publisher,
-                        &storage,
-                        &per_ip_rate,
-                        &global_rate,
-                        &expensive_per_ip,
-                        &expensive_global,
-                        &expensive,
-                        &metrics,
-                        &limiter_telemetry,
+                        HandleContext {
+                            publisher: &publisher,
+                            storage: &storage,
+                            per_ip_rate: &per_ip_rate,
+                            global_rate: &global_rate,
+                            expensive_per_ip: &expensive_per_ip,
+                            expensive_global: &expensive_global,
+                            expensive: &expensive,
+                            metrics: &metrics,
+                            limiter_telemetry: &limiter_telemetry,
+                        },
                     );
                 }));
                 if result.is_err() {
@@ -316,20 +318,34 @@ fn try_reserve_ip_connection(
     accepted
 }
 
-#[allow(clippy::too_many_arguments)]
+struct HandleContext<'a> {
+    publisher: &'a crate::rpc_snapshot::RpcSnapshotPublisher,
+    storage: &'a crate::rpc_snapshot::RpcStorageReadHandles,
+    per_ip_rate: &'a RpcRateLimiter,
+    global_rate: &'a RpcGlobalRateLimiter,
+    expensive_per_ip: &'a RpcWindowRateLimiter,
+    expensive_global: &'a RpcGlobalWindowRateLimiter,
+    expensive: &'a Semaphore,
+    metrics: &'a MetricsState,
+    limiter_telemetry: &'a RpcLimiterTelemetry,
+}
+
 fn handle(
     stream: TcpStream,
     ip: IpAddr,
-    publisher: &crate::rpc_snapshot::RpcSnapshotPublisher,
-    storage: &crate::rpc_snapshot::RpcStorageReadHandles,
-    per_ip_rate: &RpcRateLimiter,
-    global_rate: &RpcGlobalRateLimiter,
-    expensive_per_ip: &RpcWindowRateLimiter,
-    expensive_global: &RpcGlobalWindowRateLimiter,
-    expensive: &Semaphore,
-    metrics: &MetricsState,
-    limiter_telemetry: &RpcLimiterTelemetry,
+    context: HandleContext<'_>,
 ) {
+    let HandleContext {
+        publisher,
+        storage,
+        per_ip_rate,
+        global_rate,
+        expensive_per_ip,
+        expensive_global,
+        expensive,
+        metrics,
+        limiter_telemetry,
+    } = context;
     let started = Instant::now();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));

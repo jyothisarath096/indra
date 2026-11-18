@@ -55,9 +55,11 @@
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
-        clippy::unimplemented
+        clippy::unimplemented,
+        clippy::indexing_slicing
     )
 )]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 
 pub mod error;
 pub mod handlers;
@@ -67,7 +69,7 @@ pub mod types;
 pub use error::{RpcError, RpcResult};
 pub use handlers::{
     check_rpc_method_allowed, dispatch, dispatch_with_mode, DispatchResult, NetworkContext,
-    NodeState, RpcMethodAccess, RpcMode,
+    NetworkPolicyContext, NodeState, RpcMethodAccess, RpcMode,
 };
 pub use server::{
     RpcGlobalRateLimiter, RpcGlobalWindowRateLimiter, RpcRateLimiter, RpcServer,

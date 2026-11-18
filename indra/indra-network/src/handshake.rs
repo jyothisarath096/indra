@@ -181,12 +181,15 @@ fn parse_common_prefix(buf: &[u8]) -> NetworkResult<()> {
             reason: "handshake message too short".to_string(),
         });
     }
-    if &buf[..4] != MAGIC {
+    if buf.get(..4) != Some(MAGIC.as_slice()) {
         return Err(NetworkError::InvalidMagic);
     }
     let version =
         u16::from_le_bytes(
-            buf[4..6]
+            buf.get(4..6)
+                .ok_or(NetworkError::DecodeFailed {
+                    reason: "invalid handshake version bytes".to_string(),
+                })?
                 .try_into()
                 .map_err(|_| NetworkError::DecodeFailed {
                     reason: "invalid handshake version bytes".to_string(),
@@ -206,11 +209,21 @@ fn parse_step1(buf: &[u8]) -> NetworkResult<([u8; 32], [u8; ML_KEM_1024_EK_LEN],
     }
     parse_common_prefix(buf)?;
     let mut x25519_pk = [0u8; 32];
-    x25519_pk.copy_from_slice(&buf[6..38]);
+    x25519_pk.copy_from_slice(buf.get(6..38).ok_or(NetworkError::DecodeFailed {
+        reason: "invalid step1 x25519 key bytes".to_string(),
+    })?);
     let mut kem_ek = [0u8; ML_KEM_1024_EK_LEN];
-    kem_ek.copy_from_slice(&buf[38..(38 + ML_KEM_1024_EK_LEN)]);
+    kem_ek.copy_from_slice(buf.get(38..(38 + ML_KEM_1024_EK_LEN)).ok_or(
+        NetworkError::DecodeFailed {
+            reason: "invalid step1 KEM key bytes".to_string(),
+        },
+    )?);
     let mut validator_id = [0u8; 32];
-    validator_id.copy_from_slice(&buf[(38 + ML_KEM_1024_EK_LEN)..]);
+    validator_id.copy_from_slice(buf.get((38 + ML_KEM_1024_EK_LEN)..).ok_or(
+        NetworkError::DecodeFailed {
+            reason: "invalid step1 validator id bytes".to_string(),
+        },
+    )?);
     Ok((x25519_pk, kem_ek, Bytes32::from(validator_id)))
 }
 
@@ -222,11 +235,21 @@ fn parse_step2(buf: &[u8]) -> NetworkResult<([u8; 32], [u8; ML_KEM_1024_CT_LEN],
     }
     parse_common_prefix(buf)?;
     let mut x25519_pk = [0u8; 32];
-    x25519_pk.copy_from_slice(&buf[6..38]);
+    x25519_pk.copy_from_slice(buf.get(6..38).ok_or(NetworkError::DecodeFailed {
+        reason: "invalid step2 x25519 key bytes".to_string(),
+    })?);
     let mut kem_ct = [0u8; ML_KEM_1024_CT_LEN];
-    kem_ct.copy_from_slice(&buf[38..(38 + ML_KEM_1024_CT_LEN)]);
+    kem_ct.copy_from_slice(buf.get(38..(38 + ML_KEM_1024_CT_LEN)).ok_or(
+        NetworkError::DecodeFailed {
+            reason: "invalid step2 KEM ciphertext bytes".to_string(),
+        },
+    )?);
     let mut validator_id = [0u8; 32];
-    validator_id.copy_from_slice(&buf[(38 + ML_KEM_1024_CT_LEN)..]);
+    validator_id.copy_from_slice(buf.get((38 + ML_KEM_1024_CT_LEN)..).ok_or(
+        NetworkError::DecodeFailed {
+            reason: "invalid step2 validator id bytes".to_string(),
+        },
+    )?);
     Ok((x25519_pk, kem_ct, Bytes32::from(validator_id)))
 }
 

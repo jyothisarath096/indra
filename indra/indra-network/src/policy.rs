@@ -644,13 +644,19 @@ fn encode_bans(bans: &HashMap<Bytes32, u64>) -> Vec<u8> {
 }
 
 fn decode_bans(bytes: &[u8]) -> io::Result<HashMap<Bytes32, u64>> {
-    if bytes.len() < 14 || &bytes[..8] != BAN_STORE_MAGIC {
+    if bytes.len() < 14 || bytes.get(..8) != Some(BAN_STORE_MAGIC.as_slice()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid ban store header",
         ));
     }
-    let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    let version = u16::from_le_bytes(
+        bytes
+            .get(8..10)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ban version"))?
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ban version"))?,
+    );
     if version != BAN_STORE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -658,7 +664,9 @@ fn decode_bans(bytes: &[u8]) -> io::Result<HashMap<Bytes32, u64>> {
         ));
     }
     let count = u32::from_le_bytes(
-        bytes[10..14]
+        bytes
+            .get(10..14)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ban store count"))?
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ban store count"))?,
     ) as usize;
@@ -669,11 +677,19 @@ fn decode_bans(bytes: &[u8]) -> io::Result<HashMap<Bytes32, u64>> {
         ));
     }
     let mut bans = HashMap::with_capacity(count);
-    for chunk in bytes[14..].chunks_exact(40) {
+    for chunk in bytes
+        .get(14..)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ban entries"))?
+        .chunks_exact(40)
+    {
         let mut id = [0u8; 32];
-        id.copy_from_slice(&chunk[..32]);
+        id.copy_from_slice(chunk.get(..32).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid ban identity")
+        })?);
         let expiry = u64::from_le_bytes(
-            chunk[32..40]
+            chunk
+                .get(32..40)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ban expiry"))?
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ban expiry"))?,
         );

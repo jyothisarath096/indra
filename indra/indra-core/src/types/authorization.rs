@@ -132,14 +132,16 @@ impl AuthorizationEnvelope {
         payload: &[u8],
     ) -> IndraResult<Self> {
         Self::new(
-            AuthorizationDomain::Hot,
-            AuthorityRole::Hot,
-            chain_id,
-            operation_tag,
-            identity_id,
-            authority_key_version,
-            role_nonce,
-            payload,
+            AuthorizationInput {
+                domain: AuthorizationDomain::Hot,
+                authority_role: AuthorityRole::Hot,
+                chain_id,
+                operation_tag,
+                identity_id,
+                authority_key_version,
+                role_nonce,
+                payload,
+            },
         )
     }
 
@@ -153,38 +155,32 @@ impl AuthorizationEnvelope {
         payload: &[u8],
     ) -> IndraResult<Self> {
         Self::new(
-            AuthorizationDomain::Cold,
-            AuthorityRole::Cold,
-            chain_id,
-            operation_tag,
-            identity_id,
-            authority_key_version,
-            role_nonce,
-            payload,
+            AuthorizationInput {
+                domain: AuthorizationDomain::Cold,
+                authority_role: AuthorityRole::Cold,
+                chain_id,
+                operation_tag,
+                identity_id,
+                authority_key_version,
+                role_nonce,
+                payload,
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        domain: AuthorizationDomain,
-        authority_role: AuthorityRole,
-        chain_id: &[u8],
-        operation_tag: u16,
-        identity_id: Bytes32,
-        authority_key_version: u64,
-        role_nonce: u64,
-        payload: &[u8],
+        input: AuthorizationInput<'_>,
     ) -> IndraResult<Self> {
-        let chain_id = VariableBytes::from_slice(chain_id)?;
-        let payload = VariableBytes::from_slice(payload)?;
+        let chain_id = VariableBytes::from_slice(input.chain_id)?;
+        let payload = VariableBytes::from_slice(input.payload)?;
         let envelope = Self {
-            domain,
+            domain: input.domain,
             chain_id,
-            operation_tag,
-            identity_id,
-            authority_role,
-            authority_key_version,
-            role_nonce,
+            operation_tag: input.operation_tag,
+            identity_id: input.identity_id,
+            authority_role: input.authority_role,
+            authority_key_version: input.authority_key_version,
+            role_nonce: input.role_nonce,
             payload,
         };
         envelope.validate_domain_role()?;
@@ -244,6 +240,17 @@ impl AuthorizationEnvelope {
         }
         Ok(())
     }
+}
+
+struct AuthorizationInput<'a> {
+    domain: AuthorizationDomain,
+    authority_role: AuthorityRole,
+    chain_id: &'a [u8],
+    operation_tag: u16,
+    identity_id: Bytes32,
+    authority_key_version: u64,
+    role_nonce: u64,
+    payload: &'a [u8],
 }
 
 impl Encode for AuthorizationEnvelope {

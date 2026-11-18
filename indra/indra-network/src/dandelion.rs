@@ -322,12 +322,12 @@ impl State {
             || self.epoch_relay.is_none()
             || !eligible.contains(&self.epoch_relay.unwrap_or(Bytes32::from([0; 32])))
         {
-            self.epoch_relay = Some(eligible[self.rng.gen_range(0..eligible.len())]);
+            self.epoch_relay = eligible.get(self.rng.gen_range(0..eligible.len())).copied();
             self.epoch_ends_at = now + EPOCH_DURATION;
         }
         self.epoch_relay
             .filter(|relay| Some(*relay) != exclude)
-            .or_else(|| Some(eligible[self.rng.gen_range(0..eligible.len())]))
+            .or_else(|| eligible.get(self.rng.gen_range(0..eligible.len())).copied())
     }
 
     fn insert(&mut self, tx_id: Bytes32, phase: Phase, now: Instant) {

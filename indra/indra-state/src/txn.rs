@@ -911,14 +911,12 @@ pub(crate) fn complex_mutation_checkpoint() -> StateResult<()> {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn set_fail_after_mutation(target: Option<usize>) {
     FAIL_AFTER_MUTATION.with(|cell| cell.set(target));
     MUTATION_COUNT.with(|cell| cell.set(0));
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn mutation_count() -> usize {
     MUTATION_COUNT.with(std::cell::Cell::get)
 }

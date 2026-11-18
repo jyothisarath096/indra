@@ -20,6 +20,20 @@ const DEFAULT_NODE: &str = "http://127.0.0.1:8545";
 const DEFAULT_KEYS: &str = "keys.json";
 const DEFAULT_WALLET: &str = "wallet.json";
 
+macro_rules! finish_op {
+    ($args:expr, $op_name:expr, $built:expr, $signer_id:expr, $nonce:expr, $node_url:expr, $details:expr, $mark_spent:expr $(,)?) => {
+        finish_op_impl($args, FinishContext {
+            op_name: $op_name,
+            built: $built,
+            signer_id: $signer_id,
+            nonce: $nonce,
+            node_url: $node_url,
+            details: $details,
+            mark_spent: $mark_spent,
+        })
+    };
+}
+
 fn main() {
     if let Err(e) = run(std::env::args().collect()) {
         eprintln!("{e}");
@@ -83,7 +97,7 @@ fn run_register(args: &[String]) -> CliResult<()> {
         nonce,
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "register",
         &built,
@@ -128,7 +142,7 @@ fn run_self_stake(args: &[String]) -> CliResult<()> {
         cold_nonce,
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "self-stake",
         &built,
@@ -182,7 +196,7 @@ fn run_self_unstake(args: &[String]) -> CliResult<()> {
         },
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "self-unstake",
         &built,
@@ -218,7 +232,7 @@ fn run_delegate(args: &[String]) -> CliResult<()> {
         nonce,
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "delegate",
         &built,
@@ -258,7 +272,7 @@ fn run_undelegate(args: &[String]) -> CliResult<()> {
         },
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "undelegate",
         &built,
@@ -290,7 +304,7 @@ fn run_claim_rewards(args: &[String]) -> CliResult<()> {
     let nonce = fetch_next_nonce(&node_url, &signer_id)?;
     let built =
         indra_cli::tx_builder::build_claim_rewards_op(validator_id, &keypair, nonce, &chain_id)?;
-    finish_op(
+    finish_op!(
         args,
         "claim-rewards",
         &built,
@@ -338,7 +352,7 @@ fn run_set_commission(args: &[String]) -> CliResult<()> {
         cold_nonce,
         &chain_id,
     )?;
-    finish_op(
+    finish_op!(
         args,
         "set-commission",
         &built,
@@ -399,7 +413,7 @@ fn run_auto_delegate(args: &[String]) -> CliResult<()> {
     } else {
         hex::encode(target_validator_id.0)
     };
-    finish_op(
+    finish_op!(
         args,
         "auto-delegate",
         &built,
@@ -451,7 +465,7 @@ fn run_update_network_address(args: &[String]) -> CliResult<()> {
         &chain_id,
     )?;
     let action = network_addr.unwrap_or_else(|| "<clear>".to_string());
-    finish_op(
+    finish_op!(
         args,
         "update-network-address",
         &built,
@@ -485,28 +499,40 @@ fn run_nonce(args: &[String]) -> CliResult<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish_op(
-    args: &[String],
-    op_name: &str,
-    built: &BuiltStakingOp,
-    signer_id: &Bytes32,
+struct FinishContext<'a> {
+    op_name: &'a str,
+    built: &'a BuiltStakingOp,
+    signer_id: &'a Bytes32,
     nonce: u64,
-    node_url: &str,
-    details: &[(&str, String)],
-    mark_spent: Option<(&str, Bytes32)>,
+    node_url: &'a str,
+    details: &'a [(&'a str, String)],
+    mark_spent: Option<(&'a str, Bytes32)>,
+}
+
+fn finish_op_impl(
+    args: &[String],
+    context: FinishContext<'_>,
 ) -> CliResult<()> {
+    let FinishContext {
+        op_name,
+        built,
+        signer_id,
+        nonce,
+        node_url,
+        details,
+        mark_spent,
+    } = context;
     if args.iter().any(|arg| arg == "--dry-run") {
-        print_confirmation(
-            "INDRA STAKING OP DRY RUN - NOT SUBMITTED",
+        print_confirmation(ConfirmationContext {
+            title: "INDRA STAKING OP DRY RUN - NOT SUBMITTED",
             op_name,
             built,
             signer_id,
             nonce,
             node_url,
             details,
-            None,
-        );
+            response: None,
+        });
         return Ok(());
     }
 
@@ -516,30 +542,41 @@ fn finish_op(
         wallet.mark_spent(&utxo_id);
         wallet.save(wallet_path)?;
     }
-    print_confirmation(
-        "INDRA STAKING OP SUBMITTED",
+    print_confirmation(ConfirmationContext {
+        title: "INDRA STAKING OP SUBMITTED",
         op_name,
         built,
         signer_id,
         nonce,
         node_url,
         details,
-        Some(&response),
-    );
+        response: Some(&response),
+    });
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_confirmation(
-    title: &str,
-    op_name: &str,
-    built: &BuiltStakingOp,
-    signer_id: &Bytes32,
+struct ConfirmationContext<'a> {
+    title: &'a str,
+    op_name: &'a str,
+    built: &'a BuiltStakingOp,
+    signer_id: &'a Bytes32,
     nonce: u64,
-    node_url: &str,
-    details: &[(&str, String)],
-    response: Option<&str>,
-) {
+    node_url: &'a str,
+    details: &'a [(&'a str, String)],
+    response: Option<&'a str>,
+}
+
+fn print_confirmation(context: ConfirmationContext<'_>) {
+    let ConfirmationContext {
+        title,
+        op_name,
+        built,
+        signer_id,
+        nonce,
+        node_url,
+        details,
+        response,
+    } = context;
     println!("==========================================");
     println!("  {}", title);
     println!("==========================================");

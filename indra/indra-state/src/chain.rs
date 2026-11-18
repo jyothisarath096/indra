@@ -166,7 +166,6 @@ pub struct ChainState {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 impl ChainState {
     /// Return every top-level state field whose value differs.
     ///

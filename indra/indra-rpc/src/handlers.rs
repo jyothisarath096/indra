@@ -190,30 +190,31 @@ impl<'a> NodeState<'a> {
         discovered_peer_count: usize,
         observer_peer_count: usize,
     ) -> Self {
-        Self::with_network_policy(
-            engine,
+        Self::with_network_policy(engine, NetworkPolicyContext {
             validator_peer_addrs,
-            Vec::new(),
+            validator_peer_topology: Vec::new(),
             connected_validator_peer_count,
             discovered_peer_count,
             observer_peer_count,
-            RpcMode::Full,
-            false,
-        )
+            rpc_mode: RpcMode::Full,
+            admin_token_configured: false,
+        })
     }
 
     /// Construct a state object with network context and explicit RPC policy.
-    #[allow(clippy::too_many_arguments)]
     pub fn with_network_policy(
         engine: &'a impl RpcEngineView,
-        validator_peer_addrs: Vec<String>,
-        validator_peer_topology: Vec<PeerTopologyEntry>,
-        connected_validator_peer_count: usize,
-        discovered_peer_count: usize,
-        observer_peer_count: usize,
-        rpc_mode: RpcMode,
-        admin_token_configured: bool,
+        policy: NetworkPolicyContext,
     ) -> Self {
+        let NetworkPolicyContext {
+            validator_peer_addrs,
+            validator_peer_topology,
+            connected_validator_peer_count,
+            discovered_peer_count,
+            observer_peer_count,
+            rpc_mode,
+            admin_token_configured,
+        } = policy;
         let topology = if validator_peer_topology.is_empty() {
             validator_peer_addrs
                 .iter()
@@ -281,6 +282,24 @@ impl<'a> NodeState<'a> {
         }
         Ok(())
     }
+}
+
+/// Network and listener policy values used to construct an RPC state view.
+pub struct NetworkPolicyContext {
+    /// Dialable connected validator peer addresses.
+    pub validator_peer_addrs: Vec<String>,
+    /// Connected validator topology entries.
+    pub validator_peer_topology: Vec<PeerTopologyEntry>,
+    /// Number of authenticated validator connections.
+    pub connected_validator_peer_count: usize,
+    /// Number of discovered peers.
+    pub discovered_peer_count: usize,
+    /// Number of connected observer peers.
+    pub observer_peer_count: usize,
+    /// Listener mode.
+    pub rpc_mode: RpcMode,
+    /// Whether an admin token is configured.
+    pub admin_token_configured: bool,
 }
 
 /// Read-only engine view required by RPC handlers.
@@ -799,14 +818,23 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
         ));
     }
     let authenticated_owner = if params.len() == 5 {
-        Some(authorized_payment_address(&params[3..5], state)?.1)
+        Some(authorized_payment_address(
+            params.get(3..5).ok_or_else(|| {
+                RpcError::InvalidParams("missing scan authorization parameters".to_string())
+            })?,
+            state,
+        )?.1)
     } else {
         None
     };
-    let from_height = unquote(&params[0])
+    let from_height = unquote(params.first().ok_or_else(|| {
+        RpcError::InvalidParams("missing from_height".to_string())
+    })?)
         .parse::<u64>()
         .map_err(|_| RpcError::InvalidParams("invalid from_height".to_string()))?;
-    let limit = unquote(&params[1])
+    let limit = unquote(params.get(1).ok_or_else(|| {
+        RpcError::InvalidParams("missing limit".to_string())
+    })?)
         .parse::<u64>()
         .map_err(|_| RpcError::InvalidParams("invalid limit".to_string()))?;
     if limit == 0 || limit > MAX_CANONICAL_BLOCK_PAGE {
@@ -820,7 +848,13 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
             state.lowest_block
         )));
     }
-    let expected_parent = parse_hex32_param(&[params[2].clone()], "expected_parent_hash")?;
+    let expected_parent_param = params.get(2).ok_or_else(|| {
+        RpcError::InvalidParams("missing expected_parent_hash".to_string())
+    })?;
+    let expected_parent = parse_hex32_param(
+        std::slice::from_ref(expected_parent_param),
+        "expected_parent_hash",
+    )?;
     let first = state
         .engine
         .get_block_by_height(from_height)
@@ -895,8 +929,12 @@ fn get_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String
             "expected [height, tx_index]".to_string(),
         ));
     }
-    let height_str = &params[0];
-    let tx_index_str = &params[1];
+    let height_str = params.first().ok_or_else(|| {
+        RpcError::InvalidParams("missing height".to_string())
+    })?;
+    let tx_index_str = params.get(1).ok_or_else(|| {
+        RpcError::InvalidParams("missing tx_index".to_string())
+    })?;
     let height: u64 = unquote(height_str)
         .parse()
         .map_err(|_| RpcError::InvalidParams(format!("invalid height: {height_str}")))?;
@@ -1093,8 +1131,13 @@ fn authorized_payment_address(
             "expected payment_address and scan_auth_proof parameters".into(),
         ));
     }
-    let address_text = unquote(&params[0]).to_string();
-    let auth = unquote(&params[1]);
+    let address_text = unquote(params.first().ok_or_else(|| {
+        RpcError::InvalidParams("missing payment address".to_string())
+    })?)
+    .to_string();
+    let auth = unquote(params.get(1).ok_or_else(|| {
+        RpcError::InvalidParams("missing scan authorization proof".to_string())
+    })?);
     let address = PaymentAddressV1::from_text(&address_text, state.chain.chain_id.as_bytes())
         .map_err(|error| RpcError::InvalidParams(format!("invalid payment address: {error}")))?;
     let owner_pubkey = verify_scan_auth(&address_text, &address, auth)?;
@@ -1129,8 +1172,16 @@ fn explain_utxo_provenance_authorized(
             "expected address, scan_auth_proof, and utxo_id parameters".into(),
         ));
     }
-    let (address_text, authenticated_owner) = authorized_payment_address(&params[..2], state)?;
-    let utxo_id = parse_hex32_value(unquote(&params[2]), "utxo_id")?;
+    let auth_params = params.get(..2).ok_or_else(|| {
+        RpcError::InvalidParams("missing scan authorization parameters".to_string())
+    })?;
+    let (address_text, authenticated_owner) = authorized_payment_address(auth_params, state)?;
+    let utxo_id = parse_hex32_value(
+        unquote(params.get(2).ok_or_else(|| {
+            RpcError::InvalidParams("missing utxo_id".to_string())
+        })?),
+        "utxo_id",
+    )?;
     let entry =
         state.chain.utxos.get(&utxo_id).ok_or_else(|| {
             RpcError::NotFound(format!("UTXO {} not found", hex::encode(utxo_id.0)))
@@ -2772,12 +2823,14 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
                     "false"
                 },
                 value_hash,
-                compressed_terminal_json(&proof.terminal),
+                compressed_terminal_json(&proof.terminal)
+                    .map_err(RpcError::Internal)?,
                 proof
                     .steps
                     .iter()
                     .map(compressed_step_json)
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(RpcError::Internal)?
                     .join(","),
                 hex::encode(state_root.0),
             ))
@@ -2785,37 +2838,37 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
     }
 }
 
-fn compressed_terminal_json(terminal: &ProofTerminal) -> String {
+fn compressed_terminal_json(terminal: &ProofTerminal) -> Result<String, String> {
     match terminal {
-        ProofTerminal::Included => r#"{"kind":"included"}"#.to_string(),
-        ProofTerminal::MissingChild => r#"{"kind":"missing_child"}"#.to_string(),
+        ProofTerminal::Included => Ok(r#"{"kind":"included"}"#.to_string()),
+        ProofTerminal::MissingChild => Ok(r#"{"kind":"missing_child"}"#.to_string()),
         ProofTerminal::DivergentLeaf {
             existing_key,
             existing_value_hash,
-        } => format!(
+        } => Ok(format!(
             r#"{{"kind":"divergent_leaf","existing_key":"{}","existing_value_hash":"{}"}}"#,
             hex::encode(existing_key),
             hex::encode(existing_value_hash)
-        ),
+        )),
         ProofTerminal::PrefixMismatch {
             branch_prefix,
             children,
-        } => format!(
+        } => Ok(format!(
             r#"{{"kind":"prefix_mismatch","branch_prefix":"{}","children":[{}]}}"#,
-            encode_nibble_path(branch_prefix),
+            encode_nibble_path(branch_prefix)?,
             children
                 .iter()
                 .map(compressed_child_json)
                 .collect::<Vec<_>>()
                 .join(",")
-        ),
+        )),
     }
 }
 
-fn compressed_step_json(step: &indra_state::CompressedProofStep) -> String {
-    format!(
+fn compressed_step_json(step: &indra_state::CompressedProofStep) -> Result<String, String> {
+    Ok(format!(
         r#"{{"branch_prefix":"{}","target_nibble":{},"child_bitmap":{},"siblings":[{}]}}"#,
-        encode_nibble_path(&step.branch_prefix),
+        encode_nibble_path(&step.branch_prefix)?,
         step.target_nibble,
         step.child_bitmap,
         step.siblings
@@ -2823,7 +2876,7 @@ fn compressed_step_json(step: &indra_state::CompressedProofStep) -> String {
             .map(compressed_child_json)
             .collect::<Vec<_>>()
             .join(",")
-    )
+    ))
 }
 
 fn compressed_child_json(child: &indra_state::CompressedProofChild) -> String {
@@ -2839,13 +2892,15 @@ fn compressed_child_json(child: &indra_state::CompressedProofChild) -> String {
     )
 }
 
-fn encode_nibble_path(path: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+fn encode_nibble_path(path: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(path.len());
     for nibble in path {
-        out.push(HEX[usize::from(*nibble & 0x0F)] as char);
+        let value = nibble & 0x0F;
+        let digit = char::from_digit(u32::from(value), 16)
+            .ok_or_else(|| "invalid compressed proof nibble".to_string())?;
+        out.push(digit);
     }
-    out
+    Ok(out)
 }
 
 /// `indra_sendTransaction` — submit a hex-encoded signed transaction.

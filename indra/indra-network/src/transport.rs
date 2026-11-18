@@ -85,7 +85,11 @@ impl Connection {
                     break;
                 }
                 Ok(n) => {
-                    self.read_buf.extend_from_slice(&scratch[..n]);
+                    self.read_buf.extend_from_slice(scratch.get(..n).ok_or_else(|| {
+                        NetworkError::DecodeFailed {
+                            reason: "invalid transport read length".to_string(),
+                        }
+                    })?);
                     if n < scratch.len() {
                         break;
                     }
@@ -144,7 +148,13 @@ impl Connection {
 
         let payload_start = self.read_pos + 4;
         let payload_end = self.read_pos + frame_len;
-        let payload = self.read_buf[payload_start..payload_end].to_vec();
+        let payload = self
+            .read_buf
+            .get(payload_start..payload_end)
+            .ok_or_else(|| NetworkError::DecodeFailed {
+                reason: "invalid transport frame bounds".to_string(),
+            })?
+            .to_vec();
         self.read_pos = payload_end;
         self.compact_read_buf();
 
