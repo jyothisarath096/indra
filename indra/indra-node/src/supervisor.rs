@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::sync::OnceLock;
+use std::sync::{atomic::{AtomicUsize, Ordering}, OnceLock};
 use std::fmt::Display;
 use std::io::Write;
 
@@ -11,6 +11,7 @@ use futures_util::FutureExt;
 use crate::NodeResult;
 
 static GLOBAL_REPORTER: OnceLock<Sender<CriticalTaskOutcome>> = OnceLock::new();
+static REPORT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Outcome reported when a critical task stops.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,11 +139,22 @@ impl Default for CriticalTasks {
 
 /// Report a fatal event from a component that cannot own the main loop.
 pub fn report_unexpected(name: &str, reason: impl Into<String>) {
+    REPORT_COUNT.fetch_add(1, Ordering::SeqCst);
     if let Some(reporter) = GLOBAL_REPORTER.get() {
         if let Err(error) = reporter.send(critical_task_decision(false, name, reason)) {
             eprintln!("[supervisor] failed to report fatal event: {error}");
         }
     }
+}
+
+/// Reset the fatal-report counter used by focused node tests.
+pub fn reset_report_count() {
+    REPORT_COUNT.store(0, Ordering::SeqCst);
+}
+
+/// Return the number of fatal reports emitted by this process.
+pub fn report_count() -> usize {
+    REPORT_COUNT.load(Ordering::SeqCst)
 }
 
 /// Terminate the process after routing a fatal runtime error through the supervisor.

@@ -4162,11 +4162,13 @@ fn run() -> indra_node::NodeResult<()> {
                 admin_token: cfg_file
                     .rpc_admin_token
                     .clone()
-                    .filter(|token| !token.trim().is_empty()),
+                    .filter(|token| !token.trim().is_empty())
+                    .map(AdminToken::new),
                 access_token: cfg_file
                     .rpc_access_token
                     .clone()
-                    .filter(|token| !token.trim().is_empty()),
+                    .filter(|token| !token.trim().is_empty())
+                    .map(AccessToken::new),
             },
             RpcListenerState {
                 driver: Arc::clone(&driver),
@@ -4954,14 +4956,40 @@ fn rpc_public_should_start(enabled: Option<bool>) -> bool {
     enabled.unwrap_or(false)
 }
 
+#[derive(Clone, Debug)]
+struct AdminToken(String);
+
+impl AdminToken {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn matches(&self, presented: &str) -> bool {
+        self.0.as_bytes().ct_eq(presented.as_bytes()).into()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AccessToken(String);
+
+impl AccessToken {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn matches(&self, presented: &str) -> bool {
+        self.0.as_bytes().ct_eq(presented.as_bytes()).into()
+    }
+}
+
 struct RpcListenerConfig {
     label: &'static str,
     rpc_addr: String,
     mode: indra_rpc::handlers::RpcMode,
     policy: RpcListenerPolicy,
     cors_origins: Vec<String>,
-    admin_token: Option<String>,
-    access_token: Option<String>,
+    admin_token: Option<AdminToken>,
+    access_token: Option<AccessToken>,
 }
 
 struct RpcListenerState {
@@ -5115,8 +5143,8 @@ fn spawn_rpc_listener(
                             let auth = RpcHandlerAuth {
                                 cors_origins: &rpc_cors_origins,
                                 rpc_mode: mode,
-                                configured_admin_token: admin_token.as_ref().as_deref(),
-                                configured_access_token: access_token.as_ref().as_deref(),
+                                configured_admin_token: admin_token.as_ref().as_ref(),
+                                configured_access_token: access_token.as_ref().as_ref(),
                             };
                             handle_rpc(stream, node, limits, auth);
                         });
@@ -5547,8 +5575,8 @@ struct RpcHandlerLimits<'a> {
 struct RpcHandlerAuth<'a> {
     cors_origins: &'a [String],
     rpc_mode: indra_rpc::handlers::RpcMode,
-    configured_admin_token: Option<&'a str>,
-    configured_access_token: Option<&'a str>,
+    configured_admin_token: Option<&'a AdminToken>,
+    configured_access_token: Option<&'a AccessToken>,
 }
 
 fn handle_rpc(
@@ -6201,13 +6229,13 @@ fn handle_rpc(
 }
 
 fn rpc_admin_token_status(
-    configured_admin_token: Option<&str>,
+    configured_admin_token: Option<&AdminToken>,
     presented_admin_token: Option<&str>,
 ) -> (bool, bool) {
     let configured = configured_admin_token.is_some();
     let valid = configured_admin_token
         .zip(presented_admin_token)
-        .is_some_and(|(expected, presented)| constant_time_token_eq(expected, presented));
+        .is_some_and(|(expected, presented)| expected.matches(presented));
     (configured, valid)
 }
 
@@ -6224,16 +6252,10 @@ fn lock_driver_for_rpc<'a>(
     result
 }
 
-fn rpc_access_token_valid(configured: Option<&str>, presented: Option<&str>) -> bool {
+fn rpc_access_token_valid(configured: Option<&AccessToken>, presented: Option<&str>) -> bool {
     configured
         .zip(presented)
-        .is_some_and(|(expected, actual)| constant_time_token_eq(expected, actual))
-}
-
-fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
-    let expected_hash = indra_crypto::sha256(expected.as_bytes());
-    let actual_hash = indra_crypto::sha256(actual.as_bytes());
-    bool::from(expected_hash.ct_eq(&actual_hash))
+        .is_some_and(|(expected, actual)| expected.matches(actual))
 }
 
 fn rpc_bind_is_loopback(addr: &str) -> bool {
@@ -8012,23 +8034,25 @@ mod tests {
     fn rpc_admin_token_status_matches_header_policy() {
         assert_eq!(rpc_admin_token_status(None, None), (false, false));
         assert_eq!(rpc_admin_token_status(None, Some("secret")), (false, false));
-        assert_eq!(rpc_admin_token_status(Some("secret"), None), (true, false));
+        let admin = AdminToken::new("secret".to_string());
+        assert_eq!(rpc_admin_token_status(Some(&admin), None), (true, false));
         assert_eq!(
-            rpc_admin_token_status(Some("secret"), Some("wrong")),
+            rpc_admin_token_status(Some(&admin), Some("wrong")),
             (true, false)
         );
         assert_eq!(
-            rpc_admin_token_status(Some("secret"), Some("secret")),
+            rpc_admin_token_status(Some(&admin), Some("secret")),
             (true, true)
         );
     }
 
     #[test]
     fn full_rpc_access_token_is_fail_closed_even_on_loopback() {
+        let access = AccessToken::new("access".to_string());
         assert!(!rpc_access_token_valid(None, None));
-        assert!(!rpc_access_token_valid(Some("access"), None));
-        assert!(!rpc_access_token_valid(Some("access"), Some("wrong")));
-        assert!(rpc_access_token_valid(Some("access"), Some("access")));
+        assert!(!rpc_access_token_valid(Some(&access), None));
+        assert!(!rpc_access_token_valid(Some(&access), Some("wrong")));
+        assert!(rpc_access_token_valid(Some(&access), Some("access")));
     }
 
     #[test]
@@ -8037,20 +8061,22 @@ mod tests {
 
         let admin_token = "admin-A";
         let access_token = "access-B";
+        let admin = AdminToken::new(admin_token.to_string());
+        let access = AccessToken::new(access_token.to_string());
         assert_eq!(
-            rpc_admin_token_status(Some(admin_token), Some(access_token)),
+            rpc_admin_token_status(Some(&admin), Some(access_token)),
             (true, false)
         );
         assert_eq!(
-            rpc_admin_token_status(Some(admin_token), Some(admin_token)),
+            rpc_admin_token_status(Some(&admin), Some(admin_token)),
             (true, true)
         );
         assert!(!rpc_access_token_valid(
-            Some(access_token),
+            Some(&access),
             Some(admin_token)
         ));
         assert!(rpc_access_token_valid(
-            Some(access_token),
+            Some(&access),
             Some(access_token)
         ));
         assert!(check_rpc_method_allowed_with_admin(
@@ -8077,7 +8103,93 @@ mod tests {
     }
 
     #[test]
+    fn real_rpc_listener_keeps_admin_and_access_tokens_separate() {
+        let (driver, dir) = proposer_test_driver([0xE7; 32], "rpc_token_listener");
+        let snapshot = driver.engine.rpc_snapshot.clone();
+        let storage = indra_node::rpc_snapshot::RpcStorageReadHandles {
+            blocks: driver.engine.block_store.read_handle(),
+            epochs: driver.engine.epoch_store.read_handle(),
+        };
+        let driver = Arc::new(Mutex::new(driver));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime_guard = runtime.enter();
+        let (event_tx, _event_rx) = tokio_mpsc::channel(1);
+        let peer_handle = spawn_peer_manager(PeerManagerConfig {
+            local_validator_id: indra_core::Bytes32::ZERO,
+            chain_id: TEST_CHAIN_ID.to_string(),
+            relay_validator_keys: Vec::new(),
+            event_tx,
+            command_buffer: 1,
+            ban_store_path: dir.join("rpc-token-ban-store.bin"),
+        });
+        let gossip = Arc::new(NetworkBridge::new(
+            peer_handle,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        ));
+        let port_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let rpc_addr = port_probe.local_addr().unwrap();
+        drop(port_probe);
+        let metrics = MetricsState::new();
+        let handle = spawn_rpc_listener(
+            RpcListenerConfig {
+                label: "rpc-test",
+                rpc_addr: rpc_addr.to_string(),
+                mode: indra_rpc::handlers::RpcMode::Full,
+                policy: RpcListenerPolicy::full(&NodeConfigFile::default()),
+                cors_origins: Vec::new(),
+                admin_token: Some(AdminToken::new("admin-A".to_string())),
+                access_token: Some(AccessToken::new("access-B".to_string())),
+            },
+            RpcListenerState {
+                driver,
+                rpc_snapshot: snapshot,
+                rpc_storage: storage,
+                gossip,
+                discovered_peers: Arc::new(Mutex::new(HashSet::new())),
+                op_relay_seen: Arc::new(Mutex::new(InboundDedupCaches::new())),
+                observer_count: Arc::new(AtomicUsize::new(0)),
+                metrics: Arc::new(metrics),
+            },
+        )
+        .unwrap();
+        let request = |headers: &str, method: &str| {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+            for _ in 0..50 {
+                if let Ok(mut stream) = std::net::TcpStream::connect(rpc_addr) {
+                    write!(
+                        stream,
+                        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{}\r\n{}",
+                        body.len(), headers, body
+                    )
+                    .unwrap();
+                    stream.shutdown(std::net::Shutdown::Write).unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    return response;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("listener did not bind");
+        };
+        let wrong_admin = request("X-Rpc-Token: access-B\r\nX-Admin-Token: access-B\r\n", "indra_getPeerTopology");
+        assert!(wrong_admin.contains("valid X-Admin-Token"), "{wrong_admin}");
+        let right_admin = request("X-Rpc-Token: access-B\r\nX-Admin-Token: admin-A\r\n", "indra_getPeerTopology");
+        assert!(!right_admin.contains("valid X-Admin-Token"), "{right_admin}");
+        let no_access = request("", "indra_getHeight");
+        assert!(no_access.contains("full RPC requires a valid X-Rpc-Token"), "{no_access}");
+        let read_with_access = request("X-Rpc-Token: access-B\r\n", "indra_getHeight");
+        assert!(read_with_access.contains("\"height\""), "{read_with_access}");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn rpc_transaction_relay_cache_poison_returns_typed_internal_error() {
+        indra_node::supervisor::reset_report_count();
         let cache = Arc::new(Mutex::new(InboundDedupCaches::new()));
         let poisoned = Arc::clone(&cache);
         let join = std::thread::spawn(move || {
@@ -8089,6 +8201,7 @@ mod tests {
             record_transaction_relay_seen(&cache, indra_core::Bytes32::ZERO),
             Err("internal relay state unavailable")
         );
+        assert_eq!(indra_node::supervisor::report_count(), 1);
     }
 
     #[test]
