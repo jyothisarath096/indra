@@ -1,31 +1,46 @@
 //! Deterministic founder-controlled genesis configuration builder.
 
-#![allow(missing_docs)]
-
 use crate::error::{CliError, CliResult};
 use serde::{Deserialize, Serialize};
 
 /// One validator entry in the genesis config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisEntry {
+    /// Human-readable validator name.
     pub name: String,
+    /// Hex-encoded validator identity.
     pub validator_id: String,
+    /// Hex-encoded classical hot public key.
     pub hybrid_classical_pk: String,
+    /// Hex-encoded post-quantum hot public key.
     pub hybrid_pq_pk: String,
+    /// Hex-encoded VRF public key.
     pub vrf_pk: String,
+    /// Hex-encoded VRF proof-of-possession output.
     pub vrf_possession_output: String,
+    /// Hex-encoded VRF proof-of-possession proof.
     pub vrf_possession_proof: String,
+    /// Hex-encoded classical cold public key.
     pub cold_hybrid_classical_pk: String,
+    /// Hex-encoded post-quantum cold public key.
     pub cold_hybrid_pq_pk: String,
+    /// Cold-key version.
     pub cold_key_version: u64,
+    /// Cold-key nonce.
     pub cold_nonce: u64,
+    /// Initial validator stake in spark.
     pub stake: u64,
 }
+/// Founder-genesis configuration rendered as a manifest.
 #[derive(Debug, Clone)]
 pub struct GenesisConfig {
+    /// Chain identifier.
     pub chain_id: String,
+    /// Fixed genesis header timestamp.
     pub genesis_timestamp: u64,
+    /// Active-slot coefficient numerator.
     pub active_slot_coefficient_numerator: u64,
+    /// Genesis validator entries.
     pub validators: Vec<GenesisEntry>,
 }
 /// Calculate a validator's genesis-stake share in basis points.
@@ -42,6 +57,7 @@ pub fn holds_at_least_one_third(stake: u64, total: u64) -> bool {
 }
 
 impl GenesisConfig {
+    /// Render the canonical TOML manifest.
     pub fn to_toml(&self) -> String {
         let mut out = format!(
             "[genesis]\nchain_id = {}\ngenesis_timestamp = {}\nactive_slot_coefficient_numerator = \"{}\"\n\n",
@@ -83,6 +99,7 @@ impl GenesisConfig {
         out
     }
 
+    /// Validate this configuration against node genesis rules.
     pub fn validate(&self) -> CliResult<()> {
         use indra_core::types::primitives::MIN_ACTIVE_VALIDATORS;
         if self.validators.len() < MIN_ACTIVE_VALIDATORS {
@@ -100,6 +117,7 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// Build and validate a founder-genesis configuration.
 pub fn build_genesis_config(
     chain_id: &str,
     genesis_timestamp: u64,
@@ -116,6 +134,7 @@ pub fn build_genesis_config(
     Ok(config)
 }
 
+/// Build a manifest entry from a private hot/cold keystore.
 pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -> GenesisEntry {
     let entry_name = if keys.name.is_empty() {
         name.to_string()
@@ -137,6 +156,7 @@ pub fn entry_from_keys(name: &str, keys: &crate::keygen::KeysFile, stake: u64) -
         stake,
     }
 }
+/// Build a manifest entry from public validator material.
 pub fn entry_from_public_keys(
     name: &str,
     public: &crate::keygen::ValidatorKeys,

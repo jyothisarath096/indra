@@ -64,12 +64,11 @@ pub fn derive_all_seeds(master_seed: &[u8; 32]) -> Result<DerivedSeeds, CryptoEr
 fn derive_seed(master_seed: &[u8; 32], domain: &[u8]) -> Result<[u8; 32], CryptoError> {
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(master_seed).map_err(|_| {
-        CryptoError::MalformedEncoding {
+    let mut mac =
+        HmacSha256::new_from_slice(master_seed).map_err(|_| CryptoError::MalformedEncoding {
             scheme: "HMAC-SHA256 key",
             actual: master_seed.len(),
-        }
-    })?;
+        })?;
     mac.update(domain);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; 32];

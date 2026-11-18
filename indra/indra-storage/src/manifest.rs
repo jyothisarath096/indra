@@ -147,28 +147,38 @@ impl ChainManifest {
         if bytes.len() < min {
             return Err("manifest truncated".into());
         }
-        if &bytes[0..4] != MANIFEST_MAGIC {
+        if bytes.get(..4) != Some(MANIFEST_MAGIC.as_slice()) {
             return Err("manifest magic mismatch".into());
         }
-        if bytes[4] != MANIFEST_VERSION {
-            return Err(format!("unsupported manifest version {}", bytes[4]));
+        let version = bytes.get(4).copied().ok_or("manifest truncated")?;
+        if version != MANIFEST_VERSION {
+            return Err(format!("unsupported manifest version {version}"));
         }
-        let committed_height = u64::from_le_bytes(copy_8(&bytes[5..13])?);
-        let committed_block_hash = Bytes32::from(copy_32(&bytes[13..45])?);
-        let state_root = Bytes32::from(copy_32(&bytes[45..77])?);
-        let snapshot_height = u64::from_le_bytes(copy_8(&bytes[77..85])?);
-        let block_log_next_height = u64::from_le_bytes(copy_8(&bytes[85..93])?);
-        let last_qc_height = u64::from_le_bytes(copy_8(&bytes[93..101])?);
-        let epoch_log_latest_epoch = match bytes[101] {
+        let committed_height =
+            u64::from_le_bytes(copy_8(bytes.get(5..13).ok_or("manifest truncated")?)?);
+        let committed_block_hash =
+            Bytes32::from(copy_32(bytes.get(13..45).ok_or("manifest truncated")?)?);
+        let state_root = Bytes32::from(copy_32(bytes.get(45..77).ok_or("manifest truncated")?)?);
+        let snapshot_height =
+            u64::from_le_bytes(copy_8(bytes.get(77..85).ok_or("manifest truncated")?)?);
+        let block_log_next_height =
+            u64::from_le_bytes(copy_8(bytes.get(85..93).ok_or("manifest truncated")?)?);
+        let last_qc_height =
+            u64::from_le_bytes(copy_8(bytes.get(93..101).ok_or("manifest truncated")?)?);
+        let epoch_flag = bytes.get(101).copied().ok_or("manifest truncated")?;
+        let epoch_log_latest_epoch = match epoch_flag {
             0 => None,
-            1 => Some(u64::from_le_bytes(copy_8(&bytes[102..110])?)),
+            1 => Some(u64::from_le_bytes(copy_8(
+                bytes.get(102..110).ok_or("manifest truncated")?,
+            )?)),
             other => return Err(format!("invalid epoch-present flag {other}")),
         };
-        let chain_len = u16::from_le_bytes(copy_2(&bytes[110..112])?) as usize;
+        let chain_len =
+            u16::from_le_bytes(copy_2(bytes.get(110..112).ok_or("manifest truncated")?)?) as usize;
         if bytes.len() != 112 + chain_len {
             return Err("manifest length mismatch".into());
         }
-        let chain_id = std::str::from_utf8(&bytes[112..])
+        let chain_id = std::str::from_utf8(bytes.get(112..).ok_or("manifest truncated")?)
             .map_err(|e| e.to_string())?
             .to_string();
         Ok(Self {

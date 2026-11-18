@@ -166,14 +166,22 @@ impl VoteSafetyStore {
             return VoteSafetyLoadResult::Corrupt("safety record truncated".into());
         }
         let payload_len = bytes.len() - 4;
-        let stored_crc = u32::from_le_bytes(match bytes[payload_len..].try_into() {
-            Ok(value) => value,
-            Err(_) => return VoteSafetyLoadResult::Corrupt("CRC field truncated".into()),
-        });
-        if stored_crc != crc32(&bytes[..payload_len]) {
+        let stored_crc = u32::from_le_bytes(
+            match bytes
+                .get(payload_len..)
+                .and_then(|value| value.try_into().ok())
+            {
+                Some(value) => value,
+                None => return VoteSafetyLoadResult::Corrupt("CRC field truncated".into()),
+            },
+        );
+        let Some(payload) = bytes.get(..payload_len) else {
+            return VoteSafetyLoadResult::Corrupt("CRC payload truncated".into());
+        };
+        if stored_crc != crc32(payload) {
             return VoteSafetyLoadResult::Corrupt("CRC mismatch".into());
         }
-        match decode_record(&bytes[..payload_len]) {
+        match decode_record(payload) {
             Ok(record) => VoteSafetyLoadResult::Record(Box::new(record)),
             Err(error) => VoteSafetyLoadResult::Corrupt(error),
         }

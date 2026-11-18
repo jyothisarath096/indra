@@ -267,14 +267,16 @@ fn random_scalar<R: CryptoRng + RngCore>(rng: &mut R) -> Scalar {
 
 fn secret_limbs(keys: &ColdKeysFile) -> [Scalar; SECRET_LIMBS] {
     let mut secret = Zeroizing::new([0u8; SECRET_BYTES]);
-    secret[..32].copy_from_slice(&keys.classical_seed);
-    secret[32..].copy_from_slice(&keys.pq_seed);
-    std::array::from_fn(|limb| {
-        let start = limb * LIMB_BYTES;
-        let mut bytes = Zeroizing::new([0u8; LIMB_BYTES]);
-        bytes.copy_from_slice(&secret[start..start + LIMB_BYTES]);
-        Scalar::from(u128::from_le_bytes(*bytes))
-    })
+    let (classical, pq) = secret.split_at_mut(32);
+    classical.copy_from_slice(&keys.classical_seed);
+    pq.copy_from_slice(&keys.pq_seed);
+    let mut result = [Scalar::ZERO; SECRET_LIMBS];
+    for (output, chunk) in result.iter_mut().zip(secret.chunks_exact(LIMB_BYTES)) {
+        let mut bytes = [0u8; LIMB_BYTES];
+        bytes.copy_from_slice(chunk);
+        *output = Scalar::from(u128::from_le_bytes(bytes));
+    }
+    result
 }
 
 fn evaluate(coefficients: &[Scalar], x: Scalar) -> Scalar {
@@ -286,9 +288,8 @@ fn evaluate(coefficients: &[Scalar], x: Scalar) -> Scalar {
 
 fn encode_share(values: &[Scalar; SECRET_LIMBS]) -> String {
     let mut bytes = Zeroizing::new([0u8; SHARE_BYTES]);
-    for (limb, value) in values.iter().enumerate() {
-        let start = limb * SCALAR_BYTES;
-        bytes[start..start + SCALAR_BYTES].copy_from_slice(value.as_bytes());
+    for (destination, value) in bytes.chunks_exact_mut(SCALAR_BYTES).zip(values.iter()) {
+        destination.copy_from_slice(value.as_bytes());
     }
     hex::encode(bytes.as_slice())
 }
@@ -296,11 +297,9 @@ fn encode_share(values: &[Scalar; SECRET_LIMBS]) -> String {
 fn decode_share(value: &str) -> KeystoreResult<[Scalar; SECRET_LIMBS]> {
     let bytes = Zeroizing::new(decode_fixed::<SHARE_BYTES>(value, "share_value")?);
     let mut values = [Scalar::ZERO; SECRET_LIMBS];
-    for (limb, output) in values.iter_mut().enumerate() {
-        let start = limb * SCALAR_BYTES;
+    for (output, scalar_bytes) in values.iter_mut().zip(bytes.chunks_exact(SCALAR_BYTES)) {
         let scalar_bytes = Zeroizing::new(
-            bytes[start..start + SCALAR_BYTES]
-                .try_into()
+            <[u8; SCALAR_BYTES]>::try_from(scalar_bytes)
                 .map_err(|_| share_error("share scalar has the wrong length"))?,
         );
         *output = Option::<Scalar>::from(Scalar::from_canonical_bytes(*scalar_bytes))
@@ -351,14 +350,22 @@ pub fn verify_cold_share(
     let commitments = parse_commitments(&share.manifest)?;
     let x = Scalar::from(u64::from(share.share_index));
     let h = pedersen_h();
-    for limb in 0..SECRET_LIMBS {
-        let expected = commitments[limb]
+    if commitments.len() != SECRET_LIMBS {
+        return Err(share_error("share commitment limb count mismatch"));
+    }
+    for (limb, ((commitment_limb, value), blinding)) in commitments
+        .iter()
+        .zip(values.iter())
+        .zip(blindings.iter())
+        .enumerate()
+    {
+        let expected = commitment_limb
             .iter()
             .rev()
             .fold(RistrettoPoint::default(), |acc, commitment| {
                 acc * x + commitment
             });
-        let supplied = values[limb] * RISTRETTO_BASEPOINT_POINT + blindings[limb] * h;
+        let supplied = *value * RISTRETTO_BASEPOINT_POINT + *blinding * h;
         if supplied != expected {
             return Err(share_error(format!(
                 "share {} fails Pedersen verification for limb {limb}",
@@ -387,12 +394,20 @@ pub fn generate_cold_share_ceremony<R: CryptoRng + RngCore>(
         Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
     let mut blinding_polynomials =
         Zeroizing::new(vec![vec![Scalar::ZERO; threshold as usize]; SECRET_LIMBS]);
-    for limb in 0..SECRET_LIMBS {
-        polynomials[limb][0] = secrets[limb];
-        for coefficient in polynomials[limb].iter_mut().skip(1) {
+    for ((polynomial, secret), blinding_polynomial) in polynomials
+        .iter_mut()
+        .zip(secrets.iter())
+        .zip(blinding_polynomials.iter_mut())
+    {
+        if let Some(first) = polynomial.first_mut() {
+            *first = *secret;
+        } else {
+            return Err(share_error("threshold must be nonzero"));
+        }
+        for coefficient in polynomial.iter_mut().skip(1) {
             *coefficient = random_scalar(rng);
         }
-        for coefficient in &mut blinding_polynomials[limb] {
+        for coefficient in blinding_polynomial {
             *coefficient = random_scalar(rng);
         }
     }
@@ -442,11 +457,20 @@ pub fn generate_cold_share_ceremony<R: CryptoRng + RngCore>(
     let mut values = Zeroizing::new(vec![[Scalar::ZERO; SECRET_LIMBS]; share_count as usize]);
     let mut blinding_values =
         Zeroizing::new(vec![[Scalar::ZERO; SECRET_LIMBS]; share_count as usize]);
-    for (offset, share) in values.iter_mut().enumerate() {
+    for (offset, (share, blinding_share)) in values
+        .iter_mut()
+        .zip(blinding_values.iter_mut())
+        .enumerate()
+    {
         let x = Scalar::from((offset + 1) as u64);
-        for limb in 0..SECRET_LIMBS {
-            share[limb] = evaluate(&polynomials[limb], x);
-            blinding_values[offset][limb] = evaluate(&blinding_polynomials[limb], x);
+        for (((share_limb, blinding_limb), polynomial), blinding_polynomial) in share
+            .iter_mut()
+            .zip(blinding_share.iter_mut())
+            .zip(polynomials.iter())
+            .zip(blinding_polynomials.iter())
+        {
+            *share_limb = evaluate(polynomial, x);
+            *blinding_limb = evaluate(blinding_polynomial, x);
         }
     }
     let shares = values
@@ -528,36 +552,48 @@ pub fn reconstruct_cold_shares(
         }
         verify_cold_share(share, expected_hot)?;
         let index = share.share_index;
-        if seen[index as usize] {
+        let seen_index = seen
+            .get_mut(index as usize)
+            .ok_or_else(|| share_error("share index is outside byte range"))?;
+        if *seen_index {
             return Err(share_error("share indices must be unique"));
         }
-        seen[index as usize] = true;
+        *seen_index = true;
         parsed.push((index, decode_share(&share.share_value)?));
     }
     parsed.sort_by_key(|(index, _)| *index);
-    let basis = &parsed[..first.manifest.threshold as usize];
+    let basis = parsed
+        .get(..first.manifest.threshold as usize)
+        .ok_or_else(|| share_error("insufficient share points"))?;
     let mut secret = Zeroizing::new([0u8; SECRET_BYTES]);
-    for limb in 0..SECRET_LIMBS {
+    for (limb, secret_chunk) in secret.chunks_exact_mut(LIMB_BYTES).enumerate() {
         let points = Zeroizing::new(
             basis
                 .iter()
-                .map(|(index, values)| (Scalar::from(u64::from(*index)), values[limb]))
-                .collect::<Vec<_>>(),
+                .map(|(index, values)| {
+                    let value = values
+                        .get(limb)
+                        .copied()
+                        .ok_or_else(|| share_error("share limb count mismatch"))?;
+                    Ok((Scalar::from(u64::from(*index)), value))
+                })
+                .collect::<KeystoreResult<Vec<_>>>()?,
         );
         let scalar = Zeroizing::new(interpolate_zero(&points)?);
         let scalar_bytes = Zeroizing::new(scalar.to_bytes());
-        if scalar_bytes[LIMB_BYTES..].iter().any(|byte| *byte != 0) {
+        let (low, high) = scalar_bytes.split_at(LIMB_BYTES);
+        if high.iter().any(|byte| *byte != 0) {
             return Err(share_error(
                 "reconstructed limb is outside the canonical 128-bit range",
             ));
         }
-        let start = limb * LIMB_BYTES;
-        secret[start..start + LIMB_BYTES].copy_from_slice(&scalar_bytes[..LIMB_BYTES]);
+        secret_chunk.copy_from_slice(low);
     }
     let mut classical_seed = Zeroizing::new([0u8; 32]);
     let mut pq_seed = Zeroizing::new([0u8; 32]);
-    classical_seed.copy_from_slice(&secret[..32]);
-    pq_seed.copy_from_slice(&secret[32..]);
+    let (classical, pq) = secret.split_at(32);
+    classical_seed.copy_from_slice(classical);
+    pq_seed.copy_from_slice(pq);
     let keypair = ColdHybridKeypair::from_independent_seeds(*classical_seed, *pq_seed)
         .map_err(|error| share_error(error.to_string()))?;
     let public = keypair.public_key();

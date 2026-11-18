@@ -51,8 +51,6 @@
 
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
-#![allow(missing_docs)] // benchmarks don't need doc comments
-
 pub mod codec_bench;
 pub mod crypto_bench;
 pub mod fixtures;

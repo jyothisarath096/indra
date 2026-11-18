@@ -34,12 +34,13 @@ pub struct VrfKeypair {
 fn expand(seed: &[u8; 32]) -> (Scalar, [u8; 32]) {
     let mut h = Sha512::digest(seed);
     let mut x = [0; 32];
-    x.copy_from_slice(&h[..32]);
+    let (x_bytes, prefix_bytes) = h.as_slice().split_at(32);
+    x.copy_from_slice(x_bytes);
     x[0] &= 248;
     x[31] &= 127;
     x[31] |= 64;
     let mut p = [0; 32];
-    p.copy_from_slice(&h[32..]);
+    p.copy_from_slice(prefix_bytes);
     let scalar = Scalar::from_bits(x);
     // The digest and clamped bytes are transient copies derived from the
     // secret seed; the returned scalar and nonce prefix remain live.
@@ -110,9 +111,11 @@ fn challenge(ps: [&EdwardsPoint; 5]) -> [u8; 16] {
         d.update(p.compress().as_bytes())
     }
     d.update([0]);
-    let o = d.finalize();
+    let o: [u8; 64] = d.finalize().into();
     let mut c = [0; 16];
-    c.copy_from_slice(&o[..16]);
+    for (destination, source) in c.iter_mut().zip(o.iter()) {
+        *destination = *source;
+    }
     c
 }
 fn output(g: &EdwardsPoint) -> VrfOutput {
@@ -120,8 +123,7 @@ fn output(g: &EdwardsPoint) -> VrfOutput {
     d.update([SUITE, 3]);
     d.update(g.mul_by_cofactor().compress().as_bytes());
     d.update([0]);
-    let mut b = [0; 64];
-    b.copy_from_slice(&d.finalize());
+    let b: [u8; 64] = d.finalize().into();
     VrfOutput(b)
 }
 /// Produce an RFC proof and output.
@@ -161,19 +163,28 @@ pub fn vrf_verify(
     let y = CompressedEdwardsY(*pk)
         .decompress()
         .ok_or(CryptoError::InvalidPoint)?;
+    let Some(gamma_bytes) = pi.0.get(..32) else {
+        return Err(CryptoError::VrfProofFailed);
+    };
     let mut gb = [0; 32];
-    gb.copy_from_slice(&pi.0[..32]);
+    gb.copy_from_slice(gamma_bytes);
     let g = CompressedEdwardsY(gb)
         .decompress()
         .ok_or(CryptoError::InvalidPoint)?;
     if g.is_identity() || !g.is_torsion_free() || g.compress().to_bytes() != gb {
         return Err(CryptoError::VrfProofFailed);
     }
+    let Some(challenge_bytes) = pi.0.get(32..48) else {
+        return Err(CryptoError::VrfProofFailed);
+    };
     let mut cb = [0; 16];
-    cb.copy_from_slice(&pi.0[32..48]);
+    cb.copy_from_slice(challenge_bytes);
     let c = cs(&cb);
+    let Some(response_bytes) = pi.0.get(48..) else {
+        return Err(CryptoError::VrfProofFailed);
+    };
     let mut sb = [0; 32];
-    sb.copy_from_slice(&pi.0[48..]);
+    sb.copy_from_slice(response_bytes);
     let s = Option::<Scalar>::from(Scalar::from_canonical_bytes(sb))
         .ok_or(CryptoError::VrfProofFailed)?;
     let h = h2c(pk, alpha);
@@ -317,6 +328,17 @@ mod tests {
         let mut wrong = o.clone();
         wrong.0[0] ^= 1;
         assert!(vrf_verify(&kp.public_key(), b"alpha", &wrong, &p).is_err())
+    }
+
+    #[test]
+    fn truncated_vrf_proof_returns_typed_error() {
+        let kp = VrfKeypair::from_seed(&[0x2a; 32]);
+        let (output, proof) = vrf_prove(&kp, b"truncated");
+        let truncated = VrfProof(proof.0[..PROOF_BYTES - 1].to_vec());
+        assert_eq!(
+            vrf_verify(&kp.public_key(), b"truncated", &output, &truncated),
+            Err(CryptoError::VrfProofFailed)
+        );
     }
 
     #[test]

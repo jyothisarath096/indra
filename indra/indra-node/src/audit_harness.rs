@@ -1,7 +1,7 @@
 //! Feature-gated adapter exposing semantic consensus operations to audit tests.
 use crate::{ConsensusDriver, DriverAction, NodeResult};
 use indra_core::types::primitives::Bytes32;
-use indra_core::types::vote::{VoteStep, VoteV1};
+use indra_core::types::vote::VoteStep;
 
 /// Thin wrapper around a real production driver. No consensus state is copied.
 pub struct ProductionNodeAdapter { driver: ConsensusDriver }
@@ -29,6 +29,3 @@ impl ProductionNodeAdapter {
     pub fn process(&mut self, event: crate::DriverEvent) -> Vec<DriverAction> { self.driver.process(event) }
 }
 
-/// Keep the vote type referenced by the adapter API documentation.
-#[allow(dead_code)]
-fn _vote_type_marker(_: VoteV1) {}

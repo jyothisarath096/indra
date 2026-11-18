@@ -86,7 +86,6 @@ fn post_json_with_path(url: &str, body: &str, token_path: Option<PathBuf>) -> Cl
     post_json_with_tls(url, body, token_path, None)
 }
 
-#[allow(unused_mut)]
 fn post_json_with_tls(
     url: &str,
     body: &str,

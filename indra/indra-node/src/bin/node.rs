@@ -1,5 +1,12 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 //! INDRA v2 node binary.
@@ -94,12 +101,10 @@ fn unix_timestamp_secs() -> u64 {
 async fn wait_for_shutdown_signal() -> indra_node::NodeResult<()> {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .map_err(|error| indra_node::NodeError::InvalidConfiguration {
-            detail: format!("failed to install SIGTERM handler: {error}"),
-        })?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+                detail: format!("failed to install SIGTERM handler: {error}"),
+            })?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.map_err(|error| indra_node::NodeError::InvalidConfiguration {
                 detail: format!("failed to receive SIGINT: {error}"),
@@ -623,9 +628,7 @@ impl NetworkBridge {
             .collect())
     }
 
-    fn peer_topology(
-        &self,
-    ) -> indra_node::NodeResult<Vec<indra_rpc::handlers::PeerTopologyEntry>> {
+    fn peer_topology(&self) -> indra_node::NodeResult<Vec<indra_rpc::handlers::PeerTopologyEntry>> {
         let peer_addrs = locks::lock(&self.peer_addrs, "network.peer_addrs")?;
         let mut peers: Vec<_> = peer_addrs
             .iter()
@@ -644,10 +647,15 @@ impl NetworkBridge {
         Ok(peers)
     }
 
-    fn validator_for_addr(&self, addr: &SocketAddr) -> indra_node::NodeResult<Option<indra_core::Bytes32>> {
-        Ok(locks::lock(&self.addr_validators, "network.addr_validators")?
-            .get(addr)
-            .copied())
+    fn validator_for_addr(
+        &self,
+        addr: &SocketAddr,
+    ) -> indra_node::NodeResult<Option<indra_core::Bytes32>> {
+        Ok(
+            locks::lock(&self.addr_validators, "network.addr_validators")?
+                .get(addr)
+                .copied(),
+        )
     }
 }
 
@@ -709,6 +717,16 @@ fn op_relay_key(msg: &Message) -> Option<OpRelayKey> {
         ))),
         _ => None,
     }
+}
+
+fn record_transaction_relay_seen(
+    op_relay_seen: &Arc<Mutex<InboundDedupCaches>>,
+    tx_id: indra_core::Bytes32,
+) -> Result<(), &'static str> {
+    let mut cache = locks::lock(op_relay_seen, "rpc.op_relay_seen")
+        .map_err(|_| "internal relay state unavailable")?;
+    let _ = cache.transactions.insert_at(tx_id, Instant::now());
+    Ok(())
 }
 
 fn broadcast_locally_accepted_op(
@@ -1054,8 +1072,11 @@ fn record_peer_connected_event(
         locks::lock(discovered_peers, "network.discovered_peers")?.remove(&addr.to_string());
         locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?
             .remove(&addr.to_string());
-        locks::lock(authenticated_addr_validators, "network.authenticated_addr_validators")?
-            .remove(&addr.to_string());
+        locks::lock(
+            authenticated_addr_validators,
+            "network.authenticated_addr_validators",
+        )?
+        .remove(&addr.to_string());
         locks::lock(outbound_cooldowns, "network.outbound_cooldowns")?
             .reset(&OutboundCooldownKey::Address(addr.to_string()));
         locks::lock(failure_counts, "network.failure_counts")?.remove(&addr.to_string());
@@ -1076,9 +1097,13 @@ fn record_peer_connected_event(
         locks::lock(peer_addrs, "network.peer_addrs")?.insert(validator_id, addr);
         locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?
             .insert(addr.to_string());
-        locks::lock(authenticated_addr_validators, "network.authenticated_addr_validators")?
-            .insert(addr.to_string(), validator_id);
-        let authenticated = locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?.clone();
+        locks::lock(
+            authenticated_addr_validators,
+            "network.authenticated_addr_validators",
+        )?
+        .insert(addr.to_string(), validator_id);
+        let authenticated =
+            locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?.clone();
         let mut discovered = locks::lock(discovered_peers, "network.discovered_peers")?;
         insert_discovered_peer_bounded(
             &mut discovered,
@@ -1984,11 +2009,12 @@ fn start_network_runtime(
         }
     });
 
-    let peer_manager = handle_rx.recv().map_err(|error| {
-        indra_node::NodeError::InvalidConfiguration {
-            detail: format!("peer manager failed before publishing its handle: {error}"),
-        }
-    })?;
+    let peer_manager =
+        handle_rx
+            .recv()
+            .map_err(|error| indra_node::NodeError::InvalidConfiguration {
+                detail: format!("peer manager failed before publishing its handle: {error}"),
+            })?;
     let bridge = Arc::new(NetworkBridge::new(
         peer_manager,
         peer_addrs,
@@ -2029,7 +2055,10 @@ fn start_observer_runtime(
 
             let (block_tx, _) =
                 tokio::sync::broadcast::channel::<indra_core::types::block::BlockProposalVNext>(64);
-            indra_node::supervisor::spawn_critical("observer-block-poller", observer_block_poller(Arc::clone(&driver), block_tx.clone()));
+            indra_node::supervisor::spawn_critical(
+                "observer-block-poller",
+                observer_block_poller(Arc::clone(&driver), block_tx.clone()),
+            );
 
             loop {
                 let (stream, addr) = match listener.accept().await {
@@ -2043,19 +2072,25 @@ fn start_observer_runtime(
                 let observer_count = Arc::clone(&observer_count);
                 let metrics = Arc::clone(&metrics);
                 let mut block_rx = block_tx.subscribe();
-                indra_node::supervisor::spawn_connection("observer", Arc::clone(&metrics), async move {
-                    match handle_observer_connection(
-                        stream,
-                        addr,
-                        driver,
-                        observer_count,
-                        Arc::clone(&metrics),
-                        &mut block_rx,
-                    ).await {
-                        Ok(()) => {}
-                        Err(e) => eprintln!("[observer] connection {} closed: {}", addr, e),
-                    }
-                });
+                indra_node::supervisor::spawn_connection(
+                    "observer",
+                    Arc::clone(&metrics),
+                    async move {
+                        match handle_observer_connection(
+                            stream,
+                            addr,
+                            driver,
+                            observer_count,
+                            Arc::clone(&metrics),
+                            &mut block_rx,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => eprintln!("[observer] connection {} closed: {}", addr, e),
+                        }
+                    },
+                );
             }
         })
     }))
@@ -2098,8 +2133,10 @@ async fn handle_observer_connection(
 ) -> indra_network::NetworkResult<()> {
     let result = perform_observer_handshake_responder(stream, NODE_TYPE_FULL).await?;
     let mut stream = result.stream;
-    let status = current_status_message(&driver).map_err(|error| indra_network::NetworkError::DecodeFailed {
-        reason: error.to_string(),
+    let status = current_status_message(&driver).map_err(|error| {
+        indra_network::NetworkError::DecodeFailed {
+            reason: error.to_string(),
+        }
     })?;
     write_message_plain(&mut stream, &status).await?;
 
@@ -2119,13 +2156,17 @@ async fn handle_observer_connection(
     let mut request_blocks_limiter =
         TokenBucket::new(OBSERVER_REQUEST_BLOCKS_RATE, OBSERVER_REQUEST_BLOCKS_BURST);
 
-    let writer_task = indra_node::supervisor::spawn_connection("observer-writer", Arc::clone(&metrics), async move {
-        while let Some(msg) = write_rx.recv().await {
-            if write_message_plain(&mut writer, &msg).await.is_err() {
-                break;
+    let writer_task = indra_node::supervisor::spawn_connection(
+        "observer-writer",
+        Arc::clone(&metrics),
+        async move {
+            while let Some(msg) = write_rx.recv().await {
+                if write_message_plain(&mut writer, &msg).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        },
+    );
 
     loop {
         tokio::select! {
@@ -2229,7 +2270,11 @@ fn observer_blocks_for_range(
     Option<u64>,
 )> {
     let mut d = locks::lock(driver, "observer.driver")?;
-    Ok(blocks_for_range_with_availability(&mut d.engine.block_store, from_height, to_height))
+    Ok(blocks_for_range_with_availability(
+        &mut d.engine.block_store,
+        from_height,
+        to_height,
+    ))
 }
 
 fn blocks_for_range_with_availability(
@@ -2670,11 +2715,10 @@ fn run() -> indra_node::NodeResult<()> {
     eprintln!("\nStarting P2P and consensus...\n");
 
     let vote_safety = indra_storage::VoteSafetyStore::open(engine.config.vote_safety_path());
-    let mut driver_state = ConsensusDriver::try_new(engine, vote_safety)
-        .unwrap_or_else(|error| {
-            eprintln!("ERROR: failed to initialize consensus driver: {error}");
-            std::process::exit(1);
-        });
+    let mut driver_state = ConsensusDriver::try_new(engine, vote_safety).unwrap_or_else(|error| {
+        eprintln!("ERROR: failed to initialize consensus driver: {error}");
+        std::process::exit(1);
+    });
     driver_state.refresh_registered_voters();
     let startup_qc_request = driver_state.request_qc_if_needed();
     let handshake_config = match build_handshake_config(&driver_state.engine) {
@@ -4076,17 +4120,17 @@ fn run() -> indra_node::NodeResult<()> {
     if !startup_qc_request.is_empty() {
         let current_height = locks::lock(&driver, "main.driver.startup_height")?.height();
         if let Err(error) = process_driver_actions(
-    DriverActionContext {
-        driver: &driver,
-        gossip: &gossip,
-        height_tx: &height_tx,
-        handshake_config: &handshake_config,
-        previous_height: current_height,
-        metrics_state: &metrics_state,
-        last_block_timestamp: &last_block_timestamp,
-    },
-    startup_qc_request,
-) {
+            DriverActionContext {
+                driver: &driver,
+                gossip: &gossip,
+                height_tx: &height_tx,
+                handshake_config: &handshake_config,
+                previous_height: current_height,
+                metrics_state: &metrics_state,
+                last_block_timestamp: &last_block_timestamp,
+            },
+            startup_qc_request,
+        ) {
             eprintln!("ERROR: startup driver action processing failed: {error}");
             std::process::exit(1);
         }
@@ -4230,7 +4274,8 @@ fn run() -> indra_node::NodeResult<()> {
             };
             if !on_chain_addrs.is_empty() {
                 let source_addrs = on_chain_addrs.clone();
-                let local_validator_id = locks::read(&handshake_config, "main.handshake_config")?.my_validator_id;
+                let local_validator_id =
+                    locks::read(&handshake_config, "main.handshake_config")?.my_validator_id;
                 let connected = match gossip.connected_addrs() {
                     Ok(addrs) => addrs,
                     Err(error) => {
@@ -4243,7 +4288,9 @@ fn run() -> indra_node::NodeResult<()> {
                         });
                     }
                 };
-                let authenticated = locks::lock(&authenticated_peer_addrs, "main.authenticated_peer_addrs")?.clone();
+                let authenticated =
+                    locks::lock(&authenticated_peer_addrs, "main.authenticated_peer_addrs")?
+                        .clone();
                 let mut discovered_guard = locks::lock(&discovered_peers, "main.discovered_peers")?;
                 let accepted = insert_on_chain_validator_network_addrs(
                     OnChainAddressContext {
@@ -4284,19 +4331,18 @@ fn run() -> indra_node::NodeResult<()> {
             let connected = match gossip.connected_addrs() {
                 Ok(addrs) => addrs,
                 Err(error) => {
-                    indra_node::supervisor::report_unexpected("network-event-loop", error.to_string());
+                    indra_node::supervisor::report_unexpected(
+                        "network-event-loop",
+                        error.to_string(),
+                    );
                     return Err(indra_node::NodeError::InvalidConfiguration {
                         detail: format!("network address query failed: {error}"),
                     });
                 }
             };
             let addr_validators = locks::lock(&gossip.addr_validators, "main.addr_validators")?;
-            let known_addrs = peer_list_payload_with_identities(
-                connected,
-                None,
-                &self_addrs,
-                &addr_validators,
-            );
+            let known_addrs =
+                peer_list_payload_with_identities(connected, None, &self_addrs, &addr_validators);
             if !known_addrs.is_empty() {
                 let message = Message::PeerList(known_addrs);
                 if let Ok(wire) = message.encode_wire() {
@@ -4349,7 +4395,10 @@ fn process_driver_actions(
             let peers: Vec<SocketAddr> = match gossip.connected_addrs() {
                 Ok(peers) => peers,
                 Err(error) => {
-                    indra_node::supervisor::report_unexpected("consensus-driver", error.to_string());
+                    indra_node::supervisor::report_unexpected(
+                        "consensus-driver",
+                        error.to_string(),
+                    );
                     return Err(error);
                 }
             };
@@ -4540,7 +4589,10 @@ fn should_log_sync_height(height: u64) -> bool {
     height <= 5 || height.is_multiple_of(100)
 }
 
-fn broadcast_status(driver: &Arc<Mutex<ConsensusDriver>>, gossip: &Arc<NetworkBridge>) -> indra_node::NodeResult<()> {
+fn broadcast_status(
+    driver: &Arc<Mutex<ConsensusDriver>>,
+    gossip: &Arc<NetworkBridge>,
+) -> indra_node::NodeResult<()> {
     let (height, tip_hash, round) = {
         let d = locks::lock(driver, "consensus.driver")?;
         (d.height(), d.engine.state.tip_hash, d.current_round())
@@ -4962,8 +5014,11 @@ fn spawn_rpc_listener(
     let expensive_semaphore = Arc::new(RpcSemaphore::new(MAX_CONCURRENT_EXPENSIVE_RPC));
     let rejection_counters = Arc::new(RpcRejectionCounters::default());
     let limiter_telemetry = Arc::new(RpcLimiterTelemetry::default());
-    metrics.register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry))
-        .map_err(|_| indra_node::NodeError::LockPoisoned { name: "metrics.rpc_limiter_telemetry" })?;
+    metrics
+        .register_rpc_limiter_telemetry(Arc::clone(&limiter_telemetry))
+        .map_err(|_| indra_node::NodeError::LockPoisoned {
+            name: "metrics.rpc_limiter_telemetry",
+        })?;
     eprintln!("[{}] listening on {} ({:?})", label, rpc_addr, mode);
 
     Ok(std::thread::spawn(move || {
@@ -4987,10 +5042,15 @@ fn spawn_rpc_listener(
                     }
                     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
                     if let Some(ip) = peer_ip {
-                        let mut counts = match indra_node::locks::lock(&rpc_ip_connections, "rpc-ip-state") {
+                        let mut counts = match indra_node::locks::lock(
+                            &rpc_ip_connections,
+                            "rpc-ip-state",
+                        ) {
                             Ok(counts) => counts,
                             Err(error) => {
-                                eprintln!("[{label}] rejecting connection after lock failure: {error}");
+                                eprintln!(
+                                    "[{label}] rejecting connection after lock failure: {error}"
+                                );
                                 eprintln!("[{label}] CRITICAL: per-IP connection mutex poisoned for {ip}; rejecting connection");
                                 release_rpc_connection(&rpc_conn_count);
                                 drop(stream);
@@ -6080,23 +6140,22 @@ fn handle_rpc(
                             });
                         match submit_result {
                             Ok(tx_id) => {
-                                let mut cache = match indra_node::locks::lock(op_relay_seen, "rpc.op_relay_seen") {
-                                    Ok(cache) => cache,
-                                    Err(_) => {
-                                        return send_http(
-                                            &stream,
-                                            &cors,
-                                            &RpcResponse::err(
-                                                req.id.clone(),
-                                                -32000,
-                                                "internal relay state unavailable".to_string(),
-                                            )
-                                            .to_json(),
-                                            metrics,
-                                        );
-                                    }
-                                };
-                                let _ = cache.transactions.insert_at(tx_id, Instant::now());
+                                if let Err(error) =
+                                    record_transaction_relay_seen(op_relay_seen, tx_id)
+                                {
+                                    indra_node::supervisor::report_unexpected("rpc-handler", error);
+                                    return send_http(
+                                        &stream,
+                                        &cors,
+                                        &RpcResponse::err(
+                                            req.id.clone(),
+                                            -32000,
+                                            error.to_string(),
+                                        )
+                                        .to_json(),
+                                        metrics,
+                                    );
+                                }
                                 gossip.start_tx_stem(tx);
                                 RpcResponse::ok(
                                     req.id.clone(),
@@ -6155,8 +6214,7 @@ fn lock_driver_for_rpc<'a>(
     metrics: &MetricsState,
 ) -> Result<std::sync::MutexGuard<'a, indra_node::driver::ConsensusDriver>, String> {
     let started = Instant::now();
-    let result = indra_node::locks::lock(driver, "rpc-driver")
-        .map_err(|error| error.to_string());
+    let result = indra_node::locks::lock(driver, "rpc-driver").map_err(|error| error.to_string());
     metrics.rpc_lock_wait_micros_total.fetch_add(
         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         Ordering::Relaxed,
@@ -6338,13 +6396,15 @@ fn decode_node_rpc_transaction(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
 
     #[test]
     fn full_rpc_handler_panic_is_counted_and_next_handler_runs() {
         let metrics = MetricsState::new();
-        assert!(!run_isolated_handler("full_rpc", &metrics, || panic!("test panic")));
+        assert!(!run_isolated_handler("full_rpc", &metrics, || panic!(
+            "test panic"
+        )));
         assert!(run_isolated_handler("full_rpc", &metrics, || {}));
         let counts = metrics.handler_panics_total.lock().unwrap();
         assert_eq!(counts.get("full_rpc"), Some(&1));
@@ -6352,7 +6412,7 @@ mod tests {
 
     fn test_manifest(chain_id: &str, entries: &[([u8; 32], [u8; 32], [u8; 32])]) -> String {
         use indra_core::types::staking::StakingOp;
-        use indra_crypto::{ColdHybridKeypair, ClassicalKeypair, PqKeypair, VrfKeypair};
+        use indra_crypto::{ClassicalKeypair, ColdHybridKeypair, PqKeypair, VrfKeypair};
         let mut output = format!("[genesis]\nchain_id = \"{chain_id}\"\ngenesis_timestamp = 1700000000\nactive_slot_coefficient_numerator = \"{}\"\n", indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR);
         for (index, (classical_seed, pq_seed, vrf_seed)) in entries.iter().enumerate() {
             let classical = ClassicalKeypair::from_seed(classical_seed);
@@ -6362,10 +6422,23 @@ mod tests {
             cold_classical_seed[0] ^= 0xA5;
             let mut cold_pq_seed = *classical_seed;
             cold_pq_seed[0] ^= 0x5A;
-            let cold_public = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap().public_key();
+            let cold_public =
+                ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed)
+                    .unwrap()
+                    .public_key();
             let cold = cold_public.as_complete_hybrid();
-            let id = indra_core::types::crypto::hybrid_identity_id(&classical.public_key().0, &pq.public_key().0).0;
-            let challenge = StakingOp::vrf_possession_challenge(chain_id, &indra_core::Bytes32::from(id), &indra_core::Bytes32::from(vrf.public_key()), 0).unwrap();
+            let id = indra_core::types::crypto::hybrid_identity_id(
+                &classical.public_key().0,
+                &pq.public_key().0,
+            )
+            .0;
+            let challenge = StakingOp::vrf_possession_challenge(
+                chain_id,
+                &indra_core::Bytes32::from(id),
+                &indra_core::Bytes32::from(vrf.public_key()),
+                0,
+            )
+            .unwrap();
             let (vrf_output, vrf_proof) = indra_crypto::vrf_prove(&vrf, &challenge);
             output.push_str(&format!("\n[[validators]]\nname = \"test-validator-{index}\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n", hex::encode(id), hex::encode(classical.public_key().0), hex::encode(pq.public_key().0), hex::encode(vrf.public_key()), hex::encode(vrf_output.0), hex::encode(vrf_proof.0), hex::encode(cold.classical.0), hex::encode(cold.pq.0)));
         }
@@ -6376,7 +6449,19 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let genesis_path = data_dir.join("genesis.toml");
         if !genesis_path.exists() {
-            std::fs::write(&genesis_path, test_manifest("indra-testnet-1", &[([0x42; 32], [0x42; 32], [0x42; 32]), ([0x52; 32], [0x52; 32], [0x52; 32]), ([0x62; 32], [0x62; 32], [0x62; 32]), ([0x72; 32], [0x72; 32], [0x72; 32])])).unwrap();
+            std::fs::write(
+                &genesis_path,
+                test_manifest(
+                    "indra-testnet-1",
+                    &[
+                        ([0x42; 32], [0x42; 32], [0x42; 32]),
+                        ([0x52; 32], [0x52; 32], [0x52; 32]),
+                        ([0x62; 32], [0x62; 32], [0x62; 32]),
+                        ([0x72; 32], [0x72; 32], [0x72; 32]),
+                    ],
+                ),
+            )
+            .unwrap();
         }
         let mut config = NodeConfig::full_node(data_dir);
         config.genesis_path = Some(genesis_path.to_string_lossy().into_owned());
@@ -6457,7 +6542,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let genesis = test_manifest(
             "indra-testnet-1",
-            &[(seed, seed, seed), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
+            &[
+                (seed, seed, seed),
+                ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+                ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+                ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+            ],
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         config.genesis_path = Some(genesis_path.to_string_lossy().to_string());
@@ -7445,7 +7535,12 @@ mod tests {
         let failure_counts = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 
         let accepted = record_peer_connected_event(
-            PeerConnectionEvent { local_validator_id: local, validator_id: local, addr, is_outbound: true },
+            PeerConnectionEvent {
+                local_validator_id: local,
+                validator_id: local,
+                addr,
+                is_outbound: true,
+            },
             PeerConnectionState {
                 connected_addrs: &connected_addrs,
                 peer_addrs: &peer_addrs,
@@ -7514,7 +7609,12 @@ mod tests {
             is_outbound: bool,
         ) -> bool {
             record_peer_connected_event(
-                PeerConnectionEvent { local_validator_id: local, validator_id: validator, addr, is_outbound },
+                PeerConnectionEvent {
+                    local_validator_id: local,
+                    validator_id: validator,
+                    addr,
+                    is_outbound,
+                },
                 PeerConnectionState {
                     connected_addrs: &self.connected_addrs,
                     peer_addrs: &self.peer_addrs,
@@ -7528,7 +7628,8 @@ mod tests {
                     outbound_cooldowns: &self.outbound_cooldowns,
                     failure_counts: &self.failure_counts,
                 },
-            ).unwrap()
+            )
+            .unwrap()
         }
 
         fn gossip_payload(&self) -> Vec<PeerListEntry> {
@@ -7746,11 +7847,7 @@ mod tests {
 
         for idx in 0..MAX_INBOUND_PEERS {
             let ip = IpAddr::from([198, 51, (idx / 250) as u8, (idx % 250 + 1) as u8]);
-            assert!(reserve_inbound_connection(
-                &inbound_count,
-                &inbound_by_ip,
-                ip
-            ).unwrap());
+            assert!(reserve_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap());
             reserved_ips.push(ip);
         }
 
@@ -7758,7 +7855,8 @@ mod tests {
             &inbound_count,
             &inbound_by_ip,
             IpAddr::from([203, 0, 113, 250])
-        ).unwrap());
+        )
+        .unwrap());
 
         for ip in reserved_ips {
             release_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap();
@@ -7773,17 +7871,9 @@ mod tests {
         let ip = IpAddr::from([203, 0, 113, 77]);
 
         for _ in 0..MAX_INBOUND_PER_IP {
-            assert!(reserve_inbound_connection(
-                &inbound_count,
-                &inbound_by_ip,
-                ip
-            ).unwrap());
+            assert!(reserve_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap());
         }
-        assert!(!reserve_inbound_connection(
-            &inbound_count,
-            &inbound_by_ip,
-            ip
-        ).unwrap());
+        assert!(!reserve_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap());
 
         for _ in 0..MAX_INBOUND_PER_IP {
             release_inbound_connection(&inbound_count, &inbound_by_ip, ip).unwrap();
@@ -7937,6 +8027,66 @@ mod tests {
         assert!(!rpc_access_token_valid(Some("access"), None));
         assert!(!rpc_access_token_valid(Some("access"), Some("wrong")));
         assert!(rpc_access_token_valid(Some("access"), Some("access")));
+    }
+
+    #[test]
+    fn rpc_token_wiring_keeps_admin_and_access_roles_distinct() {
+        use indra_rpc::handlers::{check_rpc_method_allowed_with_admin, RpcMode};
+
+        let admin_token = "admin-A";
+        let access_token = "access-B";
+        assert_eq!(
+            rpc_admin_token_status(Some(admin_token), Some(access_token)),
+            (true, false)
+        );
+        assert_eq!(
+            rpc_admin_token_status(Some(admin_token), Some(admin_token)),
+            (true, true)
+        );
+        assert!(!rpc_access_token_valid(
+            Some(access_token),
+            Some(admin_token)
+        ));
+        assert!(rpc_access_token_valid(
+            Some(access_token),
+            Some(access_token)
+        ));
+        assert!(check_rpc_method_allowed_with_admin(
+            "indra_getStakingStateSummary",
+            RpcMode::Full,
+            true,
+            false,
+        )
+        .is_err());
+        assert!(check_rpc_method_allowed_with_admin(
+            "indra_getStakingStateSummary",
+            RpcMode::Full,
+            true,
+            true,
+        )
+        .is_ok());
+        assert!(check_rpc_method_allowed_with_admin(
+            "indra_sendTransaction",
+            RpcMode::ReadOnly,
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rpc_transaction_relay_cache_poison_returns_typed_internal_error() {
+        let cache = Arc::new(Mutex::new(InboundDedupCaches::new()));
+        let poisoned = Arc::clone(&cache);
+        let join = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test");
+        });
+        assert!(join.join().is_err());
+        assert_eq!(
+            record_transaction_relay_seen(&cache, indra_core::Bytes32::ZERO),
+            Err("internal relay state unavailable")
+        );
     }
 
     #[test]
@@ -8142,7 +8292,8 @@ mod tests {
         let snapshot = RpcSnapshot {
             read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 3, false, 0, 43)
                 .unwrap()
-                .load().unwrap(),
+                .load()
+                .unwrap(),
             requested_blocks: HashMap::new(),
             latest_epoch: None,
             epoch_records: HashMap::new(),
@@ -8267,7 +8418,8 @@ mod tests {
                 &chain, 0, true, 126_677, 50_000,
             )
             .unwrap()
-            .load().unwrap(),
+            .load()
+            .unwrap(),
             requested_blocks: HashMap::from([(height, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
@@ -8337,7 +8489,10 @@ mod tests {
         };
         let expected_hash = hex::encode(block.header.block_hash().0);
         let snapshot = RpcSnapshot {
-            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2).unwrap().load().unwrap(),
+            read: indra_node::rpc_snapshot::RpcSnapshotPublisher::new(&chain, 0, true, 1, 2)
+                .unwrap()
+                .load()
+                .unwrap(),
             requested_blocks: HashMap::from([(1, block.block)]),
             latest_epoch: None,
             epoch_records: HashMap::new(),
@@ -8587,7 +8742,12 @@ mod tests {
         let failure_counts = Arc::new(Mutex::new(HashMap::from([(addr.to_string(), 7)])));
 
         assert!(record_peer_connected_event(
-            PeerConnectionEvent { local_validator_id: local, validator_id: validator, addr, is_outbound: true },
+            PeerConnectionEvent {
+                local_validator_id: local,
+                validator_id: validator,
+                addr,
+                is_outbound: true
+            },
             PeerConnectionState {
                 connected_addrs: &connected_addrs,
                 peer_addrs: &peer_addrs,
@@ -8601,7 +8761,8 @@ mod tests {
                 outbound_cooldowns: &outbound_cooldowns,
                 failure_counts: &failure_counts,
             },
-        ).unwrap());
+        )
+        .unwrap());
 
         assert!(!failure_counts
             .lock()

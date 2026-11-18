@@ -54,13 +54,29 @@ impl PaymentAddressV1 {
         if bytes.len() < FIXED_BYTES || bytes.len() > MAX_BINARY_BYTES {
             return malformed(bytes.len());
         }
-        if bytes[0] != PAYMENT_ADDRESS_VERSION {
+        let version = bytes
+            .first()
+            .copied()
+            .ok_or(CryptoError::MalformedEncoding {
+                scheme: "PaymentAddressV1",
+                actual: bytes.len(),
+            })?;
+        if version != PAYMENT_ADDRESS_VERSION {
             return Err(CryptoError::UnsupportedVersion {
                 scheme: "PaymentAddressV1",
-                version: bytes[0],
+                version,
             });
         }
-        let chain_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+        let chain_len_bytes = bytes.get(1..3).ok_or(CryptoError::MalformedEncoding {
+            scheme: "PaymentAddressV1",
+            actual: bytes.len(),
+        })?;
+        let chain_len = u16::from_be_bytes(chain_len_bytes.try_into().map_err(|_| {
+            CryptoError::MalformedEncoding {
+                scheme: "PaymentAddressV1",
+                actual: bytes.len(),
+            }
+        })?) as usize;
         if chain_len == 0 || chain_len > MAX_PAYMENT_CHAIN_ID_BYTES {
             return Err(CryptoError::InvalidPaymentAddress {
                 reason: "chain ID length is outside protocol bounds",
@@ -71,7 +87,12 @@ impl PaymentAddressV1 {
             return malformed(bytes.len());
         }
         let chain_end = 3 + chain_len;
-        let chain_id = &bytes[3..chain_end];
+        let chain_id = bytes
+            .get(3..chain_end)
+            .ok_or(CryptoError::MalformedEncoding {
+                scheme: "PaymentAddressV1",
+                actual: bytes.len(),
+            })?;
         if chain_id != expected_chain_id {
             return Err(CryptoError::InvalidPaymentAddress {
                 reason: "chain ID mismatch",
@@ -81,7 +102,13 @@ impl PaymentAddressV1 {
         let key_start = chain_end;
         let pq_len_start = key_start + 32;
         let pq_start = pq_len_start + PQ_LENGTH_BYTES;
-        let pq_len = u32::from_le_bytes(bytes[pq_len_start..pq_start].try_into().map_err(|_| {
+        let pq_len_bytes =
+            bytes
+                .get(pq_len_start..pq_start)
+                .ok_or(CryptoError::InvalidPaymentAddress {
+                    reason: "malformed PQ key length",
+                })?;
+        let pq_len = u32::from_le_bytes(pq_len_bytes.try_into().map_err(|_| {
             CryptoError::InvalidPaymentAddress {
                 reason: "malformed PQ key length",
             }
@@ -96,19 +123,45 @@ impl PaymentAddressV1 {
         if pq_end != checksum_start {
             return malformed(bytes.len());
         }
-        if checksum(&bytes[..checksum_start]) != bytes[checksum_start..] {
+        let checksum_payload =
+            bytes
+                .get(..checksum_start)
+                .ok_or(CryptoError::MalformedEncoding {
+                    scheme: "PaymentAddressV1",
+                    actual: bytes.len(),
+                })?;
+        let supplied_checksum =
+            bytes
+                .get(checksum_start..)
+                .ok_or(CryptoError::MalformedEncoding {
+                    scheme: "PaymentAddressV1",
+                    actual: bytes.len(),
+                })?;
+        if checksum(checksum_payload).as_slice() != supplied_checksum {
             return Err(CryptoError::InvalidPaymentAddress {
                 reason: "checksum mismatch",
             });
         }
 
-        let classical: [u8; 32] = bytes[key_start..pq_len_start].try_into().map_err(|_| {
-            CryptoError::InvalidPaymentAddress {
-                reason: "malformed classical public key",
-            }
-        })?;
+        let classical_bytes =
+            bytes
+                .get(key_start..pq_len_start)
+                .ok_or(CryptoError::InvalidPaymentAddress {
+                    reason: "malformed classical public key",
+                })?;
+        let classical: [u8; 32] =
+            classical_bytes
+                .try_into()
+                .map_err(|_| CryptoError::InvalidPaymentAddress {
+                    reason: "malformed classical public key",
+                })?;
+        let pq_bytes = bytes
+            .get(pq_start..pq_end)
+            .ok_or(CryptoError::InvalidPaymentAddress {
+                reason: "malformed PQ public key",
+            })?;
         let pq: [u8; PQ_PK_BYTES] =
-            bytes[pq_start..pq_end]
+            pq_bytes
                 .try_into()
                 .map_err(|_| CryptoError::InvalidPaymentAddress {
                     reason: "malformed PQ public key",
@@ -203,9 +256,11 @@ fn checksum(payload: &[u8]) -> [u8; CHECKSUM_BYTES] {
     material.extend_from_slice(CHECKSUM_DOMAIN);
     material.extend_from_slice(payload);
     let digest = sha256(&material);
-    digest[..CHECKSUM_BYTES]
-        .try_into()
-        .unwrap_or([0; CHECKSUM_BYTES])
+    let mut result = [0; CHECKSUM_BYTES];
+    for (destination, source) in result.iter_mut().zip(digest.iter()) {
+        *destination = *source;
+    }
+    result
 }
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -213,16 +268,26 @@ const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 fn encode_base64url(bytes: &[u8]) -> String {
     let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
     for chunk in bytes.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        out.push(BASE64URL[(a >> 2) as usize] as char);
-        out.push(BASE64URL[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+        let Some((&a, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let b = rest.first().copied().unwrap_or(0);
+        let c = rest.get(1).copied().unwrap_or(0);
+        if let Some(value) = BASE64URL.get((a >> 2) as usize) {
+            out.push(char::from(*value));
+        }
+        if let Some(value) = BASE64URL.get((((a & 3) << 4) | (b >> 4)) as usize) {
+            out.push(char::from(*value));
+        }
         if chunk.len() > 1 {
-            out.push(BASE64URL[(((b & 15) << 2) | (c >> 6)) as usize] as char);
+            if let Some(value) = BASE64URL.get((((b & 15) << 2) | (c >> 6)) as usize) {
+                out.push(char::from(*value));
+            }
         }
         if chunk.len() > 2 {
-            out.push(BASE64URL[(c & 63) as usize] as char);
+            if let Some(value) = BASE64URL.get((c & 63) as usize) {
+                out.push(char::from(*value));
+            }
         }
     }
     out
@@ -246,12 +311,20 @@ fn decode_base64url(text: &str) -> CryptoResult<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     for chunk in values.chunks(4) {
-        out.push((chunk[0] << 2) | (chunk[1] >> 4));
-        if chunk.len() > 2 {
-            out.push((chunk[1] << 4) | (chunk[2] >> 2));
-        }
-        if chunk.len() > 3 {
-            out.push((chunk[2] << 6) | chunk[3]);
+        let Some((&first, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let Some(&second) = rest.first() else {
+            return Err(CryptoError::InvalidPaymentAddress {
+                reason: "invalid unpadded Base64URL",
+            });
+        };
+        out.push((first << 2) | (second >> 4));
+        if let Some(&third) = rest.get(1) {
+            out.push((second << 4) | (third >> 2));
+            if let Some(&fourth) = rest.get(2) {
+                out.push((third << 6) | fourth);
+            }
         }
     }
     Ok(out)
@@ -313,5 +386,14 @@ mod tests {
         assert!(PaymentAddressV1::decode(&bad_checksum, b"indra-mainnet").is_err());
         let oversized = format!("indra:{}", "A".repeat(MAX_TEXT_PAYLOAD_BYTES + 1));
         assert!(PaymentAddressV1::from_text(&oversized, b"indra-mainnet").is_err());
+    }
+
+    #[test]
+    fn malformed_short_and_long_binary_addresses_return_errors() {
+        let address = address();
+        assert!(PaymentAddressV1::decode(&[], b"indra-mainnet").is_err());
+        let mut oversized = address.encode();
+        oversized.extend(std::iter::repeat_n(0, MAX_PAYMENT_CHAIN_ID_BYTES + 1));
+        assert!(PaymentAddressV1::decode(&oversized, b"indra-mainnet").is_err());
     }
 }

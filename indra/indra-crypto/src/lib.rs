@@ -6,6 +6,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 #![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 #![cfg_attr(
     test,
     allow(

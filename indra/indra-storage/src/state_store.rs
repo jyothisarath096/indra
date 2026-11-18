@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use indra_core::codec::{ByteReader, Decode, Encode};
 use indra_core::types::primitives::{Bytes32, SCHEMA_VERSION};
-use indra_state::{ChainState, compute_state_roots};
+use indra_state::{compute_state_roots, ChainState};
 
 static SNAPSHOT_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 
@@ -148,23 +148,36 @@ impl StateStore {
                         detail: "snapshot header truncated".into(),
                     });
                 }
-                let header = &file_bytes[..12];
+                let header = file_bytes
+                    .get(..12)
+                    .ok_or_else(|| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated".into(),
+                    })?;
 
-                let height_bytes: [u8; 8] =
-                    header[..8]
-                        .try_into()
-                        .map_err(|_| StorageError::Corruption {
-                            height: 0,
-                            detail: "snapshot header truncated while reading height".to_string(),
-                        })?;
+                let height_bytes: [u8; 8] = header
+                    .get(..8)
+                    .ok_or_else(|| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated while reading height".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated while reading height".to_string(),
+                    })?;
                 let height = u64::from_le_bytes(height_bytes);
-                let length_bytes: [u8; 4] =
-                    header[8..12]
-                        .try_into()
-                        .map_err(|_| StorageError::Corruption {
-                            height,
-                            detail: "snapshot header truncated while reading length".to_string(),
-                        })?;
+                let length_bytes: [u8; 4] = header
+                    .get(8..12)
+                    .ok_or_else(|| StorageError::Corruption {
+                        height: 0,
+                        detail: "snapshot header truncated while reading length".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| StorageError::Corruption {
+                        height,
+                        detail: "snapshot header truncated while reading length".to_string(),
+                    })?;
                 let length = u32::from_le_bytes(length_bytes) as usize;
 
                 if file_bytes.len() != 12 + length {
@@ -178,7 +191,12 @@ impl StateStore {
                     });
                 }
 
-                let state_bytes = &file_bytes[12..];
+                let state_bytes = file_bytes
+                    .get(12..)
+                    .ok_or_else(|| StorageError::Corruption {
+                        height,
+                        detail: "snapshot payload truncated".into(),
+                    })?;
 
                 let state = deserialise_chain_state(state_bytes, height)
                     .map_err(|e| StorageError::Corruption { height, detail: e })?;
@@ -412,29 +430,45 @@ impl SnapshotMeta {
         if bytes.len() < min {
             return Err("snapshot metadata truncated".into());
         }
-        if &bytes[0..4] != SNAPSHOT_META_MAGIC {
+        if bytes.get(..4) != Some(SNAPSHOT_META_MAGIC.as_slice()) {
             return Err("snapshot metadata magic mismatch".into());
         }
-        if bytes[4] != SNAPSHOT_META_VERSION {
-            return Err(format!(
-                "unsupported snapshot metadata version {}",
-                bytes[4]
-            ));
+        let version = bytes.get(4).copied().ok_or("snapshot metadata truncated")?;
+        if version != SNAPSHOT_META_VERSION {
+            return Err(format!("unsupported snapshot metadata version {}", version));
         }
-        let height = u64::from_le_bytes(copy_8(&bytes[5..13])?);
-        let block_hash = Bytes32::from(copy_32(&bytes[13..45])?);
-        let state_root = Bytes32::from(copy_32(&bytes[45..77])?);
-        let validator_set_root = Bytes32::from(copy_32(&bytes[77..109])?);
-        let chain_len = u16::from_le_bytes(copy_2(&bytes[109..111])?) as usize;
+        let height = u64::from_le_bytes(copy_8(
+            bytes.get(5..13).ok_or("snapshot metadata truncated")?,
+        )?);
+        let block_hash = Bytes32::from(copy_32(
+            bytes.get(13..45).ok_or("snapshot metadata truncated")?,
+        )?);
+        let state_root = Bytes32::from(copy_32(
+            bytes.get(45..77).ok_or("snapshot metadata truncated")?,
+        )?);
+        let validator_set_root = Bytes32::from(copy_32(
+            bytes.get(77..109).ok_or("snapshot metadata truncated")?,
+        )?);
+        let chain_len = u16::from_le_bytes(copy_2(
+            bytes.get(109..111).ok_or("snapshot metadata truncated")?,
+        )?) as usize;
         let chain_start = 111;
         let chain_end = chain_start + chain_len;
         if bytes.len() != chain_end + 4 {
             return Err("snapshot metadata length mismatch".into());
         }
-        let chain_id = std::str::from_utf8(&bytes[chain_start..chain_end])
-            .map_err(|e| e.to_string())?
-            .to_string();
-        let checksum = u32::from_le_bytes(copy_4(&bytes[chain_end..chain_end + 4])?);
+        let chain_id = std::str::from_utf8(
+            bytes
+                .get(chain_start..chain_end)
+                .ok_or("snapshot metadata truncated")?,
+        )
+        .map_err(|e| e.to_string())?
+        .to_string();
+        let checksum = u32::from_le_bytes(copy_4(
+            bytes
+                .get(chain_end..chain_end + 4)
+                .ok_or("snapshot metadata truncated")?,
+        )?);
         Ok(Self {
             height,
             block_hash,
@@ -468,8 +502,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+        for nibble in [(byte >> 4) as usize, (byte & 0x0f) as usize] {
+            for (position, value) in HEX.iter().enumerate() {
+                if position == nibble {
+                    out.push(char::from(*value));
+                    break;
+                }
+            }
+        }
     }
     out
 }
@@ -547,13 +587,13 @@ mod tests {
         assert_eq!(StateStore::cleanup_failure_count(), before + 1);
     }
     use indra_core::{
-        Bytes32, ProtocolVersion, VariableBytes,
         types::block::{BlockHeaderVNext, BlockVNext},
         types::primitives::DUST_LIMIT_SPARK,
+        Bytes32, ProtocolVersion, VariableBytes,
     };
     use indra_state::{
-        ValidatorEntry, ValidatorStatus, apply_block_for_test as apply_block, compute_state_root,
-        compute_validator_set_root,
+        apply_block_for_test as apply_block, compute_state_root, compute_validator_set_root,
+        ValidatorEntry, ValidatorStatus,
     };
     use std::io::Write;
 
@@ -752,10 +792,9 @@ mod tests {
         write_snapshot(&dir, state.height, &payload);
 
         let err = store.load_latest().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("does not match node schema version")
-        );
+        assert!(err
+            .to_string()
+            .contains("does not match node schema version"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -958,10 +997,9 @@ mod tests {
         drop(file);
 
         let err = store.load_latest().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported snapshot format version")
-        );
+        assert!(err
+            .to_string()
+            .contains("unsupported snapshot format version"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
