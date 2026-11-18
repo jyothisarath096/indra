@@ -767,19 +767,6 @@ fn rebroadcast_inbound_accepted_op(
     gossip.broadcast_except(origin, &msg);
 }
 
-fn has_connected_ip(
-    connected_addrs: &Arc<Mutex<HashMap<IpAddr, usize>>>,
-    addr: &SocketAddr,
-) -> indra_node::NodeResult<bool> {
-    Ok(locks::lock(connected_addrs, "network.connected_addrs")?.contains_key(&addr.ip()))
-}
-
-fn has_connected_ip_from_socket_addrs(connected_addrs: &[SocketAddr], addr: &SocketAddr) -> bool {
-    connected_addrs
-        .iter()
-        .any(|connected| connected.ip() == addr.ip())
-}
-
 fn choose_discovery_eviction_candidate(
     discovered_peers: &HashSet<String>,
     authenticated_peer_addrs: &HashSet<String>,
@@ -974,7 +961,7 @@ fn discovery_accepts_peer_addr(
     }
     !is_configured_self_addr(addr, local_p2p_addr)
         && is_address_acceptable_for_discovery(addr)
-        && !has_connected_ip_from_socket_addrs(connected_addrs, addr)
+        && !connected_addrs.contains(addr)
 }
 
 fn peer_list_payload_with_identities(
@@ -1685,7 +1672,6 @@ fn start_network_runtime(
                 indra_node::supervisor::spawn_critical("network-dialer", {
                     let handshake_config = Arc::clone(&handshake_config);
                     let peer_manager = PeerManagerHandle::clone(&network_bridge);
-                    let connected_addrs = Arc::clone(&connected_addrs);
                     let outbound_cooldowns = Arc::clone(&outbound_cooldowns);
                     let handshake_sem = Arc::clone(&handshake_sem);
                     let discovered_peers = Arc::clone(&discovered_peers);
@@ -1823,7 +1809,6 @@ fn start_network_runtime(
                                     return false;
                                 };
                                 if is_configured_self_addr(&addr, &p2p_addr_for_port)
-                                    || has_connected_ip(&connected_addrs, &addr).unwrap_or(false)
                                     || should_skip_dial_for_connected_validator(
                                         peer,
                                         &*fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.eligibility"),
@@ -1863,12 +1848,6 @@ fn start_network_runtime(
                                 if is_configured_self_addr(&addr, &p2p_addr_for_port) {
                                     fatal_lock!(discovered_peers, "network.discovered_peers.self").remove(peer_addr_str);
                                     fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.self").reset(
-                                        &OutboundCooldownKey::Address(peer_addr_str.clone()),
-                                    );
-                                    continue;
-                                }
-                                if has_connected_ip(&connected_addrs, &addr).unwrap_or(false) {
-                                    fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connected_ip").reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
                                     continue;
@@ -8655,6 +8634,21 @@ mod tests {
             &unknown_addr,
             &authenticated_addr_validators,
             &connected_validator_ids,
+        ));
+    }
+
+    #[test]
+    fn distinct_authenticated_peers_on_one_ip_are_not_filtered() {
+        let local_p2p_addr = "198.51.100.10:32600";
+        let connected = ["198.51.100.10:32610".parse::<SocketAddr>().unwrap()];
+        let candidate = "198.51.100.10:32620".parse::<SocketAddr>().unwrap();
+
+        assert!(discovery_accepts_peer_addr(
+            &candidate,
+            Some(indra_core::Bytes32::from([0x22; 32])),
+            indra_core::Bytes32::from([0x11; 32]),
+            local_p2p_addr,
+            &connected,
         ));
     }
 
