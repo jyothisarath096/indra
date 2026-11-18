@@ -18,8 +18,8 @@
 //!     scrape_timeout: 10s
 //! ```
 
-use std::fmt::Write as _;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -145,22 +145,26 @@ impl MetricsState {
     }
 
     /// Register one listener-owned limiter gauge source.
-    pub fn register_rpc_limiter_telemetry(&self, telemetry: Arc<RpcLimiterTelemetry>) -> NodeResult<()> {
-        locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?
-            .push(telemetry);
+    pub fn register_rpc_limiter_telemetry(
+        &self,
+        telemetry: Arc<RpcLimiterTelemetry>,
+    ) -> NodeResult<()> {
+        locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?.push(telemetry);
         Ok(())
     }
 
     fn rpc_limiter_totals(&self) -> NodeResult<(u64, u64)> {
-        Ok(locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?
-            .iter()
-            .map(|telemetry| telemetry.load())
-            .fold((0u64, 0u64), |(entries, evictions), current| {
-                (
-                    entries.saturating_add(current.0),
-                    evictions.saturating_add(current.1),
-                )
-            }))
+        Ok(
+            locks::lock(&self.rpc_limiter_telemetry, "metrics.rpc_limiter_telemetry")?
+                .iter()
+                .map(|telemetry| telemetry.load())
+                .fold((0u64, 0u64), |(entries, evictions), current| {
+                    (
+                        entries.saturating_add(current.0),
+                        evictions.saturating_add(current.1),
+                    )
+                }),
+        )
     }
 
     /// Record a panic that was isolated to a listener or connection handler.
@@ -175,7 +179,8 @@ impl MetricsState {
     pub fn record_stale_sync_response(&self, kind: &str) {
         match kind {
             "qc_response" => {
-                self.stale_sync_qc_responses_total.fetch_add(1, Ordering::Relaxed);
+                self.stale_sync_qc_responses_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
             "certificate" => {
                 self.stale_sync_certificate_responses_total
@@ -184,7 +189,6 @@ impl MetricsState {
             _ => {}
         }
     }
-
 }
 
 impl Default for MetricsState {
@@ -330,7 +334,9 @@ pub fn start_metrics_server(config: MetricsServerConfig) -> JoinHandle<()> {
                                 Ok(body) => body,
                                 Err(error) => {
                                     eprintln!("[metrics] snapshot failed: {error}");
-                                    if let Err(write_error) = write_http_metrics_error(stream, &error.to_string()) {
+                                    if let Err(write_error) =
+                                        write_http_metrics_error(stream, &error.to_string())
+                                    {
                                         eprintln!("[metrics] connection error: {write_error}");
                                     }
                                     return;
@@ -395,7 +401,9 @@ pub fn start_observer_metrics_server(
                                 Ok(body) => body,
                                 Err(error) => {
                                     eprintln!("[metrics] snapshot failed: {error}");
-                                    if let Err(write_error) = write_http_metrics_error(stream, &error.to_string()) {
+                                    if let Err(write_error) =
+                                        write_http_metrics_error(stream, &error.to_string())
+                                    {
                                         eprintln!("[metrics] connection error: {write_error}");
                                     }
                                     return;
@@ -407,7 +415,9 @@ pub fn start_observer_metrics_server(
                         }));
                         if result.is_err() {
                             eprintln!("[metrics] observer handler panicked");
-                            if let Err(error) = metrics_state.record_handler_panic("observer-metrics") {
+                            if let Err(error) =
+                                metrics_state.record_handler_panic("observer-metrics")
+                            {
                                 eprintln!("[metrics] failed to record handler panic: {error}");
                             }
                         }
@@ -483,10 +493,8 @@ impl MetricsSnapshot {
             .validator_id()
             .map(|id| hex::encode(&id.0[..4]))
             .unwrap_or_else(|| "none".to_string());
-        let (_next_height, block_reward) = metrics_values_for_height(
-            s.height,
-            s.monetary_ledger.reward_budget_spark,
-        )?;
+        let (_next_height, block_reward) =
+            metrics_values_for_height(s.height, s.monetary_ledger.reward_budget_spark)?;
         Ok(Self {
             height: s.height,
             epoch: s.current_epoch(),
@@ -541,19 +549,26 @@ fn render_snapshot(
     let (rpc_limiter_entries, rpc_limiter_evictions) = metrics_state
         .rpc_limiter_totals()
         .map_err(|_| MetricsError::LockPoisoned("metrics.rpc_limiter_telemetry"))?;
-    let panics = locks::lock(&metrics_state.handler_panics_total, "metrics.handler_panics_total")
-        .map_err(|_| MetricsError::LockPoisoned("metrics.handler_panics_total"))?;
+    let panics = locks::lock(
+        &metrics_state.handler_panics_total,
+        "metrics.handler_panics_total",
+    )
+    .map_err(|_| MetricsError::LockPoisoned("metrics.handler_panics_total"))?;
     {
         let _ = writeln!(
             buf,
-            "# HELP indra_handler_panics_total Isolated handler panics by component\n# TYPE indra_handler_panics_total counter"
+            "# HELP indra_handler_panics Isolated handler panics by component\n# TYPE indra_handler_panics counter"
         );
-        for (component, count) in panics.iter() {
-            let _ = writeln!(
-                buf,
-                "indra_handler_panics_total{{component=\"{}\"}} {}",
-                component, count
-            );
+        if panics.is_empty() {
+            let _ = writeln!(buf, "indra_handler_panics_total{{component=\"none\"}} 0");
+        } else {
+            for (component, count) in panics.iter() {
+                let _ = writeln!(
+                    buf,
+                    "indra_handler_panics_total{{component=\"{}\"}} {}",
+                    component, count
+                );
+            }
         }
     }
     gauge(
@@ -608,7 +623,11 @@ fn render_snapshot(
         &mut buf,
         "indra_vote_safety_unavailable",
         "1 if this validator cannot vote at the current height without operator recovery",
-        if snapshot.vote_safety_unavailable { 1 } else { 0 },
+        if snapshot.vote_safety_unavailable {
+            1
+        } else {
+            0
+        },
     );
     gauge(
         &mut buf,
@@ -959,7 +978,10 @@ mod tests {
 
         let error = drain_http_request_reader(&mut OversizedReader).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "metrics request read length exceeds buffer");
+        assert_eq!(
+            error.to_string(),
+            "metrics request read length exceeds buffer"
+        );
     }
     use std::net::TcpStream;
     use std::sync::atomic::AtomicUsize;
@@ -1006,6 +1028,24 @@ mod tests {
     }
 
     #[test]
+    fn index6_fresh_metrics_export_zero_panic_and_stale_sync_series() {
+        let (driver, data_dir) = test_driver();
+        let output = render_metrics(
+            &driver,
+            &Arc::new(AtomicUsize::new(0)),
+            0,
+            &MetricsState::new(),
+            &AtomicU64::new(0),
+            &data_dir.path().to_string_lossy(),
+            "0.1.0",
+        )
+        .expect("fresh metrics render");
+        assert!(output.contains("indra_handler_panics_total{component=\"none\"} 0"));
+        assert!(output.contains("indra_stale_sync_responses_total{kind=\"qc_response\"} 0"));
+        assert!(output.contains("indra_stale_sync_responses_total{kind=\"certificate\"} 0"));
+    }
+
+    #[test]
     fn test_counter_helper_format() {
         let mut buf = String::new();
         counter(&mut buf, "indra_events", "Example counter", 9);
@@ -1019,8 +1059,18 @@ mod tests {
     fn stale_qc_response_is_counted_without_supervisor_report() {
         let metrics = MetricsState::new();
         metrics.record_stale_sync_response("qc_response");
-        assert_eq!(metrics.stale_sync_qc_responses_total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.stale_sync_certificate_responses_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .stale_sync_qc_responses_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .stale_sync_certificate_responses_total
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -1219,8 +1269,12 @@ mod tests {
         let metrics = MetricsState::new();
         let full = Arc::new(RpcLimiterTelemetry::default());
         let public = Arc::new(RpcLimiterTelemetry::default());
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&full)).unwrap();
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&public)).unwrap();
+        metrics
+            .register_rpc_limiter_telemetry(Arc::clone(&full))
+            .unwrap();
+        metrics
+            .register_rpc_limiter_telemetry(Arc::clone(&public))
+            .unwrap();
         full.update(7, 2);
         public.update(5, 3);
         assert_eq!(metrics.rpc_limiter_totals().unwrap(), (12, 5));
@@ -1235,8 +1289,12 @@ mod tests {
         let metrics = MetricsState::new();
         let full = Arc::new(RpcLimiterTelemetry::default());
         let public = Arc::new(RpcLimiterTelemetry::default());
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&full)).unwrap();
-        metrics.register_rpc_limiter_telemetry(Arc::clone(&public)).unwrap();
+        metrics
+            .register_rpc_limiter_telemetry(Arc::clone(&full))
+            .unwrap();
+        metrics
+            .register_rpc_limiter_telemetry(Arc::clone(&public))
+            .unwrap();
 
         let barrier = Arc::new(Barrier::new(9));
         let mut workers = Vec::new();

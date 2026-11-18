@@ -216,12 +216,7 @@ pub fn start_hardened_observer_rpc(
                 total.fetch_sub(1, Ordering::AcqRel);
                 continue;
             }
-            if !try_reserve_ip_connection(
-                &per_ip_connections,
-                &total,
-                ip,
-                PER_IP_CONNECTION_CAP,
-            ) {
+            if !try_reserve_ip_connection(&per_ip_connections, &total, ip, PER_IP_CONNECTION_CAP) {
                 continue;
             }
             metrics
@@ -306,7 +301,9 @@ fn try_reserve_ip_connection(
     let mut counts = match crate::locks::lock(counts, "observer-rpc.per_ip_connections") {
         Ok(counts) => counts,
         Err(_) => {
-            eprintln!("[observer-rpc] per-IP connection mutex failed for {ip}; rejecting connection");
+            eprintln!(
+                "[observer-rpc] per-IP connection mutex failed for {ip}; rejecting connection"
+            );
             total.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
@@ -330,11 +327,7 @@ struct HandleContext<'a> {
     limiter_telemetry: &'a RpcLimiterTelemetry,
 }
 
-fn handle(
-    stream: TcpStream,
-    ip: IpAddr,
-    context: HandleContext<'_>,
-) {
+fn handle(stream: TcpStream, ip: IpAddr, context: HandleContext<'_>) {
     let HandleContext {
         publisher,
         storage,
@@ -410,13 +403,13 @@ fn handle(
         let permit = match expensive.acquire(deadline) {
             Ok(Some(permit)) => permit,
             Ok(None) => {
-            write_json_error(
-                &stream,
-                -32029,
-                "expensive RPC concurrency limit exceeded",
-                metrics,
-            );
-            return;
+                write_json_error(
+                    &stream,
+                    -32029,
+                    "expensive RPC concurrency limit exceeded",
+                    metrics,
+                );
+                return;
             }
             Err(error) => {
                 write_json_error(&stream, -32000, &error, metrics);
@@ -568,28 +561,46 @@ fn read_request(stream: &TcpStream, started: Instant, deadline: Instant) -> Resu
     if content_length == 0 || content_length > RPC_PUBLIC_MAX_BODY_BYTES {
         return Err("invalid or oversized request body".to_string());
     }
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|e| e.to_string())?;
+    let body = read_body(&mut reader, content_length, started, deadline, &mut bytes)?;
+    String::from_utf8(body).map_err(|_| "request body is not UTF-8".to_string())
+}
+
+fn read_body<R: Read>(
+    reader: &mut R,
+    content_length: usize,
+    started: Instant,
+    deadline: Instant,
+    bytes: &mut usize,
+) -> Result<Vec<u8>, String> {
     let mut body = vec![0u8; content_length];
     let mut offset = 0usize;
     while offset < body.len() {
-        ensure_progress(started, deadline, bytes)?;
-        reader
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .map_err(|e| e.to_string())?;
+        ensure_progress(started, deadline, *bytes)?;
         let Some(destination) = body.get_mut(offset..) else {
             return Err("invalid request body offset".to_string());
         };
         match reader.read(destination) {
             Ok(0) => return Err("incomplete request body".to_string()),
             Ok(count) => {
-                offset += count;
-                bytes += count;
+                if count > destination.len() {
+                    return Err("request body read length exceeds buffer".to_string());
+                }
+                offset = offset
+                    .checked_add(count)
+                    .ok_or("request body offset overflow")?;
+                *bytes = bytes
+                    .checked_add(count)
+                    .ok_or("request byte count overflow")?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(error) => return Err(error.to_string()),
         }
     }
-    String::from_utf8(body).map_err(|_| "request body is not UTF-8".to_string())
+    Ok(body)
 }
 
 fn timed_line(
@@ -793,12 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn index5_hardened_read_rpc_offset_guard_is_unreachable_by_bounded_loop() {
-        // `offset` starts at zero and is increased only by the successful read
-        // of the slice beginning at that offset; the loop condition therefore
-        // prevents an out-of-range slice request.
-        let source = include_str!("hardened_read_rpc.rs");
-        assert!(source.contains("while offset < body.len()"));
-        assert!(source.contains("body.get_mut(offset..)"));
+    fn index6_hardened_read_rpc_oversized_reader_count_is_rejected() {
+        struct OversizedReader;
+        impl Read for OversizedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                Ok(buffer.len().saturating_add(1))
+            }
+        }
+
+        let mut reader = OversizedReader;
+        let mut bytes = 0;
+        let error = read_body(
+            &mut reader,
+            4,
+            Instant::now(),
+            Instant::now() + Duration::from_secs(1),
+            &mut bytes,
+        )
+        .unwrap_err();
+        assert_eq!(error, "request body read length exceeds buffer");
     }
 }

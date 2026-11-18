@@ -1171,10 +1171,11 @@ pub(crate) fn project_and_verify_block_state_root(
         })?;
     let epoch_record = outcome.epoch_record;
 
-    let actual_roots = compute_state_roots(&projected).map_err(|error| NodeError::BlockInvalid {
-        height: block.header.height,
-        reason: format!("state commitment rebuild failed: {error}"),
-    })?;
+    let actual_roots =
+        compute_state_roots(&projected).map_err(|error| NodeError::BlockInvalid {
+            height: block.header.height,
+            reason: format!("state commitment rebuild failed: {error}"),
+        })?;
     if actual_roots.state_root != expected_state_root {
         return Err(NodeError::BlockInvalid {
             height: block.header.height,
@@ -1230,7 +1231,6 @@ pub(crate) fn verify_block_state_root(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use indra_consensus::qc::{verify_qc_strict, QcValidator};
     use indra_consensus::{
@@ -1239,13 +1239,10 @@ mod tests {
         qc::build_qc,
         vote::produce_vote,
     };
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::Encode,
-        types::{
-            block::BlockVNext,
-            primitives::EPOCH_DURATION_BLOCKS,
-            vote::VoteStep,
-        },
+        types::{block::BlockVNext, primitives::EPOCH_DURATION_BLOCKS, vote::VoteStep},
         Bytes32, QuorumCertificateV1, VariableBytes,
     };
     use indra_crypto::{
@@ -1474,7 +1471,18 @@ mod tests {
             stake,
             snapshot_root,
         } = fixture;
-        let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: value_hash, validator_id, snapshot_root, chain_id: TEST_CHAIN_ID }, hybrid)
+        let vote = produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash: value_hash,
+                validator_id,
+                snapshot_root,
+                chain_id: TEST_CHAIN_ID,
+            },
+            hybrid,
+        )
         .unwrap();
         let qc = build_qc(
             height,
@@ -1509,7 +1517,18 @@ mod tests {
                     &signer.public_key().classical.0,
                     &signer.public_key().pq.0,
                 );
-                produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
+                produce_vote(
+                    indra_consensus::vote::VoteRequest {
+                        height,
+                        round: 0,
+                        step: VoteStep::Precommit,
+                        block_hash,
+                        validator_id,
+                        snapshot_root: snapshot.snapshot_root,
+                        chain_id: TEST_CHAIN_ID,
+                    },
+                    signer,
+                )
                 .unwrap()
             })
             .collect();
@@ -1745,8 +1764,7 @@ mod tests {
             let actual = validate_imported_block(&block, &actual_state, 1_900_000_000).unwrap();
             let actual_record = actual.epoch_record.clone();
             actual_state = actual.state;
-            publish_committed_effects(&actual_state, &mut actual_mempool, &actual.effects)
-                .unwrap();
+            publish_committed_effects(&actual_state, &mut actual_mempool, &actual.effects).unwrap();
 
             assert_eq!(reference_record, actual_record);
             assert_import_state_equivalent(&reference_state, &actual_state, &block);
@@ -1782,7 +1800,10 @@ mod tests {
             let live_record = apply_verified_test(&mut live_state, &block, 0).unwrap();
             let imported = validate_imported_block(&block, &imported_state, 0).unwrap();
             assert_eq!(live_record, imported.epoch_record);
-            assert_eq!(compute_state_root(&live_state), compute_state_root(&imported.state));
+            assert_eq!(
+                compute_state_root(&live_state),
+                compute_state_root(&imported.state)
+            );
             assert_eq!(live_state.encode_to_vec(), imported.state.encode_to_vec());
 
             let position_id = indra_core::types::stake_position::derive_position_id(
@@ -2220,7 +2241,10 @@ mod tests {
         sync.peer_connected(id_b);
 
         assert_eq!(
-            sync.observe_status((id_a, peer_a, 10_000, Bytes32::ZERO, 33, 100, 0).into(), now),
+            sync.observe_status(
+                (id_a, peer_a, 10_000, Bytes32::ZERO, 33, 100, 0).into(),
+                now
+            ),
             None,
             "one sub-one-third identity must not set a target"
         );
@@ -2371,7 +2395,10 @@ mod tests {
         let mut sync = SyncState::follower(0);
         assert!(sync.accept_response(id, peer, &[]).is_err());
         sync.peer_connected(id);
-        sync.observe_status((id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
+        sync.observe_status(
+            (id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(),
+            Instant::now(),
+        );
         assert!(sync.accept_response(wrong_id, wrong_peer, &[]).is_err());
         let mut out_of_range = make_block(&crate::genesis::test_genesis_state());
         out_of_range.header.height = 99;
@@ -2385,7 +2412,10 @@ mod tests {
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
         let request = sync
-            .observe_status((id, peer, 3, Bytes32::ZERO, 100, 100, 0).into(), Instant::now())
+            .observe_status(
+                (id, peer, 3, Bytes32::ZERO, 100, 100, 0).into(),
+                Instant::now(),
+            )
             .expect("request should be issued");
         assert_eq!(request.1, 1);
         let mut block = make_block(&crate::genesis::test_genesis_state());
@@ -2403,14 +2433,42 @@ mod tests {
         let id = Bytes32::from([0xB2; 32]);
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
-        sync.observe_status((id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
-        sync.observe_status((id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
+        sync.observe_status(
+            (id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(),
+            Instant::now(),
+        );
+        sync.observe_status(
+            (id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(),
+            Instant::now(),
+        );
         let mut first = make_block(&crate::genesis::test_genesis_state());
         let mut third = first.clone();
         first.header.height = 1;
         third.header.height = 3;
         assert_eq!(
             sync.accept_response(id, peer, &[first, third]).unwrap_err(),
+            "response block heights are not contiguous"
+        );
+        assert!(sync.accept_response(id, peer, &[]).is_ok());
+    }
+
+    #[test]
+    fn index5_sync_duplicate_window_rejected_without_consuming_request() {
+        let peer: SocketAddr = "127.0.0.1:30113".parse().unwrap();
+        let id = Bytes32::from([0xB3; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        sync.observe_status(
+            (id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(),
+            Instant::now(),
+        );
+        let mut first = make_block(&crate::genesis::test_genesis_state());
+        let mut duplicate = first.clone();
+        first.header.height = 1;
+        duplicate.header.height = 1;
+        assert_eq!(
+            sync.accept_response(id, peer, &[first, duplicate])
+                .unwrap_err(),
             "response block heights are not contiguous"
         );
         assert!(sync.accept_response(id, peer, &[]).is_ok());
@@ -2463,7 +2521,10 @@ mod tests {
         let id = Bytes32::from([0xA7; 32]);
         let mut sync = SyncState::follower(0);
         sync.peer_connected(id);
-        sync.observe_status((id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
+        sync.observe_status(
+            (id, peer, 2, Bytes32::ZERO, 100, 100, 0).into(),
+            Instant::now(),
+        );
         sync.peer_disconnected(id, peer);
         assert!(matches!(sync.phase(), SyncPhase::AwaitingPeers));
         assert!(sync.accept_response(id, peer, &[]).is_err());
@@ -3212,13 +3273,35 @@ mod tests {
             snapshot.snapshot_root,
             voters,
         );
-        let a_vote = produce_vote(indra_consensus::vote::VoteRequest { height: u64::MAX, round: 0, step: VoteStep::Precommit, block_hash: block_h_hash, validator_id: a_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &a)
+        let a_vote = produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height: u64::MAX,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash: block_h_hash,
+                validator_id: a_id,
+                snapshot_root: snapshot.snapshot_root,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &a,
+        )
         .unwrap();
         let b_id = indra_core::types::crypto::hybrid_identity_id(
             &b.public_key().classical.0,
             &b.public_key().pq.0,
         );
-        let b_vote = produce_vote(indra_consensus::vote::VoteRequest { height: u64::MAX, round: 0, step: VoteStep::Precommit, block_hash: block_h_hash, validator_id: b_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &b)
+        let b_vote = produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height: u64::MAX,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash: block_h_hash,
+                validator_id: b_id,
+                snapshot_root: snapshot.snapshot_root,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &b,
+        )
         .unwrap();
         assert!(matches!(
             collector.add_vote(a_vote.clone()).unwrap(),
