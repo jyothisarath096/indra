@@ -179,6 +179,37 @@ fn node_refuses_invalid_genesis_without_panic() {
 }
 
 #[test]
+fn index5_node_refuses_malformed_network_addresses_with_field_name() {
+    let cases = [
+        ("host-without-port", "validator.example"),
+        ("port-only", "30303"),
+        ("empty", ""),
+        ("non-numeric-port", "validator.example:nope"),
+        ("port-zero", "validator.example:0"),
+        ("port-too-large", "validator.example:65536"),
+        ("trailing-space", "validator.example:30303 "),
+    ];
+    for (name, address) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_file(
+            dir.path(),
+            &dir.path().join("data"),
+            &dir.path().join("keys.json"),
+            &dir.path().join("genesis.toml"),
+        );
+        let contents = fs::read_to_string(&config).expect("read test config");
+        fs::write(
+            &config,
+            contents.replace("127.0.0.1:30303", address),
+        )
+        .expect("rewrite test config");
+        let output = run_node(&["--config".into(), config.display().to_string()]);
+        assert_refused(&output, "network.p2p_addr must be valid host:port");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"), "case {name}");
+    }
+}
+
+#[test]
 fn node_refuses_corrupt_vote_safety_record_without_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (key_file, keys, password) = encrypted_keys(dir.path(), b"correct");

@@ -2157,6 +2157,115 @@ mod handle_tests {
     }
 
     #[test]
+    fn index5_ffi_output_buffers_reject_short_lengths_without_writes() {
+        let mnemonic_guard = [0x5Au8; 64];
+        let mut mnemonic = mnemonic_guard.map(|byte| byte as c_char);
+        assert_eq!(
+            unsafe { indra_generate_mnemonic(mnemonic.as_mut_ptr(), 1) },
+            IndraError::BufferTooSmall.code()
+        );
+        assert_eq!(mnemonic, mnemonic_guard.map(|byte| byte as c_char));
+
+        let tx_bytes = [1u8, 2u8];
+        let tx_guard = [0x5Au8; 16];
+        let mut tx_hex = tx_guard.map(|byte| byte as c_char);
+        assert_eq!(
+            unsafe {
+                indra_tx_to_hex(
+                    tx_bytes.as_ptr(),
+                    tx_bytes.len(),
+                    tx_hex.as_mut_ptr(),
+                    2,
+                )
+            },
+            IndraError::BufferTooSmall.code()
+        );
+        assert_eq!(tx_hex, tx_guard.map(|byte| byte as c_char));
+
+        let session = create_session();
+        let result = handles::store_result(
+            session,
+            tx::BuiltTxOwned {
+                tx_id: [0x11; 32],
+                tx_bytes: vec![1, 2, 3].into_boxed_slice(),
+                change_spark: 0,
+                spent_indices: vec![4, 5].into_boxed_slice(),
+            },
+        )
+        .unwrap();
+        let tx_result_guard = [0x5Au8; 8];
+        let mut tx_result = tx_result_guard;
+        assert_eq!(
+            unsafe {
+                indra_result_copy_tx_bytes(
+                    session,
+                    result,
+                    tx_result.as_mut_ptr(),
+                    2,
+                )
+            },
+            IndraError::BufferTooSmall.code()
+        );
+        assert_eq!(tx_result, tx_result_guard);
+        let spent_guard = [usize::MAX; 4];
+        let mut spent = spent_guard;
+        assert_eq!(
+            unsafe { indra_result_copy_spent_indices(session, result, spent.as_mut_ptr(), 1) },
+            IndraError::BufferTooSmall.code()
+        );
+        assert_eq!(spent, spent_guard);
+        assert_eq!(indra_destroy_result(session, result), OK);
+
+        let staking_guard = [0x5Au8; 8];
+        let mut staking = staking_guard.map(|byte| byte as c_char);
+        assert_eq!(
+            unsafe {
+                crate::staking::write_hex_to_buf("abcd", staking.as_mut_ptr(), 4)
+            },
+            Err(IndraError::BufferTooSmall)
+        );
+        assert_eq!(staking, staking_guard.map(|byte| byte as c_char));
+    }
+
+    #[test]
+    fn index5_ffi_null_zero_exact_and_oversized_lengths_are_typed() {
+        assert_eq!(
+            unsafe { indra_generate_mnemonic(std::ptr::null_mut(), 0) },
+            IndraError::NullPointer.code()
+        );
+        let mut mnemonic = [0i8; MAX_MNEMONIC_BYTES];
+        let mnemonic_result = unsafe { indra_generate_mnemonic(mnemonic.as_mut_ptr(), 0) };
+        assert_eq!(mnemonic_result, IndraError::BufferTooSmall.code());
+        assert_eq!(
+            unsafe { indra_generate_mnemonic(mnemonic.as_mut_ptr(), MAX_MNEMONIC_BYTES + 1) },
+            IndraError::InvalidParam.code()
+        );
+
+        let bytes = [0x01u8, 0x02];
+        assert_eq!(
+            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), std::ptr::null_mut(), 0) },
+            IndraError::NullPointer.code()
+        );
+        let mut exact = [0i8; 5];
+        assert_eq!(
+            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), exact.as_mut_ptr(), exact.len()) },
+            IndraError::Ok.code()
+        );
+        assert_eq!(&exact[..4], &[b'0' as i8, b'1' as i8, b'0' as i8, b'2' as i8]);
+        assert_eq!(exact[4], 0);
+        let mut short = [0x5Ai8; 4];
+        assert_eq!(
+            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), short.as_mut_ptr(), short.len()) },
+            IndraError::BufferTooSmall.code()
+        );
+        assert_eq!(short, [0x5Ai8; 4]);
+        assert_eq!(
+            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), exact.as_mut_ptr(), MAX_TX_HEX_BYTES + 1) },
+            IndraError::InvalidParam.code()
+        );
+    }
+
+    #[test]
     fn secret_containers_have_drop_guaranteed_zeroization() {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<indra_cli::KeysFile>();

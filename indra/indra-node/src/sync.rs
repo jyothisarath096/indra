@@ -2379,6 +2379,50 @@ mod tests {
     }
 
     #[test]
+    fn index5_sync_response_short_window_rejected_without_consuming_request() {
+        let peer: SocketAddr = "127.0.0.1:30111".parse().unwrap();
+        let id = Bytes32::from([0xB1; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        let request = sync
+            .observe_status((id, peer, 3, Bytes32::ZERO, 100, 100, 0).into(), Instant::now())
+            .expect("request should be issued");
+        assert_eq!(request.1, 1);
+        let mut block = make_block(&crate::genesis::test_genesis_state());
+        block.header.height = 5;
+        assert_eq!(
+            sync.accept_response(id, peer, &[block]).unwrap_err(),
+            "response contains a block outside the requested range"
+        );
+        assert!(sync.accept_response(id, peer, &[]).is_ok());
+    }
+
+    #[test]
+    fn index5_sync_non_contiguous_window_rejected_without_consuming_request() {
+        let peer: SocketAddr = "127.0.0.1:30112".parse().unwrap();
+        let id = Bytes32::from([0xB2; 32]);
+        let mut sync = SyncState::follower(0);
+        sync.peer_connected(id);
+        sync.observe_status((id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
+        sync.observe_status((id, peer, 4, Bytes32::ZERO, 100, 100, 0).into(), Instant::now());
+        let mut first = make_block(&crate::genesis::test_genesis_state());
+        let mut third = first.clone();
+        first.header.height = 1;
+        third.header.height = 3;
+        assert_eq!(
+            sync.accept_response(id, peer, &[first, third]).unwrap_err(),
+            "response block heights are not contiguous"
+        );
+        assert!(sync.accept_response(id, peer, &[]).is_ok());
+    }
+
+    #[test]
+    fn index5_sync_empty_supporters_is_not_selected() {
+        let sync = SyncState::follower(0);
+        assert_eq!(sync.corroborated_target(0, Instant::now()), None);
+    }
+
+    #[test]
     fn provisional_qc_response_requires_selected_peer_and_height() {
         let peer: SocketAddr = "127.0.0.1:30109".parse().unwrap();
         let wrong_peer: SocketAddr = "127.0.0.1:30110".parse().unwrap();

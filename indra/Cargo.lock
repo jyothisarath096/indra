@@ -1071,6 +1071,7 @@ dependencies = [
  "indra-crypto",
  "indra-keystore",
  "indra-network",
+ "indra-node",
  "indra-rpc",
  "indra-state",
  "indra-storage",

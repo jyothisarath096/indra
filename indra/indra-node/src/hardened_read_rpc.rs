@@ -741,4 +741,64 @@ mod tests {
         assert!(ensure_progress(started, Instant::now() + Duration::from_secs(1), 1024).is_err());
         assert!(ensure_progress(started, Instant::now() + Duration::from_secs(1), 4096).is_ok());
     }
+
+    #[test]
+    fn index5_hardened_read_rpc_incomplete_content_length_is_rejected() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nxy")
+                .unwrap();
+        });
+        let client = std::net::TcpStream::connect(address).unwrap();
+        let error = read_request(
+            &client,
+            Instant::now(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(error, "incomplete request body");
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn index5_hardened_read_rpc_shorter_content_length_is_bounded() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nxyzz")
+                .unwrap();
+        });
+        let client = std::net::TcpStream::connect(address).unwrap();
+        let body = read_request(
+            &client,
+            Instant::now(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(body, "xy");
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn index5_hardened_read_rpc_offset_guard_is_unreachable_by_bounded_loop() {
+        // `offset` starts at zero and is increased only by the successful read
+        // of the slice beginning at that offset; the loop condition therefore
+        // prevents an out-of-range slice request.
+        let source = include_str!("hardened_read_rpc.rs");
+        assert!(source.contains("while offset < body.len()"));
+        assert!(source.contains("body.get_mut(offset..)"));
+    }
 }

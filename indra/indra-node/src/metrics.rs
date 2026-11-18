@@ -20,7 +20,7 @@
 
 use std::fmt::Write as _;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{
@@ -869,10 +869,14 @@ fn write_http_metrics_error(mut stream: TcpStream, reason: &str) -> std::io::Res
 
 fn drain_http_request(stream: &mut TcpStream) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    drain_http_request_reader(&mut BufReader::new(stream))
+}
+
+fn drain_http_request_reader<R: Read>(reader: &mut R) -> std::io::Result<()> {
     let mut buf = [0u8; 512];
     let mut seen = Vec::new();
     loop {
-        let n = stream.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             return Ok(());
         }
@@ -942,6 +946,20 @@ mod tests {
             metrics_values_for_height(u64::MAX - 1, u64::MAX),
             Err(MetricsError::RewardUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn index5_metrics_oversized_reader_count_is_typed_io_error() {
+        struct OversizedReader;
+        impl Read for OversizedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                Ok(buffer.len().saturating_add(1))
+            }
+        }
+
+        let error = drain_http_request_reader(&mut OversizedReader).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "metrics request read length exceeds buffer");
     }
     use std::net::TcpStream;
     use std::sync::atomic::AtomicUsize;

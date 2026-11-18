@@ -34,6 +34,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 toml.workspace = true
 
 [dev-dependencies]
+indra-node      = { path = ".", features = ["test-support"] }
 indra-core      = { path = "../indra-core", features = ["test-support"] }
 indra-crypto    = { path = "../indra-crypto" }
 indra-state     = { path = "../indra-state" }

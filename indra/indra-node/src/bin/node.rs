@@ -8201,7 +8201,6 @@ mod tests {
 
     #[test]
     fn rpc_transaction_relay_cache_poison_returns_typed_internal_error() {
-        #[cfg(feature = "test-support")]
         indra_node::supervisor::reset_report_count();
         let cache = Arc::new(Mutex::new(InboundDedupCaches::new()));
         let poisoned = Arc::clone(&cache);
@@ -8214,7 +8213,6 @@ mod tests {
             record_transaction_relay_seen(&cache, indra_core::Bytes32::ZERO),
             Err("internal relay state unavailable")
         );
-        #[cfg(feature = "test-support")]
         assert_eq!(indra_node::supervisor::report_count(), 1);
     }
 

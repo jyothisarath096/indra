@@ -396,6 +396,35 @@ mod tests {
     }
 
     #[test]
+    fn index5_rpc_client_flag_as_last_argument_is_not_indexed() {
+        let args = vec!["--node".to_string(), "http://127.0.0.1:8545".to_string(), "--rpc-token-file".to_string()];
+        assert_eq!(flag_value(&args, "--rpc-token-file"), None);
+    }
+
+    #[test]
+    fn index5_rpc_client_repeated_flags_use_the_first_complete_pair() {
+        let args = vec![
+            "--rpc-token-file".to_string(),
+            "first".to_string(),
+            "--rpc-token-file".to_string(),
+            "second".to_string(),
+        ];
+        assert_eq!(flag_value(&args, "--rpc-token-file"), Some("first".to_string()));
+    }
+
+    #[test]
+    fn index5_rpc_client_empty_flag_value_is_preserved() {
+        let args = vec!["--rpc-token-file".to_string(), String::new()];
+        assert_eq!(flag_value(&args, "--rpc-token-file"), Some(String::new()));
+    }
+
+    #[test]
+    fn index5_rpc_client_missing_flag_value_is_not_indexed() {
+        let args = vec!["--rpc-token-file".to_string()];
+        assert_eq!(flag_value(&args, "--rpc-token-file"), None);
+    }
+
+    #[test]
     fn self_signed_https_is_rejected_without_test_ca_and_accepted_with_it() {
         let (url, _cert, dir, mut child) = self_signed_tls_server();
         assert_eq!(

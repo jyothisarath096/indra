@@ -1109,4 +1109,30 @@ genesis = "/tmp/indra/genesis.toml"
             .unwrap_or_else(|e| panic!("{}", e));
         assert_eq!(node.prune_keep_blocks, None);
     }
+
+    #[test]
+    fn index5_config_address_matrix_rejects_malformed_values_without_panicking() {
+        let cases = [
+            ("host-without-port", "validator.example", false),
+            ("port-only", "30303", false),
+            ("empty", "", false),
+            ("multiple-colons", "validator:with:30303", true),
+            ("ipv6-literal", "[::1]:30303", true),
+            ("non-numeric-port", "validator.example:nope", false),
+            ("port-zero", "validator.example:0", false),
+            ("port-too-large", "validator.example:65536", false),
+            ("trailing-space", "validator.example:30303 ", false),
+            ("valid-hostname", "validator.example:30303", true),
+            ("valid-ipv4", "127.0.0.1:1", true),
+            ("valid-max-port", "127.0.0.1:65535", true),
+            ("negative-port", "validator.example:-1", false),
+            ("hex-port", "validator.example:0x1", false),
+            ("unicode-host", "验证器.example:30303", true),
+            ("long-host", &format!("{}:30303", "a".repeat(256)), true),
+        ];
+        for (name, value, expected) in cases {
+            assert_eq!(is_valid_addr(value), expected, "case {name}: {value:?}");
+        }
+    }
+
 }
