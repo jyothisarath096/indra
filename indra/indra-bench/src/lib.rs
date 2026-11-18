@@ -28,7 +28,7 @@
 //! # Run a specific benchmark
 //! cargo test -p indra-bench bench_hybrid -- --nocapture
 //! ```
-//!
+
 //! ## Reading results
 //!
 //! Each benchmark prints:
@@ -51,6 +51,21 @@
 
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![deny(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 pub mod codec_bench;
 pub mod crypto_bench;
 pub mod fixtures;

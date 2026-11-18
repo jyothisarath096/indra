@@ -1,5 +1,6 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 //! `indra-governance` — build and submit governance operations.
 
@@ -46,7 +47,9 @@ fn run() -> CliResult<()> {
     }
     reject_removed_vote_nonce_flag(&args)?;
 
-    let command = args[0].as_str();
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(());
+    };
     let keys_path = flag_value(&args, "--keys").unwrap_or_else(|| "keys.json".into());
     let keys = indra_cli::load_keys_for_cli(&keys_path, &args)?;
     let keypair = reconstruct_keypair(&keys)?;
@@ -491,8 +494,11 @@ fn load_vote_nonce(
     let signer_hex = hex::encode(signer_id.0);
     for line in contents.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 3 && parts[0] == proposal_hex && parts[1] == signer_hex {
-            return parse_hex32(parts[2]).map(Some);
+        match parts.as_slice() {
+            [proposal, signer, nonce] if proposal == &proposal_hex && signer == &signer_hex => {
+                return parse_hex32(nonce).map(Some);
+            }
+            _ => {}
         }
     }
     Ok(None)
@@ -521,11 +527,17 @@ fn save_vote_nonce(
             .map_err(|e| CliError::Io(format!("{}: {}", path.display(), e)))?;
         for line in contents.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 3 && parts[0] == proposal_hex && parts[1] == signer_hex {
-                lines.push(format!("{proposal_hex} {signer_hex} {nonce_hex}"));
-                replaced = true;
-            } else if !line.trim().is_empty() {
-                lines.push(line.to_string());
+            match parts.as_slice() {
+                [proposal, signer, _nonce]
+                    if proposal == &proposal_hex && signer == &signer_hex =>
+                {
+                    lines.push(format!("{proposal_hex} {signer_hex} {nonce_hex}"));
+                    replaced = true;
+                }
+                _ if !line.trim().is_empty() => {
+                    lines.push(line.to_string());
+                }
+                _ => {}
             }
         }
     }
@@ -635,8 +647,10 @@ fn required_flag(args: &[String], flag: &str) -> CliResult<String> {
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
-        .find(|window| window[0] == flag)
-        .map(|window| window[1].clone())
+        .find_map(|window| match window {
+            [candidate, value] if candidate == flag => Some(value.clone()),
+            _ => None,
+        })
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {

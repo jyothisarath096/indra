@@ -1,5 +1,6 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 use indra_cli::{KeysFile, TxParams, Wallet};
 use indra_core::types::{
@@ -17,10 +18,17 @@ fn main() {
         usage_and_exit();
     }
 
-    match args[1].as_str() {
-        "address" => cmd_address(&args[2..]),
-        "balance" => cmd_balance(&args[2..]),
-        "send" => cmd_send(&args[2..]),
+    let Some(command) = args.get(1).map(String::as_str) else {
+        usage_and_exit();
+    };
+    let Some(command_args) = args.get(2..) else {
+        eprintln!("Error: missing command arguments");
+        std::process::exit(1);
+    };
+    match command {
+        "address" => cmd_address(command_args),
+        "balance" => cmd_balance(command_args),
+        "send" => cmd_send(command_args),
         _ => usage_and_exit(),
     }
 }

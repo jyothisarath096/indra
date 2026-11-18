@@ -876,7 +876,13 @@ fn drain_http_request(stream: &mut TcpStream) -> std::io::Result<()> {
         if n == 0 {
             return Ok(());
         }
-        seen.extend_from_slice(&buf[..n]);
+        let Some(chunk) = buf.get(..n) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metrics request read length exceeds buffer",
+            ));
+        };
+        seen.extend_from_slice(chunk);
         if seen.windows(4).any(|window| window == b"\r\n\r\n") || seen.len() > 8192 {
             return Ok(());
         }

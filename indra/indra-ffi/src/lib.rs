@@ -16,12 +16,14 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 #![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![deny(clippy::indexing_slicing)]
 #![cfg_attr(
     test,
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
+        clippy::indexing_slicing,
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented
@@ -311,8 +313,14 @@ pub unsafe extern "C" fn indra_generate_mnemonic(out_phrase: *mut c_char, out_le
             return Err(IndraError::BufferTooSmall);
         }
         let out_slice = std::slice::from_raw_parts_mut(out_phrase.cast::<u8>(), out_len);
-        out_slice[..bytes.len()].copy_from_slice(bytes);
-        out_slice[bytes.len()] = 0;
+        let Some(destination) = out_slice.get_mut(..bytes.len()) else {
+            return Err(IndraError::BufferTooSmall);
+        };
+        destination.copy_from_slice(bytes);
+        let Some(terminator) = out_slice.get_mut(bytes.len()) else {
+            return Err(IndraError::BufferTooSmall);
+        };
+        *terminator = 0;
         Ok(())
     }) {
         Ok(Ok(())) => IndraError::Ok.code(),
@@ -607,8 +615,14 @@ pub unsafe extern "C" fn indra_tx_to_hex(
         }
 
         let out_bytes = std::slice::from_raw_parts_mut(out_hex.cast::<u8>(), out_hex_len);
-        out_bytes[..encoded.len()].copy_from_slice(encoded.as_bytes());
-        out_bytes[encoded.len()] = 0;
+        let Some(destination) = out_bytes.get_mut(..encoded.len()) else {
+            return Err(IndraError::BufferTooSmall);
+        };
+        destination.copy_from_slice(encoded.as_bytes());
+        let Some(terminator) = out_bytes.get_mut(encoded.len()) else {
+            return Err(IndraError::BufferTooSmall);
+        };
+        *terminator = 0;
         Ok(())
     }) {
         Ok(Ok(())) => IndraError::Ok.code(),
@@ -636,8 +650,12 @@ pub unsafe extern "C" fn indra_result_copy_tx_bytes(
             if out_len < owned.tx_bytes.len() {
                 return Err(IndraError::BufferTooSmall);
             }
-            std::slice::from_raw_parts_mut(out, out_len)[..owned.tx_bytes.len()]
-                .copy_from_slice(&owned.tx_bytes);
+            let Some(destination) = std::slice::from_raw_parts_mut(out, out_len)
+                .get_mut(..owned.tx_bytes.len())
+            else {
+                return Err(IndraError::BufferTooSmall);
+            };
+            destination.copy_from_slice(&owned.tx_bytes);
             Ok(())
         })?
     }) {
@@ -666,8 +684,12 @@ pub unsafe extern "C" fn indra_result_copy_spent_indices(
             if out_len < owned.spent_indices.len() {
                 return Err(IndraError::BufferTooSmall);
             }
-            std::slice::from_raw_parts_mut(out, out_len)[..owned.spent_indices.len()]
-                .copy_from_slice(&owned.spent_indices);
+            let Some(destination) = std::slice::from_raw_parts_mut(out, out_len)
+                .get_mut(..owned.spent_indices.len())
+            else {
+                return Err(IndraError::BufferTooSmall);
+            };
+            destination.copy_from_slice(&owned.spent_indices);
             Ok(())
         })?
     }) {

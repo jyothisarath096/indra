@@ -237,8 +237,10 @@ fn map_transport_error(error: ureq::Error) -> CliError {
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
-        .find(|pair| pair[0] == flag)
-        .map(|pair| pair[1].clone())
+        .find_map(|pair| match pair {
+            [candidate, value] if candidate == flag => Some(value.clone()),
+            _ => None,
+        })
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 //! INDRA observer/full-node binary.
 
@@ -191,7 +191,9 @@ async fn run() -> Result<(), String> {
         {
             return Err(format!("critical observer task {name} exited: {reason}"));
         }
-        let peer = &connect_peers[peer_index % connect_peers.len()];
+        let Some(peer) = connect_peers.get(peer_index % connect_peers.len()) else {
+            return Err("observer peer list became empty".to_string());
+        };
         peer_index = peer_index.saturating_add(1);
         match connect_and_sync(
             peer,
@@ -459,7 +461,10 @@ fn local_height(engine: &Arc<Mutex<NodeEngine>>) -> Result<u64, String> {
 
 async fn write_message(stream: &mut tokio::net::TcpStream, msg: &Message) -> Result<(), String> {
     let wire = msg.encode_wire().map_err(|e| e.to_string())?;
-    write_frame_plain(stream, &wire[4..])
+    let payload = wire
+        .get(4..)
+        .ok_or_else(|| "encoded message is shorter than its frame header".to_string())?;
+    write_frame_plain(stream, payload)
         .await
         .map_err(|e| e.to_string())
 }

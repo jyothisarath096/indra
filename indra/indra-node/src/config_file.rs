@@ -587,11 +587,10 @@ fn is_blank(value: Option<&str>) -> bool {
 }
 
 fn is_valid_addr(s: &str) -> bool {
-    let parts: Vec<&str> = s.rsplitn(2, ':').collect();
-    if parts.len() != 2 || parts[1].is_empty() {
+    let Some((host, port)) = s.rsplit_once(':') else {
         return false;
-    }
-    parts[0].parse::<u16>().map(|p| p > 0).unwrap_or(false)
+    };
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
 fn is_loopback_addr(s: &str) -> bool {

@@ -1,5 +1,6 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 use std::{
     fs::{File, OpenOptions},
@@ -50,12 +51,20 @@ fn create_new_output(path: &str) -> Result<File, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let result = match args.get(1).map(String::as_str) {
-        Some("create-vrf-proof") => create_vrf_proof(&args[2..]),
-        Some("validator-entry") => validator_entry(&args[2..]),
-        Some("build") => build(&args[2..]),
-        Some("validate") => validate(&args[2..]),
-        Some("inspect") => inspect(&args[2..]),
+    let Some(command) = args.get(1).map(String::as_str) else {
+        print_help();
+        return;
+    };
+    let Some(command_args) = args.get(2..) else {
+        eprintln!("Error: missing command arguments");
+        std::process::exit(1);
+    };
+    let result = match command {
+        "create-vrf-proof" => create_vrf_proof(command_args),
+        "validator-entry" => validator_entry(command_args),
+        "build" => build(command_args),
+        "validate" => validate(command_args),
+        "inspect" => inspect(command_args),
         _ => {
             print_help();
             return;

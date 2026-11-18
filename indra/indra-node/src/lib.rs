@@ -29,12 +29,14 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 #![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![deny(clippy::indexing_slicing)]
 #![cfg_attr(
     any(test, feature = "test-support"),
     allow(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
+        clippy::indexing_slicing,
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented

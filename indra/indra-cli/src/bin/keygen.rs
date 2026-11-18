@@ -1,5 +1,6 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 use std::io::Write;
 
@@ -20,15 +21,18 @@ fn main() {
         return;
     }
     if args.get(1).map(String::as_str) == Some("inspect") {
-        cmd_inspect(&args[2..]);
+        let Some(rest) = args.get(2..) else { cold_fail("missing inspect arguments") };
+        cmd_inspect(rest);
         return;
     }
     if args.get(1).map(String::as_str) == Some("export-public") {
-        cmd_export_public(&args[2..]);
+        let Some(rest) = args.get(2..) else { cold_fail("missing export arguments") };
+        cmd_export_public(rest);
         return;
     }
     if args.get(1).map(String::as_str) == Some("cold") {
-        cmd_cold(&args[2..]);
+        let Some(rest) = args.get(2..) else { cold_fail("missing cold arguments") };
+        cmd_cold(rest);
         return;
     }
 
@@ -321,11 +325,26 @@ fn owner_details(
 
 fn cmd_cold(args: &[String]) {
     match args.first().map(String::as_str) {
-        Some("ceremony") => return cmd_cold_ceremony(&args[1..]),
-        Some("split") => return cmd_cold_split(&args[1..]),
-        Some("verify") => return cmd_cold_verify(&args[1..]),
-        Some("recover") => return cmd_cold_recover(&args[1..]),
-        Some("dealer-rekey") => return cmd_cold_dealer_rekey(&args[1..]),
+        Some("ceremony") => {
+            let Some(rest) = args.get(1..) else { cold_fail("missing ceremony arguments") };
+            return cmd_cold_ceremony(rest);
+        }
+        Some("split") => {
+            let Some(rest) = args.get(1..) else { cold_fail("missing split arguments") };
+            return cmd_cold_split(rest);
+        }
+        Some("verify") => {
+            let Some(rest) = args.get(1..) else { cold_fail("missing verify arguments") };
+            return cmd_cold_verify(rest);
+        }
+        Some("recover") => {
+            let Some(rest) = args.get(1..) else { cold_fail("missing recover arguments") };
+            return cmd_cold_recover(rest);
+        }
+        Some("dealer-rekey") => {
+            let Some(rest) = args.get(1..) else { cold_fail("missing dealer-rekey arguments") };
+            return cmd_cold_dealer_rekey(rest);
+        }
         _ => {}
     }
     let output = get(args, "--output").unwrap_or_else(|| "validator-cold-keys.json".to_string());
@@ -371,7 +390,7 @@ fn share_paths(args: &[String]) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--share" {
+        if args.get(index).is_some_and(|arg| arg == "--share") {
             let path = args
                 .get(index + 1)
                 .unwrap_or_else(|| cold_fail("--share requires a path"));
@@ -551,6 +570,10 @@ fn cmd_cold_verify(args: &[String]) {
     for share in &shares {
         indra_cli::verify_cold_share(share, &hot).unwrap_or_else(|error| cold_fail(error));
     }
+    let first_share = match shares.first() {
+        Some(share) => share,
+        None => cold_fail("no shares supplied"),
+    };
     let keys =
         indra_cli::reconstruct_cold_shares(&shares, &hot, &cold).unwrap_or_else(|e| cold_fail(e));
     keys.reconstruct().unwrap_or_else(|e| cold_fail(e));
@@ -558,8 +581,8 @@ fn cmd_cold_verify(args: &[String]) {
         let receipt = serde_json::json!({
             "format": "indra-cold-dealer-rekey-verification",
             "version": 1,
-            "ceremony_id": shares[0].manifest.ceremony_id,
-            "validator_id": shares[0].manifest.validator_id,
+            "ceremony_id": first_share.manifest.ceremony_id,
+            "validator_id": first_share.manifest.validator_id,
             "cold_classical_pk": hex::encode(cold.classical),
             "cold_pq_pk": hex::encode(&cold.pq),
             "verified_share_count": shares.len(),

@@ -106,8 +106,14 @@ pub(crate) unsafe fn write_hex_to_buf(
         return Err(IndraError::BufferTooSmall);
     }
     let out_bytes = std::slice::from_raw_parts_mut(out.cast::<u8>(), out_len);
-    out_bytes[..hex.len()].copy_from_slice(hex.as_bytes());
-    out_bytes[hex.len()] = 0;
+    let Some(destination) = out_bytes.get_mut(..hex.len()) else {
+        return Err(IndraError::BufferTooSmall);
+    };
+    destination.copy_from_slice(hex.as_bytes());
+    let Some(terminator) = out_bytes.get_mut(hex.len()) else {
+        return Err(IndraError::BufferTooSmall);
+    };
+    *terminator = 0;
     Ok(())
 }
 

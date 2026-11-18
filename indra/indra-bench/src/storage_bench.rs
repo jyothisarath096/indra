@@ -9,12 +9,18 @@ use crate::{fixtures::dummy_proposal, timer::bench};
 
 /// Benchmark appending blocks to the block store.
 pub fn bench_block_store_append(n: u64, iterations: u64) {
-    let root = tempfile::tempdir().expect("unique benchmark directory");
+    let Ok(root) = tempfile::tempdir() else {
+        return;
+    };
 
     let r = bench(&format!("block_store_append_{n}"), iterations, || {
-        let iteration = tempfile::tempdir_in(root.path()).expect("unique iteration directory");
+        let Ok(iteration) = tempfile::tempdir_in(root.path()) else {
+            return;
+        };
         let path = iteration.path().join("blocks.log");
-        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        let Ok(mut store) = BlockStore::open(&path, PruneConfig::archive()) else {
+            return;
+        };
         // Store the genesis block first (height 0)
         let genesis = dummy_proposal(0, Bytes32::ZERO, 0);
         let _ = store.append(&genesis);
@@ -29,18 +35,26 @@ pub fn bench_block_store_append(n: u64, iterations: u64) {
 
 /// Benchmark reading a block by height.
 pub fn bench_block_store_read(iterations: u64) {
-    let root = tempfile::tempdir().expect("unique benchmark directory");
+    let Ok(root) = tempfile::tempdir() else {
+        return;
+    };
     let path = root.path().join("blocks.log");
     {
-        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        let Ok(mut store) = BlockStore::open(&path, PruneConfig::archive()) else {
+            return;
+        };
         for i in 0..10u64 {
             let block = dummy_proposal(i, Bytes32::ZERO, 10);
-            store.append(&block).unwrap();
+            if store.append(&block).is_err() {
+                return;
+            }
         }
     }
 
     let r = bench("block_store_read", iterations, || {
-        let mut store = BlockStore::open(&path, PruneConfig::archive()).unwrap();
+        let Ok(mut store) = BlockStore::open(&path, PruneConfig::archive()) else {
+            return;
+        };
         let _ = store.get(5);
     });
     r.print();

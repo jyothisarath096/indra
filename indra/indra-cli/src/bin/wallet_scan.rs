@@ -1,5 +1,6 @@
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 //! Wallet scan — discover outputs owned by this keypair from canonical blocks.
 //!
@@ -65,11 +66,19 @@ fn main() {
             std::process::exit(1);
         }
 
-        let utxo_id_bytes = hex::decode(parts[0]).unwrap_or_else(|_| {
+        let Some(utxo_id_text) = parts.first() else {
+            eprintln!("Error: missing utxo_id");
+            std::process::exit(1);
+        };
+        let Some(value_text) = parts.get(1) else {
+            eprintln!("Error: missing value");
+            std::process::exit(1);
+        };
+        let utxo_id_bytes = hex::decode(utxo_id_text).unwrap_or_else(|_| {
             eprintln!("Error: bad utxo_id hex");
             std::process::exit(1);
         });
-        let value: u64 = parts[1].parse().unwrap_or_else(|_| {
+        let value: u64 = value_text.parse().unwrap_or_else(|_| {
             eprintln!("Error: bad value");
             std::process::exit(1);
         });
@@ -109,7 +118,7 @@ fn main() {
             eprintln!("Error saving wallet: {}", e);
             std::process::exit(1);
         });
-        println!("Added UTXO: {} ({} Spark)", parts[0], value);
+        println!("Added UTXO: {} ({} Spark)", utxo_id_text, value);
         println!(
             "New balance: {} Spark ({:.8} INDRA)",
             wallet.balance_owned_by(&owner_pubkey),

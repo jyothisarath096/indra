@@ -18,6 +18,13 @@ use indra_crypto::{
     VrfKeypair,
 };
 
+fn must<T, E>(value: Result<T, E>) -> T {
+    match value {
+        Ok(value) => value,
+        Err(_) => std::process::abort(),
+    }
+}
+
 /// A pre-built transaction for benchmarks.
 pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
     TransactionV1 {
@@ -30,15 +37,14 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
             value_spark: 1_000_000,
             owner_pubkey: HybridPubKey {
                 classical_pk: Bytes32::ZERO,
-                pq_pk: VariableBytes::from_slice(&[0u8; 32]).unwrap(),
+                pq_pk: must(VariableBytes::from_slice(&[0u8; 32])),
             },
             lock_height: 0,
         }],
         fee_amount: fee,
         signature: HybridSignature {
-            classical_sig: VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0u8; 64])
-                .unwrap(),
-            pq_sig: VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&[0u8; 32]).unwrap(),
+            classical_sig: must(VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0u8; 64])),
+            pq_sig: must(VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&[0u8; 32])),
         },
     }
 }
@@ -67,23 +73,21 @@ pub fn dummy_block(height: u64, prev_hash: Bytes32, tx_count: usize) -> BlockVNe
             proposer_id: Bytes32::ZERO,
             vrf_suite: VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
             election_seed: Bytes64([0; 64]),
-            proposer_vrf_output: VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
+            proposer_vrf_output: must(VariableBytes::<MAX_STANDARD_VRF_OUTPUT_BYTES>::from_slice(
                 &vrf_output.0,
-            )
-            .unwrap(),
-            proposer_vrf_proof: VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
+            )),
+            proposer_vrf_proof: must(VariableBytes::<MAX_STANDARD_VRF_PROOF_BYTES>::from_slice(
                 &vrf_proof.0,
-            )
-            .unwrap(),
+            )),
             value_entropy: indra_core::types::block::ProposalEntropyV1 {
                 origin_proposer_id: Bytes32::ZERO,
                 origin_round: 0,
-                vrf_output: VariableBytes::from_slice(&vrf_output.0).unwrap(),
-                vrf_proof: VariableBytes::from_slice(&vrf_proof.0).unwrap(),
+                vrf_output: must(VariableBytes::from_slice(&vrf_output.0)),
+                vrf_proof: must(VariableBytes::from_slice(&vrf_proof.0)),
             },
             sortition_claim: SortitionClaimV1::PraosThreshold,
             proposer_priority: Bytes64([0; 64]),
-            quorum_certificate: VariableBytes::from_slice(&[]).unwrap(),
+            quorum_certificate: must(VariableBytes::from_slice(&[])),
         },
         transactions: txs,
         slashing_evidence: vec![],

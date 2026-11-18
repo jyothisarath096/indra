@@ -22,4 +22,5 @@ rand.workspace     = true
 cc = "1.0"
 
 [dev-dependencies]
+indra-core = { path = "../indra-core", features = ["test-support"] }
 indra-state = { path = "../indra-state" }

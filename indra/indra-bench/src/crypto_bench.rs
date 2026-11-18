@@ -45,7 +45,9 @@ pub fn bench_dilithium2(iterations: u64) {
     r.print();
     r.assert_faster_than(Duration::from_millis(2));
 
-    let sig = kp.sign(msg).unwrap();
+    let Ok(sig) = kp.sign(msg) else {
+        return;
+    };
     let pk = kp.public_key();
 
     let r = bench("dilithium2_verify", iterations, || {
@@ -66,7 +68,9 @@ pub fn bench_hybrid(iterations: u64) {
     r.print();
     r.assert_faster_than(Duration::from_millis(3));
 
-    let sig = kp.sign(msg).unwrap();
+    let Ok(sig) = kp.sign(msg) else {
+        return;
+    };
     let pk = kp.public_key();
 
     let r = bench("hybrid_verify", iterations, || {

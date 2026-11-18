@@ -1,6 +1,11 @@
 //! Full benchmark suite — run with:
 //!   cargo test -p indra-bench --test full_bench -- --nocapture
 
+#![deny(unused_must_use)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+#![deny(clippy::indexing_slicing)]
+
 use indra_bench::{
     codec_bench::*, crypto_bench::*, mempool_bench::*, state_bench::*, storage_bench::*,
 };

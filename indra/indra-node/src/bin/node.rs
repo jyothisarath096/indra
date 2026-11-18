@@ -5,9 +5,10 @@
     clippy::panic,
     clippy::unreachable,
     clippy::todo,
-    clippy::unimplemented
+    clippy::unimplemented,
+    clippy::indexing_slicing
 )]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 //! INDRA v2 node binary.
 //!
@@ -2320,7 +2321,12 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let wire = msg.encode_wire()?;
-    write_frame_plain(writer, &wire[4..]).await
+    let payload = wire.get(4..).ok_or_else(|| {
+        indra_network::NetworkError::DecodeFailed {
+            reason: "encoded message is shorter than its frame header".to_string(),
+        }
+    })?;
+    write_frame_plain(writer, payload).await
 }
 
 macro_rules! supervised_lock {
@@ -6375,7 +6381,13 @@ fn read_exact_with_deadline(
         reader
             .get_ref()
             .set_read_timeout(Some(remaining.min(Duration::from_secs(1))))?;
-        match reader.read(&mut output[offset..]) {
+        let Some(destination) = output.get_mut(offset..) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid RPC response offset",
+            ));
+        };
+        match reader.read(destination) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(count) => {
                 offset = offset.saturating_add(count);
@@ -8189,6 +8201,7 @@ mod tests {
 
     #[test]
     fn rpc_transaction_relay_cache_poison_returns_typed_internal_error() {
+        #[cfg(feature = "test-support")]
         indra_node::supervisor::reset_report_count();
         let cache = Arc::new(Mutex::new(InboundDedupCaches::new()));
         let poisoned = Arc::clone(&cache);
@@ -8201,6 +8214,7 @@ mod tests {
             record_transaction_relay_seen(&cache, indra_core::Bytes32::ZERO),
             Err("internal relay state unavailable")
         );
+        #[cfg(feature = "test-support")]
         assert_eq!(indra_node::supervisor::report_count(), 1);
     }
 

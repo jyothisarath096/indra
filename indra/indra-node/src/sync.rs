@@ -429,7 +429,7 @@ impl SyncState {
                 && u128::from(supporting_stake) * 3 > u128::from(self.total_active_stake);
             let identity_corroborated = supporters.len() >= 2 || self.connected_peers.len() < 2;
             if stake_corroborated && identity_corroborated {
-                let (id, claim) = supporters[0];
+                let (id, claim) = supporters.first().copied()?;
                 // Retain the selected tip commitment for same-height
                 // contradiction diagnostics and source rotation.
                 let _selected_tip_hash = claim.tip_hash;
@@ -491,7 +491,10 @@ impl SyncState {
             return Err("response contains a block outside the requested range");
         }
         if blocks.windows(2).any(|pair| {
-            pair[1].block.header.height != pair[0].block.header.height.saturating_add(1)
+            let [first, second] = pair else {
+                return true;
+            };
+            second.block.header.height != first.block.header.height.saturating_add(1)
         }) {
             return Err("response block heights are not contiguous");
         }

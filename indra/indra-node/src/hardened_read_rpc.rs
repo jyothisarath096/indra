@@ -576,7 +576,10 @@ fn read_request(stream: &TcpStream, started: Instant, deadline: Instant) -> Resu
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(1)))
             .map_err(|e| e.to_string())?;
-        match reader.read(&mut body[offset..]) {
+        let Some(destination) = body.get_mut(offset..) else {
+            return Err("invalid request body offset".to_string());
+        };
+        match reader.read(destination) {
             Ok(0) => return Err("incomplete request body".to_string()),
             Ok(count) => {
                 offset += count;
