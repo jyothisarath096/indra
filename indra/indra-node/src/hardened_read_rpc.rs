@@ -808,7 +808,8 @@ mod tests {
         struct OversizedReader;
         impl Read for OversizedReader {
             fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                Ok(buffer.len().saturating_add(1))
+                let _ = buffer;
+                Ok(usize::MAX)
             }
         }
 
