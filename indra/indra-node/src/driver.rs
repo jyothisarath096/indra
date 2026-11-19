@@ -219,6 +219,11 @@ pub struct ConsensusDriver {
     /// Independently verified signed votes proving validators reached a round.
     /// One entry per validator is counted across both vote steps.
     round_advance_evidence: HashMap<(u64, u32), BTreeMap<Bytes32, VoteV1>>,
+    /// Highest verified vote round observed from each active validator at the
+    /// next height. This is bounded by the active validator set and is kept
+    /// separately from the bounded vote collectors so a paused node can learn
+    /// about a distant round without buffering all of its votes.
+    highest_verified_round_by_validator: BTreeMap<Bytes32, u32>,
     /// Pending blocks by block hash.
     pending_blocks: HashMap<Bytes32, BlockProposalVNext>,
     /// Votes received before the matching proposal was staged locally.
@@ -271,6 +276,7 @@ impl ConsensusDriver {
             slash_detector: SlashDetector::new(),
             vote_collectors: HashMap::new(),
             round_advance_evidence: HashMap::new(),
+            highest_verified_round_by_validator: BTreeMap::new(),
             pending_blocks: HashMap::new(),
             buffered_votes: HashMap::new(),
             requested_proposals: HashSet::new(),
@@ -322,6 +328,7 @@ impl ConsensusDriver {
     pub fn set_voters(&mut self, voters: Vec<RegisteredVoter>) {
         self.vote_collectors.clear();
         self.round_advance_evidence.clear();
+        self.highest_verified_round_by_validator.clear();
         self.registered_voters = voters;
     }
 
@@ -1000,6 +1007,94 @@ impl ConsensusDriver {
         }
     }
 
+    fn prune_highest_verified_rounds(&mut self) {
+        let active: HashSet<Bytes32> = self
+            .registered_voters
+            .iter()
+            .map(|voter| voter.validator_id)
+            .collect();
+        self.highest_verified_round_by_validator
+            .retain(|validator_id, _| active.contains(validator_id));
+    }
+
+    fn record_highest_verified_round(&mut self, vote: &VoteV1) {
+        if vote.height != self.next_height()
+            || !self
+                .registered_voters
+                .iter()
+                .any(|voter| voter.validator_id == vote.validator_id)
+        {
+            return;
+        }
+        self.highest_verified_round_by_validator
+            .entry(vote.validator_id)
+            .and_modify(|highest| *highest = (*highest).max(vote.round))
+            .or_insert(vote.round);
+        self.prune_highest_verified_rounds();
+    }
+
+    /// Return the largest round supported by strictly more than one third of
+    /// active stake using verified per-validator round records. The u128
+    /// multiplication keeps the comparison exact for the full u64 stake
+    /// domain without floating point or overflow.
+    fn highest_one_third_round(&self) -> Option<u32> {
+        let total_stake: u128 = self
+            .registered_voters
+            .iter()
+            .map(|voter| u128::from(voter.stake))
+            .try_fold(0u128, |total, stake| total.checked_add(stake))?;
+        if total_stake == 0 {
+            return None;
+        }
+        let mut candidates: Vec<u32> = self
+            .highest_verified_round_by_validator
+            .values()
+            .copied()
+            .filter(|round| *round > self.current_round)
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.into_iter().rev().find(|target_round| {
+            let Some(supported_stake) = self
+                .registered_voters
+                .iter()
+                .filter(|voter| {
+                    self.highest_verified_round_by_validator
+                        .get(&voter.validator_id)
+                        .is_some_and(|round| round >= target_round)
+                })
+                .map(|voter| u128::from(voter.stake))
+                .try_fold(0u128, |total, stake| total.checked_add(stake))
+            else {
+                return false;
+            };
+            supported_stake.checked_mul(3).is_some_and(|stake| stake > total_stake)
+        })
+    }
+
+    fn maybe_advance_to_stake_supported_round(&mut self, height: u64) -> Vec<DriverAction> {
+        if !self.sync.is_caught_up() || height != self.next_height() {
+            return Vec::new();
+        }
+        let Some(target_round) = self.highest_one_third_round() else {
+            return Vec::new();
+        };
+        eprintln!(
+            "[consensus] stake-supported round advance: {} → {} at height={} (>1/3 evidence)",
+            self.current_round, target_round, height
+        );
+        if let Err(error) = self.start_round(target_round) {
+            eprintln!("[consensus] CRITICAL: stake-supported round advance failed: {error}");
+            return Vec::new();
+        }
+        if let Err(error) = self.apply_vote_safety() {
+            eprintln!("[vote_safety] CRITICAL: failed after stake-supported round advance: {error}");
+            return Vec::new();
+        }
+        self.prune_stalled_collections();
+        self.maybe_prevote_current_round_proposal()
+    }
+
     fn prune_vote_collectors(&mut self) {
         if self.vote_collectors.len() <= MAX_STALLED_HEIGHT_ENTRIES {
             return;
@@ -1565,13 +1660,9 @@ impl ConsensusDriver {
             return actions;
         }
 
-        let maximum_jump_round = self
-            .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
-            .min(MAX_ROUNDS_PER_HEIGHT - 1);
-        if vote.height != self.next_height() || vote.round > maximum_jump_round {
+        if vote.height != self.next_height() {
             return actions;
         }
-
         if self
             .engine
             .validator_id()
@@ -1642,6 +1733,10 @@ impl ConsensusDriver {
             self.vote_admission_metrics.successful_mldsa_verifications += 1;
         }
 
+        self.record_highest_verified_round(&vote);
+        let mut stake_supported_round_actions =
+            self.maybe_advance_to_stake_supported_round(vote.height);
+
         if let Some(evidence) = self.slash_detector.observe_vote(vote.clone()) {
             actions.push(DriverAction::SlashDetected(Box::new(evidence)));
         }
@@ -1667,14 +1762,29 @@ impl ConsensusDriver {
         // step and value. A one-per-validator union across the two steps is a
         // compact round-change certificate proving strict >2/3 stake reached
         // the target round; no Status or proposal assertion contributes.
-        self.round_advance_evidence
-            .entry((vote.height, vote.round))
-            .or_default()
-            .entry(vote.validator_id)
-            .or_insert_with(|| vote.clone());
-        self.prune_round_advance_evidence();
+        let maximum_near_round = self
+            .current_round
+            .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+            .min(MAX_ROUNDS_PER_HEIGHT - 1);
+        if vote.round <= maximum_near_round {
+            self.round_advance_evidence
+                .entry((vote.height, vote.round))
+                .or_default()
+                .entry(vote.validator_id)
+                .or_insert_with(|| vote.clone());
+            self.prune_round_advance_evidence();
+        }
         let mut round_advance_actions =
             self.maybe_advance_to_certified_round(vote.height, vote.round);
+        actions.append(&mut stake_supported_round_actions);
+
+        // A distant vote is retained only as per-validator round evidence. It
+        // must not enter unbounded vote/proposal collections until enough
+        // independent stake has moved this node to its round.
+        if vote.round > self.current_round {
+            actions.append(&mut round_advance_actions);
+            return actions;
+        }
 
         if !self.sync.is_caught_up() {
             actions.extend(self.record_vote_passive(from, vote, true));
@@ -2169,6 +2279,7 @@ impl ConsensusDriver {
                     .retain(|(vote_height, _, _), _| *vote_height > height);
                 self.round_advance_evidence
                     .retain(|(vote_height, _), _| *vote_height > height);
+                self.highest_verified_round_by_validator.clear();
                 self.pending_blocks
                     .retain(|_, pending| pending.block.header.height > height);
                 self.buffered_votes

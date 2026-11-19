@@ -4386,8 +4386,8 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
         assert!(!observer.round_advance_evidence.contains_key(&(1, 0)));
 
         // Pruning stale minority evidence must retain a newly admissible
-        // certificate. Three distinct, authenticated validator identities at
-        // the next legal round cross strict 3/4 stake through the ordinary
+        // certificate. Two distinct, authenticated validator identities at
+        // the next legal round cross strict >1/3 stake through the ordinary
         // inbound-vote path and advance the observer without direct mutation.
         let target_round = pressure_round + 1;
         assert!(target_round <= maximum_retained_round);
@@ -4405,8 +4405,10 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 vote,
             });
             assert!(observer.round_advance_evidence.len() <= MAX_STALLED_HEIGHT_ENTRIES);
-            if signer_index < 2 {
+            if signer_index == 0 {
                 assert_eq!(observer.current_round(), pressure_round);
+            } else {
+                assert_eq!(observer.current_round(), target_round);
             }
         }
         assert_eq!(observer.current_round(), target_round);
@@ -5241,6 +5243,192 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     }
 
     #[test]
+    fn distant_verified_rounds_jump_on_more_than_one_third_stake() {
+        let (mut driver, dir) = local_driver([0x94u8; 32], "distant_round_evidence");
+        let signers: Vec<HybridKeypair> = (0u8..4)
+            .map(|i| {
+                let seed = [0xB0u8.saturating_add(i); 32];
+                HybridKeypair::new(
+                    ClassicalKeypair::from_seed(&seed),
+                    PqKeypair::from_seed(&seed).unwrap(),
+                )
+            })
+            .collect();
+        driver.set_voters(
+            signers
+                .iter()
+                .map(|signer| {
+                    let public = signer.public_key();
+                    RegisteredVoter {
+                        validator_id: validator_id_for(signer),
+                        classical_pk: public.classical.0,
+                        pq_pk: public.pq.0.to_vec(),
+                        stake: 1,
+                    }
+                })
+                .collect(),
+        );
+
+        for (index, signer) in signers.iter().take(2).enumerate() {
+            let vote = indra_consensus::vote::produce_vote(
+                indra_consensus::vote::VoteRequest {
+                    height: 1,
+                    round: 20,
+                    step: VoteStep::Prevote,
+                    block_hash: Bytes32::ZERO,
+                    validator_id: validator_id_for(signer),
+                    snapshot_root: governing_snapshot_root(&driver, 1),
+                    chain_id: TEST_CHAIN_ID,
+                },
+                signer,
+            )
+            .unwrap();
+            driver.process(DriverEvent::InboundVote {
+                from: format!("127.0.0.1:{}", 9600 + index).parse().unwrap(),
+                vote,
+            });
+            assert_eq!(driver.highest_verified_round_by_validator.len(), index + 1);
+        }
+        assert_eq!(driver.current_round(), 20);
+        assert_eq!(driver.current_phase(), RoundPhase::Propose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_validator_high_round_replay_keeps_round_evidence_bounded() {
+        let (mut driver, dir) = local_driver([0x97u8; 32], "high_round_replay_bound");
+        let signer = HybridKeypair::new(
+            ClassicalKeypair::from_seed(&[0xE2; 32]),
+            PqKeypair::from_seed(&[0xE2; 32]).unwrap(),
+        );
+        let public = signer.public_key();
+        let mut voters = vec![RegisteredVoter {
+            validator_id: validator_id_for(&signer),
+            classical_pk: public.classical.0,
+            pq_pk: public.pq.0.to_vec(),
+            stake: 1,
+        }];
+        for index in 1u8..4 {
+            voters.push(RegisteredVoter {
+                validator_id: Bytes32::from([index; 32]),
+                classical_pk: [index; 32],
+                pq_pk: vec![index; 32],
+                stake: 1,
+            });
+        }
+        driver.set_voters(voters);
+        let vote = indra_consensus::vote::produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height: 1,
+                round: 1_000_000,
+                step: VoteStep::Prevote,
+                block_hash: Bytes32::ZERO,
+                validator_id: validator_id_for(&signer),
+                snapshot_root: governing_snapshot_root(&driver, 1),
+                chain_id: TEST_CHAIN_ID,
+            },
+            &signer,
+        )
+        .unwrap();
+        for index in 0..10_000 {
+            driver.process(DriverEvent::InboundVote {
+                from: format!("127.0.0.1:{}", 9700 + (index % 100)).parse().unwrap(),
+                vote: vote.clone(),
+            });
+        }
+        assert_eq!(driver.current_round(), 0);
+        assert_eq!(driver.highest_verified_round_by_validator.len(), 1);
+        assert_eq!(
+            driver.highest_verified_round_by_validator[&validator_id_for(&signer)],
+            1_000_000
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_validator_cannot_jump_but_a_forty_percent_validator_can() {
+        let (mut driver, dir) = local_driver([0x95u8; 32], "one_third_round_arithmetic");
+        let signers: Vec<HybridKeypair> = (0u8..4)
+            .map(|i| {
+                let seed = [0xC0u8.saturating_add(i); 32];
+                HybridKeypair::new(
+                    ClassicalKeypair::from_seed(&seed),
+                    PqKeypair::from_seed(&seed).unwrap(),
+                )
+            })
+            .collect();
+        driver.set_voters(
+            signers
+                .iter()
+                .enumerate()
+                .map(|(index, signer)| {
+                    let public = signer.public_key();
+                    RegisteredVoter {
+                        validator_id: validator_id_for(signer),
+                        classical_pk: public.classical.0,
+                        pq_pk: public.pq.0.to_vec(),
+                        stake: if index == 0 { 40 } else { 20 },
+                    }
+                })
+                .collect(),
+        );
+        driver
+            .highest_verified_round_by_validator
+            .insert(validator_id_for(&signers[1]), 10);
+        assert_eq!(driver.highest_one_third_round(), None);
+
+        driver
+            .highest_verified_round_by_validator
+            .insert(validator_id_for(&signers[0]), 12);
+        assert_eq!(driver.highest_one_third_round(), Some(12));
+        let actions = driver.maybe_advance_to_stake_supported_round(1);
+        assert!(actions.is_empty());
+        assert_eq!(driver.current_round(), 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distant_round_jump_preserves_lock_state() {
+        let (mut driver, dir) = local_driver([0x96u8; 32], "distant_round_lock");
+        let signers: Vec<HybridKeypair> = (0u8..2)
+            .map(|i| {
+                let seed = [0xD0u8.saturating_add(i); 32];
+                HybridKeypair::new(
+                    ClassicalKeypair::from_seed(&seed),
+                    PqKeypair::from_seed(&seed).unwrap(),
+                )
+            })
+            .collect();
+        driver.set_voters(
+            signers
+                .iter()
+                .map(|signer| {
+                    let public = signer.public_key();
+                    RegisteredVoter {
+                        validator_id: validator_id_for(signer),
+                        classical_pk: public.classical.0,
+                        pq_pk: public.pq.0.to_vec(),
+                        stake: 1,
+                    }
+                })
+                .collect(),
+        );
+        driver.locked_round = Some(3);
+        driver.locked_value = Some(Bytes32::from([0xE1; 32]));
+        for signer in &signers {
+            driver
+                .highest_verified_round_by_validator
+                .insert(validator_id_for(signer), 20);
+        }
+
+        let _ = driver.maybe_advance_to_stake_supported_round(1);
+        assert_eq!(driver.current_round(), 20);
+        assert_eq!(driver.locked_round, Some(3));
+        assert_eq!(driver.locked_value, Some(Bytes32::from([0xE1; 32])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn final_round_timeout_fails_closed_without_state_mutation() {
         let (mut driver, dir) = local_driver([0x48u8; 32], "round_limit");
         driver.current_round = MAX_ROUNDS_PER_HEIGHT - 2;
@@ -5398,10 +5586,10 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
                 from: format!("127.0.0.1:{}", 9500 + index).parse().unwrap(),
                 vote,
             });
-            if index < 2 {
-                assert_eq!(driver.current_round(), 0, "<=2/3 must not advance");
+            if index == 0 {
+                assert_eq!(driver.current_round(), 0, "one quarter stake must not advance");
             } else {
-                assert_eq!(driver.current_round(), 4, "strict >2/3 must advance");
+                assert_eq!(driver.current_round(), 4, "two quarters exceed one third");
                 break;
             }
         }

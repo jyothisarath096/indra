@@ -117,6 +117,10 @@ struct PeerManagerActor {
     relay_keys: HashMap<Bytes32, RelayValidatorKey>,
     relay_chain_id: String,
     relay_consensus_context: Option<(u64, u32)>,
+    /// Highest same-height round relayed for each validator. This permits a
+    /// paused node to receive distant-round evidence without relaying an
+    /// unbounded stream of repeated high-round messages.
+    relay_highest_rounds: HashMap<(u64, Bytes32), u32>,
     relay_fanout: usize,
     relay_seen: RelaySeenCache,
     block_relay_slots: HashMap<BlockRelaySlotKey, Bytes32>,
@@ -660,6 +664,7 @@ impl PeerManagerActor {
         let Some(class) = relay_message_class(msg) else {
             return;
         };
+        let mut verified_distant_round = false;
         if let Some((height, round)) = self.relay_consensus_context {
             let (message_height, message_round) = match msg {
                 Message::Vote(vote) => (vote.height, vote.round),
@@ -667,6 +672,11 @@ impl PeerManagerActor {
                     proposal.block.header.height,
                     proposal.block.header.proposer_round,
                 ),
+                _ => return,
+            };
+            let message_validator_id = match msg {
+                Message::Vote(vote) => vote.validator_id,
+                Message::Block(proposal) => proposal.block.header.proposer_id,
                 _ => return,
             };
             let min_height = height.saturating_sub(MAX_RELAY_HEIGHT_SKEW);
@@ -677,7 +687,23 @@ impl PeerManagerActor {
                 .min(MAX_ROUNDS_PER_HEIGHT - 1);
             let slot_matches = (min_height..=max_height).contains(&message_height)
                 && (min_round..=max_round).contains(&message_round);
-            if !slot_matches {
+            if !slot_matches && message_height == height && message_round > max_round {
+                let previous_round = self
+                    .relay_highest_rounds
+                    .get(&(message_height, message_validator_id))
+                    .copied();
+                if previous_round.is_some_and(|previous| message_round <= previous) {
+                    self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+                    return;
+                }
+                if !self.relay_verification_passes(msg) {
+                    self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
+                    return;
+                }
+                self.relay_highest_rounds
+                    .insert((message_height, message_validator_id), message_round);
+                verified_distant_round = true;
+            } else if !slot_matches {
                 self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
                 // Slot distance is a relay admission decision, not proof that
                 // the authenticated peer sent invalid consensus data. A
@@ -695,7 +721,7 @@ impl PeerManagerActor {
         };
         let already_seen = self.relay_seen.is_seen(&key);
         if !already_seen {
-            if !self.relay_verification_passes(msg) {
+            if !verified_distant_round && !self.relay_verification_passes(msg) {
                 self.increment_relay_metric(class, |metrics| metrics.verification_failed += 1);
                 return;
             }
@@ -954,6 +980,8 @@ impl PeerManagerActor {
             }
             NetworkCommand::UpdateRelayConsensusContext { height, round } => {
                 self.relay_consensus_context = Some((height, round));
+                self.relay_highest_rounds
+                    .retain(|(message_height, _), _| *message_height == height);
             }
         }
     }
@@ -1513,6 +1541,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         last_tie_break_log: HashMap::new(),
         relay_chain_id: config.chain_id,
         relay_consensus_context: None,
+        relay_highest_rounds: HashMap::new(),
         relay_fanout: derive_consensus_relay_fanout(config.relay_validator_keys.len()),
         relay_keys: relay_key_map(config.relay_validator_keys),
         relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
@@ -1586,6 +1615,7 @@ mod tests {
             relay_keys: HashMap::new(),
             relay_chain_id: "indra-testnet-1".to_string(),
             relay_consensus_context: None,
+            relay_highest_rounds: HashMap::new(),
             relay_fanout: derive_consensus_relay_fanout(0),
             relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
             block_relay_slots: HashMap::new(),
@@ -2816,7 +2846,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_window_honest_lag_is_dropped_without_scoring_or_blocking_catchup() {
+    async fn distant_same_height_round_relay_is_verified_and_deduplicated() {
+        let sender = Bytes32::from([0x57; 32]);
+        let receiver = Bytes32::from([0x56; 32]);
+        let keypair = hybrid_key(0x57);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34057);
+        actor
+            .handle_command(NetworkCommand::UpdateRelayConsensusContext {
+                height: 7,
+                round: 0,
+            })
+            .await;
+        let high_round = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            7,
+            20,
+            VoteStep::Prevote,
+            Bytes32::from([0x57; 32]),
+        ));
+        actor.relay_if_eligible(sender, &high_round).await;
+        assert!(receiver_rx.try_recv().is_ok());
+
+        let duplicate_high_round = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            7,
+            20,
+            VoteStep::Precommit,
+            Bytes32::from([0x58; 32]),
+        ));
+        actor
+            .relay_if_eligible(sender, &duplicate_high_round)
+            .await;
+        assert!(receiver_rx.try_recv().is_err());
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_window_honest_lag_is_relayed_without_scoring_or_blocking_catchup() {
         let sender = Bytes32::from([0x58; 32]);
         let receiver = Bytes32::from([0x59; 32]);
         let keypair = hybrid_key(0x58);
@@ -2839,7 +2911,7 @@ mod tests {
         for (height, round, hash) in [
             (97, 0, 0x61), // three heights behind
             (80, 0, 0x62), // twenty heights behind
-            (100, 9, 0x63), // nine rounds ahead after a stall
+            (100, 9, 0x63), // distant same-height evidence after a stall
         ] {
             actor
                 .relay_if_eligible(
@@ -2856,10 +2928,12 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 3);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 2);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].verification_failed, 0);
         assert_eq!(actor.peer_table.get(&addr).unwrap().score, INITIAL_SCORE);
         assert_eq!(actor.peer_table.get(&addr).unwrap().status, PeerStatus::Connected);
+        assert!(receiver_rx.try_recv().is_ok());
 
         // The same authenticated peer can immediately deliver a current-slot
         // vote, which represents the relay/sync path remaining usable.
@@ -2877,7 +2951,7 @@ mod tests {
             )
             .await;
         assert!(receiver_rx.try_recv().is_ok());
-        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 2);
     }
 
     #[tokio::test]

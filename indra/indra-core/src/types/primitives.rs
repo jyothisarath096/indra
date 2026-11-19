@@ -60,7 +60,8 @@ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 /// merely because a healthy node exhausted a small local round counter.
 pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1 << 24;
 
-/// Maximum round distance retained by consensus admission and pruning.
+/// Maximum round distance for ordinary bounded consensus admission and relay.
+/// Distant verified round-sync evidence uses the per-validator high-water path.
 pub const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
 
 /// Maximum one-height timing skew that consensus gossip may bridge.
