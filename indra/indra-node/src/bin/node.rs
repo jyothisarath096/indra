@@ -91,6 +91,10 @@ const PRE_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
 const POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY: usize = 16;
 const POST_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
+/// A connected authenticated peer is sufficient to enter consensus because
+/// consensus messages are relayed over the authenticated peer graph. Quorum
+/// formation remains enforced by the consensus driver and QC verification.
+const MIN_CONSENSUS_PEERS: usize = 1;
 
 fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
@@ -616,6 +620,12 @@ impl NetworkBridge {
             validator_id,
             event,
         });
+    }
+
+    fn update_relay_consensus_context(&self, height: u64, round: u32) {
+        let _ = self
+            .handle
+            .send_blocking(NetworkCommand::UpdateRelayConsensusContext { height, round });
     }
 
     fn connection_count(&self) -> usize {
@@ -3705,6 +3715,7 @@ fn run() -> indra_node::NodeResult<()> {
             let mut failed_proposal_at_slot: Option<((u64, u32), Instant)> = None;
             let mut last_commit_time: Option<std::time::SystemTime> = None;
             let mut last_observed_height = 0u64;
+            let mut last_relay_context = None::<(u64, u32)>;
             let mut phase_started_at = Instant::now();
             let mut last_observed = None::<(u64, u32, RoundPhase)>;
             let mut last_status_at = Instant::now() - STATUS_INTERVAL;
@@ -3723,6 +3734,11 @@ fn run() -> indra_node::NodeResult<()> {
                         d.engine.state.tip_hash,
                     )
                 };
+                let relay_context = (height.saturating_add(1), round);
+                if last_relay_context != Some(relay_context) {
+                    gossip.update_relay_consensus_context(relay_context.0, relay_context.1);
+                    last_relay_context = Some(relay_context);
+                }
                 let last_qc_bytes_empty = supervised_lock!(driver, "consensus.driver.last_qc").last_qc_bytes().is_empty();
                 if height > last_observed_height {
                     last_commit_time = Some(std::time::SystemTime::now());
@@ -3763,9 +3779,12 @@ fn run() -> indra_node::NodeResult<()> {
                     last_observed = Some(observed);
                 }
 
-                if connected < 2 {
+                if connected < MIN_CONSENSUS_PEERS {
                     if last_peer_wait_log != Some(connected) {
-                        eprintln!("[consensus] waiting for peers (have {}, need 2)", connected);
+                        eprintln!(
+                            "[consensus] waiting for peers (have {}, need {})",
+                            connected, MIN_CONSENSUS_PEERS
+                        );
                         last_peer_wait_log = Some(connected);
                     }
                     phase_started_at = Instant::now();

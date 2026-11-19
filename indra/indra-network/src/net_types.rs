@@ -123,4 +123,11 @@ pub enum NetworkCommand {
         /// Active validator public keys.
         validators: Vec<RelayValidatorKey>,
     },
+    /// Update the consensus slot that transport relay may forward.
+    UpdateRelayConsensusContext {
+        /// Next block height currently being voted on.
+        height: u64,
+        /// Current consensus round for that height.
+        round: u32,
+    },
 }

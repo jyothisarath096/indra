@@ -115,6 +115,7 @@ struct PeerManagerActor {
     last_tie_break_log: HashMap<Bytes32, Instant>,
     relay_keys: HashMap<Bytes32, RelayValidatorKey>,
     relay_chain_id: String,
+    relay_consensus_context: Option<(u64, u32)>,
     relay_fanout: usize,
     relay_seen: RelaySeenCache,
     block_relay_slots: HashMap<BlockRelaySlotKey, Bytes32>,
@@ -658,6 +659,20 @@ impl PeerManagerActor {
         let Some(class) = relay_message_class(msg) else {
             return;
         };
+        if let Some((height, round)) = self.relay_consensus_context {
+            let slot_matches = match msg {
+                Message::Vote(vote) => vote.height == height && vote.round == round,
+                Message::Block(proposal) => {
+                    proposal.block.header.height == height
+                        && proposal.block.header.proposer_round == round
+                }
+                _ => true,
+            };
+            if !slot_matches {
+                self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+                return;
+            }
+        }
         let Some(key) = relay_message_key(msg) else {
             self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
             return;
@@ -920,6 +935,9 @@ impl PeerManagerActor {
                 self.relay_fanout = derive_consensus_relay_fanout(validators.len());
                 self.relay_keys = relay_key_map(validators);
                 self.relay_chain_id = chain_id;
+            }
+            NetworkCommand::UpdateRelayConsensusContext { height, round } => {
+                self.relay_consensus_context = Some((height, round));
             }
         }
     }
@@ -1478,6 +1496,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         last_tie_break_log: HashMap::new(),
         relay_chain_id: config.chain_id,
+        relay_consensus_context: None,
         relay_fanout: derive_consensus_relay_fanout(config.relay_validator_keys.len()),
         relay_keys: relay_key_map(config.relay_validator_keys),
         relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
@@ -1549,6 +1568,7 @@ mod tests {
             last_tie_break_log: HashMap::new(),
             relay_keys: HashMap::new(),
             relay_chain_id: "indra-testnet-1".to_string(),
+            relay_consensus_context: None,
             relay_fanout: derive_consensus_relay_fanout(0),
             relay_seen: RelaySeenCache::new(CONSENSUS_RELAY_SEEN_CAPACITY),
             block_relay_slots: HashMap::new(),
@@ -1868,9 +1888,20 @@ mod tests {
         step: VoteStep,
         block_hash: Bytes32,
     ) -> VoteV1 {
+        signed_vote_at(validator_id, keypair, 7, 2, step, block_hash)
+    }
+
+    fn signed_vote_at(
+        validator_id: Bytes32,
+        keypair: &HybridKeypair,
+        height: u64,
+        round: u32,
+        step: VoteStep,
+        block_hash: Bytes32,
+    ) -> VoteV1 {
         let bytes = vote_signing_bytes(
-            7,
-            2,
+            height,
+            round,
             step,
             &block_hash,
             &validator_id,
@@ -1879,8 +1910,8 @@ mod tests {
         )
         .unwrap();
         VoteV1 {
-            height: 7,
-            round: 2,
+            height,
+            round,
             step,
             block_hash,
             validator_id,
@@ -2722,6 +2753,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pre_relay_slot_context_rejects_wrong_height_and_round() {
+        let sender = Bytes32::from([0x50; 32]);
+        let receiver = Bytes32::from([0x51; 32]);
+        let keypair = hybrid_key(0x50);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34051);
+        actor
+            .handle_command(NetworkCommand::UpdateRelayConsensusContext {
+                height: 7,
+                round: 2,
+            })
+            .await;
+
+        actor
+            .relay_if_eligible(
+                sender,
+                &Message::Vote(signed_vote_at(
+                    sender,
+                    &keypair,
+                    8,
+                    2,
+                    VoteStep::Prevote,
+                    Bytes32::from([0x52; 32]),
+                )),
+            )
+            .await;
+        actor
+            .relay_if_eligible(
+                sender,
+                &Message::Vote(signed_vote_at(
+                    sender,
+                    &keypair,
+                    7,
+                    3,
+                    VoteStep::Prevote,
+                    Bytes32::from([0x53; 32]),
+                )),
+            )
+            .await;
+        assert!(receiver_rx.try_recv().is_err());
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 2);
+    }
+
     #[test]
     fn block_relay_verifies_embedded_proposer_vrf_not_election_authority() {
         let validator_id = Bytes32::from([0x60; 32]);
@@ -2866,6 +2943,152 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    type RelayInbox = (
+        mpsc::Receiver<OutboundMessage>,
+        mpsc::Receiver<OutboundMessage>,
+    );
+
+    fn drain_relay_outbox(
+        node: usize,
+        inboxes: &mut [HashMap<usize, RelayInbox>],
+        queue: &mut VecDeque<(usize, usize, Message)>,
+    ) {
+        for (peer, (small_receiver, large_receiver)) in &mut inboxes[node] {
+            while let Ok(outbound) = small_receiver.try_recv() {
+                queue.push_back((node, *peer, outbound.msg));
+            }
+            while let Ok(outbound) = large_receiver.try_recv() {
+                queue.push_back((node, *peer, outbound.msg));
+            }
+        }
+    }
+
+    async fn relay_through_topology(
+        graph: &[&[usize]],
+        messages: Vec<(usize, Message)>,
+    ) -> (HashSet<usize>, usize) {
+        let keys = (0..4u8)
+            .map(|seed| {
+                let id = Bytes32::from([seed.saturating_add(1); 32]);
+                (id, hybrid_key(seed.saturating_add(1)))
+            })
+            .collect::<Vec<_>>();
+        let relay_keys = keys
+            .iter()
+            .map(|(id, keypair)| relay_key(*id, keypair))
+            .collect::<Vec<_>>();
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut actors = (0..4)
+            .map(|index| test_actor(event_tx.clone(), Bytes32::from([index as u8 + 1; 32])))
+            .collect::<Vec<_>>();
+        let mut inboxes = (0..4)
+            .map(|_| HashMap::<usize, RelayInbox>::new())
+            .collect::<Vec<_>>();
+        for (node, peers) in graph.iter().enumerate() {
+            for peer in *peers {
+                let receivers = add_test_peer_receivers(
+                    &mut actors[node],
+                    Bytes32::from([*peer as u8 + 1; 32]),
+                    34200 + (node * 10 + *peer) as u16,
+                );
+                inboxes[node].insert(*peer, receivers);
+            }
+            install_relay_keys(&mut actors[node], relay_keys.clone());
+        }
+
+        let mut reached = HashSet::new();
+        let mut queue = VecDeque::new();
+        for (origin, message) in messages {
+            reached.insert(origin);
+            actors[origin]
+                .handle_command(NetworkCommand::Broadcast(message))
+                .await;
+            drain_relay_outbox(origin, &mut inboxes, &mut queue);
+            assert!(!queue.is_empty(), "origin broadcast must enqueue a neighbor delivery");
+        }
+        let mut deliveries = 0usize;
+        while let Some((sender, receiver, message)) = queue.pop_front() {
+            deliveries += 1;
+            assert!(
+                deliveries <= 64,
+                "relay graph must terminate with bounded deliveries"
+            );
+            reached.insert(receiver);
+            actors[receiver]
+                .relay_if_eligible(Bytes32::from([sender as u8 + 1; 32]), &message)
+                .await;
+            drain_relay_outbox(receiver, &mut inboxes, &mut queue);
+        }
+        (reached, deliveries)
+    }
+
+    #[tokio::test]
+    async fn relay_reaches_all_nodes_through_line_star_and_ring() {
+        let line = [&[1][..], &[0, 2][..], &[1, 3][..], &[2][..]];
+        let star = [&[1, 2, 3][..], &[0][..], &[0][..], &[0][..]];
+        let ring = [&[1, 3][..], &[0, 2][..], &[1, 3][..], &[2, 0][..]];
+
+        for (name, graph) in [("line", line), ("star", star), ("ring", ring)] {
+            let messages = (0..5u64)
+                .map(|height| {
+                    let origin = 0usize;
+                    let keypair = hybrid_key(origin as u8 + 1);
+                    let validator_id = Bytes32::from([origin as u8 + 1; 32]);
+                    let message = if height == 0 {
+                        let vrf = VrfKeypair::from_seed(&validator_id.0);
+                        Message::Block(Box::new(relay_test_block(
+                            validator_id,
+                            &vrf,
+                            &keypair,
+                            1,
+                            0,
+                            Bytes32::ZERO,
+                            Bytes32::from([0xA1; 32]),
+                        )))
+                    } else {
+                        Message::Vote(signed_vote_at(
+                            validator_id,
+                            &keypair,
+                            height + 1,
+                            height as u32,
+                            VoteStep::Prevote,
+                            Bytes32::from([(height + 1) as u8; 32]),
+                        ))
+                    };
+                    (
+                        origin,
+                        message,
+                    )
+                })
+                .collect();
+            let (reached, deliveries) = relay_through_topology(&graph, messages).await;
+            assert_eq!(reached.len(), 4, "{name} topology must reach every validator");
+            assert!(deliveries <= 40, "{name} topology relay count must stay bounded");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_bounds_duplicate_and_conflicting_messages() {
+        let graph = [&[1, 3][..], &[0, 2][..], &[1, 3][..], &[2, 0][..]];
+        let sender = Bytes32::from([1; 32]);
+        let keypair = hybrid_key(1);
+        let message = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            9,
+            0,
+            VoteStep::Prevote,
+            Bytes32::from([0x91; 32]),
+        ));
+        let (reached, deliveries) = relay_through_topology(
+            &graph,
+            vec![(0, message.clone()), (0, message)],
+        )
+        .await;
+        assert_eq!(reached.len(), 4);
+        assert!(deliveries <= 16, "duplicate ring delivery must be deduplicated");
     }
 
     const SIM_VALIDATORS_N200: usize = 200;
