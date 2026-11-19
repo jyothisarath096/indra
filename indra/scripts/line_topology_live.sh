@@ -8,6 +8,7 @@ TARGET_HEIGHT=${TARGET_HEIGHT:-10}
 CAP_SECONDS=${CAP_SECONDS:-2400}
 START_NODE1_DELAY_SECONDS=${START_NODE1_DELAY_SECONDS:-0}
 STOP_NODE2_SECONDS=${STOP_NODE2_SECONDS:-0}
+EXPECT_PEER_COUNTS=${EXPECT_PEER_COUNTS:-}
 BASE_P2P_PORT=${BASE_P2P_PORT:-32700}
 BASE_RPC_PORT=${BASE_RPC_PORT:-19700}
 ROOT=${1:-"$(mktemp -d /tmp/indra-line-topology.XXXXXX)"}
@@ -180,11 +181,18 @@ panics=$(grep -hEc 'panicked at|handler panic' "$ROOT"/node-*.stderr 2>/dev/null
 stale=$(grep -hE 'indra_stale_sync_responses_total' "$ROOT"/metrics-* 2>/dev/null | awk '{s+=$2} END{print s+0}')
 exits_ok=1
 for i in 0 1 2 3; do [ "$(cat "$ROOT/exit-$i")" = 0 ] || exits_ok=0; done
+peer_counts_ok=1
+if [ -n "$EXPECT_PEER_COUNTS" ]; then
+    IFS=, read -r -a expected_peers <<<"$EXPECT_PEER_COUNTS"
+    for i in 0 1 2 3; do
+        [ "${expected_peers[$i]:-}" = "$(field peers <"$ROOT/info-$i.json")" ] || peer_counts_ok=0
+    done
+fi
 
 {
     printf '# line topology live run\n\n'
-    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s elapsed_seconds=%s\n\n' \
-        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$((SECONDS-started))"
+    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s peer_counts_ok=%s elapsed_seconds=%s\n\n' \
+        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$peer_counts_ok" "$((SECONDS-started))"
     printf '| node | height | tip | peers | exit | topology |\n|---:|---:|---|---:|---:|---|\n'
     for i in 0 1 2 3; do
         printf '| %s | %s | %s | %s | %s | %s |\n' "$i" \
@@ -197,7 +205,7 @@ for i in 0 1 2 3; do [ "$(cat "$ROOT/exit-$i")" = 0 ] || exits_ok=0; done
 } | tee "$ROOT/summary.md"
 
 if [ "$reached" -eq 1 ] && [ "$same_tip" -eq 1 ] && [ "$panics" -eq 0 ] && \
-    [ "${stale:-0}" -eq 0 ] && [ "$exits_ok" -eq 1 ]; then
+    [ "${stale:-0}" -eq 0 ] && [ "$exits_ok" -eq 1 ] && [ "$peer_counts_ok" -eq 1 ]; then
     printf 'PASS\n'
     exit 0
 fi

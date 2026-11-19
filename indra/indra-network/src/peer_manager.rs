@@ -679,12 +679,13 @@ impl PeerManagerActor {
                 && (min_round..=max_round).contains(&message_round);
             if !slot_matches {
                 self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
-                // A valid signature does not make an arbitrarily distant slot
-                // useful. Penalize this existing invalid-consensus path so a
-                // peer cannot use signed garbage-slot variants as a relay
-                // amplification probe.
-                self.score_validator(sender, ScoreEvent::InvalidMessage, BAN_DURATION)
-                    .await;
+                // Slot distance is a relay admission decision, not proof that
+                // the authenticated peer sent invalid consensus data. A
+                // validator may be catching up after a restart, SIGSTOP, or a
+                // partition. Keep this check before signature verification so
+                // stale/flooded slots are cheap to discard, but leave scoring
+                // of provably invalid consensus messages to the authoritative
+                // validation path below the relay layer.
                 return;
             }
         }
@@ -1531,6 +1532,7 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::PeerStatus;
     use crate::rate_limit::RateLimitReason;
     use indra_core::types::{
         block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
@@ -2811,6 +2813,117 @@ mod tests {
         assert!(receiver_rx.try_recv().is_err());
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 4);
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_window_honest_lag_is_dropped_without_scoring_or_blocking_catchup() {
+        let sender = Bytes32::from([0x58; 32]);
+        let receiver = Bytes32::from([0x59; 32]);
+        let keypair = hybrid_key(0x58);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let _sender_rx = add_test_peer(&mut actor, sender, 34058);
+        let mut receiver_rx = add_test_peer(&mut actor, receiver, 34059);
+        actor
+            .handle_command(NetworkCommand::UpdateRelayConsensusContext {
+                height: 100,
+                round: 0,
+            })
+            .await;
+        let addr = actor.peers_by_validator.get(&sender).unwrap().addr;
+
+        // A restarted/syncing validator may still have votes from several old
+        // heights in flight. They are validly signed, but not useful to this
+        // relay slot.
+        for (height, round, hash) in [
+            (97, 0, 0x61), // three heights behind
+            (80, 0, 0x62), // twenty heights behind
+            (100, 9, 0x63), // nine rounds ahead after a stall
+        ] {
+            actor
+                .relay_if_eligible(
+                    sender,
+                    &Message::Vote(signed_vote_at(
+                        sender,
+                        &keypair,
+                        height,
+                        round,
+                        VoteStep::Prevote,
+                        Bytes32::from([hash; 32]),
+                    )),
+                )
+                .await;
+        }
+
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 3);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].verification_failed, 0);
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, INITIAL_SCORE);
+        assert_eq!(actor.peer_table.get(&addr).unwrap().status, PeerStatus::Connected);
+
+        // The same authenticated peer can immediately deliver a current-slot
+        // vote, which represents the relay/sync path remaining usable.
+        actor
+            .relay_if_eligible(
+                sender,
+                &Message::Vote(signed_vote_at(
+                    sender,
+                    &keypair,
+                    100,
+                    0,
+                    VoteStep::Prevote,
+                    Bytes32::from([0x64; 32]),
+                )),
+            )
+            .await;
+        assert!(receiver_rx.try_recv().is_ok());
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_out_of_window_votes_are_rejected_before_verification() {
+        let sender = Bytes32::from([0x5A; 32]);
+        let receiver = Bytes32::from([0x5B; 32]);
+        let keypair = hybrid_key(0x5A);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        install_relay_keys(&mut actor, vec![relay_key(sender, &keypair)]);
+        let _sender_rx = add_test_peer(&mut actor, sender, 34060);
+        let _receiver_rx = add_test_peer(&mut actor, receiver, 34061);
+        actor
+            .handle_command(NetworkCommand::UpdateRelayConsensusContext {
+                height: 100,
+                round: 0,
+            })
+            .await;
+        let addr = actor.peers_by_validator.get(&sender).unwrap().addr;
+
+        let signed_template = signed_vote_at(
+            sender,
+            &keypair,
+            80,
+            0,
+            VoteStep::Prevote,
+            Bytes32::ZERO,
+        );
+        for index in 0u64..10_000 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&index.to_le_bytes());
+            let mut vote = signed_template.clone();
+            vote.block_hash = Bytes32::from(hash);
+            actor
+                .relay_if_eligible(
+                    sender,
+                    &Message::Vote(vote),
+                )
+                .await;
+        }
+
+        let metrics = actor.relay_metrics[&RelayMessageClass::Vote];
+        assert_eq!(metrics.dropped, 10_000);
+        assert_eq!(metrics.verification_failed, 0);
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, INITIAL_SCORE);
+        assert_eq!(actor.peer_table.get(&addr).unwrap().status, PeerStatus::Connected);
     }
 
     #[test]
