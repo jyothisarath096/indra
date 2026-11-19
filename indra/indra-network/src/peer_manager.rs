@@ -32,7 +32,7 @@ use crate::{
     frame::{FrameReader, FrameWriter},
     handshake::HandshakeResult,
     message::Message,
-    net_types::{NetworkCommand, NetworkEvent, RelayValidatorKey},
+    net_types::{NetworkCommand, NetworkEvent, PeerDisconnectReason, RelayValidatorKey},
     peer::{
         BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE, MAX_SCORE, PeerTable,
         ScoreEvent,
@@ -78,6 +78,7 @@ enum PeerManagerMessage {
     Disconnected {
         validator_id: Bytes32,
         addr: SocketAddr,
+        reason: PeerDisconnectReason,
     },
     InboundMessage {
         validator_id: Bytes32,
@@ -548,7 +549,8 @@ impl PeerManagerActor {
                 short_validator_id(&validator_id),
                 addr,
             );
-            self.drop_peer(validator_id, addr).await;
+            self.drop_peer(validator_id, addr, PeerDisconnectReason::Ban)
+                .await;
         } else {
             eprintln!("{}", format_rate_limit_log(addr, validator_id, violation));
         }
@@ -845,7 +847,8 @@ impl PeerManagerActor {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(message)) => {
                 if message.point_to_point {
-                    self.drop_peer(validator_id, addr).await;
+                    self.drop_peer(validator_id, addr, PeerDisconnectReason::Timeout)
+                        .await;
                 } else {
                     self.peer_table.score_event(&addr, ScoreEvent::Timeout);
                     self.record_queue_full_drop(validator_id, addr, &message.msg);
@@ -853,7 +856,8 @@ impl PeerManagerActor {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.drop_peer(validator_id, addr).await;
+                self.drop_peer(validator_id, addr, PeerDisconnectReason::WriteError)
+                    .await;
                 false
             }
         }
@@ -941,7 +945,8 @@ impl PeerManagerActor {
             }
             NetworkCommand::Disconnect { validator_id } => {
                 if let Some(peer) = self.peers_by_validator.get(&validator_id) {
-                    self.drop_peer(validator_id, peer.addr).await;
+                    self.drop_peer(validator_id, peer.addr, PeerDisconnectReason::Operator)
+                        .await;
                 }
             }
             NetworkCommand::DisconnectInvalidConsensusPeer {
@@ -959,7 +964,8 @@ impl PeerManagerActor {
                         reason
                     );
                     if self.peers_by_validator.contains_key(&validator_id) {
-                        self.drop_peer(validator_id, addr).await;
+                        self.drop_peer(validator_id, addr, PeerDisconnectReason::Ban)
+                            .await;
                     }
                 }
             }
@@ -1037,8 +1043,12 @@ impl PeerManagerActor {
             PeerManagerMessage::Connected { addr, handshake } => {
                 self.register_peer(addr, handshake).await;
             }
-            PeerManagerMessage::Disconnected { validator_id, addr } => {
-                self.drop_peer(validator_id, addr).await;
+            PeerManagerMessage::Disconnected {
+                validator_id,
+                addr,
+                reason,
+            } => {
+                self.drop_peer(validator_id, addr, reason).await;
             }
             PeerManagerMessage::InboundMessage {
                 validator_id,
@@ -1171,7 +1181,12 @@ impl PeerManagerActor {
                         short_validator_id(&peer_validator_id),
                     );
                 }
-                self.drop_peer(peer_validator_id, existing_addr).await;
+                self.drop_peer(
+                    peer_validator_id,
+                    existing_addr,
+                    PeerDisconnectReason::DuplicateConnection,
+                )
+                .await;
             } else {
                 if should_log_tie_break(
                     &mut self.last_tie_break_log,
@@ -1212,10 +1227,14 @@ impl PeerManagerActor {
             let mut duplicate_filter =
                 ConsensusDuplicateFilter::new(CONSENSUS_DUPLICATE_FILTER_CAPACITY);
             let mut status_coalescer = StatusCoalescer::new(STATUS_COALESCE_WINDOW);
+            let mut disconnect_reason = PeerDisconnectReason::RemoteClosed;
             loop {
                 let plaintext = match reader.read_frame().await {
                     Ok(bytes) => bytes,
-                    Err(_) => break,
+                    Err(_) => {
+                        disconnect_reason = PeerDisconnectReason::ReadError;
+                        break;
+                    }
                 };
                 let msg_size = plaintext.len();
                 let msg = match Message::decode_framed_wire(&plaintext) {
@@ -1248,6 +1267,7 @@ impl PeerManagerActor {
                 .send(PeerManagerMessage::Disconnected {
                     validator_id: peer_validator_id,
                     addr,
+                    reason: disconnect_reason,
                 })
                 .await;
         });
@@ -1300,7 +1320,12 @@ impl PeerManagerActor {
         self.refresh_connection_counts();
     }
 
-    async fn drop_peer(&mut self, validator_id: Bytes32, addr: SocketAddr) {
+    async fn drop_peer(
+        &mut self,
+        validator_id: Bytes32,
+        addr: SocketAddr,
+        reason: PeerDisconnectReason,
+    ) {
         let mut is_outbound = false;
         if let Some(peer) = self.peers_by_validator.get(&validator_id) {
             if peer.addr == addr {
@@ -1331,6 +1356,7 @@ impl PeerManagerActor {
                 validator_id,
                 addr,
                 is_outbound,
+                reason,
             })
             .await;
     }
@@ -1388,7 +1414,8 @@ impl PeerManagerActor {
                 eprintln!("[p2p] failed to persist identity ban: {error}");
             }
             if let Some(addr) = addr {
-                self.drop_peer(validator_id, addr).await;
+                self.drop_peer(validator_id, addr, PeerDisconnectReason::Ban)
+                    .await;
             }
         }
     }
@@ -1429,7 +1456,11 @@ async fn run_write_loop(
         }
     }
     let _ = control_tx
-        .send(PeerManagerMessage::Disconnected { validator_id, addr })
+        .send(PeerManagerMessage::Disconnected {
+            validator_id,
+            addr,
+            reason: PeerDisconnectReason::WriteError,
+        })
         .await;
 }
 
@@ -2342,7 +2373,9 @@ mod tests {
                 })
                 .await;
         }
-        actor.drop_peer(validator, addr).await;
+        actor
+            .drop_peer(validator, addr, PeerDisconnectReason::Operator)
+            .await;
         actor
             .handle_control(PeerManagerMessage::InboundMessage {
                 validator_id: validator,
@@ -3746,7 +3779,9 @@ mod tests {
         actor.register_peer(addr_old, old_hs).await;
         actor.register_peer(addr_new, new_hs).await;
         let before = actor.connected_peers.load(Ordering::Relaxed);
-        actor.drop_peer(peer, addr_old).await;
+        actor
+            .drop_peer(peer, addr_old, PeerDisconnectReason::DuplicateConnection)
+            .await;
 
         assert_eq!(actor.connected_peers.load(Ordering::Relaxed), before);
         assert_eq!(actor.peers_by_validator.get(&peer).unwrap().addr, addr_new);

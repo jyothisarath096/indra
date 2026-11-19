@@ -79,7 +79,7 @@ pub use handshake::{
     perform_handshake_initiator, perform_handshake_responder, HandshakeConfig, HandshakeResult,
 };
 pub use message::{Message, MessageType, PeerListEntry};
-pub use net_types::{NetworkCommand, NetworkEvent, RelayValidatorKey};
+pub use net_types::{NetworkCommand, NetworkEvent, PeerDisconnectReason, RelayValidatorKey};
 pub use observer::{
     perform_observer_handshake_initiator, perform_observer_handshake_responder, read_frame_plain,
     read_frame_plain_limited, write_frame_plain, ObserverFrameLimiter, ObserverHandshakeResult,

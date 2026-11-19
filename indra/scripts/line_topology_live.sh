@@ -7,7 +7,9 @@ set -u
 TARGET_HEIGHT=${TARGET_HEIGHT:-10}
 CAP_SECONDS=${CAP_SECONDS:-2400}
 START_NODE1_DELAY_SECONDS=${START_NODE1_DELAY_SECONDS:-0}
-STOP_NODE2_SECONDS=${STOP_NODE2_SECONDS:-0}
+STOP_NODE_INDEX=${STOP_NODE_INDEX:-1}
+STOP_AFTER_HEIGHT=${STOP_AFTER_HEIGHT:-3}
+STOP_SECONDS=${STOP_SECONDS:-0}
 EXPECT_PEER_COUNTS=${EXPECT_PEER_COUNTS:-}
 BASE_P2P_PORT=${BASE_P2P_PORT:-32700}
 BASE_RPC_PORT=${BASE_RPC_PORT:-19700}
@@ -17,6 +19,26 @@ command -v curl >/dev/null || { echo 'curl is required' >&2; exit 2; }
 command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 2; }
 
 PIDS=()
+timestamp_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+timeline() { printf '%s %s\n' "$(timestamp_ms)" "$*" >>"$ROOT/timeline.log"; }
+log_events_after() {
+    awk -v start="$1" '
+        /\[p2p\] t=[0-9]+ms (authenticated peer connected|peer disconnected)/ {
+            t=$0; sub(/^.* t=/, "", t); sub(/ms.*$/, "", t);
+            if ((t + 0) >= (start + 0)) count++
+        }
+        END { print count + 0 }
+    ' "$2"
+}
+rounds_between() {
+    awk -v start="$1" -v end="$2" '
+        /\[timing\] t=[0-9]+ms ROUND ADVANCED/ {
+            t=$0; sub(/^.* t=/, "", t); sub(/ms.*$/, "", t);
+            if ((t + 0) >= (start + 0) && (t + 0) <= (end + 0)) count++
+        }
+        END { print count + 0 }
+    ' "$3"
+}
 cleanup() {
     local pid
     for pid in "${PIDS[@]-}"; do [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true; done
@@ -121,7 +143,7 @@ start_nodes() {
     for i in 0 2 3; do
         printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
         "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
-        PIDS+=($!)
+        PIDS[$i]=$!
     done
     if [ "$START_NODE1_DELAY_SECONDS" -gt 0 ]; then
         sleep "$START_NODE1_DELAY_SECONDS"
@@ -129,13 +151,7 @@ start_nodes() {
     i=1
     printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
     "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
-    PIDS+=($!)
-    if [ "$STOP_NODE2_SECONDS" -gt 0 ]; then
-        sleep 2
-        kill -STOP "${PIDS[1]}" 2>/dev/null || true
-        sleep "$STOP_NODE2_SECONDS"
-        kill -CONT "${PIDS[1]}" 2>/dev/null || true
-    fi
+    PIDS[$i]=$!
 }
 
 snapshot() {
@@ -151,16 +167,78 @@ snapshot() {
 
 make_genesis "$ROOT" || { echo "genesis failed; see $ROOT/genesis.log" >&2; exit 1; }
 for i in 0 1 2 3; do write_config "$ROOT" "$i"; done
+timeline t_start
 start_nodes "$ROOT"
 started=$SECONDS
+if [ "$STOP_SECONDS" -gt 0 ]; then
+    stop_started=$SECONDS
+    while [ "$SECONDS" -lt "$((stop_started+CAP_SECONDS))" ]; do
+        stop_height=0
+        for i in 0 1 2 3; do
+            height=$(rpc $((BASE_RPC_PORT+i*10)) indra_getTip | field height)
+            [ -n "$height" ] || height=0
+            [ "$height" -gt "$stop_height" ] 2>/dev/null && stop_height=$height
+        done
+        if [ "$stop_height" -ge "$STOP_AFTER_HEIGHT" ] 2>/dev/null; then break; fi
+        sleep 2
+    done
+    if [ "$stop_height" -lt "$STOP_AFTER_HEIGHT" ] 2>/dev/null; then
+        echo "failed to reach STOP_AFTER_HEIGHT=$STOP_AFTER_HEIGHT before pause" >&2
+        exit 1
+    fi
+    height_at_stop=$stop_height
+    t_stop_ms=$(timestamp_ms)
+    timeline "t_stop t_ms=$t_stop_ms height=$height_at_stop node=$STOP_NODE_INDEX"
+    kill -STOP "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+    sleep "$STOP_SECONDS"
+    t_cont_ms=$(timestamp_ms)
+    timeline "t_cont t_ms=$t_cont_ms height_at_stop=$height_at_stop"
+    kill -CONT "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+    timeline "resume_observed height_at_stop=$height_at_stop"
+else
+    height_at_stop=0
+    t_cont_ms=0
+fi
 reached=0
+t_first_block_after_cont_ms=
+t_all_nodes_at_tip_ms=
+paused_both_neighbours_ms=
 while [ "$SECONDS" -lt "$((started+CAP_SECONDS))" ]; do
     min_height=999999
+    max_height=0
+    tips=()
     for i in 0 1 2 3; do
         height=$(rpc $((BASE_RPC_PORT+i*10)) indra_getTip | field height)
         [ -n "$height" ] || height=0
         [ "$height" -lt "$min_height" ] 2>/dev/null && min_height=$height
+        [ "$height" -gt "$max_height" ] 2>/dev/null && max_height=$height
+        tips[$i]=$(rpc $((BASE_RPC_PORT+i*10)) indra_getTip | field tip_hash)
     done
+    now_ms=$(timestamp_ms)
+    if [ "$STOP_SECONDS" -gt 0 ] && [ -z "$t_first_block_after_cont_ms" ] && \
+        [ "$max_height" -gt "$height_at_stop" ] 2>/dev/null; then
+        t_first_block_after_cont_ms=$now_ms
+        timeline "t_first_block_after_cont height=$max_height"
+    fi
+    if [ "$STOP_SECONDS" -gt 0 ] && [ -z "$paused_both_neighbours_ms" ]; then
+        peer_count=$(admin_rpc $((BASE_RPC_PORT+STOP_NODE_INDEX*10)) indra_getPeerTopology | field peer_count)
+        if [ "$peer_count" -ge 2 ] 2>/dev/null; then
+            paused_both_neighbours_ms=$now_ms
+            timeline "paused_node_both_neighbours_connected peer_count=$peer_count"
+        fi
+    fi
+    target_after_pause=$((height_at_stop+5))
+    if [ "$STOP_SECONDS" -gt 0 ] && [ "$min_height" -ge "$target_after_pause" ] 2>/dev/null; then
+        same_current_tip=1
+        first_current_tip=${tips[0]}
+        for i in 1 2 3; do [ "${tips[$i]}" = "$first_current_tip" ] || same_current_tip=0; done
+        if [ "$same_current_tip" -eq 1 ]; then
+            t_all_nodes_at_tip_ms=$now_ms
+            timeline "t_all_nodes_at_tip height=$min_height tip=$first_current_tip"
+            reached=1
+            break
+        fi
+    fi
     if [ "$min_height" -ge "$TARGET_HEIGHT" ] 2>/dev/null; then reached=1; break; fi
     sleep 2
 done
@@ -191,15 +269,27 @@ fi
 
 {
     printf '# line topology live run\n\n'
-    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s peer_counts_ok=%s elapsed_seconds=%s\n\n' \
-        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$peer_counts_ok" "$((SECONDS-started))"
-    printf '| node | height | tip | peers | exit | topology |\n|---:|---:|---|---:|---:|---|\n'
+    rounds_during_pause=0
+    connection_events_after_resume=()
     for i in 0 1 2 3; do
-        printf '| %s | %s | %s | %s | %s | %s |\n' "$i" \
+        connection_events_after_resume[$i]=$(log_events_after "${t_cont_ms:-0}" "$ROOT/node-$i.stderr")
+        rounds_during_pause=$((rounds_during_pause+$(rounds_between "${t_stop_ms:-0}" "${t_cont_ms:-0}" "$ROOT/node-$i.stderr")))
+    done
+    recovery_seconds=
+    if [ -n "$t_first_block_after_cont_ms" ]; then
+        recovery_ms=$((t_first_block_after_cont_ms-t_cont_ms))
+        recovery_seconds=$(awk -v ms="$recovery_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+    fi
+    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s peer_counts_ok=%s elapsed_seconds_after_start=%s pause_seconds=%s rounds_reached_during_pause=%s recovery_seconds=%s t_all_nodes_at_tip_ms=%s paused_node_both_neighbours_ms=%s\n\n' \
+        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$peer_counts_ok" "$((SECONDS-started))" "$STOP_SECONDS" "$rounds_during_pause" "${recovery_seconds:-}" "${t_all_nodes_at_tip_ms:-}" "${paused_both_neighbours_ms:-}"
+    printf '| node | height | tip | peers | exit | post-resume connection events | topology |\n|---:|---:|---|---:|---:|---:|---|\n'
+    for i in 0 1 2 3; do
+        printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$i" \
             "$(field height <"$ROOT/tip-$i.json")" \
             "$(field tip_hash <"$ROOT/tip-$i.json")" \
             "$(field peers <"$ROOT/info-$i.json")" \
             "$(cat "$ROOT/exit-$i")" \
+            "${connection_events_after_resume[$i]:-0}" \
             "$(tr '\n' ' ' <"$ROOT/topology-$i.json")"
     done
 } | tee "$ROOT/summary.md"

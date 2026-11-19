@@ -106,7 +106,8 @@ fn consensus_peer_gate(connected: usize) -> bool {
 
 fn consensus_peer_wait_message(connected: usize) -> String {
     format!(
-        "[consensus] waiting for peers (have {}, need {})",
+        "[consensus] t={}ms waiting for peers (have {}, need {})",
+        now_ms(),
         connected, MIN_CONSENSUS_PEERS
     )
 }
@@ -1537,7 +1538,7 @@ fn start_network_runtime(
                                         });
                                     }
                                 }
-                                NetworkEvent::PeerDisconnected { validator_id, addr, is_outbound } => {
+                                NetworkEvent::PeerDisconnected { validator_id, addr, is_outbound, reason: _ } => {
                                     if !is_outbound {
                                         fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.disconnected")
                                             .post_auth
@@ -2860,14 +2861,21 @@ fn run() -> indra_node::NodeResult<()> {
                 connected_validator_peers.store(gossip.connection_count(), Ordering::Relaxed);
                 match event {
                     NetworkEvent::PeerConnected {
-                        validator_id, addr, ..
+                        validator_id,
+                        addr,
+                        is_outbound,
                     } => {
                         supervised_lock!(driver, "network.driver.peer_connected")
                             .sync_mut()
                             .peer_connected(validator_id);
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
-                        eprintln!("[p2p] authenticated peer connected: {}", addr);
+                        eprintln!(
+                            "[p2p] t={}ms authenticated peer connected: {} direction={}",
+                            now_ms(),
+                            addr,
+                            if is_outbound { "outbound" } else { "inbound" },
+                        );
                         let self_addrs = configured_self_addr_set(&local_p2p_addr);
                         let connected = match gossip.connected_addrs() {
                             Ok(addrs) => addrs,
@@ -2919,14 +2927,23 @@ fn run() -> indra_node::NodeResult<()> {
                         }
                     }
                     NetworkEvent::PeerDisconnected {
-                        validator_id, addr, ..
+                        validator_id,
+                        addr,
+                        is_outbound,
+                        reason,
                     } => {
                         supervised_lock!(driver, "network.driver.peer_disconnected")
                             .sync_mut()
                             .peer_disconnected(validator_id, addr);
                         connected_validator_peers
                             .store(gossip.connection_count(), Ordering::Relaxed);
-                        eprintln!("[p2p] peer disconnected: {}", addr);
+                        eprintln!(
+                            "[p2p] t={}ms peer disconnected: {} direction={} reason={}",
+                            now_ms(),
+                            addr,
+                            if is_outbound { "outbound" } else { "inbound" },
+                            reason,
+                        );
                     }
                     NetworkEvent::SlashDetected(evidence) => {
                         let evidence = *evidence;
@@ -3635,7 +3652,8 @@ fn run() -> indra_node::NodeResult<()> {
                                 }
                                 if let Some(height) = caught_up_height {
                                     eprintln!(
-                                        "[sync] caught up to height={}, joining consensus",
+                                        "[consensus] t={}ms caught up to height={}, joining consensus",
+                                        now_ms(),
                                         height
                                     );
                                 }
@@ -6455,10 +6473,9 @@ mod tests {
 
     #[test]
     fn consensus_peer_wait_log_is_truthful() {
-        assert_eq!(
-            consensus_peer_wait_message(0),
-            "[consensus] waiting for peers (have 0, need 1)"
-        );
+        let message = consensus_peer_wait_message(0);
+        assert!(message.starts_with("[consensus] t="));
+        assert!(message.ends_with("waiting for peers (have 0, need 1)"));
     }
 
     #[test]

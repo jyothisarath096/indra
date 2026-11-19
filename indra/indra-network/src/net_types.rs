@@ -54,9 +54,45 @@ pub enum NetworkEvent {
         addr: SocketAddr,
         /// True when this node initiated the disconnected connection.
         is_outbound: bool,
+        /// Why the authenticated transport ended.
+        reason: PeerDisconnectReason,
     },
     /// Slash evidence detected by the transport before rate limiting.
     SlashDetected(Box<SlashEvidenceV1>),
+}
+
+/// Stable high-level reason for an authenticated transport disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerDisconnectReason {
+    /// The remote side closed the stream or the read loop observed EOF.
+    RemoteClosed,
+    /// The encrypted frame reader failed.
+    ReadError,
+    /// The encrypted frame writer failed.
+    WriteError,
+    /// A bounded outbound queue could not accept a point-to-point message.
+    Timeout,
+    /// Duplicate authenticated connections were reconciled by the tie-break.
+    DuplicateConnection,
+    /// The peer was disconnected after a ban or invalid-message decision.
+    Ban,
+    /// The local operator explicitly requested a disconnect.
+    Operator,
+}
+
+impl std::fmt::Display for PeerDisconnectReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::RemoteClosed => "remote closed",
+            Self::ReadError => "read error",
+            Self::WriteError => "write error",
+            Self::Timeout => "timeout",
+            Self::DuplicateConnection => "duplicate connection dropped by tie-break",
+            Self::Ban => "ban",
+            Self::Operator => "operator disconnect",
+        };
+        formatter.write_str(text)
+    }
 }
 
 /// Commands sent from the node to the async network layer.
