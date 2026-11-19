@@ -1021,6 +1021,83 @@ fn test_state_roots(state: &indra_state::ChainState) -> indra_state::state_root:
     }
 
     #[test]
+    fn audit_harness_four_validators_commit_with_one_missing_edge() {
+        let mut fixture = shared_four_validator_fixture();
+        for driver in &mut fixture.drivers {
+            driver.sync.mark_caught_up(driver.height());
+        }
+        let election = fixture.drivers[0].proposer_election_for_height(1, 0).unwrap();
+        let proposer = (0..4)
+            .find(|index| fixture.drivers[*index].engine.is_proposer(&election))
+            .unwrap();
+        let proposal = fixture.drivers[proposer]
+            .engine
+            .propose(&election, 1_700_000_000, vec![], None)
+            .unwrap();
+        let hash = proposal.block.header.block_hash();
+        for driver in &mut fixture.drivers {
+            driver.process(DriverEvent::InboundBlock {
+                from: None,
+                proposal: Box::new(proposal.clone()),
+            });
+        }
+
+        let mut prevotes = Vec::new();
+        for driver in &mut fixture.drivers {
+            prevotes.push(
+                driver
+                    .on_propose_timeout()
+                    .into_iter()
+                    .find_map(|action| match action {
+                        DriverAction::BroadcastVote(vote) => Some(vote),
+                        _ => None,
+                    })
+                    .unwrap(),
+            );
+        }
+        let edge_present = |left: usize, right: usize| !(left >= 2 && right >= 2 && left != right);
+        let mut precommits = Vec::new();
+        for receiver in 0..4 {
+            for (sender, vote) in prevotes.iter().enumerate() {
+                if receiver == sender || !edge_present(receiver, sender) {
+                    continue;
+                }
+                let actions = fixture.drivers[receiver].process(DriverEvent::InboundVote {
+                    from: format!("127.0.0.1:{}", 22_000 + sender).parse().unwrap(),
+                    vote: vote.clone(),
+                });
+                for action in actions {
+                    if let DriverAction::BroadcastVote(vote) = action {
+                        if vote.step == VoteStep::Precommit {
+                            precommits.push((receiver, vote));
+                        }
+                    }
+                }
+            }
+        }
+        for (sender, vote) in precommits {
+            for receiver in 0..4 {
+                if receiver != sender && edge_present(receiver, sender) {
+                    fixture.drivers[receiver].process(DriverEvent::InboundVote {
+                        from: format!("127.0.0.1:{}", 23_000 + sender).parse().unwrap(),
+                        vote: vote.clone(),
+                    });
+                }
+            }
+        }
+        for driver in &fixture.drivers {
+            assert_eq!(driver.engine.state.height, 1);
+            assert_eq!(driver.engine.state.tip_hash, hash);
+            assert_eq!(driver.last_qc_height(), Some(1));
+        }
+        let dirs = fixture.dirs;
+        drop(fixture.drivers);
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn audit_harness_four_validators_converge_across_two_heights() {
         let mut fixture = shared_four_validator_fixture();
         for d in &mut fixture.drivers { d.sync.mark_caught_up(d.height()); }

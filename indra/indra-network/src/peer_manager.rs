@@ -58,6 +58,10 @@ const MIN_CONSENSUS_RELAY_FANOUT: usize = 4;
 const MAX_CONSENSUS_RELAY_FANOUT: usize = 16;
 const BLOCK_RELAY_FANOUT_MULTIPLIER: usize = 2;
 const MAX_BLOCK_RELAY_FANOUT: usize = 24;
+/// Maximum authenticated non-validator peers accepted from one IP address.
+/// Active validators are identified by their authenticated validator ID and
+/// are bounded by the active validator set plus the global peer-table cap.
+const MAX_NON_VALIDATOR_PEERS_PER_IP: usize = 3;
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -1057,6 +1061,34 @@ impl PeerManagerActor {
             return;
         }
 
+        let is_active_validator = self.relay_keys.contains_key(&peer_validator_id);
+        if !is_active_validator
+            && !self.peers_by_validator.contains_key(&peer_validator_id)
+            && self
+                .peers_by_validator
+                .values()
+                .filter(|peer| {
+                    peer.addr.ip() == addr.ip()
+                        && !self.relay_keys.contains_key(
+                            &self
+                                .validator_by_addr
+                                .get(&peer.addr)
+                                .copied()
+                                .unwrap_or(Bytes32::ZERO),
+                        )
+                })
+                .count()
+                >= MAX_NON_VALIDATOR_PEERS_PER_IP
+        {
+            eprintln!(
+                "[p2p] rejected non-validator peer {} from {}: per-IP authenticated cap reached",
+                short_validator_id(&peer_validator_id),
+                addr,
+            );
+            drop(handshake.stream);
+            return;
+        }
+
         if let Some(existing) = self.peers_by_validator.get(&peer_validator_id) {
             let keep_new = tie_break_keep_new(
                 self.local_validator_id,
@@ -1590,6 +1622,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_validator_authenticated_peers_are_capped_per_ip() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0xF3; 32]));
+        let mut keepalive = Vec::new();
+        for index in 0..MAX_NON_VALIDATOR_PEERS_PER_IP {
+            let (handshake, peer_stream) =
+                handshake_result(Bytes32::from([index as u8 + 1; 32]), false).await;
+            actor
+                .register_peer(
+                    format!("127.0.0.1:{}", 30_100 + index)
+                        .parse()
+                        .unwrap(),
+                    handshake,
+                )
+                .await;
+            keepalive.push(peer_stream);
+            assert!(matches!(event_rx.recv().await, Some(NetworkEvent::PeerConnected { .. })));
+        }
+
+        let (handshake, rejected_stream) =
+            handshake_result(Bytes32::from([0xEE; 32]), false).await;
+        actor
+            .register_peer("127.0.0.1:30100".parse().unwrap(), handshake)
+            .await;
+        keepalive.push(rejected_stream);
+        assert_eq!(actor.peers_by_validator.len(), MAX_NON_VALIDATOR_PEERS_PER_IP);
+        assert!(!actor
+            .peers_by_validator
+            .contains_key(&Bytes32::from([0xEE; 32])));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn active_validator_shared_ip_is_exempt_but_loses_exemption_when_removed() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0xF4; 32]));
+        let active = Bytes32::from([0xAA; 32]);
+        actor.relay_keys.insert(
+            active,
+            RelayValidatorKey {
+                validator_id: active,
+                hybrid_classical_pk: [0; 32],
+                hybrid_pq_pk: vec![0; PQ_PK_BYTES],
+                vrf_pk: None,
+            },
+        );
+        let mut keepalive = Vec::new();
+        for index in 0..MAX_NON_VALIDATOR_PEERS_PER_IP {
+            let (handshake, peer_stream) =
+                handshake_result(Bytes32::from([index as u8 + 1; 32]), false).await;
+            actor
+                .register_peer(
+                    format!("127.0.0.1:{}", 30_200 + index)
+                        .parse()
+                        .unwrap(),
+                    handshake,
+                )
+                .await;
+            keepalive.push(peer_stream);
+            let _ = event_rx.recv().await;
+        }
+        let (handshake, active_stream) = handshake_result(active, false).await;
+        actor
+            .register_peer("127.0.0.1:30200".parse().unwrap(), handshake)
+            .await;
+        keepalive.push(active_stream);
+        let _ = event_rx.recv().await;
+        assert_eq!(actor.peers_by_validator.len(), MAX_NON_VALIDATOR_PEERS_PER_IP + 1);
+
+        actor.relay_keys.clear();
+        let inactive = Bytes32::from([0xAB; 32]);
+        let (handshake, inactive_stream) = handshake_result(inactive, false).await;
+        actor
+            .register_peer("127.0.0.1:30201".parse().unwrap(), handshake)
+            .await;
+        keepalive.push(inactive_stream);
+        assert!(!actor.peers_by_validator.contains_key(&inactive));
+    }
+
+    #[tokio::test]
     async fn registration_at_peer_table_capacity_evicts_stale_and_remains_scored() {
         let (event_tx, _event_rx) = mpsc::channel(4);
         let mut actor = test_actor(event_tx, Bytes32::from([0xF2; 32]));
@@ -1661,6 +1773,24 @@ mod tests {
             tie_break_keep_new(local, peer, true),
             "same validator pair and connection direction must resolve the same way"
         );
+    }
+
+    #[test]
+    fn duplicate_connection_tie_breaking_is_symmetric_for_200_cases() {
+        for seed in 0..200u16 {
+            let mut local_bytes = [0u8; 32];
+            let mut peer_bytes = [0u8; 32];
+            local_bytes[..2].copy_from_slice(&seed.to_be_bytes());
+            peer_bytes[..2].copy_from_slice(&(u16::MAX - seed).to_be_bytes());
+            let local = Bytes32::from(local_bytes);
+            let peer = Bytes32::from(peer_bytes);
+
+            assert_eq!(
+                tie_break_keep_new(local, peer, true),
+                tie_break_keep_new(peer, local, false),
+                "both endpoints must choose the same connection for case {seed}"
+            );
+        }
     }
 
     #[test]
