@@ -19,7 +19,8 @@ use indra_core::codec::{Decode, Encode};
 use indra_core::types::{
     block::{BlockProposalVNext, BlockVNext},
     primitives::{
-        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ROUNDS_PER_HEIGHT,
+        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32,
+        MAX_ACCEPTED_ROUND_JUMP, MAX_ROUNDS_PER_HEIGHT,
     },
     proposal::verify_proposal,
     qc::QuorumCertificateV1,
@@ -41,12 +42,6 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
-
-/// Maximum round jump accepted from one quorum-backed round certificate.
-///
-/// This is defense in depth only. The primary authorization boundary is a
-/// strict >2/3 stake union of hybrid-signed votes at the target height/round.
-const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
 
 /// Maximum entries retained per stalled-height consensus collection.
 ///

@@ -17,7 +17,8 @@ use tokio::{
 };
 
 use indra_core::types::{
-    primitives::Bytes32, slash_detector::SlashDetector, slashing::SlashEvidenceV1,
+    primitives::{Bytes32, MAX_ACCEPTED_ROUND_JUMP, MAX_RELAY_HEIGHT_SKEW, MAX_ROUNDS_PER_HEIGHT},
+    slash_detector::SlashDetector, slashing::SlashEvidenceV1,
     vote_signing::vote_signing_bytes,
 };
 use indra_core::{codec::Encode, ssz::sha256};
@@ -660,16 +661,30 @@ impl PeerManagerActor {
             return;
         };
         if let Some((height, round)) = self.relay_consensus_context {
-            let slot_matches = match msg {
-                Message::Vote(vote) => vote.height == height && vote.round == round,
-                Message::Block(proposal) => {
-                    proposal.block.header.height == height
-                        && proposal.block.header.proposer_round == round
-                }
-                _ => true,
+            let (message_height, message_round) = match msg {
+                Message::Vote(vote) => (vote.height, vote.round),
+                Message::Block(proposal) => (
+                    proposal.block.header.height,
+                    proposal.block.header.proposer_round,
+                ),
+                _ => return,
             };
+            let min_height = height.saturating_sub(MAX_RELAY_HEIGHT_SKEW);
+            let max_height = height.saturating_add(MAX_RELAY_HEIGHT_SKEW);
+            let min_round = round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
+            let max_round = round
+                .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+                .min(MAX_ROUNDS_PER_HEIGHT - 1);
+            let slot_matches = (min_height..=max_height).contains(&message_height)
+                && (min_round..=max_round).contains(&message_round);
             if !slot_matches {
                 self.increment_relay_metric(class, |metrics| metrics.dropped += 1);
+                // A valid signature does not make an arbitrarily distant slot
+                // useful. Penalize this existing invalid-consensus path so a
+                // peer cannot use signed garbage-slot variants as a relay
+                // amplification probe.
+                self.score_validator(sender, ScoreEvent::InvalidMessage, BAN_DURATION)
+                    .await;
                 return;
             }
         }
@@ -2769,34 +2784,33 @@ mod tests {
             })
             .await;
 
-        actor
-            .relay_if_eligible(
-                sender,
-                &Message::Vote(signed_vote_at(
+        for (height, round, hash) in [
+            (7, 2, 0x52),
+            (7, 0, 0x53),
+            (7, 10, 0x54),
+            (5, 2, 0x55),
+            (8, 2, 0x56),
+        ] {
+            actor
+                .relay_if_eligible(
                     sender,
-                    &keypair,
-                    8,
-                    2,
-                    VoteStep::Prevote,
-                    Bytes32::from([0x52; 32]),
-                )),
-            )
-            .await;
-        actor
-            .relay_if_eligible(
-                sender,
-                &Message::Vote(signed_vote_at(
-                    sender,
-                    &keypair,
-                    7,
-                    3,
-                    VoteStep::Prevote,
-                    Bytes32::from([0x53; 32]),
-                )),
-            )
-            .await;
+                    &Message::Vote(signed_vote_at(
+                        sender,
+                        &keypair,
+                        height,
+                        round,
+                        VoteStep::Prevote,
+                        Bytes32::from([hash; 32]),
+                    )),
+                )
+                .await;
+        }
+        for _ in 0..4 {
+            assert!(receiver_rx.try_recv().is_ok());
+        }
         assert!(receiver_rx.try_recv().is_err());
-        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 2);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 4);
+        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
     }
 
     #[test]
@@ -2969,6 +2983,14 @@ mod tests {
         graph: &[&[usize]],
         messages: Vec<(usize, Message)>,
     ) -> (HashSet<usize>, usize) {
+        relay_through_topology_with_contexts(graph, messages, [None; 4]).await
+    }
+
+    async fn relay_through_topology_with_contexts(
+        graph: &[&[usize]],
+        messages: Vec<(usize, Message)>,
+        contexts: [Option<(u64, u32)>; 4],
+    ) -> (HashSet<usize>, usize) {
         let keys = (0..4u8)
             .map(|seed| {
                 let id = Bytes32::from([seed.saturating_add(1); 32]);
@@ -2987,6 +3009,7 @@ mod tests {
             .map(|_| HashMap::<usize, RelayInbox>::new())
             .collect::<Vec<_>>();
         for (node, peers) in graph.iter().enumerate() {
+            actors[node].relay_consensus_context = contexts[node];
             for peer in *peers {
                 let receivers = add_test_peer_receivers(
                     &mut actors[node],
@@ -3022,6 +3045,45 @@ mod tests {
             drain_relay_outbox(receiver, &mut inboxes, &mut queue);
         }
         (reached, deliveries)
+    }
+
+    #[tokio::test]
+    async fn relay_timing_skew_bridges_adjacent_slots_but_not_garbage() {
+        let line = [&[1][..], &[0, 2][..], &[1, 3][..], &[2][..]];
+        let sender = Bytes32::from([1; 32]);
+        let keypair = hybrid_key(1);
+        let round_ahead = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            7,
+            3,
+            VoteStep::Prevote,
+            Bytes32::from([0xA7; 32]),
+        ));
+        let next_height = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            8,
+            2,
+            VoteStep::Prevote,
+            Bytes32::from([0xA8; 32]),
+        ));
+        let far_round = Message::Vote(signed_vote_at(
+            sender,
+            &keypair,
+            7,
+            11,
+            VoteStep::Prevote,
+            Bytes32::from([0xAF; 32]),
+        ));
+        let (reached, deliveries) = relay_through_topology_with_contexts(
+            &line,
+            vec![(0, round_ahead), (0, next_height), (0, far_round)],
+            [Some((7, 2)), Some((7, 2)), Some((7, 2)), Some((7, 2))],
+        )
+        .await;
+        assert_eq!(reached.len(), 4, "bounded skew messages must reach endpoint");
+        assert!(deliveries < 20, "far-slot flood must not amplify");
     }
 
     #[tokio::test]

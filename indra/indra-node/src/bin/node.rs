@@ -91,10 +91,25 @@ const PRE_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
 const POST_AUTH_COOLDOWN_PER_VALIDATOR_CAPACITY: usize = 16;
 const POST_AUTH_COOLDOWN_RETENTION: Duration = Duration::from_secs(60);
 const MAX_DIAL_FAILURES_BEFORE_EVICTION: u32 = 20;
-/// A connected authenticated peer is sufficient to enter consensus because
-/// consensus messages are relayed over the authenticated peer graph. Quorum
-/// formation remains enforced by the consensus driver and QC verification.
+/// A connected authenticated validator peer is sufficient to enter consensus:
+/// consensus messages are relayed over the authenticated graph, while strict
+/// >2/3 stake quorum formation remains enforced by the consensus driver/QC.
+///
+/// This is a liveness gate, not a quorum-reachability claim: an eclipsed node
+/// with one withholding peer starts its state machine but cannot finalize a
+/// fork without the required authenticated validator signatures.
 const MIN_CONSENSUS_PEERS: usize = 1;
+
+fn consensus_peer_gate(connected: usize) -> bool {
+    connected >= MIN_CONSENSUS_PEERS
+}
+
+fn consensus_peer_wait_message(connected: usize) -> String {
+    format!(
+        "[consensus] waiting for peers (have {}, need {})",
+        connected, MIN_CONSENSUS_PEERS
+    )
+}
 
 fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
@@ -3779,12 +3794,9 @@ fn run() -> indra_node::NodeResult<()> {
                     last_observed = Some(observed);
                 }
 
-                if connected < MIN_CONSENSUS_PEERS {
+                if !consensus_peer_gate(connected) {
                     if last_peer_wait_log != Some(connected) {
-                        eprintln!(
-                            "[consensus] waiting for peers (have {}, need {})",
-                            connected, MIN_CONSENSUS_PEERS
-                        );
+                        eprintln!("{}", consensus_peer_wait_message(connected));
                         last_peer_wait_log = Some(connected);
                     }
                     phase_started_at = Instant::now();
@@ -6432,6 +6444,22 @@ fn decode_node_rpc_transaction(
 mod tests {
     use super::*;
     use indra_core::types::primitives::TEST_CHAIN_ID;
+
+    #[test]
+    fn consensus_peer_gate_accepts_one_authenticated_peer_only() {
+        assert!(!consensus_peer_gate(0));
+        assert!(consensus_peer_gate(1));
+        assert!(consensus_peer_gate(2));
+        assert!(consensus_peer_gate(3));
+    }
+
+    #[test]
+    fn consensus_peer_wait_log_is_truthful() {
+        assert_eq!(
+            consensus_peer_wait_message(0),
+            "[consensus] waiting for peers (have 0, need 1)"
+        );
+    }
 
     #[test]
     fn full_rpc_handler_panic_is_counted_and_next_handler_runs() {

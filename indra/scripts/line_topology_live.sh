@@ -6,6 +6,8 @@ set -u
 : "${KEYGEN_BIN:?set KEYGEN_BIN}"
 TARGET_HEIGHT=${TARGET_HEIGHT:-10}
 CAP_SECONDS=${CAP_SECONDS:-2400}
+START_NODE1_DELAY_SECONDS=${START_NODE1_DELAY_SECONDS:-0}
+STOP_NODE2_SECONDS=${STOP_NODE2_SECONDS:-0}
 BASE_P2P_PORT=${BASE_P2P_PORT:-32700}
 BASE_RPC_PORT=${BASE_RPC_PORT:-19700}
 ROOT=${1:-"$(mktemp -d /tmp/indra-line-topology.XXXXXX)"}
@@ -115,11 +117,24 @@ EOF
 
 start_nodes() {
     local d=$1 i
-    for i in 0 1 2 3; do
+    for i in 0 2 3; do
         printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
         "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
         PIDS+=($!)
     done
+    if [ "$START_NODE1_DELAY_SECONDS" -gt 0 ]; then
+        sleep "$START_NODE1_DELAY_SECONDS"
+    fi
+    i=1
+    printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
+    "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
+    PIDS+=($!)
+    if [ "$STOP_NODE2_SECONDS" -gt 0 ]; then
+        sleep 2
+        kill -STOP "${PIDS[1]}" 2>/dev/null || true
+        sleep "$STOP_NODE2_SECONDS"
+        kill -CONT "${PIDS[1]}" 2>/dev/null || true
+    fi
 }
 
 snapshot() {
@@ -167,7 +182,7 @@ exits_ok=1
 for i in 0 1 2 3; do [ "$(cat "$ROOT/exit-$i")" = 0 ] || exits_ok=0; done
 
 {
-    printf '# NET_3 line topology live run\n\n'
+    printf '# line topology live run\n\n'
     printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s elapsed_seconds=%s\n\n' \
         "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$((SECONDS-started))"
     printf '| node | height | tip | peers | exit | topology |\n|---:|---:|---|---:|---:|---|\n'

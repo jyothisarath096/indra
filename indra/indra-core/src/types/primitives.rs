@@ -60,6 +60,12 @@ pub const MIN_ROUND_TIME_MS: u64 = 3_000;
 /// merely because a healthy node exhausted a small local round counter.
 pub const MAX_ROUNDS_PER_HEIGHT: u32 = 1 << 24;
 
+/// Maximum round distance retained by consensus admission and pruning.
+pub const MAX_ACCEPTED_ROUND_JUMP: u32 = 8;
+
+/// Maximum one-height timing skew that consensus gossip may bridge.
+pub const MAX_RELAY_HEIGHT_SKEW: u64 = 1;
+
 /// Validate one consensus round against the authoritative protocol domain.
 pub fn validate_consensus_round(round: u32) -> IndraResult<u32> {
     if round < MAX_ROUNDS_PER_HEIGHT {
