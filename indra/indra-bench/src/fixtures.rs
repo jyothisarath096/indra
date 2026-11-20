@@ -43,7 +43,9 @@ pub fn dummy_tx(nonce: u8, fee: u64) -> TransactionV1 {
         }],
         fee_amount: fee,
         signature: HybridSignature {
-            classical_sig: must(VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(&[0u8; 64])),
+            classical_sig: must(VariableBytes::<MAX_CLASSICAL_SIG_BYTES>::from_slice(
+                &[0u8; 64],
+            )),
             pq_sig: must(VariableBytes::<MAX_PQ_SIG_BYTES>::from_slice(&[0u8; 32])),
         },
     }

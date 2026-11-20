@@ -3,14 +3,14 @@
 //! This is everything a node needs to validate the next block.
 //! It is the input and output of `apply_block`.
 
-use indra_core::codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len};
+use indra_core::codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode};
 use indra_core::error::{IndraError, IndraResult};
 use indra_core::types::crypto::HybridPubKey;
 use indra_core::types::reward_economic_snapshot::{
     RewardEconomicDelegatorEntry, RewardEconomicSnapshot, RewardEconomicValidatorEntry,
 };
 use indra_core::types::slash_membership::{
-    MAX_SLASH_MEMBERSHIP_ROOT_RECORDS, SlashMembershipRootRecord, compute_slash_membership_root,
+    compute_slash_membership_root, SlashMembershipRootRecord, MAX_SLASH_MEMBERSHIP_ROOT_RECORDS,
 };
 use indra_core::types::{
     block::VrfSuiteV1,
@@ -18,10 +18,10 @@ use indra_core::types::{
 };
 
 use indra_core::types::primitives::{
-    Bytes32, Bytes64, EPOCH_DURATION_BLOCKS, INITIAL_BASE_FEE_SPARK_PER_KB,
+    Bytes32, Bytes64, VariableBytes, EPOCH_DURATION_BLOCKS, INITIAL_BASE_FEE_SPARK_PER_KB,
     MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, MAX_CHAIN_ID_BYTES,
     MAX_STAKE_POSITIONS_PER_VALIDATOR, MAX_STAKE_POSITIONS_TOTAL, MAX_TRANCHES_PER_POSITION,
-    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL, VariableBytes,
+    MAX_TRANCHES_PER_VALIDATOR, MAX_TRANCHES_TOTAL,
 };
 use indra_core::types::stake_position::{
     ActiveStakeAggregateV1, PositionCustodyV1, StakePositionV1, UnbondingTrancheV1,
@@ -609,7 +609,9 @@ impl ChainState {
             .as_ref()
             .map(StateCommitmentV2::root)
             .map(Ok)
-            .unwrap_or_else(|| StateCommitmentV2::from_state(self, height).map(|commitment| commitment.root()))
+            .unwrap_or_else(|| {
+                StateCommitmentV2::from_state(self, height).map(|commitment| commitment.root())
+            })
     }
 
     /// Resolve the one authoritative snapshot for a governed consensus height.
@@ -1856,7 +1858,7 @@ mod tests {
         error::IndraError,
         types::{
             crypto::HybridPubKey,
-            primitives::{INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS, VariableBytes},
+            primitives::{VariableBytes, INITIAL_BASE_FEE_SPARK_PER_KB, MAX_VALIDATORS},
         },
     };
 
@@ -2061,14 +2063,12 @@ mod tests {
             }],
         };
         state.height = 10;
-        assert!(
-            indra_core::types::qc::verify_qc_against_snapshot(
-                &qc,
-                state.snapshot_for_consensus_height(10).unwrap(),
-                &state.chain_id,
-            )
-            .is_ok()
-        );
+        assert!(indra_core::types::qc::verify_qc_against_snapshot(
+            &qc,
+            state.snapshot_for_consensus_height(10).unwrap(),
+            &state.chain_id,
+        )
+        .is_ok());
         {
             let validator = state.validators.get_mut(&revoked).unwrap();
             validator.status = crate::validator::ValidatorStatus::Slashed;
@@ -2130,11 +2130,9 @@ mod tests {
         first.rotate_consensus_snapshot_after_boundary(300).unwrap();
         let regular = first.snapshot_for_consensus_height(301).unwrap();
         assert_eq!(regular.source_boundary_height, 300);
-        assert!(
-            regular
-                .entry_with_position(&Bytes32::from([1; 32]))
-                .is_none()
-        );
+        assert!(regular
+            .entry_with_position(&Bytes32::from([1; 32]))
+            .is_none());
         assert_eq!(first.consensus_snapshots.len(), 2);
         assert_eq!(
             first
@@ -2487,7 +2485,9 @@ mod tests {
             .unwrap();
         reference.height = u64::MAX;
         reference.tip_hash = Bytes32::from([0xF0; 32]);
-        reference.rebuild_state_commitment_v2(reference.height).unwrap();
+        reference
+            .rebuild_state_commitment_v2(reference.height)
+            .unwrap();
 
         // Independently replay the same historical event transcript from
         // genesis rather than cloning the reference state.
@@ -2539,7 +2539,9 @@ mod tests {
         }
         replayed.height = u64::MAX;
         replayed.tip_hash = Bytes32::from([0xF0; 32]);
-        replayed.rebuild_state_commitment_v2(replayed.height).unwrap();
+        replayed
+            .rebuild_state_commitment_v2(replayed.height)
+            .unwrap();
 
         assert_eq!(reference.consensus_snapshots.len(), 2);
         assert_eq!(reference.consensus_snapshots, replayed.consensus_snapshots);

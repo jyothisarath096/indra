@@ -199,9 +199,9 @@ pub fn produce_block(
 /// This binds the header hash to the exact transaction set included in the block.
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::mempool::Mempool;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_crypto::VrfKeypair;
     use indra_state::{
         apply_block_for_test as apply_block, state_root, ChainState, ValidatorEntry,
@@ -319,7 +319,18 @@ mod tests {
         );
         let snapshot = state.snapshot_for_consensus_height(state.height).unwrap();
         let entry = &snapshot.entries()[0];
-        let vote = crate::vote::produce_vote(crate::vote::VoteRequest { height: state.height, round: 0, step: indra_core::types::vote::VoteStep::Precommit, block_hash: state.tip_hash, validator_id: entry.validator_id, snapshot_root: snapshot.snapshot_root, chain_id: &state.chain_id }, &hot)
+        let vote = crate::vote::produce_vote(
+            crate::vote::VoteRequest {
+                height: state.height,
+                round: 0,
+                step: indra_core::types::vote::VoteStep::Precommit,
+                block_hash: state.tip_hash,
+                validator_id: entry.validator_id,
+                snapshot_root: snapshot.snapshot_root,
+                chain_id: &state.chain_id,
+            },
+            &hot,
+        )
         .unwrap();
         crate::qc::build_qc(
             state.height,

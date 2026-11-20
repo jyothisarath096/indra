@@ -338,17 +338,29 @@ fn keygen_export_public_round_trips_hot_and_cold_without_secrets() {
             .args(args)
             .output()
             .unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         let json = std::fs::read_to_string(output).unwrap();
         let parsed: indra_cli::PublicKeyExport = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.kind, if output == &hot_output { "hot" } else { "cold" });
+        assert_eq!(
+            parsed.kind,
+            if output == &hot_output { "hot" } else { "cold" }
+        );
         assert!(!json.contains(&hex::encode(hot.ed25519_seed)));
         assert!(!json.contains(&hex::encode(hot.ml_dsa_seed)));
         assert!(!json.contains(&hex::encode(hot.vrf_seed)));
         assert!(!json.contains(&hex::encode(cold.classical_seed)));
         assert!(!json.contains(&hex::encode(cold.pq_seed)));
         #[cfg(unix)]
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(output).unwrap().permissions()) & 0o777, 0o644);
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(output).unwrap().permissions()
+            ) & 0o777,
+            0o644
+        );
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -360,7 +372,10 @@ fn genesis_validator_entry_rejects_removed_keystore_flags_exactly() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert_eq!(String::from_utf8_lossy(&result.stderr), "Error: unknown argument --hot-keys\n");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stderr),
+        "Error: unknown argument --hot-keys\n"
+    );
 }
 
 #[test]
@@ -718,22 +733,42 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
     let cold_export = dir.join("cold-export.json");
     let result = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .args([
-            "export-public", "--keys", hot_path.to_str().unwrap(), "--chain-id",
-            "validator-entry-chain", "--output", hot_export.to_str().unwrap(),
+            "export-public",
+            "--keys",
+            hot_path.to_str().unwrap(),
+            "--chain-id",
+            "validator-entry-chain",
+            "--output",
+            hot_export.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let result = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .args([
-            "export-public", "--keys", cold_path.to_str().unwrap(), "--chain-id",
-            "validator-entry-chain", "--hot-export", hot_export.to_str().unwrap(),
-            "--keys-password-file", password_path.to_str().unwrap(), "--output",
+            "export-public",
+            "--keys",
+            cold_path.to_str().unwrap(),
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            hot_export.to_str().unwrap(),
+            "--keys-password-file",
+            password_path.to_str().unwrap(),
+            "--output",
             cold_export.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let proof_path = dir.join("proof.json");
     let proof = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args([
@@ -749,7 +784,11 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
         ])
         .output()
         .unwrap();
-    assert!(proof.status.success(), "{}", String::from_utf8_lossy(&proof.stderr));
+    assert!(
+        proof.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proof.stderr)
+    );
     let output = dir.join("entry.json");
     std::fs::write(&output, b"must remain unchanged").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
@@ -798,26 +837,54 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
         ])
         .output()
         .unwrap();
-    assert!(accepted.status.success(), "{}", String::from_utf8_lossy(&accepted.stderr));
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
     let swapped_hot = generate_from_master_seed("swapped-hot".to_string(), [0x32; 32]).unwrap();
     let swapped_hot_path = dir.join("swapped-hot.json");
-    std::fs::write(&swapped_hot_path, indra_cli::encrypt_keys(&swapped_hot, b"pw").unwrap()).unwrap();
+    std::fs::write(
+        &swapped_hot_path,
+        indra_cli::encrypt_keys(&swapped_hot, b"pw").unwrap(),
+    )
+    .unwrap();
     let swapped_hot_export = dir.join("swapped-hot-export.json");
     let swapped = Command::new(env!("CARGO_BIN_EXE_indra-keygen"))
         .args([
-            "export-public", "--keys", swapped_hot_path.to_str().unwrap(), "--chain-id",
-            "validator-entry-chain", "--output", swapped_hot_export.to_str().unwrap(),
+            "export-public",
+            "--keys",
+            swapped_hot_path.to_str().unwrap(),
+            "--chain-id",
+            "validator-entry-chain",
+            "--output",
+            swapped_hot_export.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(swapped.status.success(), "{}", String::from_utf8_lossy(&swapped.stderr));
+    assert!(
+        swapped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swapped.stderr)
+    );
     let swapped_output = dir.join("swapped-entry.json");
     let swapped_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args([
-            "validator-entry", "--name", "existing", "--stake", "1000000000",
-            "--chain-id", "validator-entry-chain", "--hot-export", swapped_hot_export.to_str().unwrap(),
-            "--cold-export", cold_export.to_str().unwrap(), "--vrf-proof",
-            proof_path.to_str().unwrap(), "--output", swapped_output.to_str().unwrap(),
+            "validator-entry",
+            "--name",
+            "existing",
+            "--stake",
+            "1000000000",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            swapped_hot_export.to_str().unwrap(),
+            "--cold-export",
+            cold_export.to_str().unwrap(),
+            "--vrf-proof",
+            proof_path.to_str().unwrap(),
+            "--output",
+            swapped_output.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -827,7 +894,8 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
         "Error: genesis error: cold pairing proof does not match hot validator\n"
     );
     assert!(!swapped_output.exists());
-    let valid_proof_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
+    let valid_proof_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
     let mut bad_proof = valid_proof_json.clone();
     bad_proof["vrf_possession_output"] = serde_json::Value::String("00".into());
     std::fs::write(&proof_path, serde_json::to_vec(&bad_proof).unwrap()).unwrap();
@@ -853,25 +921,50 @@ fn genesis_cli_validator_entry_refuses_to_overwrite_existing_output() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert_eq!(String::from_utf8_lossy(&rejected.stderr), "Error: VRF proof output has wrong length\n");
+    assert_eq!(
+        String::from_utf8_lossy(&rejected.stderr),
+        "Error: VRF proof output has wrong length\n"
+    );
     assert!(!bad_output.exists());
     let mut wrong_proof = valid_proof_json;
-    let proof_hex = wrong_proof["vrf_possession_proof"].as_str().unwrap().to_string();
-    let replacement = if proof_hex.starts_with("00") { "01" } else { "00" };
-    wrong_proof["vrf_possession_proof"] = serde_json::Value::String(format!("{replacement}{}", &proof_hex[2..]));
+    let proof_hex = wrong_proof["vrf_possession_proof"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replacement = if proof_hex.starts_with("00") {
+        "01"
+    } else {
+        "00"
+    };
+    wrong_proof["vrf_possession_proof"] =
+        serde_json::Value::String(format!("{replacement}{}", &proof_hex[2..]));
     std::fs::write(&proof_path, serde_json::to_vec(&wrong_proof).unwrap()).unwrap();
     let wrong_proof_output = dir.join("wrong-proof-entry.json");
     let wrong_proof_result = Command::new(env!("CARGO_BIN_EXE_indra-genesis"))
         .args([
-            "validator-entry", "--name", "existing", "--stake", "1000000000",
-            "--chain-id", "validator-entry-chain", "--hot-export", hot_export.to_str().unwrap(),
-            "--cold-export", cold_export.to_str().unwrap(), "--vrf-proof", proof_path.to_str().unwrap(),
-            "--output", wrong_proof_output.to_str().unwrap(),
+            "validator-entry",
+            "--name",
+            "existing",
+            "--stake",
+            "1000000000",
+            "--chain-id",
+            "validator-entry-chain",
+            "--hot-export",
+            hot_export.to_str().unwrap(),
+            "--cold-export",
+            cold_export.to_str().unwrap(),
+            "--vrf-proof",
+            proof_path.to_str().unwrap(),
+            "--output",
+            wrong_proof_output.to_str().unwrap(),
         ])
         .output()
         .unwrap();
     assert!(!wrong_proof_result.status.success());
-    assert_eq!(String::from_utf8_lossy(&wrong_proof_result.stderr), "Error: invalid VRF proof for hot export\n");
+    assert_eq!(
+        String::from_utf8_lossy(&wrong_proof_result.stderr),
+        "Error: invalid VRF proof for hot export\n"
+    );
     assert!(!wrong_proof_output.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1219,7 +1312,8 @@ fn test_build_and_decode_all_staking_ops() {
         classical_pk: Bytes32::from(public.classical.0),
         pq_pk: VariableBytes::from_slice(&public.pq.0).unwrap(),
     };
-    let built = [build_register_validator_op_with_cold(
+    let built = [
+        build_register_validator_op_with_cold(
             1_000,
             deposit_utxo_id,
             &keypair,
@@ -1265,7 +1359,8 @@ fn test_build_and_decode_all_staking_ops() {
             7,
             chain_id,
         )
-        .unwrap()];
+        .unwrap(),
+    ];
 
     for (idx, op) in built.iter().enumerate() {
         let bytes = hex::decode(&op.op_hex).unwrap();

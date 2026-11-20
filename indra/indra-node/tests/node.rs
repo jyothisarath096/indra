@@ -48,7 +48,16 @@ fn observe_sync_status(
     let validator_id = Bytes32::from([0x13; 32]);
     sync.peer_connected(validator_id);
     sync.observe_status(
-        (validator_id, peer, peer_height, Bytes32::ZERO, 100, 100, local_height).into(),
+        (
+            validator_id,
+            peer,
+            peer_height,
+            Bytes32::ZERO,
+            100,
+            100,
+            local_height,
+        )
+            .into(),
         Instant::now(),
     )
 }
@@ -59,12 +68,9 @@ fn temp_dir(suffix: &str) -> PathBuf {
     p
 }
 
-fn test_genesis_toml(
-    chain_id: &str,
-    entries: &[([u8; 32], [u8; 32], [u8; 32])],
-) -> String {
+fn test_genesis_toml(chain_id: &str, entries: &[([u8; 32], [u8; 32], [u8; 32])]) -> String {
     use indra_core::types::staking::StakingOp;
-    use indra_crypto::{ColdHybridKeypair, ClassicalKeypair, PqKeypair, VrfKeypair};
+    use indra_crypto::{ClassicalKeypair, ColdHybridKeypair, PqKeypair, VrfKeypair};
     let mut output = format!(
         "[genesis]\nchain_id = \"{chain_id}\"\ngenesis_timestamp = 1700000000\nactive_slot_coefficient_numerator = \"{}\"\n",
         indra_core::types::primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
@@ -77,10 +83,23 @@ fn test_genesis_toml(
         cold_classical_seed[0] ^= 0xA5;
         let mut cold_pq_seed = *classical_seed;
         cold_pq_seed[0] ^= 0x5A;
-        let cold_public = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed).unwrap().public_key();
+        let cold_public =
+            ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed)
+                .unwrap()
+                .public_key();
         let cold = cold_public.as_complete_hybrid();
-        let validator_id = indra_core::types::crypto::hybrid_identity_id(&classical.public_key().0, &pq.public_key().0).0;
-        let challenge = StakingOp::vrf_possession_challenge(chain_id, &indra_core::Bytes32::from(validator_id), &indra_core::Bytes32::from(vrf.public_key()), 0).unwrap();
+        let validator_id = indra_core::types::crypto::hybrid_identity_id(
+            &classical.public_key().0,
+            &pq.public_key().0,
+        )
+        .0;
+        let challenge = StakingOp::vrf_possession_challenge(
+            chain_id,
+            &indra_core::Bytes32::from(validator_id),
+            &indra_core::Bytes32::from(vrf.public_key()),
+            0,
+        )
+        .unwrap();
         let (output_bytes, proof) = indra_crypto::vrf_prove(&vrf, &challenge);
         output.push_str(&format!(
             "\n[[validators]]\nname = \"test-validator-{index}\"\nvalidator_id = \"{}\"\nstake = 1000000000000\nhybrid_classical_pk = \"{}\"\nhybrid_pq_pk = \"{}\"\nvrf_pk = \"{}\"\nvrf_possession_output = \"{}\"\nvrf_possession_proof = \"{}\"\ncold_hybrid_classical_pk = \"{}\"\ncold_hybrid_pq_pk = \"{}\"\ncold_key_version = 1\ncold_nonce = 0\n",
@@ -360,7 +379,12 @@ fn write_single_validator_genesis(dir: &std::path::Path, seed: [u8; 32], _name: 
     let path = dir.join("genesis.toml");
     let genesis = test_genesis_toml_single_authority(
         "indra-testnet-1",
-        &[(seed, seed, seed), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
+        &[
+            (seed, seed, seed),
+            ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+            ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+            ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+        ],
     );
     std::fs::write(&path, genesis).unwrap();
     path.to_string_lossy().to_string()
@@ -379,14 +403,32 @@ fn build_single_validator_qc_bytes(
     let seeds = [[0x42; 32], [0xB2; 32], [0xC3; 32], [0xD4; 32]];
     let signers: Vec<_> = seeds
         .iter()
-        .map(|seed| HybridKeypair::new(ClassicalKeypair::from_seed(seed), PqKeypair::from_seed(seed).unwrap()))
+        .map(|seed| {
+            HybridKeypair::new(
+                ClassicalKeypair::from_seed(seed),
+                PqKeypair::from_seed(seed).unwrap(),
+            )
+        })
         .collect();
     let votes: Vec<_> = signers
         .iter()
         .map(|signer| {
             let public = signer.public_key();
-            let validator_id = indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
-            produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root: snapshot.snapshot_root, chain_id: &state.chain_id }, signer).unwrap()
+            let validator_id =
+                indra_core::types::crypto::hybrid_identity_id(&public.classical.0, &public.pq.0);
+            produce_vote(
+                indra_consensus::vote::VoteRequest {
+                    height,
+                    round,
+                    step: VoteStep::Precommit,
+                    block_hash,
+                    validator_id,
+                    snapshot_root: snapshot.snapshot_root,
+                    chain_id: &state.chain_id,
+                },
+                signer,
+            )
+            .unwrap()
         })
         .collect();
     let validators: Vec<_> = snapshot
@@ -401,7 +443,16 @@ fn build_single_validator_qc_bytes(
             stake: entry.consensus_weight_spark,
         })
         .collect();
-    let qc = build_qc(height, round, block_hash, &state.chain_id, snapshot.snapshot_root, &validators, votes.iter().collect()).unwrap();
+    let qc = build_qc(
+        height,
+        round,
+        block_hash,
+        &state.chain_id,
+        snapshot.snapshot_root,
+        &validators,
+        votes.iter().collect(),
+    )
+    .unwrap();
     qc.encode_to_vec()
 }
 
@@ -447,15 +498,29 @@ fn assert_block_log_roundtrip_and_links(log_path: &std::path::Path) {
 
 #[test]
 fn genesis_rejects_3_validators() {
-    let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32])];
-    let error = parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap_err();
-    assert!(error.contains("at least 4 validators"), "unexpected error: {error}");
+    let entries = [
+        ([1; 32], [1; 32], [1; 32]),
+        ([2; 32], [2; 32], [2; 32]),
+        ([3; 32], [3; 32], [3; 32]),
+    ];
+    let error =
+        parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap_err();
+    assert!(
+        error.contains("at least 4 validators"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
 fn genesis_with_4_validators() {
-    let entries = [([1; 32], [1; 32], [1; 32]), ([2; 32], [2; 32], [2; 32]), ([3; 32], [3; 32], [3; 32]), ([4; 32], [4; 32], [4; 32])];
-    let manifest = parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap();
+    let entries = [
+        ([1; 32], [1; 32], [1; 32]),
+        ([2; 32], [2; 32], [2; 32]),
+        ([3; 32], [3; 32], [3; 32]),
+        ([4; 32], [4; 32], [4; 32]),
+    ];
+    let manifest =
+        parse_genesis_manifest_str(&test_genesis_toml("node-minimum", &entries)).unwrap();
     assert_eq!(manifest.validators.len(), 4);
 }
 
@@ -989,12 +1054,23 @@ fn node_syncs_before_joining_consensus() {
         &remote.public_key().classical.0,
         &remote.public_key().pq.0,
     );
-    let vote = indra_consensus::vote::produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::from([0xCCu8; 32]), validator_id: remote_id, snapshot_root: driver
-            .engine
-            .state
-            .snapshot_for_consensus_height(1)
-            .unwrap()
-            .snapshot_root, chain_id: TEST_CHAIN_ID }, &remote)
+    let vote = indra_consensus::vote::produce_vote(
+        indra_consensus::vote::VoteRequest {
+            height: 1,
+            round: 0,
+            step: VoteStep::Prevote,
+            block_hash: Bytes32::from([0xCCu8; 32]),
+            validator_id: remote_id,
+            snapshot_root: driver
+                .engine
+                .state
+                .snapshot_for_consensus_height(1)
+                .unwrap()
+                .snapshot_root,
+            chain_id: TEST_CHAIN_ID,
+        },
+        &remote,
+    )
     .unwrap();
 
     let actions = driver.process(DriverEvent::InboundVote { from: peer, vote });

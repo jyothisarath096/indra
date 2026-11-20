@@ -64,9 +64,9 @@ pub fn configure_from_args(args: &[String]) -> CliResult<()> {
         }
         // The environment variable stores only a path, never the token.
         // This is process-local CLI configuration and is read by post_json.
-        TOKEN_FILE_OVERRIDE
-            .set(PathBuf::from(path))
-            .map_err(|_| RpcClientError::TokenFile("RPC token file was configured more than once"))?;
+        TOKEN_FILE_OVERRIDE.set(PathBuf::from(path)).map_err(|_| {
+            RpcClientError::TokenFile("RPC token file was configured more than once")
+        })?;
     }
     Ok(())
 }
@@ -93,12 +93,23 @@ fn post_json_with_tls(
     #[cfg(test)] test_root: Option<Vec<u8>>,
     #[cfg(not(test))] _test_root: Option<Vec<u8>>,
 ) -> CliResult<String> {
-    post_json_with_limits(url, body, token_path, RPC_CONNECT_TIMEOUT, RPC_TOTAL_TIMEOUT, {
-        #[cfg(test)]
-        { test_root }
-        #[cfg(not(test))]
-        { _test_root }
-    })
+    post_json_with_limits(
+        url,
+        body,
+        token_path,
+        RPC_CONNECT_TIMEOUT,
+        RPC_TOTAL_TIMEOUT,
+        {
+            #[cfg(test)]
+            {
+                test_root
+            }
+            #[cfg(not(test))]
+            {
+                _test_root
+            }
+        },
+    )
 }
 
 fn post_json_with_limits(
@@ -126,8 +137,8 @@ fn post_json_with_limits(
         .max_redirects_will_error(false);
     #[cfg(test)]
     if let Some(root) = test_root {
-        let certificate = ureq::tls::Certificate::from_pem(&root)
-            .map_err(|_| RpcClientError::Transport)?;
+        let certificate =
+            ureq::tls::Certificate::from_pem(&root).map_err(|_| RpcClientError::Transport)?;
         let tls = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::new_with_certs(&[certificate]))
             .build();
@@ -170,9 +181,9 @@ fn post_json_with_limits(
 }
 
 fn validate_url(url: &str) -> Result<(), RpcClientError> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or(RpcClientError::InvalidUrl("RPC URL must include http:// or https://"))?;
+    let (scheme, rest) = url.split_once("://").ok_or(RpcClientError::InvalidUrl(
+        "RPC URL must include http:// or https://",
+    ))?;
     if scheme != "http" && scheme != "https" {
         return Err(RpcClientError::InvalidUrl("RPC URL scheme is unsupported"));
     }
@@ -184,7 +195,9 @@ fn validate_url(url: &str) -> Result<(), RpcClientError> {
         let host = if let Some(bracketed) = authority.strip_prefix('[') {
             bracketed.split_once(']').map_or("", |(host, _)| host)
         } else {
-            authority.split_once(':').map_or(authority, |(host, _)| host)
+            authority
+                .split_once(':')
+                .map_or(authority, |(host, _)| host)
         };
         if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
             return Err(RpcClientError::InvalidUrl(
@@ -204,7 +217,8 @@ fn token_path() -> Option<PathBuf> {
 
 fn load_token_file(path: Option<PathBuf>) -> Result<Option<String>, RpcClientError> {
     let Some(path) = path else { return Ok(None) };
-    let metadata = fs::metadata(&path).map_err(|_| RpcClientError::TokenFile("cannot read RPC token file"))?;
+    let metadata =
+        fs::metadata(&path).map_err(|_| RpcClientError::TokenFile("cannot read RPC token file"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -236,19 +250,23 @@ fn map_transport_error(error: ureq::Error) -> CliError {
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|pair| match pair {
-            [candidate, value] if candidate == flag => Some(value.clone()),
-            _ => None,
-        })
+    args.windows(2).find_map(|pair| match pair {
+        [candidate, value] if candidate == flag => Some(value.clone()),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::{Read, Write}, net::TcpListener, process::Command, thread};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        process::Command,
+        thread,
+    };
 
     fn server(response: &'static str) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -283,44 +301,81 @@ mod tests {
         let key_path = dir.join("key.pem");
         let generated = Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout",
-                key_path.to_str().unwrap(), "-out", cert_path.to_str().unwrap(),
-                "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
-                "-days", "1",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                key_path.to_str().unwrap(),
+                "-out",
+                cert_path.to_str().unwrap(),
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-days",
+                "1",
             ])
             .output()
             .unwrap();
-        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let child = Command::new("openssl")
             .args([
-                "s_server", "-accept", &port.to_string(), "-cert",
-                cert_path.to_str().unwrap(), "-key", key_path.to_str().unwrap(),
-                "-www", "-quiet",
+                "s_server",
+                "-accept",
+                &port.to_string(),
+                "-cert",
+                cert_path.to_str().unwrap(),
+                "-key",
+                key_path.to_str().unwrap(),
+                "-www",
+                "-quiet",
             ])
             .spawn()
             .unwrap();
         thread::sleep(Duration::from_millis(100));
-        (format!("https://localhost:{port}"), fs::read(cert_path).unwrap(), dir, child)
+        (
+            format!("https://localhost:{port}"),
+            fs::read(cert_path).unwrap(),
+            dir,
+            child,
+        )
     }
 
     #[test]
     fn loopback_http_is_allowed_and_redirect_is_rejected() {
         let url = server("HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n");
-        assert_eq!(post_json(&url, "{}").unwrap_err().to_string(), "RPC error: RPC redirects are not allowed");
+        assert_eq!(
+            post_json(&url, "{}").unwrap_err().to_string(),
+            "RPC error: RPC redirects are not allowed"
+        );
     }
 
     #[test]
     fn non_loopback_http_is_rejected_exactly() {
-        assert_eq!(post_json("http://example.com", "{}").unwrap_err().to_string(), "RPC error: plain http is only allowed for loopback nodes; use https");
+        assert_eq!(
+            post_json("http://example.com", "{}")
+                .unwrap_err()
+                .to_string(),
+            "RPC error: plain http is only allowed for loopback nodes; use https"
+        );
     }
 
     #[test]
     fn response_cap_is_rejected() {
         let url = server("HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n\r\n");
-        assert_eq!(post_json(&url, "{}").unwrap_err().to_string(), "RPC error: RPC response exceeds 8 MiB limit");
+        assert_eq!(
+            post_json(&url, "{}").unwrap_err().to_string(),
+            "RPC error: RPC response exceeds 8 MiB limit"
+        );
     }
 
     #[test]
@@ -369,27 +424,38 @@ mod tests {
     fn token_file_policy_is_exact_and_token_is_not_in_error() {
         let path = std::env::temp_dir().join(format!("indra-rpc-token-{}", std::process::id()));
         fs::write(&path, b"secret\n").unwrap();
-        #[cfg(unix)] fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let error = load_token_file(Some(path.clone())).unwrap_err().to_string();
-        assert_eq!(error, "RPC token file must not be readable by group or others");
+        assert_eq!(
+            error,
+            "RPC token file must not be readable by group or others"
+        );
         assert!(!error.contains("secret"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn token_header_is_sent_and_empty_file_is_rejected() {
-        let path = std::env::temp_dir().join(format!("indra-rpc-token-header-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("indra-rpc-token-header-{}", std::process::id()));
         fs::write(&path, b"secret-token\n").unwrap();
-        #[cfg(unix)] fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let (url, handle) = header_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-        assert_eq!(post_json_with_path(&url, "{}", Some(path.clone())).unwrap(), "ok");
+        assert_eq!(
+            post_json_with_path(&url, "{}", Some(path.clone())).unwrap(),
+            "ok"
+        );
         let request = handle.join().unwrap();
         assert!(request
             .to_ascii_lowercase()
             .contains("x-rpc-token: secret-token"));
         fs::write(&path, b"").unwrap();
         assert_eq!(
-            post_json_with_path(&url, "{}", Some(path.clone())).unwrap_err().to_string(),
+            post_json_with_path(&url, "{}", Some(path.clone()))
+                .unwrap_err()
+                .to_string(),
             "RPC error: RPC token file is empty"
         );
         let _ = fs::remove_file(path);
@@ -397,7 +463,11 @@ mod tests {
 
     #[test]
     fn index5_rpc_client_flag_as_last_argument_is_not_indexed() {
-        let args = vec!["--node".to_string(), "http://127.0.0.1:8545".to_string(), "--rpc-token-file".to_string()];
+        let args = vec![
+            "--node".to_string(),
+            "http://127.0.0.1:8545".to_string(),
+            "--rpc-token-file".to_string(),
+        ];
         assert_eq!(flag_value(&args, "--rpc-token-file"), None);
     }
 
@@ -409,7 +479,10 @@ mod tests {
             "--rpc-token-file".to_string(),
             "second".to_string(),
         ];
-        assert_eq!(flag_value(&args, "--rpc-token-file"), Some("first".to_string()));
+        assert_eq!(
+            flag_value(&args, "--rpc-token-file"),
+            Some("first".to_string())
+        );
     }
 
     #[test]

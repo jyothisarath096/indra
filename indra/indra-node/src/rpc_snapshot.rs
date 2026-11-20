@@ -5,12 +5,12 @@ use std::sync::{
     Arc, RwLock,
 };
 
+use crate::{locks, NodeError, NodeResult};
 use indra_core::types::{
     primitives::Bytes32,
     stake_position::{StakePositionV1, UnbondingTrancheV1},
 };
 use indra_state::{compute_state_root, ChainState, PersistentOrdMap};
-use crate::{locks, NodeResult, NodeError};
 
 /// Dedicated append-independent storage readers used by historical RPCs.
 #[derive(Clone)]
@@ -292,8 +292,7 @@ impl RpcSnapshotPublisher {
 
     /// Obtain a consistent snapshot without touching the consensus mutex.
     pub fn load(&self) -> NodeResult<Arc<RpcReadSnapshot>> {
-        let snapshot = locks::read(&self.current, "rpc-snapshot.current")
-            ?;
+        let snapshot = locks::read(&self.current, "rpc-snapshot.current")?;
         Ok(Arc::clone(&snapshot))
     }
 
@@ -306,16 +305,17 @@ impl RpcSnapshotPublisher {
         lowest_block: u64,
         blocks_retained: usize,
     ) -> NodeResult<()> {
-        let next = Arc::new(RpcReadSnapshot::build(
-            state,
-            Arc::clone(&self.mempool_size),
-            pruned_mode,
-            lowest_block,
-            blocks_retained,
-        )
-        .map_err(NodeError::RpcSnapshot)?);
-        let mut current = locks::write(&self.current, "rpc-snapshot.current")
-            ?;
+        let next = Arc::new(
+            RpcReadSnapshot::build(
+                state,
+                Arc::clone(&self.mempool_size),
+                pruned_mode,
+                lowest_block,
+                blocks_retained,
+            )
+            .map_err(NodeError::RpcSnapshot)?,
+        );
+        let mut current = locks::write(&self.current, "rpc-snapshot.current")?;
         *current = next;
         self.mempool_size.store(mempool_size, Ordering::Relaxed);
         Ok(())
@@ -332,18 +332,19 @@ impl RpcSnapshotPublisher {
         blocks_retained: usize,
     ) -> NodeResult<()> {
         let previous = self.load()?;
-        let next = Arc::new(RpcReadSnapshot::build_incremental(
-            &previous,
-            state,
-            effects,
-            Arc::clone(&self.mempool_size),
-            pruned_mode,
-            lowest_block,
-            blocks_retained,
-        )
-        .map_err(NodeError::RpcSnapshot)?);
-        *locks::write(&self.current, "rpc-snapshot.current")
-            ? = next;
+        let next = Arc::new(
+            RpcReadSnapshot::build_incremental(
+                &previous,
+                state,
+                effects,
+                Arc::clone(&self.mempool_size),
+                pruned_mode,
+                lowest_block,
+                blocks_retained,
+            )
+            .map_err(NodeError::RpcSnapshot)?,
+        );
+        *locks::write(&self.current, "rpc-snapshot.current")? = next;
         self.mempool_size.store(mempool_size, Ordering::Relaxed);
         Ok(())
     }
@@ -434,8 +435,8 @@ fn index_tranche(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::stake_position::{PositionCustodyV1, UnbondingTimingV1};
     use std::{
         collections::BTreeMap,
@@ -482,9 +483,7 @@ mod tests {
             state.unbonding_tranches.insert(tranche.tranche_id, tranche);
         }
         state.rebuild_position_tranche_index().unwrap();
-        state
-            .ensure_state_commitment_v2(state.height)
-            .unwrap();
+        state.ensure_state_commitment_v2(state.height).unwrap();
         state
     }
 
@@ -620,7 +619,9 @@ mod tests {
         effects
             .position_tranche_capacity_changed_for
             .insert(position_id);
-        publisher.publish_with_effects(&after, &effects, 0, false, 0, 0).unwrap();
+        publisher
+            .publish_with_effects(&after, &effects, 0, false, 0, 0)
+            .unwrap();
         assert_eq!(publisher.load().unwrap().indexes, build_indexes(&after));
     }
 
@@ -642,7 +643,9 @@ mod tests {
             .insert(changed_position_id, changed_position);
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.stake_positions_changed.insert(changed_position_id);
-        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
+        publisher
+            .publish_with_effects(&state, &effects, 0, false, 0, 0)
+            .unwrap();
         assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
 
         let removed_position_id = position_ids[1];
@@ -656,13 +659,17 @@ mod tests {
         effects
             .position_tranche_capacity_changed_for
             .insert(removed_position_id);
-        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
+        publisher
+            .publish_with_effects(&state, &effects, 0, false, 0, 0)
+            .unwrap();
         assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
 
         state.stake_positions.remove(&removed_position_id);
         let mut effects = indra_state::CanonicalStateEffects::default();
         effects.stake_positions_changed.insert(removed_position_id);
-        publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
+        publisher
+            .publish_with_effects(&state, &effects, 0, false, 0, 0)
+            .unwrap();
         assert_eq!(publisher.load().unwrap().indexes, build_indexes(&state));
     }
 
@@ -684,7 +691,9 @@ mod tests {
         let mut incremental = Vec::new();
         for _ in 0..7 {
             let started = Instant::now();
-            publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
+            publisher
+                .publish_with_effects(&state, &effects, 0, false, 0, 0)
+                .unwrap();
             incremental.push(started.elapsed());
         }
         let mut full = Vec::new();
@@ -737,7 +746,9 @@ mod tests {
         let mut samples = Vec::new();
         for _ in 0..9 {
             let started = Instant::now();
-            publisher.publish_with_effects(&state, &effects, 0, false, 0, 0).unwrap();
+            publisher
+                .publish_with_effects(&state, &effects, 0, false, 0, 0)
+                .unwrap();
             samples.push(started.elapsed());
         }
         samples.sort_unstable();
@@ -745,6 +756,9 @@ mod tests {
             "rpc snapshot dominant-validator incremental benchmark: median={:?} samples={samples:?} positions={COUNT} tranches={COUNT}",
             samples[samples.len() / 2]
         );
-        assert_eq!(publisher.load().unwrap().indexes, build_indexes_bulk(&state));
+        assert_eq!(
+            publisher.load().unwrap().indexes,
+            build_indexes_bulk(&state)
+        );
     }
 }

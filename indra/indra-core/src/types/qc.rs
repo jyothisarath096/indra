@@ -5,17 +5,17 @@
 
 use crate::types::{consensus_snapshot::ConsensusSnapshot, vote::VoteStep};
 use crate::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
-        crypto::{PQVoteSig, decode_fixed_signature},
+        crypto::{decode_fixed_signature, PQVoteSig},
         primitives::{
-            Bytes32, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS, VariableBytes,
+            Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_QC_SIGNERS, MAX_VALIDATORS,
         },
     },
 };
 use indra_crypto::hybrid::{
-    ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature, verify_classical, verify_pq,
+    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
 };
 use std::collections::{HashMap, HashSet};
 

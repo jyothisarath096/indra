@@ -211,7 +211,10 @@ where
 }
 
 /// Compute the consensus-required fee for an encoded transaction.
-pub fn required_fee_for_transaction(tx: &TransactionV1, base_fee_spark_per_kb: u64) -> CliResult<u64> {
+pub fn required_fee_for_transaction(
+    tx: &TransactionV1,
+    base_fee_spark_per_kb: u64,
+) -> CliResult<u64> {
     base_fee_spark_per_kb
         .checked_mul(tx.weight_kb())
         .ok_or_else(|| CliError::Transaction("fee calculation overflow".into()))
@@ -227,8 +230,9 @@ pub fn default_fee_for_base_fee(base_fee_spark_per_kb: u64) -> CliResult<u64> {
 fn required_fee_from_built(built: &BuiltTransaction, base_fee: u64) -> CliResult<u64> {
     let bytes = hex::decode(&built.tx_hex)
         .map_err(|_| CliError::Transaction("built transaction is not canonical hex".into()))?;
-    let tx = TransactionV1::decode_exact(&bytes)
-        .map_err(|error| CliError::Transaction(format!("built transaction decode failed: {error}")))?;
+    let tx = TransactionV1::decode_exact(&bytes).map_err(|error| {
+        CliError::Transaction(format!("built transaction decode failed: {error}"))
+    })?;
     required_fee_for_transaction(&tx, base_fee)
 }
 
@@ -269,7 +273,9 @@ pub fn build_transaction_with_fee_policy(
         }
         return Ok((built, required));
     }
-    Err(CliError::Transaction("fee calculation did not converge".into()))
+    Err(CliError::Transaction(
+        "fee calculation did not converge".into(),
+    ))
 }
 
 /// Build a cold transfer using the current chain fee.
@@ -307,7 +313,9 @@ pub fn build_cold_transaction_with_fee_policy(
         }
         return Ok((built, required));
     }
-    Err(CliError::Transaction("fee calculation did not converge".into()))
+    Err(CliError::Transaction(
+        "fee calculation did not converge".into(),
+    ))
 }
 
 /// Build and sign a transaction.
@@ -810,7 +818,9 @@ mod tests {
             let tx = TransactionV1 {
                 version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
                 signature_module_id: 1,
-                inputs: vec![InputV1 { utxo_id: Bytes32::ZERO }],
+                inputs: vec![InputV1 {
+                    utxo_id: Bytes32::ZERO,
+                }],
                 outputs: vec![OutputV1 {
                     value_spark: 1,
                     owner_pubkey: HybridPubKey {
@@ -830,9 +840,18 @@ mod tests {
                 found[len - 1023] = Some(tx);
             }
         }
-        assert_eq!(found[0].as_ref().map(TransactionV1::encoded_len), Some(1023));
-        assert_eq!(found[1].as_ref().map(TransactionV1::encoded_len), Some(1024));
-        assert_eq!(found[2].as_ref().map(TransactionV1::encoded_len), Some(1025));
+        assert_eq!(
+            found[0].as_ref().map(TransactionV1::encoded_len),
+            Some(1023)
+        );
+        assert_eq!(
+            found[1].as_ref().map(TransactionV1::encoded_len),
+            Some(1024)
+        );
+        assert_eq!(
+            found[2].as_ref().map(TransactionV1::encoded_len),
+            Some(1025)
+        );
         assert_eq!(found[0].as_ref().map(TransactionV1::weight_kb), Some(1));
         assert_eq!(found[1].as_ref().map(TransactionV1::weight_kb), Some(1));
         assert_eq!(found[2].as_ref().map(TransactionV1::weight_kb), Some(2));
@@ -844,7 +863,9 @@ mod tests {
         let tx = TransactionV1 {
             version: ProtocolVersion(TRANSACTION_PROTOCOL_VERSION),
             signature_module_id: 1,
-            inputs: vec![InputV1 { utxo_id: Bytes32::ZERO }],
+            inputs: vec![InputV1 {
+                utxo_id: Bytes32::ZERO,
+            }],
             outputs: vec![OutputV1 {
                 value_spark: 1,
                 owner_pubkey: HybridPubKey {
@@ -864,7 +885,10 @@ mod tests {
         oversized.outputs[0].owner_pubkey.pq_pk =
             VariableBytes::from_slice(&vec![0; 2048]).unwrap();
         let overflow = required_fee_for_transaction(&oversized, u64::MAX).unwrap_err();
-        assert_eq!(overflow.to_string(), "transaction error: fee calculation overflow");
+        assert_eq!(
+            overflow.to_string(),
+            "transaction error: fee calculation overflow"
+        );
     }
 
     #[test]

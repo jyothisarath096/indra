@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! `indra-stake` — build and submit staking operations.
 
@@ -23,15 +39,18 @@ const DEFAULT_WALLET: &str = "wallet.json";
 
 macro_rules! finish_op {
     ($args:expr, $op_name:expr, $built:expr, $signer_id:expr, $nonce:expr, $node_url:expr, $details:expr, $mark_spent:expr $(,)?) => {
-        finish_op_impl($args, FinishContext {
-            op_name: $op_name,
-            built: $built,
-            signer_id: $signer_id,
-            nonce: $nonce,
-            node_url: $node_url,
-            details: $details,
-            mark_spent: $mark_spent,
-        })
+        finish_op_impl(
+            $args,
+            FinishContext {
+                op_name: $op_name,
+                built: $built,
+                signer_id: $signer_id,
+                nonce: $nonce,
+                node_url: $node_url,
+                details: $details,
+                mark_spent: $mark_spent,
+            },
+        )
     };
 }
 
@@ -510,10 +529,7 @@ struct FinishContext<'a> {
     mark_spent: Option<(&'a str, Bytes32)>,
 }
 
-fn finish_op_impl(
-    args: &[String],
-    context: FinishContext<'_>,
-) -> CliResult<()> {
+fn finish_op_impl(args: &[String], context: FinishContext<'_>) -> CliResult<()> {
     let FinishContext {
         op_name,
         built,

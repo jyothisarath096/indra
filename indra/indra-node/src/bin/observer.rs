@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! INDRA observer/full-node binary.
 
@@ -255,13 +271,17 @@ fn start_observer_reserve(
                 };
                 let engine = Arc::clone(&engine);
                 let observer_count = Arc::clone(&observer_count);
-                indra_node::supervisor::spawn_connection("observer-reserve", Arc::clone(&metrics), async move {
-                    observer_count.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = serve_observer_peer(stream, engine).await {
-                        eprintln!("[observer] reserve peer {} closed: {}", peer, e);
-                    }
-                    observer_count.fetch_sub(1, Ordering::Relaxed);
-                });
+                indra_node::supervisor::spawn_connection(
+                    "observer-reserve",
+                    Arc::clone(&metrics),
+                    async move {
+                        observer_count.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = serve_observer_peer(stream, engine).await {
+                            eprintln!("[observer] reserve peer {} closed: {}", peer, e);
+                        }
+                        observer_count.fetch_sub(1, Ordering::Relaxed);
+                    },
+                );
             }
         });
     })
@@ -454,9 +474,11 @@ fn local_status(engine: &Arc<Mutex<NodeEngine>>) -> Result<Message, String> {
 }
 
 fn local_height(engine: &Arc<Mutex<NodeEngine>>) -> Result<u64, String> {
-    Ok(indra_node::locks::lock(engine, "observer-local-height.engine")
-        .map_err(|error| error.to_string())?
-        .height())
+    Ok(
+        indra_node::locks::lock(engine, "observer-local-height.engine")
+            .map_err(|error| error.to_string())?
+            .height(),
+    )
 }
 
 async fn write_message(stream: &mut tokio::net::TcpStream, msg: &Message) -> Result<(), String> {

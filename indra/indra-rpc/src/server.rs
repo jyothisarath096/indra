@@ -615,8 +615,8 @@ fn dispatch_to_response<E: RpcEngineMut>(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::Encode,
         types::{

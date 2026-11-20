@@ -790,11 +790,9 @@ async fn resolve_seed_with_hickory_dnssec_async(
         opts.use_hosts_file = ResolveHosts::Never;
         opts.try_tcp_on_error = true;
     }
-    let resolver = builder.build().map_err(|e| {
-        io::Error::other(
-            format!("DNS resolver build failed: {e}"),
-        )
-    })?;
+    let resolver = builder
+        .build()
+        .map_err(|e| io::Error::other(format!("DNS resolver build failed: {e}")))?;
 
     let mut addrs = Vec::new();
     let mut saw_unsigned_answer = false;
@@ -919,11 +917,7 @@ async fn resolve_txt_records_dnssec(
     let lookup = resolver
         .lookup(dns_query_name(name).as_str(), RecordType::TXT)
         .await
-        .map_err(|e| {
-            io::Error::other(
-                format!("TXT lookup for {name} failed: {e}"),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("TXT lookup for {name} failed: {e}")))?;
     let status = dnssec_status_for_lookup_answers(&lookup, RecordType::TXT);
     if status != DnsSeedValidationStatus::Secure {
         return Err(io::Error::new(
@@ -972,11 +966,9 @@ async fn resolve_signed_seed_with_hickory_dnssec_async(
         opts.use_hosts_file = ResolveHosts::Never;
         opts.try_tcp_on_error = true;
     }
-    let resolver = builder.build().map_err(|e| {
-        io::Error::other(
-            format!("DNS resolver build failed: {e}"),
-        )
-    })?;
+    let resolver = builder
+        .build()
+        .map_err(|e| io::Error::other(format!("DNS resolver build failed: {e}")))?;
 
     let roots = resolve_txt_records_dnssec(&resolver, host).await?;
     let root_txt = roots

@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::io::Write;
 
@@ -21,17 +37,23 @@ fn main() {
         return;
     }
     if args.get(1).map(String::as_str) == Some("inspect") {
-        let Some(rest) = args.get(2..) else { cold_fail("missing inspect arguments") };
+        let Some(rest) = args.get(2..) else {
+            cold_fail("missing inspect arguments")
+        };
         cmd_inspect(rest);
         return;
     }
     if args.get(1).map(String::as_str) == Some("export-public") {
-        let Some(rest) = args.get(2..) else { cold_fail("missing export arguments") };
+        let Some(rest) = args.get(2..) else {
+            cold_fail("missing export arguments")
+        };
         cmd_export_public(rest);
         return;
     }
     if args.get(1).map(String::as_str) == Some("cold") {
-        let Some(rest) = args.get(2..) else { cold_fail("missing cold arguments") };
+        let Some(rest) = args.get(2..) else {
+            cold_fail("missing cold arguments")
+        };
         cmd_cold(rest);
         return;
     }
@@ -273,10 +295,9 @@ fn cmd_export_public(args: &[String]) {
         std::process::exit(1);
     }
     #[cfg(unix)]
-    if let Err(error) = std::fs::set_permissions(
-        &output,
-        std::os::unix::fs::PermissionsExt::from_mode(0o644),
-    ) {
+    if let Err(error) =
+        std::fs::set_permissions(&output, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+    {
         eprintln!("Error: cannot set permissions on {output}: {error}");
         std::process::exit(1);
     }
@@ -326,23 +347,33 @@ fn owner_details(
 fn cmd_cold(args: &[String]) {
     match args.first().map(String::as_str) {
         Some("ceremony") => {
-            let Some(rest) = args.get(1..) else { cold_fail("missing ceremony arguments") };
+            let Some(rest) = args.get(1..) else {
+                cold_fail("missing ceremony arguments")
+            };
             return cmd_cold_ceremony(rest);
         }
         Some("split") => {
-            let Some(rest) = args.get(1..) else { cold_fail("missing split arguments") };
+            let Some(rest) = args.get(1..) else {
+                cold_fail("missing split arguments")
+            };
             return cmd_cold_split(rest);
         }
         Some("verify") => {
-            let Some(rest) = args.get(1..) else { cold_fail("missing verify arguments") };
+            let Some(rest) = args.get(1..) else {
+                cold_fail("missing verify arguments")
+            };
             return cmd_cold_verify(rest);
         }
         Some("recover") => {
-            let Some(rest) = args.get(1..) else { cold_fail("missing recover arguments") };
+            let Some(rest) = args.get(1..) else {
+                cold_fail("missing recover arguments")
+            };
             return cmd_cold_recover(rest);
         }
         Some("dealer-rekey") => {
-            let Some(rest) = args.get(1..) else { cold_fail("missing dealer-rekey arguments") };
+            let Some(rest) = args.get(1..) else {
+                cold_fail("missing dealer-rekey arguments")
+            };
             return cmd_cold_dealer_rekey(rest);
         }
         _ => {}

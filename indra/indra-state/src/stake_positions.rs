@@ -264,12 +264,11 @@ pub fn release_matured_position_tranches(
 
     let mut prepared = Vec::with_capacity(mature.len());
     for (ordinal, tranche) in mature.iter().enumerate() {
-        let position = state
-            .stake_positions
-            .get(&tranche.position_id)
-            .ok_or(StateError::InvariantViolation {
+        let position = state.stake_positions.get(&tranche.position_id).ok_or(
+            StateError::InvariantViolation {
                 message: "mature tranche references missing position",
-            })?;
+            },
+        )?;
         let owner = resolve_position_owner(state, position)?;
         let UnbondingTimingV1::HeightPrecise { end_epoch, .. } = tranche.timing;
         let output = OutputV1 {
@@ -525,10 +524,7 @@ fn preflight_exit_usage(u: CapacityUsage, full_exit: bool) -> StateResult<()> {
         u.tranches_position + 1 + usize::from(!full_exit) <= MAX_TRANCHES_PER_POSITION,
         "per-position final-exit reservation",
     )?;
-    check_capacity(
-        u.tranches_total < MAX_TRANCHES_TOTAL,
-        "global tranche cap",
-    )?;
+    check_capacity(u.tranches_total < MAX_TRANCHES_TOTAL, "global tranche cap")?;
     check_capacity(
         u.tranches_validator < MAX_TRANCHES_PER_VALIDATOR,
         "per-validator tranche cap",
@@ -561,8 +557,8 @@ fn invalid_position(error: indra_core::error::IndraError) -> StateError {
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::{Decode, Encode},
         types::crypto::HybridSignature,
@@ -976,9 +972,11 @@ mod tests {
         let one_epoch_early =
             (end_epoch - 1) * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
         let mut early_release = state.clone();
-        assert!(release_matured_position_tranches(&mut early_release, one_epoch_early)
-            .unwrap()
-            .is_empty());
+        assert!(
+            release_matured_position_tranches(&mut early_release, one_epoch_early)
+                .unwrap()
+                .is_empty()
+        );
         assert!(early_release.unbonding_tranches.contains_key(&first));
         let release_height = end_epoch * indra_core::types::primitives::EPOCH_DURATION_BLOCKS;
         let before_failed_release = state.clone();

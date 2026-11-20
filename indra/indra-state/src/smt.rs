@@ -292,8 +292,7 @@ impl CompressedAuthTree {
                 || step.target_nibble > 0x0F
                 || !starts_with_nibbles(&key_nibbles, &step.branch_prefix)
                 || step.branch_prefix.len() >= key_nibbles.len()
-                || key_nibbles.get(step.branch_prefix.len()).copied()
-                    != Some(step.target_nibble)
+                || key_nibbles.get(step.branch_prefix.len()).copied() != Some(step.target_nibble)
             {
                 return false;
             }
@@ -460,8 +459,7 @@ impl SparseMerkleTree {
             let Some(child_level) = levels.get(child_depth).cloned() else {
                 continue;
             };
-            let mut grouped: HashMap<NodeLoc, ChildHashes> =
-                HashMap::new();
+            let mut grouped: HashMap<NodeLoc, ChildHashes> = HashMap::new();
             for (loc, hash) in child_level {
                 let parent = NodeLoc {
                     depth: depth_from_bit(bit_index),
@@ -583,26 +581,22 @@ fn build_compressed_subtree(
                     site: "smt::build_compressed_subtree index",
                 })?;
                 let nibbles = key_to_nibbles(key);
-                let child_nibble = nibbles
-                    .iter()
-                    .copied()
-                    .nth(prefix.len())
-                    .ok_or(StateError::InternalInvariant {
+                let child_nibble = nibbles.iter().copied().nth(prefix.len()).ok_or(
+                    StateError::InternalInvariant {
                         site: "smt::build_compressed_subtree child nibble",
-                    })?;
+                    },
+                )?;
                 let mut end = index + 1;
                 while end < pairs.len() {
                     let (other_key, _) = pairs.get(end).ok_or(StateError::InternalInvariant {
                         site: "smt::build_compressed_subtree end",
                     })?;
                     let other = key_to_nibbles(other_key);
-                    let other_nibble = other
-                        .iter()
-                        .copied()
-                        .nth(prefix.len())
-                        .ok_or(StateError::InternalInvariant {
+                    let other_nibble = other.iter().copied().nth(prefix.len()).ok_or(
+                        StateError::InternalInvariant {
                             site: "smt::build_compressed_subtree other nibble",
-                        })?;
+                        },
+                    )?;
                     if other_nibble != child_nibble {
                         break;
                     }
@@ -685,11 +679,14 @@ fn compressed_insert(
             let key_nibbles = key_to_nibbles(&key);
             let shared = common_nibble_prefix_len(&prefix, &key_nibbles, 0);
             if shared < prefix.len() {
-                let old_nibble = prefix.iter().copied().nth(shared).ok_or(
-                    StateError::InternalInvariant {
-                        site: "smt::compressed_insert old nibble",
-                    },
-                )?;
+                let old_nibble =
+                    prefix
+                        .iter()
+                        .copied()
+                        .nth(shared)
+                        .ok_or(StateError::InternalInvariant {
+                            site: "smt::compressed_insert old nibble",
+                        })?;
                 let new_nibble = key_nibbles.iter().copied().nth(shared).ok_or(
                     StateError::InternalInvariant {
                         site: "smt::compressed_insert new split nibble",
@@ -1689,7 +1686,12 @@ mod tests {
         for sibling in proof.siblings {
             proof_bytes.extend_from_slice(&sibling);
         }
-        let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
         assert_eq!(
             hex(&SparseMerkleTree::new().root()),
             "aee65339a08b06fbd1665922de21c2d317f62b6cdccde6a3734a3e76adcbf85d"

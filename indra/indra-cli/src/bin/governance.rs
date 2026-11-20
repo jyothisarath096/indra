@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! `indra-governance` — build and submit governance operations.
 
@@ -646,11 +662,10 @@ fn required_flag(args: &[String], flag: &str) -> CliResult<String> {
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|window| match window {
-            [candidate, value] if candidate == flag => Some(value.clone()),
-            _ => None,
-        })
+    args.windows(2).find_map(|window| match window {
+        [candidate, value] if candidate == flag => Some(value.clone()),
+        _ => None,
+    })
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {

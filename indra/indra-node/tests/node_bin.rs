@@ -21,7 +21,9 @@ fn run_node(args: &[String]) -> Output {
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child.wait_with_output().expect("collect timed-out node output");
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out node output");
             panic!("node did not refuse within 30 seconds: {:?}", output);
         }
         thread::sleep(Duration::from_millis(25));
@@ -31,9 +33,15 @@ fn run_node(args: &[String]) -> Output {
 fn assert_refused(output: &Output, cause: &str) {
     assert!(!output.status.success(), "node unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(cause), "stderr did not contain {cause:?}: {stderr}");
+    assert!(
+        stderr.contains(cause),
+        "stderr did not contain {cause:?}: {stderr}"
+    );
     assert!(!stderr.contains("panicked at"), "panic in stderr: {stderr}");
-    assert!(!stderr.contains("RUST_BACKTRACE"), "backtrace marker in stderr: {stderr}");
+    assert!(
+        !stderr.contains("RUST_BACKTRACE"),
+        "backtrace marker in stderr: {stderr}"
+    );
 }
 
 fn config_file(dir: &Path, data_dir: &Path, keys: &Path, genesis: &Path) -> PathBuf {
@@ -48,10 +56,7 @@ fn config_file(dir: &Path, data_dir: &Path, keys: &Path, genesis: &Path) -> Path
     path
 }
 
-fn encrypted_keys(
-    dir: &Path,
-    password: &[u8],
-) -> (indra_keystore::KeysFile, PathBuf, PathBuf) {
+fn encrypted_keys(dir: &Path, password: &[u8]) -> (indra_keystore::KeysFile, PathBuf, PathBuf) {
     let keys = indra_keystore::generate_from_master_seed("startup-test".into(), [0x41; 32])
         .expect("generate test keys");
     let keys_path = dir.join("keys.json");
@@ -60,13 +65,15 @@ fn encrypted_keys(
     indra_keystore::write_keys_secure(keys_path.to_str().expect("keys path"), &encrypted)
         .expect("write test keys");
     fs::write(&password_path, password).expect("write password");
-    fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600))
-        .expect("chmod password");
+    fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600)).expect("chmod password");
     (keys, keys_path, password_path)
 }
 
 fn valid_genesis_for(keys: &indra_keystore::KeysFile) -> String {
-    use indra_core::types::{crypto::hybrid_identity_id, primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR, staking::StakingOp};
+    use indra_core::types::{
+        crypto::hybrid_identity_id, primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
+        staking::StakingOp,
+    };
     use indra_crypto::{vrf_prove, ClassicalKeypair, ColdHybridKeypair, PqKeypair, VrfKeypair};
     let chain_id = "node-bin-valid";
     let entries = [
@@ -86,8 +93,9 @@ fn valid_genesis_for(keys: &indra_keystore::KeysFile) -> String {
         cold_classical_seed[0] ^= 0xA5;
         let mut cold_pq_seed = *classical_seed;
         cold_pq_seed[0] ^= 0x5A;
-        let cold_keypair = ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed)
-            .expect("test cold key");
+        let cold_keypair =
+            ColdHybridKeypair::from_independent_seeds(cold_classical_seed, cold_pq_seed)
+                .expect("test cold key");
         let cold_public = cold_keypair.public_key();
         let cold = cold_public.as_complete_hybrid();
         let validator_id = hybrid_identity_id(&classical.public_key().0, &pq.public_key().0).0;
@@ -198,14 +206,14 @@ fn index5_node_refuses_malformed_network_addresses_with_field_name() {
             &dir.path().join("genesis.toml"),
         );
         let contents = fs::read_to_string(&config).expect("read test config");
-        fs::write(
-            &config,
-            contents.replace("127.0.0.1:30303", address),
-        )
-        .expect("rewrite test config");
+        fs::write(&config, contents.replace("127.0.0.1:30303", address))
+            .expect("rewrite test config");
         let output = run_node(&["--config".into(), config.display().to_string()]);
         assert_refused(&output, "network.p2p_addr must be valid host:port");
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"), "case {name}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked at"),
+            "case {name}"
+        );
     }
 }
 
@@ -251,7 +259,10 @@ fn node_started_from_valid_fixture_stops_cleanly_on_sigterm() {
             "--no-observer-port",
             "--no-metrics",
         ])
-        .args(["--keys-password-file", password.to_str().expect("password path")])
+        .args([
+            "--keys-password-file",
+            password.to_str().expect("password path"),
+        ])
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
@@ -270,7 +281,11 @@ fn node_started_from_valid_fixture_stops_cleanly_on_sigterm() {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    assert!(started, "node did not reach startup:\n{}", fs::read_to_string(&stderr_path).unwrap_or_default());
+    assert!(
+        started,
+        "node did not reach startup:\n{}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
 
     let kill_result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     assert_eq!(kill_result, 0, "send SIGTERM");
@@ -279,11 +294,24 @@ fn node_started_from_valid_fixture_stops_cleanly_on_sigterm() {
         if let Some(status) = child.try_wait().expect("poll shutdown") {
             break status;
         }
-        assert!(Instant::now() < shutdown_deadline, "node did not stop within 10 seconds");
+        assert!(
+            Instant::now() < shutdown_deadline,
+            "node did not stop within 10 seconds"
+        );
         thread::sleep(Duration::from_millis(50));
     };
     let stderr = fs::read_to_string(&stderr_path).expect("read stderr log");
-    assert_eq!(status.code(), Some(0), "unexpected exit status: {status}\n{stderr}");
-    assert!(!stderr.contains("ERROR"), "clean shutdown emitted ERROR:\n{stderr}");
-    assert!(!stderr.contains("panicked at"), "clean shutdown panicked:\n{stderr}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "unexpected exit status: {status}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("ERROR"),
+        "clean shutdown emitted ERROR:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "clean shutdown panicked:\n{stderr}"
+    );
 }

@@ -63,10 +63,8 @@ fn ensure_disk_writable(data_dir: &std::path::Path) -> NodeResult<()> {
 fn protocol_hybrid_pubkey_parts(classical: [u8; 32], pq: &[u8]) -> NodeResult<HybridPubKey> {
     Ok(HybridPubKey {
         classical_pk: Bytes32::from(classical),
-        pq_pk: VariableBytes::from_slice(pq).map_err(|_| {
-            NodeError::ValidatorConfigIncomplete {
-                detail: "configured ML-DSA-87 public key is too large".to_string(),
-            }
+        pq_pk: VariableBytes::from_slice(pq).map_err(|_| NodeError::ValidatorConfigIncomplete {
+            detail: "configured ML-DSA-87 public key is too large".to_string(),
         })?,
     })
 }
@@ -503,10 +501,9 @@ impl NodeEngine {
                 });
             }
         }
-        let mut genesis_base = crate::genesis::build_finalized_genesis_state(
-            config.genesis_path.as_deref(),
-        )
-        .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
+        let mut genesis_base =
+            crate::genesis::build_finalized_genesis_state(config.genesis_path.as_deref())
+                .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         if !block_store.is_empty() && block_store.lowest_height() == 0 {
             let stored = block_store.get(0)?;
             let expected = crate::genesis::build_genesis_proposal(&genesis_base)
@@ -629,7 +626,8 @@ impl NodeEngine {
         Ok(Self {
             config,
             state,
-            rpc_snapshot: rpc_snapshot.map_err(|detail| NodeError::InvalidConfiguration { detail })?,
+            rpc_snapshot: rpc_snapshot
+                .map_err(|detail| NodeError::InvalidConfiguration { detail })?,
             mempool,
             staking_mempool: Vec::new(),
             governance_mempool: Vec::new(),
@@ -674,10 +672,9 @@ impl NodeEngine {
     /// Rebuild the current chain state by replaying the block log on top of a
     /// fresh genesis-equivalent state seeded from the configured genesis file.
     pub fn rebuild_state_from_block_log(&mut self) -> NodeResult<()> {
-        let mut rebuilt = crate::genesis::build_finalized_genesis_state(
-            self.config.genesis_path.as_deref(),
-        )
-        .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
+        let mut rebuilt =
+            crate::genesis::build_finalized_genesis_state(self.config.genesis_path.as_deref())
+                .map_err(|detail| NodeError::ValidatorConfigIncomplete { detail })?;
         rebuild_state_from_height(&mut rebuilt, &mut self.block_store, 1)?;
         self.state = rebuilt;
         Ok(())
@@ -1599,7 +1596,18 @@ impl NodeEngine {
             .state
             .snapshot_for_consensus_height(height)?
             .snapshot_root;
-        produce_vote(indra_consensus::vote::VoteRequest { height, round, step, block_hash, validator_id, snapshot_root, chain_id: &self.state.chain_id }, hybrid_keypair)
+        produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height,
+                round,
+                step,
+                block_hash,
+                validator_id,
+                snapshot_root,
+                chain_id: &self.state.chain_id,
+            },
+            hybrid_keypair,
+        )
         .map_err(NodeError::Consensus)
     }
 
@@ -1643,10 +1651,11 @@ impl NodeEngine {
                 let manifest = ChainManifest {
                     committed_height: projected_state.height,
                     committed_block_hash: projected_state.tip_hash,
-                    state_root: indra_state::compute_state_root(projected_state)
-                        .map_err(|error| NodeError::InvalidConfiguration {
+                    state_root: indra_state::compute_state_root(projected_state).map_err(
+                        |error| NodeError::InvalidConfiguration {
                             detail: error.to_string(),
-                        })?,
+                        },
+                    )?,
                     snapshot_height: state_store.latest_snapshot_height()?.unwrap_or(0),
                     block_log_next_height,
                     last_qc_height,
@@ -1887,8 +1896,8 @@ fn validate_manifest_if_present(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
 
     fn account_fixture_claims(state: &mut ChainState) {
         state.monetary_aggregates = state.recompute_monetary_aggregates().unwrap();
@@ -1998,10 +2007,7 @@ mod tests {
                 .expect("local test engine has a genesis path");
             std::fs::write(
                 &genesis_path,
-                crate::genesis::test_genesis_toml_single_authority(
-                    "indra-testnet-1",
-                    &entries,
-                ),
+                crate::genesis::test_genesis_toml_single_authority("indra-testnet-1", &entries),
             )
             .expect("rewrite four-validator test genesis");
             engine.state = crate::genesis::build_finalized_genesis_state(Some(&genesis_path))
@@ -2023,35 +2029,35 @@ mod tests {
 
         if !already_registered {
             engine
-            .state
-            .validators
-            .upsert(ValidatorEntry {
-                validator_id,
-                name: validator_name,
-                hybrid_classical_pk: Some(public.classical.0),
-                hybrid_pq_pk: Some(public.pq.0.to_vec()),
-                vrf_pk: Some(vrf_pk),
-                vrf_key_activation_epoch: 0,
-                pending_vrf_pk: None,
-                pending_vrf_activation_epoch: None,
-                stake_spark,
-                status: ValidatorStatus::Active,
-                registered_epoch: 0,
-                last_active_epoch: 0,
-                slashed_offense_id: None,
-                commission_bps: DEFAULT_COMMISSION_BPS,
-                pending_commission_bps: None,
-                pending_commission_effective_epoch: None,
-                min_delegation_spark: DUST_LIMIT_SPARK,
-                auto_delegate_to: None,
-                network_addr: None,
-                network_addr_last_updated_epoch: None,
-                cold_hybrid_classical_pk: Some(cold_public.classical.0),
-                cold_hybrid_pq_pk: Some(cold_public.pq.0),
-                cold_key_version: 1,
-                cold_nonce: 0,
-            })
-            .unwrap();
+                .state
+                .validators
+                .upsert(ValidatorEntry {
+                    validator_id,
+                    name: validator_name,
+                    hybrid_classical_pk: Some(public.classical.0),
+                    hybrid_pq_pk: Some(public.pq.0.to_vec()),
+                    vrf_pk: Some(vrf_pk),
+                    vrf_key_activation_epoch: 0,
+                    pending_vrf_pk: None,
+                    pending_vrf_activation_epoch: None,
+                    stake_spark,
+                    status: ValidatorStatus::Active,
+                    registered_epoch: 0,
+                    last_active_epoch: 0,
+                    slashed_offense_id: None,
+                    commission_bps: DEFAULT_COMMISSION_BPS,
+                    pending_commission_bps: None,
+                    pending_commission_effective_epoch: None,
+                    min_delegation_spark: DUST_LIMIT_SPARK,
+                    auto_delegate_to: None,
+                    network_addr: None,
+                    network_addr_last_updated_epoch: None,
+                    cold_hybrid_classical_pk: Some(cold_public.classical.0),
+                    cold_hybrid_pq_pk: Some(cold_public.pq.0),
+                    cold_key_version: 1,
+                    cold_nonce: 0,
+                })
+                .unwrap();
         }
         if engine.state.height == 0 && !already_registered {
             crate::genesis::finalize_test_genesis(&mut engine.state);
@@ -2090,7 +2096,12 @@ mod tests {
         let genesis_path = dir.join("genesis.toml");
         let genesis = crate::genesis::test_genesis_toml_single_authority(
             "indra-testnet-1",
-            &[(seed, seed, seed), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
+            &[
+                (seed, seed, seed),
+                ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+                ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+                ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+            ],
         );
         std::fs::write(&genesis_path, genesis).unwrap();
         genesis_path.to_string_lossy().to_string()
@@ -2431,9 +2442,31 @@ mod tests {
         );
         SlashEvidenceV1 {
             validator_id,
-            vote_1: produce_vote(indra_consensus::vote::VoteRequest { height, round: round_1, step: step_1, block_hash: hash_1, validator_id, snapshot_root: Bytes32::ZERO, chain_id: &engine.state.chain_id }, keypair)
+            vote_1: produce_vote(
+                indra_consensus::vote::VoteRequest {
+                    height,
+                    round: round_1,
+                    step: step_1,
+                    block_hash: hash_1,
+                    validator_id,
+                    snapshot_root: Bytes32::ZERO,
+                    chain_id: &engine.state.chain_id,
+                },
+                keypair,
+            )
             .unwrap(),
-            vote_2: produce_vote(indra_consensus::vote::VoteRequest { height, round: round_2, step: step_2, block_hash: hash_2, validator_id, snapshot_root: Bytes32::ZERO, chain_id: &engine.state.chain_id }, keypair)
+            vote_2: produce_vote(
+                indra_consensus::vote::VoteRequest {
+                    height,
+                    round: round_2,
+                    step: step_2,
+                    block_hash: hash_2,
+                    validator_id,
+                    snapshot_root: Bytes32::ZERO,
+                    chain_id: &engine.state.chain_id,
+                },
+                keypair,
+            )
             .unwrap(),
         }
     }
@@ -2624,7 +2657,18 @@ mod tests {
         let votes = validators
             .iter()
             .map(|(validator_id, _, signer, _)| {
-                produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: value_hash, validator_id: *validator_id, snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
+                produce_vote(
+                    indra_consensus::vote::VoteRequest {
+                        height,
+                        round,
+                        step: VoteStep::Precommit,
+                        block_hash: value_hash,
+                        validator_id: *validator_id,
+                        snapshot_root,
+                        chain_id: TEST_CHAIN_ID,
+                    },
+                    signer,
+                )
                 .unwrap()
             })
             .collect::<Vec<_>>();
@@ -2636,7 +2680,11 @@ mod tests {
                 position,
                 pq_pk: public.pq.0.to_vec(),
                 classical_pk: public.classical.0,
-                stake: if *index == 0 { 1_000_000_000_000 } else { DUST_LIMIT_SPARK },
+                stake: if *index == 0 {
+                    1_000_000_000_000
+                } else {
+                    DUST_LIMIT_SPARK
+                },
             })
             .collect::<Vec<_>>();
         let qc = build_qc(
@@ -2759,7 +2807,18 @@ mod tests {
                         &new_snapshot
                     };
                     let voters = NodeEngine::registered_voters_for_height(height, snapshot);
-                    let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::from([height as u8; 32]), validator_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, &signer)
+                    let vote = produce_vote(
+                        indra_consensus::vote::VoteRequest {
+                            height,
+                            round: 0,
+                            step: VoteStep::Prevote,
+                            block_hash: Bytes32::from([height as u8; 32]),
+                            validator_id,
+                            snapshot_root: snapshot.snapshot_root,
+                            chain_id: TEST_CHAIN_ID,
+                        },
+                        &signer,
+                    )
                     .unwrap();
                     let mut collector = indra_consensus::vote::VoteCollector::new(
                         height,
@@ -2797,7 +2856,18 @@ mod tests {
                     &signer.public_key().classical.0,
                     &signer.public_key().pq.0,
                 );
-                produce_vote(indra_consensus::vote::VoteRequest { height, round: 0, step: VoteStep::Precommit, block_hash, validator_id, snapshot_root: snapshot.snapshot_root, chain_id: TEST_CHAIN_ID }, signer)
+                produce_vote(
+                    indra_consensus::vote::VoteRequest {
+                        height,
+                        round: 0,
+                        step: VoteStep::Precommit,
+                        block_hash,
+                        validator_id,
+                        snapshot_root: snapshot.snapshot_root,
+                        chain_id: TEST_CHAIN_ID,
+                    },
+                    signer,
+                )
                 .unwrap()
             })
             .collect();
@@ -2837,7 +2907,10 @@ mod tests {
         engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 40;
         engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 30;
         engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 30;
-        let d_id = indra_core::types::crypto::hybrid_identity_id(&d.public_key().classical.0, &d.public_key().pq.0);
+        let d_id = indra_core::types::crypto::hybrid_identity_id(
+            &d.public_key().classical.0,
+            &d.public_key().pq.0,
+        );
         engine.state.validators.get_mut(&d_id).unwrap().stake_spark = 1;
         let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
         let block_hash = Bytes32::from([0xA1; 32]);
@@ -2880,7 +2953,10 @@ mod tests {
         engine.state.validators.get_mut(&a_id).unwrap().stake_spark = 20;
         engine.state.validators.get_mut(&b_id).unwrap().stake_spark = 40;
         engine.state.validators.get_mut(&c_id).unwrap().stake_spark = 40;
-        let d_id = indra_core::types::crypto::hybrid_identity_id(&d.public_key().classical.0, &d.public_key().pq.0);
+        let d_id = indra_core::types::crypto::hybrid_identity_id(
+            &d.public_key().classical.0,
+            &d.public_key().pq.0,
+        );
         engine.state.validators.get_mut(&d_id).unwrap().stake_spark = 1;
         let snapshot = engine.state.build_genesis_consensus_snapshot().unwrap();
         let qc = qc_from_test_signers(1, Bytes32::from([0xA2; 32]), &snapshot, &[&a]);
@@ -2993,7 +3069,19 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA1; 32], "slash-dedupe");
-        let evidence = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0xA1; 32]), hash_2: Bytes32::from([0xA2; 32]) });
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0xA1; 32]),
+                hash_2: Bytes32::from([0xA2; 32]),
+            },
+        );
         engine.add_slash_evidence(evidence.clone()).unwrap();
         engine.add_slash_evidence(evidence).unwrap();
         assert_eq!(engine.pending_slashes.len(), 1);
@@ -3007,19 +3095,67 @@ mod tests {
         let keypair = install_active_validator(&mut engine, [0xA2; 32], "slash-shape");
         let cases = [
             (
-                signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 1, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([1; 32]), hash_2: Bytes32::from([2; 32]) }),
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    SignedSlashEvidenceInput {
+                        height: 1,
+                        round_1: 0,
+                        round_2: 1,
+                        step_1: VoteStep::Precommit,
+                        step_2: VoteStep::Precommit,
+                        hash_1: Bytes32::from([1; 32]),
+                        hash_2: Bytes32::from([2; 32]),
+                    },
+                ),
                 "same height and round",
             ),
             (
-                signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Prevote, step_2: VoteStep::Precommit, hash_1: Bytes32::from([3; 32]), hash_2: Bytes32::from([4; 32]) }),
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    SignedSlashEvidenceInput {
+                        height: 1,
+                        round_1: 0,
+                        round_2: 0,
+                        step_1: VoteStep::Prevote,
+                        step_2: VoteStep::Precommit,
+                        hash_1: Bytes32::from([3; 32]),
+                        hash_2: Bytes32::from([4; 32]),
+                    },
+                ),
                 "must both be precommits or both be prevotes",
             ),
             (
-                signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([5; 32]), hash_2: Bytes32::from([5; 32]) }),
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    SignedSlashEvidenceInput {
+                        height: 1,
+                        round_1: 0,
+                        round_2: 0,
+                        step_1: VoteStep::Precommit,
+                        step_2: VoteStep::Precommit,
+                        hash_1: Bytes32::from([5; 32]),
+                        hash_2: Bytes32::from([5; 32]),
+                    },
+                ),
                 "same block hash",
             ),
             (
-                signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::ZERO, hash_2: Bytes32::from([6; 32]) }),
+                signed_slash_evidence(
+                    &engine,
+                    &keypair,
+                    SignedSlashEvidenceInput {
+                        height: 1,
+                        round_1: 0,
+                        round_2: 0,
+                        step_1: VoteStep::Precommit,
+                        step_2: VoteStep::Precommit,
+                        hash_1: Bytes32::ZERO,
+                        hash_2: Bytes32::from([6; 32]),
+                    },
+                ),
                 "nil vote",
             ),
         ];
@@ -3028,7 +3164,19 @@ mod tests {
             assert!(error.contains(expected), "unexpected error: {error}");
         }
 
-        let mut bad_signature = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([7; 32]), hash_2: Bytes32::from([8; 32]) });
+        let mut bad_signature = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([7; 32]),
+                hash_2: Bytes32::from([8; 32]),
+            },
+        );
         bad_signature.vote_1.signature = dummy_signature();
         let error = engine
             .add_slash_evidence(bad_signature)
@@ -3044,7 +3192,19 @@ mod tests {
         let dir = temp_dir("slash_pool_capacity");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA3; 32], "slash-cap");
-        let evidence = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([9; 32]), hash_2: Bytes32::from([10; 32]) });
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([9; 32]),
+                hash_2: Bytes32::from([10; 32]),
+            },
+        );
         let template = proof_carrying_slash(&engine, &evidence);
         engine.pending_slashes = (0..MAX_PENDING_SLASH_EVIDENCE)
             .map(|index| {
@@ -3067,8 +3227,32 @@ mod tests {
         let dir = temp_dir("slash_same_validator_conflict");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA4; 32], "slash-conflict");
-        let first = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x11; 32]), hash_2: Bytes32::from([0x12; 32]) });
-        let second = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 1, round_2: 1, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x13; 32]), hash_2: Bytes32::from([0x14; 32]) });
+        let first = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x11; 32]),
+                hash_2: Bytes32::from([0x12; 32]),
+            },
+        );
+        let second = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 1,
+                round_2: 1,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x13; 32]),
+                hash_2: Bytes32::from([0x14; 32]),
+            },
+        );
         engine.pending_slashes = vec![
             proof_carrying_slash(&engine, &first),
             proof_carrying_slash(&engine, &second),
@@ -3087,7 +3271,19 @@ mod tests {
         let dir = temp_dir("slash_v2_outlives_snapshot");
         let mut engine = NodeEngine::init(NodeConfig::local_test(dir.clone())).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA5; 32], "slash-v2");
-        let evidence = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x21; 32]), hash_2: Bytes32::from([0x22; 32]) });
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x21; 32]),
+                hash_2: Bytes32::from([0x22; 32]),
+            },
+        );
         engine.add_slash_evidence(evidence).unwrap();
         assert_eq!(engine.pending_slashes.len(), 1);
 
@@ -3127,7 +3323,19 @@ mod tests {
             &slash_key.public_key().classical.0,
             &slash_key.public_key().pq.0,
         );
-        let slash = signed_slash_evidence(&engine, &slash_key, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x31; 32]), hash_2: Bytes32::from([0x32; 32]) });
+        let slash = signed_slash_evidence(
+            &engine,
+            &slash_key,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x31; 32]),
+                hash_2: Bytes32::from([0x32; 32]),
+            },
+        );
         engine.add_slash_evidence(slash).unwrap();
 
         let staking_id = indra_core::types::crypto::hybrid_identity_id(
@@ -3304,13 +3512,16 @@ mod tests {
                 .unwrap();
         }
         let full_cycle_started = Instant::now();
-        engine.mempool.apply_canonical_effects(
-            &engine.state,
-            &indra_state::CanonicalStateEffects {
-                base_fee_changed: true,
-                ..Default::default()
-            },
-        ).unwrap();
+        engine
+            .mempool
+            .apply_canonical_effects(
+                &engine.state,
+                &indra_state::CanonicalStateEffects {
+                    base_fee_changed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let transaction_full_pool_cycle = full_cycle_started.elapsed();
         assert_eq!(engine.mempool.len(), 5_000);
 
@@ -3538,7 +3749,19 @@ mod tests {
         assert_eq!(governance_engine.governance_mempool.len(), 2_400);
 
         let slash_key = install_active_validator(&mut engine, [0xC4; 32], "bench-slash");
-        let slash = signed_slash_evidence(&engine, &slash_key, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x41; 32]), hash_2: Bytes32::from([0x42; 32]) });
+        let slash = signed_slash_evidence(
+            &engine,
+            &slash_key,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x41; 32]),
+                hash_2: Bytes32::from([0x42; 32]),
+            },
+        );
         let slash = proof_carrying_slash(&engine, &slash);
         let started = Instant::now();
         for _ in 0..1_024 {
@@ -3598,7 +3821,19 @@ mod tests {
             left[31] = 0xE1;
             let mut right = left;
             right[31] = 0xE2;
-            let evidence = signed_slash_evidence(&slash_engine, keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from(left), hash_2: Bytes32::from(right) });
+            let evidence = signed_slash_evidence(
+                &slash_engine,
+                keypair,
+                SignedSlashEvidenceInput {
+                    height: 1,
+                    round_1: 0,
+                    round_2: 0,
+                    step_1: VoteStep::Precommit,
+                    step_2: VoteStep::Precommit,
+                    hash_1: Bytes32::from(left),
+                    hash_2: Bytes32::from(right),
+                },
+            );
             slash_engine.add_slash_evidence(evidence).unwrap();
         }
         assert_eq!(slash_engine.pending_slashes.len(), 200);
@@ -3624,7 +3859,19 @@ mod tests {
         let config = NodeConfig::local_test(dir.clone());
         let mut engine = NodeEngine::init(config).unwrap();
         let keypair = install_active_validator(&mut engine, [0xA5; 32], "slash-applied");
-        let evidence = signed_slash_evidence(&engine, &keypair, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0xA4; 32]), hash_2: Bytes32::from([0xA5; 32]) });
+        let evidence = signed_slash_evidence(
+            &engine,
+            &keypair,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0xA4; 32]),
+                hash_2: Bytes32::from([0xA5; 32]),
+            },
+        );
         let snapshot = engine.state.snapshot_for_consensus_height(1).unwrap();
         let (position, _) = snapshot
             .entry_with_position(&evidence.validator_id)
@@ -4075,7 +4322,12 @@ mod tests {
         let genesis_path = config.genesis_path.as_ref().unwrap();
         let genesis = crate::genesis::test_genesis_toml_single_authority(
             "indra-custom-testnet",
-            &[([0x42; 32], [0x42; 32], [0x42; 32]), ([0xB2; 32], [0xB2; 32], [0xB2; 32]), ([0xC3; 32], [0xC3; 32], [0xC3; 32]), ([0xD4; 32], [0xD4; 32], [0xD4; 32])],
+            &[
+                ([0x42; 32], [0x42; 32], [0x42; 32]),
+                ([0xB2; 32], [0xB2; 32], [0xB2; 32]),
+                ([0xC3; 32], [0xC3; 32], [0xC3; 32]),
+                ([0xD4; 32], [0xD4; 32], [0xD4; 32]),
+            ],
         );
         std::fs::write(genesis_path, genesis).unwrap();
 
@@ -4193,10 +4445,8 @@ mod tests {
         }
 
         let state_store = StateStore::open(&state_dir).unwrap();
-        let mut snapshot = crate::genesis::build_finalized_genesis_state(
-            config.genesis_path.as_deref(),
-        )
-        .unwrap();
+        let mut snapshot =
+            crate::genesis::build_finalized_genesis_state(config.genesis_path.as_deref()).unwrap();
         snapshot.height = 10;
         snapshot.tip_hash = Bytes32::from([0x55; 32]);
         state_store.save(&snapshot).unwrap();
@@ -4837,8 +5087,14 @@ mod tests {
         };
         let tx_a = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x71);
         let tx_b = valid_tx_spending(&engine, tx_utxo, &tx_owner, [0; 32], 0x72);
-        engine.mempool.insert_unchecked_for_test(tx_a.clone(), 0).unwrap();
-        engine.mempool.insert_unchecked_for_test(tx_b.clone(), 0).unwrap();
+        engine
+            .mempool
+            .insert_unchecked_for_test(tx_a.clone(), 0)
+            .unwrap();
+        engine
+            .mempool
+            .insert_unchecked_for_test(tx_b.clone(), 0)
+            .unwrap();
         let expected_tx = engine.mempool.select_for_block(1, 0)[0].tx.clone();
 
         // Duplicate staking candidates are individually valid against pre-state.
@@ -4855,8 +5111,32 @@ mod tests {
         engine.governance_mempool = vec![governance.clone(), governance.clone()];
 
         // Two valid equivocations target the same validator.
-        let slash_a = signed_slash_evidence(&engine, &proposer, SignedSlashEvidenceInput { height: 1, round_1: 0, round_2: 0, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x81; 32]), hash_2: Bytes32::from([0x82; 32]) });
-        let slash_b = signed_slash_evidence(&engine, &proposer, SignedSlashEvidenceInput { height: 1, round_1: 1, round_2: 1, step_1: VoteStep::Precommit, step_2: VoteStep::Precommit, hash_1: Bytes32::from([0x83; 32]), hash_2: Bytes32::from([0x84; 32]) });
+        let slash_a = signed_slash_evidence(
+            &engine,
+            &proposer,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 0,
+                round_2: 0,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x81; 32]),
+                hash_2: Bytes32::from([0x82; 32]),
+            },
+        );
+        let slash_b = signed_slash_evidence(
+            &engine,
+            &proposer,
+            SignedSlashEvidenceInput {
+                height: 1,
+                round_1: 1,
+                round_2: 1,
+                step_1: VoteStep::Precommit,
+                step_2: VoteStep::Precommit,
+                hash_1: Bytes32::from([0x83; 32]),
+                hash_2: Bytes32::from([0x84; 32]),
+            },
+        );
         engine.pending_slashes = vec![
             proof_carrying_slash(&engine, &slash_a),
             proof_carrying_slash(&engine, &slash_b),

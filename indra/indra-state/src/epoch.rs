@@ -122,11 +122,11 @@ pub fn apply_epoch_transition(
     }
     let selector = reward_selector_from_signers(reward_signer_ids);
     match apply_epoch_transition_at_height_with_selector(state, context, timestamp_secs, &selector)
-    .and_then(|record| {
-        state.refresh_and_reconcile_monetary_state()?;
-        state.rebuild_state_commitment_v2(context.boundary_height)?;
-        Ok(record)
-    }) {
+        .and_then(|record| {
+            state.refresh_and_reconcile_monetary_state()?;
+            state.rebuild_state_commitment_v2(context.boundary_height)?;
+            Ok(record)
+        }) {
         Ok(record) => Ok(record),
         Err(error) => {
             *state = before;
@@ -170,11 +170,7 @@ pub(crate) fn apply_epoch_transition_at_height_with_selector(
 /// Mint and allocate the unique reward authorized for `height`.
 #[cfg(test)]
 pub(crate) fn apply_block_reward_issuance(state: &mut ChainState, height: u64) -> StateResult<u64> {
-    apply_block_reward_issuance_with_selector(
-        state,
-        height,
-        &RewardRecipientSelector::AllMembers,
-    )
+    apply_block_reward_issuance_with_selector(state, height, &RewardRecipientSelector::AllMembers)
 }
 
 /// Mint and allocate the block reward to verified QC signers, falling back to
@@ -1336,13 +1332,13 @@ pub fn epoch_for_height(height: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::{
         compute_state_root,
         governance::{GovernanceRedelegation, ProposalRecord, VoteCommit, VoteReveal},
         validator::{ValidatorEntry, ValidatorStatus},
     };
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::Encode,
         types::{
@@ -1686,8 +1682,7 @@ mod tests {
             delegator_id,
             custody,
             Some(
-                indra_core::types::stake_position::ActiveStakeAggregateV1::new(100, 0, 0)
-                    .unwrap(),
+                indra_core::types::stake_position::ActiveStakeAggregateV1::new(100, 0, 0).unwrap(),
             ),
             0,
             0,
@@ -1696,7 +1691,8 @@ mod tests {
         state.stake_positions.insert(position.position_id, position);
         state.rebuild_position_tranche_index().unwrap();
         let snapshot = state.build_genesis_consensus_snapshot().unwrap();
-        state.reward_economic_snapshot = Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
+        state.reward_economic_snapshot =
+            Some(state.build_reward_economic_snapshot(&snapshot).unwrap());
         state.consensus_snapshots = vec![snapshot];
         distribute_block_rewards_with_selector(
             &mut state,
@@ -1737,7 +1733,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ids.iter().map(|id| pending_reward(&state, *id)).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|id| pending_reward(&state, *id))
+                .collect::<Vec<_>>(),
             vec![10, 20, 30, 40]
         );
     }
@@ -1754,7 +1752,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ids.iter().map(|id| pending_reward(&state, *id)).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|id| pending_reward(&state, *id))
+                .collect::<Vec<_>>(),
             vec![10, 20, 30, 40]
         );
     }
@@ -1857,7 +1857,9 @@ mod tests {
         assert_eq!(pending_reward(&state, ids[2]), 297);
         assert_eq!(pending_reward(&state, ids[3]), 297);
         assert_eq!(
-            ids.iter().map(|id| pending_reward(&state, *id)).sum::<u64>(),
+            ids.iter()
+                .map(|id| pending_reward(&state, *id))
+                .sum::<u64>(),
             1_200
         );
     }
@@ -1871,7 +1873,10 @@ mod tests {
             distribute_block_rewards_with_selector(state, 101, 0, 1, &selector).unwrap();
         }
         assert_eq!(first, second);
-        assert_eq!(crate::compute_state_root(&first), crate::compute_state_root(&second));
+        assert_eq!(
+            crate::compute_state_root(&first),
+            crate::compute_state_root(&second)
+        );
     }
 
     #[test]
@@ -1914,9 +1919,7 @@ mod tests {
 
         all_samples.sort_unstable();
         signer_samples.sort_unstable();
-        let mean = |samples: &[u128]| {
-            samples.iter().sum::<u128>() as f64 / samples.len() as f64
-        };
+        let mean = |samples: &[u128]| samples.iter().sum::<u128>() as f64 / samples.len() as f64;
         let p99 = |samples: &[u128]| samples[(samples.len() * 99) / 100];
         println!(
             "QC_REWARD_TIMING all_members_mean_us={:.3} all_members_p99_us={}",

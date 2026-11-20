@@ -310,8 +310,8 @@ fn build_keys_file(
 
 /// Generate a complete canonical keystore from one 32-byte master seed.
 pub fn generate_from_master_seed(name: String, master_seed: [u8; 32]) -> KeystoreResult<KeysFile> {
-    let derived = derive_all_seeds(&master_seed)
-        .map_err(|error| KeystoreError::Crypto(error.to_string()))?;
+    let derived =
+        derive_all_seeds(&master_seed).map_err(|error| KeystoreError::Crypto(error.to_string()))?;
     build_keys_file(
         name,
         derived.ed25519_seed,

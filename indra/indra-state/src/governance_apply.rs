@@ -506,13 +506,11 @@ fn apply_execute(
         .iter()
         .position(|exec| exec.proposal_id == *proposal_id)
         .ok_or(StateError::GovernanceProposalNotFound)?;
-    let exec = state
-        .governance
-        .queued_executions
-        .get(exec_index)
-        .ok_or(StateError::InvariantViolation {
+    let exec = state.governance.queued_executions.get(exec_index).ok_or(
+        StateError::InvariantViolation {
             message: "queued execution index invalid before validation",
-        })?;
+        },
+    )?;
     if exec.executed {
         return invalid("proposal already executed");
     }
@@ -613,7 +611,8 @@ fn apply_governance_nonce(
         let cold_nonce = op
             .cold_authorization()
             .ok_or_else(|| StateError::InvalidGovernanceOp {
-                reason: "cold authorization missing for cold-authorized governance operation".into(),
+                reason: "cold authorization missing for cold-authorized governance operation"
+                    .into(),
             })?
             .cold_nonce;
         let validator = state
@@ -938,8 +937,8 @@ fn invalid<T>(reason: impl Into<String>) -> StateResult<T> {
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::Encode,
         types::{
@@ -1894,8 +1893,8 @@ mod tests {
         let replay = |state: &mut ChainState| {
             apply_governance_op(state, &cold_propose, 0, u64::MAX, TEST_CHAIN_ID).unwrap();
             apply_staking_op(state, &cold_commission, TEST_CHAIN_ID, u64::MAX).unwrap();
-            let error = apply_governance_op(state, &hot_propose, 0, u64::MAX, TEST_CHAIN_ID)
-                .unwrap_err();
+            let error =
+                apply_governance_op(state, &hot_propose, 0, u64::MAX, TEST_CHAIN_ID).unwrap_err();
             assert!(matches!(
                 error,
                 StateError::InvalidGovernanceOp { reason }

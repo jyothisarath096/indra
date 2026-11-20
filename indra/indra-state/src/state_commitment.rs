@@ -127,11 +127,10 @@ impl StateCommitmentV2 {
     }
 
     fn from_leaf_pairs(leaves: Vec<([u8; 32], [u8; 32])>) -> StateResult<Self> {
-        let tree = PersistentAuthTree::from_pairs(leaves).map_err(|_| {
-            StateError::InvariantViolation {
+        let tree =
+            PersistentAuthTree::from_pairs(leaves).map_err(|_| StateError::InvariantViolation {
                 message: "duplicate StateCommitmentV2 key",
-            }
-        })?;
+            })?;
         Ok(Self { tree })
     }
 
@@ -193,7 +192,11 @@ impl StateCommitmentV2 {
 
     /// Insert a slash-evidence hash leaf.
     /// Insert or replace a delegator identity-registry leaf.
-    pub fn put_delegator_identity(&mut self, delegator_id: &Bytes32, pubkey: &HybridPubKey) -> StateResult<()> {
+    pub fn put_delegator_identity(
+        &mut self,
+        delegator_id: &Bytes32,
+        pubkey: &HybridPubKey,
+    ) -> StateResult<()> {
         self.tree.insert(
             delegator_identity_key(delegator_id),
             delegator_identity_value_hash(delegator_id, pubkey),
@@ -211,7 +214,10 @@ impl StateCommitmentV2 {
     }
 
     /// Insert or replace an evicted-validator tombstone leaf.
-    pub fn put_evicted_validator_tombstone(&mut self, tombstone: &EvictedValidatorTombstoneV2) -> StateResult<()> {
+    pub fn put_evicted_validator_tombstone(
+        &mut self,
+        tombstone: &EvictedValidatorTombstoneV2,
+    ) -> StateResult<()> {
         self.tree.insert(
             evicted_validator_tombstone_key(&tombstone.validator_id),
             evicted_validator_tombstone_value_hash(tombstone),
@@ -220,7 +226,10 @@ impl StateCommitmentV2 {
     }
 
     /// Delete an evicted-validator tombstone leaf.
-    pub fn delete_evicted_validator_tombstone(&mut self, validator_id: &Bytes32) -> StateResult<()> {
+    pub fn delete_evicted_validator_tombstone(
+        &mut self,
+        validator_id: &Bytes32,
+    ) -> StateResult<()> {
         self.tree
             .delete(evicted_validator_tombstone_key(validator_id))?;
         Ok(())
@@ -406,9 +415,9 @@ pub(crate) fn delegator_identity_value_hash(
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::smt::CompressedAuthTree;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         codec::{Decode, Encode},
         types::{
@@ -426,8 +435,9 @@ mod tests {
     #[test]
     fn state_commitment_rejects_duplicate_leaf_keys() {
         let key = id(0xD1).0;
-        let error = StateCommitmentV2::from_leaf_pairs_for_test(vec![(key, [1; 32]), (key, [2; 32])])
-            .unwrap_err();
+        let error =
+            StateCommitmentV2::from_leaf_pairs_for_test(vec![(key, [1; 32]), (key, [2; 32])])
+                .unwrap_err();
         assert!(matches!(
             error,
             StateError::InvariantViolation {
@@ -506,18 +516,24 @@ mod tests {
             consensus_snapshot(1, 0, 1_000_000_000),
             consensus_snapshot(301, 300, 2_000_000_000),
         ];
-        let baseline = StateCommitmentV2::from_state(&state, height).unwrap().root();
+        let baseline = StateCommitmentV2::from_state(&state, height)
+            .unwrap()
+            .root();
 
         let mut changed_previous = state.clone();
         changed_previous.consensus_snapshots[0] = consensus_snapshot(1, 0, 1_000_000_001);
         assert_ne!(
-            StateCommitmentV2::from_state(&changed_previous, height).unwrap().root(),
+            StateCommitmentV2::from_state(&changed_previous, height)
+                .unwrap()
+                .root(),
             baseline
         );
         let mut changed_current = state.clone();
         changed_current.consensus_snapshots[1] = consensus_snapshot(301, 300, 2_000_000_001);
         assert_ne!(
-            StateCommitmentV2::from_state(&changed_current, height).unwrap().root(),
+            StateCommitmentV2::from_state(&changed_current, height)
+                .unwrap()
+                .root(),
             baseline
         );
 
@@ -526,7 +542,9 @@ mod tests {
         unrelated.monetary_ledger.epoch_slash_burned_spark = 88;
         unrelated.epoch_slash_event_count = 7;
         assert_eq!(
-            StateCommitmentV2::from_state(&unrelated, height).unwrap().root(),
+            StateCommitmentV2::from_state(&unrelated, height)
+                .unwrap()
+                .root(),
             baseline
         );
 
@@ -551,7 +569,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let baseline = StateCommitmentV2::from_state(&state, height).unwrap().root();
+        let baseline = StateCommitmentV2::from_state(&state, height)
+            .unwrap()
+            .root();
 
         let mut changed = state.clone();
         changed.reward_economic_snapshot = Some(
@@ -564,14 +584,18 @@ mod tests {
             .unwrap(),
         );
         assert_ne!(
-            StateCommitmentV2::from_state(&changed, height).unwrap().root(),
+            StateCommitmentV2::from_state(&changed, height)
+                .unwrap()
+                .root(),
             baseline
         );
 
         let mut unrelated = state.clone();
         unrelated.monetary_ledger.epoch_fee_burned_spark = 99;
         assert_eq!(
-            StateCommitmentV2::from_state(&unrelated, height).unwrap().root(),
+            StateCommitmentV2::from_state(&unrelated, height)
+                .unwrap()
+                .root(),
             baseline
         );
         assert_ne!(
@@ -589,19 +613,25 @@ mod tests {
             activation_height: height,
             membership_root: id(0xC1),
         }];
-        let baseline = StateCommitmentV2::from_state(&state, height).unwrap().root();
+        let baseline = StateCommitmentV2::from_state(&state, height)
+            .unwrap()
+            .root();
 
         let mut changed = state.clone();
         changed.slash_membership_roots[0].membership_root = id(0xC2);
         assert_ne!(
-            StateCommitmentV2::from_state(&changed, height).unwrap().root(),
+            StateCommitmentV2::from_state(&changed, height)
+                .unwrap()
+                .root(),
             baseline
         );
 
         let mut unrelated = state.clone();
         unrelated.monetary_ledger.epoch_fee_burned_spark = 99;
         assert_eq!(
-            StateCommitmentV2::from_state(&unrelated, height).unwrap().root(),
+            StateCommitmentV2::from_state(&unrelated, height)
+                .unwrap()
+                .root(),
             baseline
         );
         assert_ne!(
@@ -747,12 +777,16 @@ mod tests {
             state
                 .delegator_identities
                 .insert(delegator_id, identity.clone());
-            incremental.put_delegator_identity(&delegator_id, &identity).unwrap();
+            incremental
+                .put_delegator_identity(&delegator_id, &identity)
+                .unwrap();
         }
 
         assert_eq!(
             incremental.root(),
-            StateCommitmentV2::from_state(&state, height).unwrap().root()
+            StateCommitmentV2::from_state(&state, height)
+                .unwrap()
+                .root()
         );
         assert_eq!(
             incremental.root(),
@@ -776,7 +810,8 @@ mod tests {
             .state_commitment_v2
             .as_mut()
             .unwrap()
-            .put_delegator_identity(&delegator_id, &identity).unwrap();
+            .put_delegator_identity(&delegator_id, &identity)
+            .unwrap();
         let inserted_root = state.state_commitment_v2_root(height);
         assert_ne!(empty_root, inserted_root);
 
@@ -788,7 +823,8 @@ mod tests {
             .state_commitment_v2
             .as_mut()
             .unwrap()
-            .put_delegator_identity(&delegator_id, &updated_identity).unwrap();
+            .put_delegator_identity(&delegator_id, &updated_identity)
+            .unwrap();
         assert_ne!(inserted_root, state.state_commitment_v2_root(height));
 
         let identity_key = delegator_identity_key(&delegator_id);
@@ -821,7 +857,8 @@ mod tests {
                 .state_commitment_v2
                 .as_mut()
                 .unwrap()
-                .put_delegator_identity(&transient_id, &transient_identity).unwrap();
+                .put_delegator_identity(&transient_id, &transient_identity)
+                .unwrap();
             assert_ne!(txn.state().state_commitment_v2_root(height), baseline_root);
         }
 
@@ -926,7 +963,9 @@ mod tests {
         let height = u64::MAX;
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         state.height = height;
-        let baseline = StateCommitmentV2::from_state(&state, height).unwrap().root();
+        let baseline = StateCommitmentV2::from_state(&state, height)
+            .unwrap()
+            .root();
         let validator_id = id(0xED);
         let tombstone = EvictedValidatorTombstoneV2 {
             validator_id,
@@ -943,13 +982,20 @@ mod tests {
         state
             .evicted_validator_tombstones
             .insert(validator_id, tombstone.clone());
-        let rebuilt = StateCommitmentV2::from_state(&state, height).unwrap().root();
+        let rebuilt = StateCommitmentV2::from_state(&state, height)
+            .unwrap()
+            .root();
         assert_ne!(rebuilt, baseline);
 
-        let mut incremental = StateCommitmentV2::from_state(&ChainState::new_genesis(TEST_CHAIN_ID), height).unwrap();
-        incremental.put_evicted_validator_tombstone(&tombstone).unwrap();
+        let mut incremental =
+            StateCommitmentV2::from_state(&ChainState::new_genesis(TEST_CHAIN_ID), height).unwrap();
+        incremental
+            .put_evicted_validator_tombstone(&tombstone)
+            .unwrap();
         assert_eq!(incremental.root(), rebuilt);
-        incremental.delete_evicted_validator_tombstone(&validator_id).unwrap();
+        incremental
+            .delete_evicted_validator_tombstone(&validator_id)
+            .unwrap();
         assert_eq!(incremental.root(), baseline);
     }
 

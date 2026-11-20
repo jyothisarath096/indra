@@ -19,8 +19,8 @@ use indra_core::codec::{Decode, Encode};
 use indra_core::types::{
     block::{BlockProposalVNext, BlockVNext},
     primitives::{
-        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32,
-        MAX_ACCEPTED_ROUND_JUMP, MAX_ROUNDS_PER_HEIGHT,
+        has_strict_two_thirds_quorum, validate_consensus_round, Bytes32, MAX_ACCEPTED_ROUND_JUMP,
+        MAX_ROUNDS_PER_HEIGHT,
     },
     proposal::verify_proposal,
     qc::QuorumCertificateV1,
@@ -944,7 +944,7 @@ impl ConsensusDriver {
                             );
                             eprintln!("[vote_safety] CRITICAL: {message}");
                             self.vote_safety_unavailable = Some(message);
-                            return Ok(())
+                            return Ok(());
                         }
                     };
                     eprintln!(
@@ -994,7 +994,8 @@ impl ConsensusDriver {
         let height = self.next_height();
         let min_round = self.current_round.saturating_sub(MAX_ACCEPTED_ROUND_JUMP);
         let max_round = self
-            .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+            .current_round
+            .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
             .min(MAX_ROUNDS_PER_HEIGHT - 1);
         self.round_advance_evidence
             .retain(|(h, round), _| *h == height && *round >= min_round && *round <= max_round);
@@ -1068,7 +1069,9 @@ impl ConsensusDriver {
             else {
                 return false;
             };
-            supported_stake.checked_mul(3).is_some_and(|stake| stake > total_stake)
+            supported_stake
+                .checked_mul(3)
+                .is_some_and(|stake| stake > total_stake)
         })
     }
 
@@ -1088,7 +1091,9 @@ impl ConsensusDriver {
             return Vec::new();
         }
         if let Err(error) = self.apply_vote_safety() {
-            eprintln!("[vote_safety] CRITICAL: failed after stake-supported round advance: {error}");
+            eprintln!(
+                "[vote_safety] CRITICAL: failed after stake-supported round advance: {error}"
+            );
             return Vec::new();
         }
         self.prune_stalled_collections();
@@ -1832,7 +1837,8 @@ impl ConsensusDriver {
             || validate_consensus_round(target_round).is_err()
             || target_round
                 > self
-                    .current_round.saturating_add(MAX_ACCEPTED_ROUND_JUMP)
+                    .current_round
+                    .saturating_add(MAX_ACCEPTED_ROUND_JUMP)
                     .min(MAX_ROUNDS_PER_HEIGHT - 1)
         {
             return Vec::new();

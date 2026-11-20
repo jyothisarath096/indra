@@ -736,16 +736,15 @@ impl Message {
                         reason: "invalid status tip hash".to_string(),
                     })?;
                 let height = u64::from_le_bytes(height_bytes);
-                let round_bytes: [u8; 4] =
-                    payload
-                        .get(40..44)
-                        .ok_or(NetworkError::DecodeFailed {
-                            reason: "invalid status round".to_string(),
-                        })?
-                        .try_into()
-                        .map_err(|_| NetworkError::DecodeFailed {
-                            reason: "invalid status round".to_string(),
-                        })?;
+                let round_bytes: [u8; 4] = payload
+                    .get(40..44)
+                    .ok_or(NetworkError::DecodeFailed {
+                        reason: "invalid status round".to_string(),
+                    })?
+                    .try_into()
+                    .map_err(|_| NetworkError::DecodeFailed {
+                        reason: "invalid status round".to_string(),
+                    })?;
                 let round =
                     validate_consensus_round(u32::from_le_bytes(round_bytes)).map_err(|error| {
                         NetworkError::DecodeFailed {
@@ -1221,7 +1220,10 @@ mod tests {
 
     #[test]
     fn block_wire_decoding_rejects_trailing_bytes() {
-        let mut encoded = Message::Block(Box::new(test_proposal(1))).encode_wire().unwrap()[4..].to_vec();
+        let mut encoded = Message::Block(Box::new(test_proposal(1)))
+            .encode_wire()
+            .unwrap()[4..]
+            .to_vec();
         encoded.push(0xA5);
         assert!(Message::decode_wire(&encoded).is_err());
     }

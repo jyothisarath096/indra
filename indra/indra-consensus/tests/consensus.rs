@@ -281,7 +281,18 @@ fn full_consensus_round() {
     );
 
     for v in &validators {
-        let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id: v.id, snapshot_root: Bytes32::ZERO, chain_id: TEST_CHAIN_ID }, &v.hybrid_kp)
+        let vote = produce_vote(
+            indra_consensus::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.id,
+                snapshot_root: Bytes32::ZERO,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &v.hybrid_kp,
+        )
         .unwrap();
         collector.add_vote(vote).unwrap();
     }
@@ -382,7 +393,18 @@ fn qc_builder_quorum_detection() {
     assert_eq!(builder.current_stake_bps(), 0);
 
     // v1 votes (70%) → quorum reached (need > 2/3)
-    let vote1 = produce_vote(indra_consensus::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v1.id, snapshot_root: Bytes32::ZERO, chain_id: TEST_CHAIN_ID }, &v1.hybrid_kp)
+    let vote1 = produce_vote(
+        indra_consensus::vote::VoteRequest {
+            height: 1,
+            round: 0,
+            step: VoteStep::Precommit,
+            block_hash,
+            validator_id: v1.id,
+            snapshot_root: Bytes32::ZERO,
+            chain_id: TEST_CHAIN_ID,
+        },
+        &v1.hybrid_kp,
+    )
     .unwrap();
     builder.add_precommit(vote1);
     assert!(builder.current_stake_bps() >= 6_667);
@@ -395,9 +417,11 @@ fn strict_qc_verification_accepts_hybrid_qc() {
     use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
     use indra_core::types::qc::{ClassicalVoteSig, QuorumCertificateV1, SIGNER_BITFIELD_BYTES};
 
-    let validators = [TestValidator::new(0x21, 3_400),
+    let validators = [
+        TestValidator::new(0x21, 3_400),
         TestValidator::new(0x22, 3_300),
-        TestValidator::new(0x23, 3_300)];
+        TestValidator::new(0x23, 3_300),
+    ];
     let qc_validators: Vec<QcValidator> = validators
         .iter()
         .enumerate()
@@ -416,7 +440,18 @@ fn strict_qc_verification_accepts_hybrid_qc() {
         .enumerate()
         .for_each(|(position, validator)| {
             signer_bitfield[position / 8] |= 1 << (position % 8);
-            let vote = produce_vote(indra_consensus::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash, validator_id: validator.id, snapshot_root, chain_id: TEST_CHAIN_ID }, &validator.hybrid_kp)
+            let vote = produce_vote(
+                indra_consensus::vote::VoteRequest {
+                    height,
+                    round,
+                    step: VoteStep::Precommit,
+                    block_hash,
+                    validator_id: validator.id,
+                    snapshot_root,
+                    chain_id: TEST_CHAIN_ID,
+                },
+                &validator.hybrid_kp,
+            )
             .unwrap();
             pq_signatures.push(PQVoteSig {
                 validator_id: validator.id,

@@ -650,8 +650,8 @@ pub unsafe extern "C" fn indra_result_copy_tx_bytes(
             if out_len < owned.tx_bytes.len() {
                 return Err(IndraError::BufferTooSmall);
             }
-            let Some(destination) = std::slice::from_raw_parts_mut(out, out_len)
-                .get_mut(..owned.tx_bytes.len())
+            let Some(destination) =
+                std::slice::from_raw_parts_mut(out, out_len).get_mut(..owned.tx_bytes.len())
             else {
                 return Err(IndraError::BufferTooSmall);
             };
@@ -684,8 +684,8 @@ pub unsafe extern "C" fn indra_result_copy_spent_indices(
             if out_len < owned.spent_indices.len() {
                 return Err(IndraError::BufferTooSmall);
             }
-            let Some(destination) = std::slice::from_raw_parts_mut(out, out_len)
-                .get_mut(..owned.spent_indices.len())
+            let Some(destination) =
+                std::slice::from_raw_parts_mut(out, out_len).get_mut(..owned.spent_indices.len())
             else {
                 return Err(IndraError::BufferTooSmall);
             };
@@ -725,7 +725,7 @@ mod handle_tests {
             crypto::HybridPubKey,
             governance::{governance_vote_commit_hash, GovernanceOpV2, GovernancePayload},
             primitives::{
-                Bytes32, VariableBytes, TEST_CHAIN_ID, MINIMUM_VALIDATOR_SELF_STAKE_SPARK,
+                Bytes32, VariableBytes, MINIMUM_VALIDATOR_SELF_STAKE_SPARK, TEST_CHAIN_ID,
             },
             staking::{StakingOp, StakingOpBody},
             transaction::{OutputV1, TransactionV1},
@@ -2170,14 +2170,7 @@ mod handle_tests {
         let tx_guard = [0x5Au8; 16];
         let mut tx_hex = tx_guard.map(|byte| byte as c_char);
         assert_eq!(
-            unsafe {
-                indra_tx_to_hex(
-                    tx_bytes.as_ptr(),
-                    tx_bytes.len(),
-                    tx_hex.as_mut_ptr(),
-                    2,
-                )
-            },
+            unsafe { indra_tx_to_hex(tx_bytes.as_ptr(), tx_bytes.len(), tx_hex.as_mut_ptr(), 2,) },
             IndraError::BufferTooSmall.code()
         );
         assert_eq!(tx_hex, tx_guard.map(|byte| byte as c_char));
@@ -2196,14 +2189,7 @@ mod handle_tests {
         let tx_result_guard = [0x5Au8; 8];
         let mut tx_result = tx_result_guard;
         assert_eq!(
-            unsafe {
-                indra_result_copy_tx_bytes(
-                    session,
-                    result,
-                    tx_result.as_mut_ptr(),
-                    2,
-                )
-            },
+            unsafe { indra_result_copy_tx_bytes(session, result, tx_result.as_mut_ptr(), 2,) },
             IndraError::BufferTooSmall.code()
         );
         assert_eq!(tx_result, tx_result_guard);
@@ -2219,9 +2205,7 @@ mod handle_tests {
         let staking_guard = [0x5Au8; 8];
         let mut staking = staking_guard.map(|byte| byte as c_char);
         assert_eq!(
-            unsafe {
-                crate::staking::write_hex_to_buf("abcd", staking.as_mut_ptr(), 4)
-            },
+            unsafe { crate::staking::write_hex_to_buf("abcd", staking.as_mut_ptr(), 4) },
             Err(IndraError::BufferTooSmall)
         );
         assert_eq!(staking, staking_guard.map(|byte| byte as c_char));
@@ -2248,19 +2232,33 @@ mod handle_tests {
         );
         let mut exact = [0i8; 5];
         assert_eq!(
-            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), exact.as_mut_ptr(), exact.len()) },
+            unsafe {
+                indra_tx_to_hex(bytes.as_ptr(), bytes.len(), exact.as_mut_ptr(), exact.len())
+            },
             IndraError::Ok.code()
         );
-        assert_eq!(&exact[..4], &[b'0' as i8, b'1' as i8, b'0' as i8, b'2' as i8]);
+        assert_eq!(
+            &exact[..4],
+            &[b'0' as i8, b'1' as i8, b'0' as i8, b'2' as i8]
+        );
         assert_eq!(exact[4], 0);
         let mut short = [0x5Ai8; 4];
         assert_eq!(
-            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), short.as_mut_ptr(), short.len()) },
+            unsafe {
+                indra_tx_to_hex(bytes.as_ptr(), bytes.len(), short.as_mut_ptr(), short.len())
+            },
             IndraError::BufferTooSmall.code()
         );
         assert_eq!(short, [0x5Ai8; 4]);
         assert_eq!(
-            unsafe { indra_tx_to_hex(bytes.as_ptr(), bytes.len(), exact.as_mut_ptr(), MAX_TX_HEX_BYTES + 1) },
+            unsafe {
+                indra_tx_to_hex(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    exact.as_mut_ptr(),
+                    MAX_TX_HEX_BYTES + 1,
+                )
+            },
             IndraError::InvalidParam.code()
         );
     }

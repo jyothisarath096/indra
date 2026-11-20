@@ -10,6 +10,8 @@ START_NODE1_DELAY_SECONDS=${START_NODE1_DELAY_SECONDS:-0}
 STOP_NODE_INDEX=${STOP_NODE_INDEX:-1}
 STOP_AFTER_HEIGHT=${STOP_AFTER_HEIGHT:-3}
 STOP_SECONDS=${STOP_SECONDS:-0}
+RESTART_MODE=${RESTART_MODE:-0}
+DOWN_SECONDS=${DOWN_SECONDS:-900}
 EXPECT_PEER_COUNTS=${EXPECT_PEER_COUNTS:-}
 BASE_P2P_PORT=${BASE_P2P_PORT:-32700}
 BASE_RPC_PORT=${BASE_RPC_PORT:-19700}
@@ -138,20 +140,23 @@ enabled = true
 EOF
 }
 
+start_one_node() {
+    local d=$1 i=$2
+    printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
+    "$NODE_BIN" --config "$d/config-$i.toml" >>"$d/node-$i.stdout" 2>>"$d/node-$i.stderr" &
+    PIDS[$i]=$!
+}
+
 start_nodes() {
     local d=$1 i
     for i in 0 2 3; do
-        printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
-        "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
-        PIDS[$i]=$!
+        start_one_node "$d" "$i"
     done
     if [ "$START_NODE1_DELAY_SECONDS" -gt 0 ]; then
         sleep "$START_NODE1_DELAY_SECONDS"
     fi
     i=1
-    printf 'COMMAND node-%s: %q --config %q\n' "$i" "$NODE_BIN" "$d/config-$i.toml" >>"$d/commands.log"
-    "$NODE_BIN" --config "$d/config-$i.toml" >"$d/node-$i.stdout" 2>"$d/node-$i.stderr" &
-    PIDS[$i]=$!
+    start_one_node "$d" "$i"
 }
 
 snapshot() {
@@ -168,9 +173,10 @@ snapshot() {
 make_genesis "$ROOT" || { echo "genesis failed; see $ROOT/genesis.log" >&2; exit 1; }
 for i in 0 1 2 3; do write_config "$ROOT" "$i"; done
 timeline t_start
+started_at_ms=$(timestamp_ms)
 start_nodes "$ROOT"
 started=$SECONDS
-if [ "$STOP_SECONDS" -gt 0 ]; then
+if [ "$STOP_SECONDS" -gt 0 ] || [ "$RESTART_MODE" -eq 1 ]; then
     stop_started=$SECONDS
     while [ "$SECONDS" -lt "$((stop_started+CAP_SECONDS))" ]; do
         stop_height=0
@@ -183,23 +189,35 @@ if [ "$STOP_SECONDS" -gt 0 ]; then
         sleep 2
     done
     if [ "$stop_height" -lt "$STOP_AFTER_HEIGHT" ] 2>/dev/null; then
-        echo "failed to reach STOP_AFTER_HEIGHT=$STOP_AFTER_HEIGHT before pause" >&2
+        echo "failed to reach STOP_AFTER_HEIGHT=$STOP_AFTER_HEIGHT before interruption" >&2
         exit 1
     fi
     height_at_stop=$stop_height
     t_stop_ms=$(timestamp_ms)
     timeline "t_stop t_ms=$t_stop_ms height=$height_at_stop node=$STOP_NODE_INDEX"
-    kill -STOP "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
-    sleep "$STOP_SECONDS"
+    if [ "$RESTART_MODE" -eq 1 ]; then
+        kill -KILL "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+        timeline "t_down t_ms=$t_stop_ms height_at_stop=$height_at_stop"
+        sleep "$DOWN_SECONDS"
+    else
+        kill -STOP "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+        sleep "$STOP_SECONDS"
+    fi
     t_cont_ms=$(timestamp_ms)
-    timeline "t_cont t_ms=$t_cont_ms height_at_stop=$height_at_stop"
-    kill -CONT "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+    if [ "$RESTART_MODE" -eq 1 ]; then
+        timeline "t_restart t_ms=$t_cont_ms height_at_stop=$height_at_stop"
+        start_one_node "$ROOT" "$STOP_NODE_INDEX"
+    else
+        timeline "t_cont t_ms=$t_cont_ms height_at_stop=$height_at_stop"
+        kill -CONT "${PIDS[$STOP_NODE_INDEX]}" 2>/dev/null || true
+    fi
     timeline "resume_observed height_at_stop=$height_at_stop"
 else
     height_at_stop=0
     t_cont_ms=0
 fi
 reached=0
+mesh_formed_ms=
 t_first_block_after_cont_ms=
 t_all_nodes_at_tip_ms=
 paused_both_neighbours_ms=
@@ -215,12 +233,28 @@ while [ "$SECONDS" -lt "$((started+CAP_SECONDS))" ]; do
         tips[$i]=$(rpc $((BASE_RPC_PORT+i*10)) indra_getTip | field tip_hash)
     done
     now_ms=$(timestamp_ms)
-    if [ "$STOP_SECONDS" -gt 0 ] && [ -z "$t_first_block_after_cont_ms" ] && \
+    if [ -z "$mesh_formed_ms" ]; then
+        mesh_formed=1
+        if [ -n "$EXPECT_PEER_COUNTS" ]; then
+            IFS=, read -r -a expected_peers <<<"$EXPECT_PEER_COUNTS"
+            for i in 0 1 2 3; do
+                peer_count=$(admin_rpc $((BASE_RPC_PORT+i*10)) indra_getPeerTopology | field peer_count)
+                [ "${expected_peers[$i]:-}" = "$peer_count" ] || mesh_formed=0
+            done
+        else
+            mesh_formed=0
+        fi
+        if [ "$mesh_formed" -eq 1 ]; then
+            mesh_formed_ms=$now_ms
+            timeline "mesh_formed t_ms=$mesh_formed_ms"
+        fi
+    fi
+    if { [ "$STOP_SECONDS" -gt 0 ] || [ "$RESTART_MODE" -eq 1 ]; } && [ -z "$t_first_block_after_cont_ms" ] && \
         [ "$max_height" -gt "$height_at_stop" ] 2>/dev/null; then
         t_first_block_after_cont_ms=$now_ms
         timeline "t_first_block_after_cont height=$max_height"
     fi
-    if [ "$STOP_SECONDS" -gt 0 ] && [ -z "$paused_both_neighbours_ms" ]; then
+    if { [ "$STOP_SECONDS" -gt 0 ] || [ "$RESTART_MODE" -eq 1 ]; } && [ -z "$paused_both_neighbours_ms" ]; then
         peer_count=$(admin_rpc $((BASE_RPC_PORT+STOP_NODE_INDEX*10)) indra_getPeerTopology | field peer_count)
         if [ "$peer_count" -ge 2 ] 2>/dev/null; then
             paused_both_neighbours_ms=$now_ms
@@ -228,7 +262,7 @@ while [ "$SECONDS" -lt "$((started+CAP_SECONDS))" ]; do
         fi
     fi
     target_after_pause=$((height_at_stop+5))
-    if [ "$STOP_SECONDS" -gt 0 ] && [ "$min_height" -ge "$target_after_pause" ] 2>/dev/null; then
+    if { [ "$STOP_SECONDS" -gt 0 ] || [ "$RESTART_MODE" -eq 1 ]; } && [ "$min_height" -ge "$target_after_pause" ] 2>/dev/null; then
         same_current_tip=1
         first_current_tip=${tips[0]}
         for i in 1 2 3; do [ "${tips[$i]}" = "$first_current_tip" ] || same_current_tip=0; done
@@ -271,8 +305,12 @@ fi
     printf '# line topology live run\n\n'
     rounds_during_pause=0
     connection_events_after_resume=()
+    event_reference_ms=${t_cont_ms:-0}
+    if [ "$STOP_SECONDS" -eq 0 ] && [ "$RESTART_MODE" -eq 0 ]; then
+        event_reference_ms=${mesh_formed_ms:-$started_at_ms}
+    fi
     for i in 0 1 2 3; do
-        connection_events_after_resume[$i]=$(log_events_after "${t_cont_ms:-0}" "$ROOT/node-$i.stderr")
+        connection_events_after_resume[$i]=$(log_events_after "$event_reference_ms" "$ROOT/node-$i.stderr")
         rounds_during_pause=$((rounds_during_pause+$(rounds_between "${t_stop_ms:-0}" "${t_cont_ms:-0}" "$ROOT/node-$i.stderr")))
     done
     recovery_seconds=
@@ -280,8 +318,8 @@ fi
         recovery_ms=$((t_first_block_after_cont_ms-t_cont_ms))
         recovery_seconds=$(awk -v ms="$recovery_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
     fi
-    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s peer_counts_ok=%s elapsed_seconds_after_start=%s pause_seconds=%s rounds_reached_during_pause=%s recovery_seconds=%s t_all_nodes_at_tip_ms=%s paused_node_both_neighbours_ms=%s\n\n' \
-        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$peer_counts_ok" "$((SECONDS-started))" "$STOP_SECONDS" "$rounds_during_pause" "${recovery_seconds:-}" "${t_all_nodes_at_tip_ms:-}" "${paused_both_neighbours_ms:-}"
+    printf 'target_height=%s reached=%s same_tip=%s panics=%s stale_sync=%s exits_zero=%s peer_counts_ok=%s elapsed_seconds_after_start=%s pause_seconds=%s down_seconds=%s rounds_reached_during_pause=%s recovery_seconds=%s mesh_formed_ms=%s event_reference_ms=%s t_all_nodes_at_tip_ms=%s paused_node_both_neighbours_ms=%s\n\n' \
+        "$TARGET_HEIGHT" "$reached" "$same_tip" "$panics" "${stale:-0}" "$exits_ok" "$peer_counts_ok" "$((SECONDS-started))" "$STOP_SECONDS" "$([ "$RESTART_MODE" -eq 1 ] && printf '%s' "$DOWN_SECONDS" || printf '0')" "$rounds_during_pause" "${recovery_seconds:-}" "${mesh_formed_ms:-}" "$event_reference_ms" "${t_all_nodes_at_tip_ms:-}" "${paused_both_neighbours_ms:-}"
     printf '| node | height | tip | peers | exit | post-resume connection events | topology |\n|---:|---:|---|---:|---:|---:|---|\n'
     for i in 0 1 2 3; do
         printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$i" \

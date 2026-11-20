@@ -131,18 +131,16 @@ impl AuthorizationEnvelope {
         role_nonce: u64,
         payload: &[u8],
     ) -> IndraResult<Self> {
-        Self::new(
-            AuthorizationInput {
-                domain: AuthorizationDomain::Hot,
-                authority_role: AuthorityRole::Hot,
-                chain_id,
-                operation_tag,
-                identity_id,
-                authority_key_version,
-                role_nonce,
-                payload,
-            },
-        )
+        Self::new(AuthorizationInput {
+            domain: AuthorizationDomain::Hot,
+            authority_role: AuthorityRole::Hot,
+            chain_id,
+            operation_tag,
+            identity_id,
+            authority_key_version,
+            role_nonce,
+            payload,
+        })
     }
 
     /// Construct a canonical cold-role envelope.
@@ -154,23 +152,19 @@ impl AuthorizationEnvelope {
         role_nonce: u64,
         payload: &[u8],
     ) -> IndraResult<Self> {
-        Self::new(
-            AuthorizationInput {
-                domain: AuthorizationDomain::Cold,
-                authority_role: AuthorityRole::Cold,
-                chain_id,
-                operation_tag,
-                identity_id,
-                authority_key_version,
-                role_nonce,
-                payload,
-            },
-        )
+        Self::new(AuthorizationInput {
+            domain: AuthorizationDomain::Cold,
+            authority_role: AuthorityRole::Cold,
+            chain_id,
+            operation_tag,
+            identity_id,
+            authority_key_version,
+            role_nonce,
+            payload,
+        })
     }
 
-    fn new(
-        input: AuthorizationInput<'_>,
-    ) -> IndraResult<Self> {
+    fn new(input: AuthorizationInput<'_>) -> IndraResult<Self> {
         let chain_id = VariableBytes::from_slice(input.chain_id)?;
         let payload = VariableBytes::from_slice(input.payload)?;
         let envelope = Self {

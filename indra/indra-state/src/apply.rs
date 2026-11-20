@@ -34,25 +34,25 @@
 use std::collections::{BTreeSet, HashSet};
 
 use indra_core::{
-    EpochRecord,
     codec::{Decode, Encode},
     types::{
         block::BlockVNext,
         crypto::HybridPubKey,
         governance::GovernanceOpV2,
         primitives::{
-            BLOCK_FORMAT_VERSION, Bytes32, LIFETIME_SUPPLY_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
+            Bytes32, BLOCK_FORMAT_VERSION, LIFETIME_SUPPLY_CAP_SPARK, MAX_BLOCK_SIZE_BYTES,
             MAX_GOV_OPS_PER_BLOCK, MAX_STAKING_OPS_PER_BLOCK, MAX_TX_PER_BLOCK,
             SLASH_EVIDENCE_WINDOW_EPOCHS, SLASH_REWARD_TX_IDX, TRANSACTION_PROTOCOL_VERSION,
         },
         proposal::VerifiedProposal,
-        qc::{QuorumCertificateV1, VerifiedQc, verify_qc_against_snapshot},
+        qc::{verify_qc_against_snapshot, QuorumCertificateV1, VerifiedQc},
         slash_membership::SlashMembershipRootRecord,
         slashing::{SlashEvidenceV1, SlashEvidenceV2},
         staking::StakingOp,
         transaction::{OutputV1, TransactionV1},
         vote::VoteV1,
     },
+    EpochRecord,
 };
 use indra_crypto::{validate_classical_public_key, validate_pq_public_key, verify_hybrid};
 
@@ -315,12 +315,11 @@ fn apply_verified_slash_directive(
         .map_err(|error| StateError::InvalidStakingOp(error.to_string()))?;
     let exact = active_principal_slashed
         .checked_add(directive.tranche_ids.iter().try_fold(0u64, |sum, id| {
-            let amount = allocations
-                .get(&SlashTarget::Tranche(*id))
-                .copied()
-                .ok_or(StateError::InvariantViolation {
+            let amount = allocations.get(&SlashTarget::Tranche(*id)).copied().ok_or(
+                StateError::InvariantViolation {
                     message: "verified slash tranche aggregate allocation disappeared",
-                })?;
+                },
+            )?;
             sum.checked_add(amount).ok_or(StateError::ValueOverflow)
         })?)
         .ok_or(StateError::ValueOverflow)?;
@@ -966,7 +965,7 @@ fn verify_vote_sig_with_keys(
     chain_id: &str,
 ) -> Result<(), String> {
     use indra_crypto::{
-        ClassicalPublicKey, HybridPublicKey, PQ_PK_BYTES, PqPublicKey, verify_hybrid,
+        verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES,
     };
 
     let pq_pk: [u8; PQ_PK_BYTES] = pq_pk_bytes.try_into().map_err(|_| {
@@ -1578,7 +1577,8 @@ fn apply_block_inner(
         let boundary_height = context.boundary_height;
         txn.state_mut()
             .create_consensus_snapshot_after_boundary(boundary_height)?;
-        txn.state_mut().rebuild_state_commitment_v2(boundary_height)?;
+        txn.state_mut()
+            .rebuild_state_commitment_v2(boundary_height)?;
         txn.after_mutation()?;
     }
 
@@ -1951,14 +1951,13 @@ mod tests {
     use crate::state_root::compute_state_root;
     use crate::validator::{ValidatorEntry, ValidatorStatus};
     use indra_core::{
-        Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
         codec::Encode,
         types::{
             block::{BlockHeaderVNext, BlockVNext},
             crypto::PQVoteSig,
             governance::{
-                GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
                 compute_proposal_id, governance_signing_domain, governance_vote_commit_hash,
+                GovernableAction, GovernanceActionType, GovernanceOpV2, GovernancePayload,
             },
             primitives::{
                 BLOCK_FORMAT_VERSION, DUST_LIMIT_SPARK, INITIAL_BASE_FEE_SPARK_PER_KB,
@@ -1971,8 +1970,9 @@ mod tests {
             transaction::{InputV1, OutputV1, TransactionV1},
             vote::{VoteStep, VoteV1},
         },
+        Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     };
-    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, sha256};
+    use indra_crypto::{sha256, ClassicalKeypair, HybridKeypair, PqKeypair};
     use std::collections::BTreeMap;
 
     const TEST_INPUT_VALUE: u64 = 1_000_000;
@@ -3434,7 +3434,9 @@ mod tests {
         let original = state.clone();
         let original_root = state.state_commitment_v2_root(state.height);
         let mut rebuilt_original = state.clone();
-        rebuilt_original.rebuild_state_commitment_v2(state.height).unwrap();
+        rebuilt_original
+            .rebuild_state_commitment_v2(state.height)
+            .unwrap();
         assert_eq!(
             rebuilt_original.state_commitment_v2_root(state.height),
             original_root,
@@ -3474,7 +3476,9 @@ mod tests {
             "failed rollback projection must preserve a cache that was already warm"
         );
         let failure_rollback_root = failing_state.state_commitment_v2_root(original.height);
-        failing_state.rebuild_state_commitment_v2(original.height).unwrap();
+        failing_state
+            .rebuild_state_commitment_v2(original.height)
+            .unwrap();
         assert_eq!(
             failing_state.state_commitment_v2_root(original.height),
             failure_rollback_root,
@@ -3525,9 +3529,8 @@ mod tests {
                 let tx = make_tx(&actual, &keypair, utxo_id, value, fixture_tag);
                 let block = make_block(&actual, vec![tx.clone(), tx]);
                 let actual_result = apply_block(&mut actual, &block, step);
-                let reference_result =
-                    clone_atomic_reference_apply_block(&reference, &block, step)
-                        .map(|outcome| outcome.state);
+                let reference_result = clone_atomic_reference_apply_block(&reference, &block, step)
+                    .map(|outcome| outcome.state);
                 (actual_result.map(|_| ()), reference_result.map(|_| ()))
             } else if step % 10 == 5 {
                 // A wrong parent fails before commitment and exercises a
@@ -3535,9 +3538,8 @@ mod tests {
                 let mut block = empty_block_at(&actual, actual.height + 1, step);
                 block.header.prev_hash = Bytes32::from([0xEE; 32]);
                 let actual_result = apply_block(&mut actual, &block, step);
-                let reference_result =
-                    clone_atomic_reference_apply_block(&reference, &block, step)
-                        .map(|outcome| outcome.state);
+                let reference_result = clone_atomic_reference_apply_block(&reference, &block, step)
+                    .map(|outcome| outcome.state);
                 (actual_result.map(|_| ()), reference_result.map(|_| ()))
             } else {
                 let block = empty_block_at(&actual, actual.height + 1, step);
@@ -3877,7 +3879,9 @@ mod tests {
         crate::txn::set_fail_after_mutation(None);
         apply_block(&mut success, &block, 0).unwrap();
         let success_root = success.state_commitment_v2_root(block.header.height);
-        success.rebuild_state_commitment_v2(block.header.height).unwrap();
+        success
+            .rebuild_state_commitment_v2(block.header.height)
+            .unwrap();
         assert_eq!(
             success.state_commitment_v2_root(block.header.height),
             success_root
@@ -3886,13 +3890,14 @@ mod tests {
         let mut rolled_back = state.clone();
         crate::txn::set_fail_after_mutation(Some(1));
         let err = apply_block(&mut rolled_back, &block, 0).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("state transaction failpoint injected after mutation")
-        );
+        assert!(err
+            .to_string()
+            .contains("state transaction failpoint injected after mutation"));
         assert_same_consensus_state(&rolled_back, &state);
         let rollback_root = rolled_back.state_commitment_v2_root(rolled_back.height);
-        rolled_back.rebuild_state_commitment_v2(rolled_back.height).unwrap();
+        rolled_back
+            .rebuild_state_commitment_v2(rolled_back.height)
+            .unwrap();
         assert_eq!(
             rolled_back.state_commitment_v2_root(rolled_back.height),
             rollback_root
@@ -4886,16 +4891,14 @@ mod tests {
             membership_proof: proof,
         };
         let chain_id = state.chain_id.clone();
-        assert!(
-            apply_slash_v2_at_height_with_accounting(
-                &mut state,
-                &evidence,
-                &chain_id,
-                u64::MAX,
-                None,
-            )
-            .is_err()
-        );
+        assert!(apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            u64::MAX,
+            None,
+        )
+        .is_err());
 
         state.consensus_snapshots = vec![snapshot];
         state.height = u64::MAX;
@@ -4903,16 +4906,14 @@ mod tests {
             activation_height: u64::MAX,
             membership_root: Bytes32::from([0xEE; 32]),
         }];
-        assert!(
-            apply_slash_v2_at_height_with_accounting(
-                &mut state,
-                &evidence,
-                &chain_id,
-                u64::MAX,
-                None,
-            )
-            .is_err()
-        );
+        assert!(apply_slash_v2_at_height_with_accounting(
+            &mut state,
+            &evidence,
+            &chain_id,
+            u64::MAX,
+            None,
+        )
+        .is_err());
 
         state.slash_membership_roots = vec![SlashMembershipRootRecord {
             activation_height: u64::MAX,

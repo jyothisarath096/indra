@@ -6,7 +6,6 @@
 use indra_core::types::primitives::TEST_CHAIN_ID;
 
 use indra_core::{
-    Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
     codec::{Decode, Encode},
     types::{
         block::{BlockHeaderVNext, BlockVNext},
@@ -20,13 +19,14 @@ use indra_core::{
         transaction::{InputV1, OutputV1, TransactionV1},
         vote::VoteStep,
     },
+    Bytes32, HybridPubKey, HybridSignature, ProtocolVersion, VariableBytes,
 };
 use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
 use indra_state::{
-    ChainState, ValidatorEntry, ValidatorStatus, apply_block_for_test as apply_block,
-    compute_state_root,
-    epoch::{EpochTransitionContext, apply_epoch_transition},
+    apply_block_for_test as apply_block, compute_state_root,
+    epoch::{apply_epoch_transition, EpochTransitionContext},
     utxo::UtxoSet,
+    ChainState, ValidatorEntry, ValidatorStatus,
 };
 
 const TEST_INPUT_VALUE: u64 = 1_000_000;
@@ -966,12 +966,10 @@ fn test_auto_delegate_full_lifecycle() {
         "the claim must clear prior accrual even though its own block issues a fresh reward"
     );
     assert_eq!(state.utxos.len(), utxos_before + 1);
-    assert!(
-        state
-            .utxos
-            .all_entries()
-            .any(|entry| entry.output.value_spark == claimed)
-    );
+    assert!(state
+        .utxos
+        .all_entries()
+        .any(|entry| entry.output.value_spark == claimed));
 }
 
 #[test]

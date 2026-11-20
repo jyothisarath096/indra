@@ -184,17 +184,16 @@ fn parse_common_prefix(buf: &[u8]) -> NetworkResult<()> {
     if buf.get(..4) != Some(MAGIC.as_slice()) {
         return Err(NetworkError::InvalidMagic);
     }
-    let version =
-        u16::from_le_bytes(
-            buf.get(4..6)
-                .ok_or(NetworkError::DecodeFailed {
-                    reason: "invalid handshake version bytes".to_string(),
-                })?
-                .try_into()
-                .map_err(|_| NetworkError::DecodeFailed {
-                    reason: "invalid handshake version bytes".to_string(),
-                })?,
-        );
+    let version = u16::from_le_bytes(
+        buf.get(4..6)
+            .ok_or(NetworkError::DecodeFailed {
+                reason: "invalid handshake version bytes".to_string(),
+            })?
+            .try_into()
+            .map_err(|_| NetworkError::DecodeFailed {
+                reason: "invalid handshake version bytes".to_string(),
+            })?,
+    );
     if version != VERSION {
         return Err(NetworkError::UnsupportedVersion { got: version });
     }

@@ -1,12 +1,12 @@
 //! Supervision primitives for node-owned critical tasks.
 
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
-use std::sync::OnceLock;
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt::Display;
 use std::io::Write;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::OnceLock;
+use std::thread::{self, JoinHandle};
 
 use futures_util::FutureExt;
 
@@ -60,7 +60,11 @@ impl CriticalTasks {
         if GLOBAL_REPORTER.set(tx.clone()).is_err() {
             eprintln!("[supervisor] global reporter already installed");
         }
-        Self { tx, rx, handles: Vec::new() }
+        Self {
+            tx,
+            rx,
+            handles: Vec::new(),
+        }
     }
 
     /// Spawn a task whose unexpected return or panic is reported by name.
@@ -71,19 +75,16 @@ impl CriticalTasks {
         let name = name.into();
         let task_name = name.clone();
         let tx = self.tx.clone();
-        let handle = match thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
-                let reason = match result {
-                    Ok(()) => "returned".to_string(),
-                    Err(payload) => panic_reason(payload),
-                };
-                if let Err(error) = tx.send(critical_task_decision(false, &task_name, reason)) {
-                    eprintln!("[supervisor] failed to report task exit: {error}");
-                }
-            })
-        {
+        let handle = match thread::Builder::new().name(name.clone()).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            let reason = match result {
+                Ok(()) => "returned".to_string(),
+                Err(payload) => panic_reason(payload),
+            };
+            if let Err(error) = tx.send(critical_task_decision(false, &task_name, reason)) {
+                eprintln!("[supervisor] failed to report task exit: {error}");
+            }
+        }) {
             Ok(handle) => handle,
             Err(error) => {
                 if let Err(report_error) = self.tx.send(critical_task_decision(
@@ -214,12 +215,18 @@ where
             Err(error) if error.is_cancelled() => "cancelled".to_string(),
             Err(error) => format!("panic: {error}"),
         };
-        reporter.send(critical_task_decision(false, name, reason)).unwrap();
+        reporter
+            .send(critical_task_decision(false, name, reason))
+            .unwrap();
     })
 }
 
 /// Spawn a per-connection task and isolate its panic from the node runtime.
-pub fn spawn_connection<F>(component: &'static str, metrics: std::sync::Arc<crate::metrics::MetricsState>, task: F) -> tokio::task::JoinHandle<()>
+pub fn spawn_connection<F>(
+    component: &'static str,
+    metrics: std::sync::Arc<crate::metrics::MetricsState>,
+    task: F,
+) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -251,7 +258,10 @@ mod tests {
     fn decision_reports_task_panic() {
         assert_eq!(
             critical_task_decision(false, "consensus", "panic"),
-            CriticalTaskOutcome::TaskExited { name: "consensus".into(), reason: "panic".into() }
+            CriticalTaskOutcome::TaskExited {
+                name: "consensus".into(),
+                reason: "panic".into()
+            }
         );
     }
 
@@ -259,7 +269,10 @@ mod tests {
     fn decision_reports_task_error() {
         assert_eq!(
             critical_task_decision(false, "p2p", "channel closed"),
-            CriticalTaskOutcome::TaskExited { name: "p2p".into(), reason: "channel closed".into() }
+            CriticalTaskOutcome::TaskExited {
+                name: "p2p".into(),
+                reason: "channel closed".into()
+            }
         );
     }
 
@@ -303,9 +316,13 @@ mod tests {
     #[tokio::test]
     async fn critical_task_panic_is_reported_once() {
         let (tx, rx) = mpsc::channel();
-        let handle = spawn_critical_with_reporter("panicking", async {
-            panic!("test panic");
-        }, tx);
+        let handle = spawn_critical_with_reporter(
+            "panicking",
+            async {
+                panic!("test panic");
+            },
+            tx,
+        );
         handle.await.unwrap();
         assert_eq!(rx.try_iter().count(), 1);
     }
@@ -317,7 +334,14 @@ mod tests {
             panic!("test connection panic");
         });
         handle.await.unwrap();
-        assert_eq!(metrics.handler_panics_total.lock().unwrap().get("test-connection"), Some(&1));
+        assert_eq!(
+            metrics
+                .handler_panics_total
+                .lock()
+                .unwrap()
+                .get("test-connection"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -327,13 +351,21 @@ mod tests {
             terminate_fatal("test-fatal", "supervisor test cause");
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "supervisor::tests::terminate_fatal_subprocess_exits_one_and_reports_once", "--nocapture"])
+            .args([
+                "--exact",
+                "supervisor::tests::terminate_fatal_subprocess_exits_one_and_reports_once",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(stderr.matches("ERROR: supervisor test cause").count(), 1, "{stderr}");
+        assert_eq!(
+            stderr.matches("ERROR: supervisor test cause").count(),
+            1,
+            "{stderr}"
+        );
         assert!(!stderr.contains("panicked at"), "{stderr}");
     }
 }

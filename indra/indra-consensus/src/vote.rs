@@ -20,12 +20,12 @@ use std::collections::BTreeMap;
 
 use indra_core::types::{
     crypto::HybridSignature as CoreHybridSignature,
-    primitives::{Bytes32, has_strict_two_thirds_quorum, muldiv, validate_consensus_round},
+    primitives::{has_strict_two_thirds_quorum, muldiv, validate_consensus_round, Bytes32},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
-    ClassicalPublicKey, ClassicalSignature, HybridKeypair, HybridPublicKey, HybridSignature,
-    PqPublicKey, PqSignature, verify_hybrid,
+    verify_hybrid, ClassicalPublicKey, ClassicalSignature, HybridKeypair, HybridPublicKey,
+    HybridSignature, PqPublicKey, PqSignature,
 };
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -309,7 +309,7 @@ pub fn produce_vote(request: VoteRequest<'_>, keypair: &HybridKeypair) -> Consen
         chain_id,
     } = request;
     validate_round(round)?;
-    use indra_core::types::primitives::{MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, VariableBytes};
+    use indra_core::types::primitives::{VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES};
     let signing_bytes = vote_signing_bytes(
         height,
         round,
@@ -410,7 +410,18 @@ mod tests {
             vec![v.clone()],
         );
 
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let decision = collector.add_vote(vote).unwrap();
 
@@ -425,7 +436,18 @@ mod tests {
             indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT + 1,
             u32::MAX,
         ] {
-            let error = produce_vote(VoteRequest { height: 1, round, step: VoteStep::Prevote, block_hash: TEST_SNAPSHOT_ROOT, validator_id: voter.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &keypair)
+            let error = produce_vote(
+                VoteRequest {
+                    height: 1,
+                    round,
+                    step: VoteStep::Prevote,
+                    block_hash: TEST_SNAPSHOT_ROOT,
+                    validator_id: voter.validator_id,
+                    snapshot_root: TEST_SNAPSHOT_ROOT,
+                    chain_id: TEST_CHAIN_ID,
+                },
+                &keypair,
+            )
             .unwrap_err();
             assert_eq!(
                 error.to_string(),
@@ -441,14 +463,36 @@ mod tests {
     fn oversized_chain_id_is_rejected_by_vote_sign_and_verify() {
         let (voter, keypair) = voter(0x72, 10_000);
         let oversized = "x".repeat(usize::from(u16::MAX) + 1);
-        let sign_error = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: TEST_SNAPSHOT_ROOT, validator_id: voter.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: &oversized }, &keypair)
+        let sign_error = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash: TEST_SNAPSHOT_ROOT,
+                validator_id: voter.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: &oversized,
+            },
+            &keypair,
+        )
         .unwrap_err();
         assert_eq!(
             sign_error.to_string(),
             "crypto error: field 'chain_id' length 65536 exceeds maximum 65535"
         );
 
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: TEST_SNAPSHOT_ROOT, validator_id: voter.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &keypair)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash: TEST_SNAPSHOT_ROOT,
+                validator_id: voter.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &keypair,
+        )
         .unwrap();
         let verify_error = verify_vote_authority(
             &vote,
@@ -477,7 +521,18 @@ mod tests {
         );
 
         // Vote for height 99 instead of 1
-        let vote = produce_vote(VoteRequest { height: 99, round: 0, step: VoteStep::Prevote, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 99,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         assert!(matches!(
             collector.add_vote(vote),
@@ -498,7 +553,18 @@ mod tests {
             vec![v.clone()],
         );
 
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         collector.add_vote(vote.clone()).unwrap();
         assert_eq!(collector.add_vote(vote), Err(ConsensusError::DuplicateVote));
@@ -519,7 +585,18 @@ mod tests {
             vec![v],
         );
 
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: stranger.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &stranger_kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash,
+                validator_id: stranger.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &stranger_kp,
+        )
         .unwrap();
         assert_eq!(collector.add_vote(vote), Err(ConsensusError::UnknownVoter));
     }
@@ -536,7 +613,18 @@ mod tests {
             TEST_SNAPSHOT_ROOT,
             vec![v],
         );
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash: Bytes32::from([0xBB; 32]), validator_id: stranger.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &stranger_kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash: Bytes32::from([0xBB; 32]),
+                validator_id: stranger.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &stranger_kp,
+        )
         .unwrap();
 
         assert_eq!(
@@ -558,7 +646,18 @@ mod tests {
             vec![v.clone()],
         );
 
-        let mut vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Prevote, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let mut vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Prevote,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         // Tamper with the block hash after signing
         vote.block_hash = Bytes32::from([0xFFu8; 32]);
@@ -572,7 +671,18 @@ mod tests {
     fn vote_cross_chain_replay_fails() {
         let (v, kp) = voter(0x42, 10_000);
         let block_hash = Bytes32::from([0x42u8; 32]);
-        let vote = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: "indra-testnet-1" }, &kp)
+        let vote = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: "indra-testnet-1",
+            },
+            &kp,
+        )
         .unwrap();
         let mut mainnet_collector = VoteCollector::new(
             1,
@@ -607,9 +717,31 @@ mod tests {
         );
 
         // First two votes total 66%, which is below the strict > 2/3 threshold.
-        let vote1 = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v1.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp1)
+        let vote1 = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v1.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp1,
+        )
         .unwrap();
-        let vote2 = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v2.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp2)
+        let vote2 = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v2.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp2,
+        )
         .unwrap();
 
         let d1 = collector.add_vote(vote1).unwrap();
@@ -635,11 +767,44 @@ mod tests {
             vec![v1.clone(), v2.clone(), v3.clone()],
         );
 
-        let vote1 = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v1.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp1)
+        let vote1 = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v1.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp1,
+        )
         .unwrap();
-        let vote2 = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v2.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp2)
+        let vote2 = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v2.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp2,
+        )
         .unwrap();
-        let vote3 = produce_vote(VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v3.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp3)
+        let vote3 = produce_vote(
+            VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v3.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp3,
+        )
         .unwrap();
 
         assert!(matches!(

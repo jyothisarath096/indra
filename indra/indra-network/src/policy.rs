@@ -683,9 +683,11 @@ fn decode_bans(bytes: &[u8]) -> io::Result<HashMap<Bytes32, u64>> {
         .chunks_exact(40)
     {
         let mut id = [0u8; 32];
-        id.copy_from_slice(chunk.get(..32).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid ban identity")
-        })?);
+        id.copy_from_slice(
+            chunk.get(..32).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid ban identity")
+            })?,
+        );
         let expiry = u64::from_le_bytes(
             chunk
                 .get(32..40)

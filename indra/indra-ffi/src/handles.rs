@@ -208,8 +208,7 @@ pub(crate) enum SigningMaterial {
 
 impl SigningMaterial {
     pub(crate) fn keypair(&self) -> Result<HybridKeypair, IndraError> {
-        let Self::Hot(material) = self
-        else {
+        let Self::Hot(material) = self else {
             return Err(IndraError::WrongKeyRole);
         };
         let HotSigningMaterial {
@@ -225,8 +224,7 @@ impl SigningMaterial {
     }
 
     pub(crate) fn cold_keypair(&self) -> Result<ColdHybridKeypair, IndraError> {
-        let Self::Cold(material) = self
-        else {
+        let Self::Cold(material) = self else {
             return Err(IndraError::WrongKeyRole);
         };
         let ColdSigningMaterial {

@@ -190,15 +190,18 @@ impl<'a> NodeState<'a> {
         discovered_peer_count: usize,
         observer_peer_count: usize,
     ) -> Self {
-        Self::with_network_policy(engine, NetworkPolicyContext {
-            validator_peer_addrs,
-            validator_peer_topology: Vec::new(),
-            connected_validator_peer_count,
-            discovered_peer_count,
-            observer_peer_count,
-            rpc_mode: RpcMode::Full,
-            admin_token_configured: false,
-        })
+        Self::with_network_policy(
+            engine,
+            NetworkPolicyContext {
+                validator_peer_addrs,
+                validator_peer_topology: Vec::new(),
+                connected_validator_peer_count,
+                discovered_peer_count,
+                observer_peer_count,
+                rpc_mode: RpcMode::Full,
+                admin_token_configured: false,
+            },
+        )
     }
 
     /// Construct a state object with network context and explicit RPC policy.
@@ -316,8 +319,7 @@ pub trait RpcEngineView {
     fn blocks_retained(&self) -> usize;
     /// Return the canonical state root for this immutable view.
     fn state_root(&self) -> Result<Bytes32, String> {
-        indra_state::compute_state_root(self.chain_state())
-            .map_err(|error| error.to_string())
+        indra_state::compute_state_root(self.chain_state()).map_err(|error| error.to_string())
     }
     /// Precomputed position identifiers for one principal owner, when available.
     fn position_ids_by_owner(&self, _owner: &Bytes32) -> Option<&[Bytes32]> {
@@ -818,25 +820,32 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
         ));
     }
     let authenticated_owner = if params.len() == 5 {
-        Some(authorized_payment_address(
-            params.get(3..5).ok_or_else(|| {
-                RpcError::InvalidParams("missing scan authorization parameters".to_string())
-            })?,
-            state,
-        )?.1)
+        Some(
+            authorized_payment_address(
+                params.get(3..5).ok_or_else(|| {
+                    RpcError::InvalidParams("missing scan authorization parameters".to_string())
+                })?,
+                state,
+            )?
+            .1,
+        )
     } else {
         None
     };
-    let from_height = unquote(params.first().ok_or_else(|| {
-        RpcError::InvalidParams("missing from_height".to_string())
-    })?)
-        .parse::<u64>()
-        .map_err(|_| RpcError::InvalidParams("invalid from_height".to_string()))?;
-    let limit = unquote(params.get(1).ok_or_else(|| {
-        RpcError::InvalidParams("missing limit".to_string())
-    })?)
-        .parse::<u64>()
-        .map_err(|_| RpcError::InvalidParams("invalid limit".to_string()))?;
+    let from_height = unquote(
+        params
+            .first()
+            .ok_or_else(|| RpcError::InvalidParams("missing from_height".to_string()))?,
+    )
+    .parse::<u64>()
+    .map_err(|_| RpcError::InvalidParams("invalid from_height".to_string()))?;
+    let limit = unquote(
+        params
+            .get(1)
+            .ok_or_else(|| RpcError::InvalidParams("missing limit".to_string()))?,
+    )
+    .parse::<u64>()
+    .map_err(|_| RpcError::InvalidParams("invalid limit".to_string()))?;
     if limit == 0 || limit > MAX_CANONICAL_BLOCK_PAGE {
         return Err(RpcError::InvalidParams(format!(
             "limit must be between 1 and {MAX_CANONICAL_BLOCK_PAGE}"
@@ -848,9 +857,9 @@ fn get_canonical_blocks(params: &[String], state: &NodeState<'_>) -> RpcResult<S
             state.lowest_block
         )));
     }
-    let expected_parent_param = params.get(2).ok_or_else(|| {
-        RpcError::InvalidParams("missing expected_parent_hash".to_string())
-    })?;
+    let expected_parent_param = params
+        .get(2)
+        .ok_or_else(|| RpcError::InvalidParams("missing expected_parent_hash".to_string()))?;
     let expected_parent = parse_hex32_param(
         std::slice::from_ref(expected_parent_param),
         "expected_parent_hash",
@@ -929,12 +938,12 @@ fn get_transaction(params: &[String], state: &NodeState<'_>) -> RpcResult<String
             "expected [height, tx_index]".to_string(),
         ));
     }
-    let height_str = params.first().ok_or_else(|| {
-        RpcError::InvalidParams("missing height".to_string())
-    })?;
-    let tx_index_str = params.get(1).ok_or_else(|| {
-        RpcError::InvalidParams("missing tx_index".to_string())
-    })?;
+    let height_str = params
+        .first()
+        .ok_or_else(|| RpcError::InvalidParams("missing height".to_string()))?;
+    let tx_index_str = params
+        .get(1)
+        .ok_or_else(|| RpcError::InvalidParams("missing tx_index".to_string()))?;
     let height: u64 = unquote(height_str)
         .parse()
         .map_err(|_| RpcError::InvalidParams(format!("invalid height: {height_str}")))?;
@@ -1131,13 +1140,16 @@ fn authorized_payment_address(
             "expected payment_address and scan_auth_proof parameters".into(),
         ));
     }
-    let address_text = unquote(params.first().ok_or_else(|| {
-        RpcError::InvalidParams("missing payment address".to_string())
-    })?)
+    let address_text = unquote(
+        params
+            .first()
+            .ok_or_else(|| RpcError::InvalidParams("missing payment address".to_string()))?,
+    )
     .to_string();
-    let auth = unquote(params.get(1).ok_or_else(|| {
-        RpcError::InvalidParams("missing scan authorization proof".to_string())
-    })?);
+    let auth =
+        unquote(params.get(1).ok_or_else(|| {
+            RpcError::InvalidParams("missing scan authorization proof".to_string())
+        })?);
     let address = PaymentAddressV1::from_text(&address_text, state.chain.chain_id.as_bytes())
         .map_err(|error| RpcError::InvalidParams(format!("invalid payment address: {error}")))?;
     let owner_pubkey = verify_scan_auth(&address_text, &address, auth)?;
@@ -1177,9 +1189,11 @@ fn explain_utxo_provenance_authorized(
     })?;
     let (address_text, authenticated_owner) = authorized_payment_address(auth_params, state)?;
     let utxo_id = parse_hex32_value(
-        unquote(params.get(2).ok_or_else(|| {
-            RpcError::InvalidParams("missing utxo_id".to_string())
-        })?),
+        unquote(
+            params
+                .get(2)
+                .ok_or_else(|| RpcError::InvalidParams("missing utxo_id".to_string()))?,
+        ),
         "utxo_id",
     )?;
     let entry =
@@ -1300,12 +1314,10 @@ fn retained_protocol_block(
 ) -> Result<BlockVNext, UtxoProvenanceExplanation> {
     match retained_block(entry.created_height, state) {
         Ok(Some(block)) => Ok(block),
-        Ok(None) => {
-            Err(unrecoverable(
-                "staking_protocol_output_unavailable",
-                retained_block_unavailable_reason(entry.created_height, state),
-            ))
-        }
+        Ok(None) => Err(unrecoverable(
+            "staking_protocol_output_unavailable",
+            retained_block_unavailable_reason(entry.created_height, state),
+        )),
         Err(reason) => Err(unrecoverable("staking_protocol_output_unavailable", reason)),
     }
 }
@@ -2823,8 +2835,7 @@ fn get_utxo_proof(params: &[String], state: &NodeState<'_>) -> RpcResult<String>
                     "false"
                 },
                 value_hash,
-                compressed_terminal_json(&proof.terminal)
-                    .map_err(RpcError::Internal)?,
+                compressed_terminal_json(&proof.terminal).map_err(RpcError::Internal)?,
                 proof
                     .steps
                     .iter()
@@ -2926,8 +2937,8 @@ fn send_transaction(params: &[String]) -> DispatchResult {
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         types::{
             block::{BlockHeaderVNext, BlockVNext},
@@ -2969,9 +2980,14 @@ mod tests {
             0,
         )
         .unwrap();
-        engine.stake_positions.insert(position.position_id, position);
+        engine
+            .stake_positions
+            .insert(position.position_id, position);
 
-        let result = get_validator_self_stake(&[hex::encode(validator_id.0)], &NodeState::read_only(&engine));
+        let result = get_validator_self_stake(
+            &[hex::encode(validator_id.0)],
+            &NodeState::read_only(&engine),
+        );
         assert!(matches!(
             result,
             Err(RpcError::Internal(message))

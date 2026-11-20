@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::{
     fs::{File, OpenOptions},
@@ -9,8 +25,8 @@ use std::{
 };
 
 use indra_cli::{
-    build_genesis_config, holds_at_least_one_third, stake_share_bps, validate_public_export,
-    validate_cold_hot_pairing, GenesisEntry,
+    build_genesis_config, holds_at_least_one_third, stake_share_bps, validate_cold_hot_pairing,
+    validate_public_export, GenesisEntry,
 };
 use indra_core::codec::Encode;
 use indra_core::types::{
@@ -107,7 +123,16 @@ fn create_vrf_proof(args: &[String]) -> Result<(), String> {
 
 fn validator_entry(args: &[String]) -> Result<(), String> {
     for argument in args.iter().filter(|argument| argument.starts_with("--")) {
-        if !matches!(argument.as_str(), "--name" | "--stake" | "--chain-id" | "--hot-export" | "--cold-export" | "--vrf-proof" | "--output") {
+        if !matches!(
+            argument.as_str(),
+            "--name"
+                | "--stake"
+                | "--chain-id"
+                | "--hot-export"
+                | "--cold-export"
+                | "--vrf-proof"
+                | "--output"
+        ) {
             return Err(format!("unknown argument {argument}"));
         }
     }
@@ -134,12 +159,27 @@ fn validator_entry(args: &[String]) -> Result<(), String> {
         return Err("validator-entry requires a hot export followed by a cold export".into());
     }
     validate_cold_hot_pairing(&hot, &cold).map_err(|error| error.to_string())?;
-    let validator_id = hot.validator_id.clone().ok_or("hot export is missing validator_id")?;
-    let hot_classical = hot.hybrid_classical_pk.clone().ok_or("hot export is missing hybrid_classical_pk")?;
-    let hot_pq = hot.hybrid_pq_pk.clone().ok_or("hot export is missing hybrid_pq_pk")?;
+    let validator_id = hot
+        .validator_id
+        .clone()
+        .ok_or("hot export is missing validator_id")?;
+    let hot_classical = hot
+        .hybrid_classical_pk
+        .clone()
+        .ok_or("hot export is missing hybrid_classical_pk")?;
+    let hot_pq = hot
+        .hybrid_pq_pk
+        .clone()
+        .ok_or("hot export is missing hybrid_pq_pk")?;
     let vrf_pk = hot.vrf_pk.clone().ok_or("hot export is missing vrf_pk")?;
-    let cold_classical = cold.cold_hybrid_classical_pk.clone().ok_or("cold export is missing cold_hybrid_classical_pk")?;
-    let cold_pq = cold.cold_hybrid_pq_pk.clone().ok_or("cold export is missing cold_hybrid_pq_pk")?;
+    let cold_classical = cold
+        .cold_hybrid_classical_pk
+        .clone()
+        .ok_or("cold export is missing cold_hybrid_classical_pk")?;
+    let cold_pq = cold
+        .cold_hybrid_pq_pk
+        .clone()
+        .ok_or("cold export is missing cold_hybrid_pq_pk")?;
     if hot_classical == cold_classical || hot_pq == cold_pq {
         return Err("hot and cold public keys must not be identical".into());
     }

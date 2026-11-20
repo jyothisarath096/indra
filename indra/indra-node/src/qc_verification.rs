@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn qc_worker_exit_is_reported_as_task_exit() {
         let verifier = NetworkQcVerifier::new();
-        let handle = verifier.take_worker_handle().unwrap().expect("worker handle");
+        let handle = verifier
+            .take_worker_handle()
+            .unwrap()
+            .expect("worker handle");
         drop(verifier);
         let mut tasks = CriticalTasks::new();
         tasks.adopt("network-qc-verifier", handle);
@@ -221,7 +224,9 @@ mod tests {
         .join();
         assert!(matches!(
             verifier.take_worker_handle(),
-            Err(crate::NodeError::LockPoisoned { name: "network-qc-verifier.worker_handle" })
+            Err(crate::NodeError::LockPoisoned {
+                name: "network-qc-verifier.worker_handle"
+            })
         ));
     }
 }

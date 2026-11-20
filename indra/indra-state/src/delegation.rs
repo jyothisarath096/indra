@@ -935,8 +935,14 @@ fn registry_eviction_order(
     stake_a
         .cmp(stake_b)
         .then_with(|| {
-            let epoch_a = state.validators.get(id_a).map_or(u64::MAX, |v| v.registered_epoch);
-            let epoch_b = state.validators.get(id_b).map_or(u64::MAX, |v| v.registered_epoch);
+            let epoch_a = state
+                .validators
+                .get(id_a)
+                .map_or(u64::MAX, |v| v.registered_epoch);
+            let epoch_b = state
+                .validators
+                .get(id_b)
+                .map_or(u64::MAX, |v| v.registered_epoch);
             epoch_b.cmp(&epoch_a)
         })
         .then_with(|| id_b.0.cmp(&id_a.0))
@@ -1633,12 +1639,12 @@ fn apply_update_network_address(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
     use crate::{
         chain::ChainState,
         validator::{ValidatorEntry, ValidatorStatus},
     };
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::{
         crypto::{ColdHybridPubKey, HybridPubKey, HybridSignature},
         primitives::VariableBytes,
@@ -3593,19 +3599,37 @@ mod tests {
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
         let (first_id, _) = make_active_validator(&mut state, 0xA1);
         let (second_id, _) = make_active_validator(&mut state, 0xB2);
-        state.validators.get_mut(&first_id).unwrap().registered_epoch = 4;
-        state.validators.get_mut(&second_id).unwrap().registered_epoch = 5;
+        state
+            .validators
+            .get_mut(&first_id)
+            .unwrap()
+            .registered_epoch = 4;
+        state
+            .validators
+            .get_mut(&second_id)
+            .unwrap()
+            .registered_epoch = 5;
 
         let first = (first_id, 10_000_000_000);
         let second = (second_id, 10_000_000_000);
-        assert_eq!(registry_eviction_order(&state, &first, &second), std::cmp::Ordering::Greater);
+        assert_eq!(
+            registry_eviction_order(&state, &first, &second),
+            std::cmp::Ordering::Greater
+        );
 
-        state.validators.get_mut(&second_id).unwrap().registered_epoch = 4;
+        state
+            .validators
+            .get_mut(&second_id)
+            .unwrap()
+            .registered_epoch = 4;
         let (low, high) = if first_id < second_id {
             (first, second)
         } else {
             (second, first)
         };
-        assert_eq!(registry_eviction_order(&state, &low, &high), std::cmp::Ordering::Greater);
+        assert_eq!(
+            registry_eviction_order(&state, &low, &high),
+            std::cmp::Ordering::Greater
+        );
     }
 }

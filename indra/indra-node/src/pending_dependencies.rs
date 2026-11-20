@@ -446,8 +446,8 @@ pub(crate) fn slash_footprint(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::{
         crypto::{ColdHybridPubKey, HybridSignature},
         governance::{GovernableAction, GovernanceActionType},

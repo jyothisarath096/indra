@@ -43,6 +43,8 @@
     )
 )]
 
+#[cfg(feature = "audit-harness")]
+pub mod audit_harness;
 pub mod config;
 pub mod config_file;
 mod consensus_authority;
@@ -52,18 +54,16 @@ pub mod engine;
 pub mod error;
 pub mod genesis;
 pub mod hardened_read_rpc;
-pub mod metrics;
 pub mod locks;
+pub mod metrics;
 pub mod net_driver;
 mod pending_dependencies;
 pub mod qc_verification;
 pub mod recovery;
 pub mod rpc_snapshot;
 pub mod slash;
-pub mod sync;
 pub mod supervisor;
-#[cfg(feature = "audit-harness")]
-pub mod audit_harness;
+pub mod sync;
 
 pub use config::NodeConfig;
 pub use config_file::{KeysData, NodeConfigFile};
@@ -71,9 +71,9 @@ pub use driver::{ConsensusDriver, DriverAction, DriverEvent};
 pub use engine::NodeEngine;
 pub use error::{NodeError, NodeResult};
 pub use genesis::{
-    build_finalized_genesis_state, build_genesis_block,
-    parse_genesis_manifest, parse_genesis_manifest_str,
-    validate_genesis_manifest, GenesisManifest, GenesisSeed, GenesisSettings, GenesisValidator,
+    build_finalized_genesis_state, build_genesis_block, parse_genesis_manifest,
+    parse_genesis_manifest_str, validate_genesis_manifest, GenesisManifest, GenesisSeed,
+    GenesisSettings, GenesisValidator,
 };
 pub use metrics::{
     start_metrics_server, start_observer_metrics_server, MetricsServerConfig, MetricsState,

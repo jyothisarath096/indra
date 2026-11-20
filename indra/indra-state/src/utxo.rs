@@ -331,7 +331,11 @@ impl UtxoSet {
     }
 
     #[cfg(test)]
-    pub(crate) fn restore_for_rollback_at_height(&mut self, entry: UtxoEntry, height: u64) -> StateResult<()> {
+    pub(crate) fn restore_for_rollback_at_height(
+        &mut self,
+        entry: UtxoEntry,
+        height: u64,
+    ) -> StateResult<()> {
         let id = entry.utxo_id;
         let value = Self::leaf_value(&entry);
         self.entries.insert(id, entry);
@@ -557,7 +561,8 @@ mod tests {
 
         let removed = set.spend_at_height(&refund_utxo_id, 301).unwrap();
         assert!(set.get(&refund_utxo_id).is_none());
-        set.restore_for_rollback_at_height(removed.unwrap(), 301).unwrap();
+        set.restore_for_rollback_at_height(removed.unwrap(), 301)
+            .unwrap();
         assert!(set.get(&refund_utxo_id).unwrap().tranche_refund.is_some());
     }
 }

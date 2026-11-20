@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use indra_cli::{KeysFile, TxParams, Wallet};
 use indra_core::types::{
@@ -158,16 +174,20 @@ fn cmd_send(args: &[String]) {
         eprintln!("Error fetching current base fee: {error}");
         std::process::exit(1);
     });
-    let (built, _required_fee) = indra_cli::build_transaction_with_fee_policy(&TxParams {
-        chain_id: &chain_id,
-        recipient_address: &recipient_address,
-        amount_spark,
-        fee_spark: requested_fee.unwrap_or(0),
-        wallet: &wallet,
-        ed25519_seed,
-        ml_dsa_seed_bytes,
-        sender_pubkey,
-    }, base_fee, requested_fee)
+    let (built, _required_fee) = indra_cli::build_transaction_with_fee_policy(
+        &TxParams {
+            chain_id: &chain_id,
+            recipient_address: &recipient_address,
+            amount_spark,
+            fee_spark: requested_fee.unwrap_or(0),
+            wallet: &wallet,
+            ed25519_seed,
+            ml_dsa_seed_bytes,
+            sender_pubkey,
+        },
+        base_fee,
+        requested_fee,
+    )
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
         std::process::exit(1);
@@ -176,7 +196,9 @@ fn cmd_send(args: &[String]) {
     if let Some(given) = requested_fee {
         let default_fee = indra_cli::default_fee_for_base_fee(base_fee).unwrap_or(u64::MAX);
         if given < default_fee {
-            eprintln!("Warning: requested fee may be rejected if the base fee rises before inclusion");
+            eprintln!(
+                "Warning: requested fee may be rejected if the base fee rises before inclusion"
+            );
         }
     }
     let response = rpc_call(
@@ -227,13 +249,8 @@ fn scan_wallet_or_exit(
             std::process::exit(1);
         }),
     };
-    indra_cli::scan_canonical_blocks(
-        rpc,
-        &mut wallet,
-        &[owner_pubkey],
-        expected_genesis_hash,
-    )
-    .unwrap_or_else(|error| {
+    indra_cli::scan_canonical_blocks(rpc, &mut wallet, &[owner_pubkey], expected_genesis_hash)
+        .unwrap_or_else(|error| {
             eprintln!("Error scanning canonical blocks: {}", error);
             std::process::exit(1);
         });

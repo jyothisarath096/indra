@@ -5,28 +5,29 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
 
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 
 use indra_core::types::{
     primitives::{Bytes32, MAX_ACCEPTED_ROUND_JUMP, MAX_RELAY_HEIGHT_SKEW, MAX_ROUNDS_PER_HEIGHT},
-    slash_detector::SlashDetector, slashing::SlashEvidenceV1,
+    slash_detector::SlashDetector,
+    slashing::SlashEvidenceV1,
     vote_signing::vote_signing_bytes,
 };
 use indra_core::{codec::Encode, ssz::sha256};
-use indra_crypto::{ClassicalPublicKey, HybridPublicKey, PQ_PK_BYTES, PqPublicKey, verify_hybrid};
+use indra_crypto::{verify_hybrid, ClassicalPublicKey, HybridPublicKey, PqPublicKey, PQ_PK_BYTES};
 
 use crate::{
     dandelion::{
-        Action as DandelionAction, FluffReason, RelayPeer, SWEEP_INTERVAL, State as DandelionState,
+        Action as DandelionAction, FluffReason, RelayPeer, State as DandelionState, SWEEP_INTERVAL,
     },
     error::NetworkError,
     frame::{FrameReader, FrameWriter},
@@ -34,8 +35,8 @@ use crate::{
     message::Message,
     net_types::{NetworkCommand, NetworkEvent, PeerDisconnectReason, RelayValidatorKey},
     peer::{
-        BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE, MAX_SCORE, PeerTable,
-        ScoreEvent,
+        PeerTable, ScoreEvent, BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE,
+        MAX_SCORE,
     },
     policy::{BanStore, BoundedTtlSet},
     rate_limit::{
@@ -1504,9 +1505,7 @@ impl PeerManagerHandle {
         &self,
         command: NetworkCommand,
     ) -> Result<(), Box<mpsc::error::SendError<NetworkCommand>>> {
-        self.command_tx
-            .blocking_send(command)
-            .map_err(Box::new)
+        self.command_tx.blocking_send(command).map_err(Box::new)
     }
 
     /// Register a fully handshaked peer with the actor.
@@ -1598,12 +1597,12 @@ mod tests {
         block::{BlockHeaderVNext, BlockProposalVNext, BlockVNext, SortitionClaimV1, VrfSuiteV1},
         crypto::HybridSignature,
         primitives::{
-            Bytes64, MAX_QC_SIZE_BYTES, MAX_STANDARD_VRF_OUTPUT_BYTES,
-            MAX_STANDARD_VRF_PROOF_BYTES, ProtocolVersion, VariableBytes,
+            Bytes64, ProtocolVersion, VariableBytes, MAX_QC_SIZE_BYTES,
+            MAX_STANDARD_VRF_OUTPUT_BYTES, MAX_STANDARD_VRF_PROOF_BYTES,
         },
         vote::{VoteStep, VoteV1},
     };
-    use indra_crypto::{ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair, vrf_prove};
+    use indra_crypto::{vrf_prove, ClassicalKeypair, HybridKeypair, PqKeypair, VrfKeypair};
     use tokio::net::{TcpListener, TcpStream};
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
@@ -1729,23 +1728,26 @@ mod tests {
                 handshake_result(Bytes32::from([index as u8 + 1; 32]), false).await;
             actor
                 .register_peer(
-                    format!("127.0.0.1:{}", 30_100 + index)
-                        .parse()
-                        .unwrap(),
+                    format!("127.0.0.1:{}", 30_100 + index).parse().unwrap(),
                     handshake,
                 )
                 .await;
             keepalive.push(peer_stream);
-            assert!(matches!(event_rx.recv().await, Some(NetworkEvent::PeerConnected { .. })));
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(NetworkEvent::PeerConnected { .. })
+            ));
         }
 
-        let (handshake, rejected_stream) =
-            handshake_result(Bytes32::from([0xEE; 32]), false).await;
+        let (handshake, rejected_stream) = handshake_result(Bytes32::from([0xEE; 32]), false).await;
         actor
             .register_peer("127.0.0.1:30100".parse().unwrap(), handshake)
             .await;
         keepalive.push(rejected_stream);
-        assert_eq!(actor.peers_by_validator.len(), MAX_NON_VALIDATOR_PEERS_PER_IP);
+        assert_eq!(
+            actor.peers_by_validator.len(),
+            MAX_NON_VALIDATOR_PEERS_PER_IP
+        );
         assert!(!actor
             .peers_by_validator
             .contains_key(&Bytes32::from([0xEE; 32])));
@@ -1772,9 +1774,7 @@ mod tests {
                 handshake_result(Bytes32::from([index as u8 + 1; 32]), false).await;
             actor
                 .register_peer(
-                    format!("127.0.0.1:{}", 30_200 + index)
-                        .parse()
-                        .unwrap(),
+                    format!("127.0.0.1:{}", 30_200 + index).parse().unwrap(),
                     handshake,
                 )
                 .await;
@@ -1787,7 +1787,10 @@ mod tests {
             .await;
         keepalive.push(active_stream);
         let _ = event_rx.recv().await;
-        assert_eq!(actor.peers_by_validator.len(), MAX_NON_VALIDATOR_PEERS_PER_IP + 1);
+        assert_eq!(
+            actor.peers_by_validator.len(),
+            MAX_NON_VALIDATOR_PEERS_PER_IP + 1
+        );
 
         actor.relay_keys.clear();
         let inactive = Bytes32::from([0xAB; 32]);
@@ -2912,9 +2915,7 @@ mod tests {
             VoteStep::Precommit,
             Bytes32::from([0x58; 32]),
         ));
-        actor
-            .relay_if_eligible(sender, &duplicate_high_round)
-            .await;
+        actor.relay_if_eligible(sender, &duplicate_high_round).await;
         assert!(receiver_rx.try_recv().is_err());
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 1);
@@ -2942,8 +2943,8 @@ mod tests {
         // heights in flight. They are validly signed, but not useful to this
         // relay slot.
         for (height, round, hash) in [
-            (97, 0, 0x61), // three heights behind
-            (80, 0, 0x62), // twenty heights behind
+            (97, 0, 0x61),  // three heights behind
+            (80, 0, 0x62),  // twenty heights behind
             (100, 9, 0x63), // distant same-height evidence after a stall
         ] {
             actor
@@ -2963,9 +2964,15 @@ mod tests {
 
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].dropped, 2);
         assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].relayed, 1);
-        assert_eq!(actor.relay_metrics[&RelayMessageClass::Vote].verification_failed, 0);
+        assert_eq!(
+            actor.relay_metrics[&RelayMessageClass::Vote].verification_failed,
+            0
+        );
         assert_eq!(actor.peer_table.get(&addr).unwrap().score, INITIAL_SCORE);
-        assert_eq!(actor.peer_table.get(&addr).unwrap().status, PeerStatus::Connected);
+        assert_eq!(
+            actor.peer_table.get(&addr).unwrap().status,
+            PeerStatus::Connected
+        );
         assert!(receiver_rx.try_recv().is_ok());
 
         // The same authenticated peer can immediately deliver a current-slot
@@ -3005,32 +3012,24 @@ mod tests {
             .await;
         let addr = actor.peers_by_validator.get(&sender).unwrap().addr;
 
-        let signed_template = signed_vote_at(
-            sender,
-            &keypair,
-            80,
-            0,
-            VoteStep::Prevote,
-            Bytes32::ZERO,
-        );
+        let signed_template =
+            signed_vote_at(sender, &keypair, 80, 0, VoteStep::Prevote, Bytes32::ZERO);
         for index in 0u64..10_000 {
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&index.to_le_bytes());
             let mut vote = signed_template.clone();
             vote.block_hash = Bytes32::from(hash);
-            actor
-                .relay_if_eligible(
-                    sender,
-                    &Message::Vote(vote),
-                )
-                .await;
+            actor.relay_if_eligible(sender, &Message::Vote(vote)).await;
         }
 
         let metrics = actor.relay_metrics[&RelayMessageClass::Vote];
         assert_eq!(metrics.dropped, 10_000);
         assert_eq!(metrics.verification_failed, 0);
         assert_eq!(actor.peer_table.get(&addr).unwrap().score, INITIAL_SCORE);
-        assert_eq!(actor.peer_table.get(&addr).unwrap().status, PeerStatus::Connected);
+        assert_eq!(
+            actor.peer_table.get(&addr).unwrap().status,
+            PeerStatus::Connected
+        );
     }
 
     #[test]
@@ -3170,13 +3169,11 @@ mod tests {
     #[test]
     fn relay_does_not_forward_request_or_response_messages() {
         assert!(relay_message_class(&Message::RequestQC { height: 7 }).is_none());
-        assert!(
-            relay_message_class(&Message::QCResponse {
-                height: 7,
-                qc_bytes: vec![]
-            })
-            .is_none()
-        );
+        assert!(relay_message_class(&Message::QCResponse {
+            height: 7,
+            qc_bytes: vec![]
+        })
+        .is_none());
     }
 
     type RelayInbox = (
@@ -3249,7 +3246,10 @@ mod tests {
                 .handle_command(NetworkCommand::Broadcast(message))
                 .await;
             drain_relay_outbox(origin, &mut inboxes, &mut queue);
-            assert!(!queue.is_empty(), "origin broadcast must enqueue a neighbor delivery");
+            assert!(
+                !queue.is_empty(),
+                "origin broadcast must enqueue a neighbor delivery"
+            );
         }
         let mut deliveries = 0usize;
         while let Some((sender, receiver, message)) = queue.pop_front() {
@@ -3302,7 +3302,11 @@ mod tests {
             [Some((7, 2)), Some((7, 2)), Some((7, 2)), Some((7, 2))],
         )
         .await;
-        assert_eq!(reached.len(), 4, "bounded skew messages must reach endpoint");
+        assert_eq!(
+            reached.len(),
+            4,
+            "bounded skew messages must reach endpoint"
+        );
         assert!(deliveries < 20, "far-slot flood must not amplify");
     }
 
@@ -3339,15 +3343,19 @@ mod tests {
                             Bytes32::from([(height + 1) as u8; 32]),
                         ))
                     };
-                    (
-                        origin,
-                        message,
-                    )
+                    (origin, message)
                 })
                 .collect();
             let (reached, deliveries) = relay_through_topology(&graph, messages).await;
-            assert_eq!(reached.len(), 4, "{name} topology must reach every validator");
-            assert!(deliveries <= 40, "{name} topology relay count must stay bounded");
+            assert_eq!(
+                reached.len(),
+                4,
+                "{name} topology must reach every validator"
+            );
+            assert!(
+                deliveries <= 40,
+                "{name} topology relay count must stay bounded"
+            );
         }
     }
 
@@ -3364,13 +3372,13 @@ mod tests {
             VoteStep::Prevote,
             Bytes32::from([0x91; 32]),
         ));
-        let (reached, deliveries) = relay_through_topology(
-            &graph,
-            vec![(0, message.clone()), (0, message)],
-        )
-        .await;
+        let (reached, deliveries) =
+            relay_through_topology(&graph, vec![(0, message.clone()), (0, message)]).await;
         assert_eq!(reached.len(), 4);
-        assert!(deliveries <= 16, "duplicate ring delivery must be deduplicated");
+        assert!(
+            deliveries <= 16,
+            "duplicate ring delivery must be deduplicated"
+        );
     }
 
     const SIM_VALIDATORS_N200: usize = 200;

@@ -88,9 +88,9 @@ pub use apply::{
 pub use chain::ChainState;
 pub use delegation::{apply_staking_op, apply_verified_staking_op};
 pub use effects::{AppliedBlockOutcome, CanonicalStateEffects, CommittedSlashEvent};
+pub use epoch::EpochTransitionContext;
 #[cfg(any(debug_assertions, feature = "test-support"))]
 pub use epoch::{apply_epoch_transition, apply_epoch_transition_at_height};
-pub use epoch::EpochTransitionContext;
 pub use error::{ConsensusSnapshotLookupError, StateError, StateResult};
 pub use fee::compute_next_base_fee;
 pub use governance::{GovernableParams, GovernanceState, ProposalPhase, ProposalRecord};

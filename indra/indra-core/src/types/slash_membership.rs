@@ -1,7 +1,7 @@
 //! Canonical slash-evidence membership roots and proofs.
 
 use crate::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::{
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},

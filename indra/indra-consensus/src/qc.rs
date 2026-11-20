@@ -6,14 +6,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use indra_core::types::{
     crypto::PQVoteSig,
     primitives::{
-        Bytes32, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS, VariableBytes,
         has_strict_two_thirds_quorum, muldiv, strict_two_thirds_minimum, validate_consensus_round,
+        Bytes32, VariableBytes, MAX_CLASSICAL_SIG_BYTES, MAX_PQ_SIG_BYTES, MAX_VALIDATORS,
     },
     qc::{ClassicalVoteSig, QuorumCertificateV1},
     vote::{VoteStep, VoteV1},
 };
 use indra_crypto::hybrid::{
-    ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature, verify_classical, verify_pq,
+    verify_classical, verify_pq, ClassicalPublicKey, ClassicalSignature, PqPublicKey, PqSignature,
 };
 
 use crate::{
@@ -428,8 +428,8 @@ mod tests {
         primitives::MAINNET_ACTIVE_SLOT_COEFFICIENT_NUMERATOR,
         qc::verify_qc_against_snapshot,
     };
-    use indra_crypto::VrfKeypair;
     use indra_crypto::hybrid::{ClassicalKeypair, HybridKeypair, PqKeypair};
+    use indra_crypto::VrfKeypair;
 
     const TEST_SNAPSHOT_ROOT: Bytes32 = Bytes32([0x5A; 32]);
 
@@ -483,7 +483,18 @@ mod tests {
         assert_ne!(snapshot_a.snapshot_root, snapshot_b.snapshot_root);
 
         let block_hash = Bytes32::from([0x63; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: validator.validator_id, snapshot_root: snapshot_a.snapshot_root, chain_id: TEST_CHAIN_ID }, &signer)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: validator.validator_id,
+                snapshot_root: snapshot_a.snapshot_root,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &signer,
+        )
         .unwrap();
         let qc = build_qc(
             1,
@@ -507,29 +518,60 @@ mod tests {
         let block_hash = Bytes32::from([0x66; 32]);
         let root_a = Bytes32::from([0xA1; 32]);
         let root_b = Bytes32::from([0xB2; 32]);
-        let vote_a = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: a.validator_id, snapshot_root: root_a, chain_id: TEST_CHAIN_ID }, &a_key)
-        .unwrap();
-        let vote_b = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: b.validator_id, snapshot_root: root_b, chain_id: TEST_CHAIN_ID }, &b_key)
-        .unwrap();
-        assert!(
-            build_qc(
-                1,
-                0,
+        let vote_a = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
                 block_hash,
-                TEST_CHAIN_ID,
-                root_a,
-                &[a, b],
-                vec![&vote_a, &vote_b],
-            )
-            .is_err()
-        );
+                validator_id: a.validator_id,
+                snapshot_root: root_a,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &a_key,
+        )
+        .unwrap();
+        let vote_b = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: b.validator_id,
+                snapshot_root: root_b,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &b_key,
+        )
+        .unwrap();
+        assert!(build_qc(
+            1,
+            0,
+            block_hash,
+            TEST_CHAIN_ID,
+            root_a,
+            &[a, b],
+            vec![&vote_a, &vote_b],
+        )
+        .is_err());
     }
 
     #[test]
     fn build_qc_single_validator() {
         let (v, kp) = make_validator(0x01, 0, 10_000);
         let block_hash = Bytes32::from([0xAAu8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let qc = build_qc(
             1,
@@ -549,7 +591,18 @@ mod tests {
     #[test]
     fn qc_construction_rejects_round_limit_and_above() {
         let (validator, keypair) = make_validator(0x72, 0, 10_000);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash: TEST_SNAPSHOT_ROOT, validator_id: validator.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &keypair)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash: TEST_SNAPSHOT_ROOT,
+                validator_id: validator.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &keypair,
+        )
         .unwrap();
         for round in [
             indra_core::types::primitives::MAX_ROUNDS_PER_HEIGHT,
@@ -580,7 +633,18 @@ mod tests {
     fn qc_bitfield_set_correctly() {
         let (v, kp) = make_validator(0x02, 5, 10_000);
         let block_hash = Bytes32::from([0xBBu8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let qc = build_qc(
             1,
@@ -600,7 +664,18 @@ mod tests {
     fn verify_qc_passes_with_quorum() {
         let (v, kp) = make_validator(0x03, 0, 10_000);
         let block_hash = Bytes32::from([0xCCu8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
@@ -628,7 +703,18 @@ mod tests {
     fn verify_qc_requires_both_classical_and_pq_when_hybrid_active() {
         let (v, kp) = make_validator(0x13, 0, 10_000);
         let block_hash = Bytes32::from([0x13u8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let mut qc = build_qc(
             1,
@@ -655,7 +741,18 @@ mod tests {
     fn verify_qc_accepts_valid_hybrid_qc() {
         let (v, kp) = make_validator(0x14, 0, 10_000);
         let block_hash = Bytes32::from([0x14u8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let qc = build_qc(
             1,
@@ -675,7 +772,18 @@ mod tests {
     fn verify_qc_rejects_classical_forgery() {
         let (v, kp) = make_validator(0x15, 0, 10_000);
         let block_hash = Bytes32::from([0x15u8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let mut qc = build_qc(
             1,
@@ -701,7 +809,18 @@ mod tests {
         let (v1, kp1) = make_validator(0x01, 0, 3_000);
         let (v2, _) = make_validator(0x02, 1, 7_000);
         let block_hash = Bytes32::from([0xDDu8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v1.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp1)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v1.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp1,
+        )
         .unwrap();
         let qc = build_qc(
             1,
@@ -773,7 +892,18 @@ mod tests {
     fn verify_qc_rejects_duplicate_pq_signatures() {
         let (v, kp) = make_validator(0x0C, 0, 10_000);
         let block_hash = Bytes32::from([0x12u8; 32]);
-        let vote = produce_vote(crate::vote::VoteRequest { height: 1, round: 0, step: VoteStep::Precommit, block_hash, validator_id: v.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &kp)
+        let vote = produce_vote(
+            crate::vote::VoteRequest {
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_hash,
+                validator_id: v.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &kp,
+        )
         .unwrap();
         let mut signer_bitfield = [0u8; SIGNER_BITFIELD_BYTES];
         signer_bitfield[0] = 0b0000_0001;
@@ -835,13 +965,57 @@ mod tests {
         let hash_a = Bytes32::from([0xA1; 32]);
         let hash_b = Bytes32::from([0xB2; 32]);
 
-        let byzantine_a = produce_vote(crate::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: hash_a, validator_id: byzantine.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &byzantine_key)
+        let byzantine_a = produce_vote(
+            crate::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash: hash_a,
+                validator_id: byzantine.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &byzantine_key,
+        )
         .unwrap();
-        let honest_a_vote = produce_vote(crate::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: hash_a, validator_id: honest_a.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &honest_a_key)
+        let honest_a_vote = produce_vote(
+            crate::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash: hash_a,
+                validator_id: honest_a.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &honest_a_key,
+        )
         .unwrap();
-        let byzantine_b = produce_vote(crate::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: hash_b, validator_id: byzantine.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &byzantine_key)
+        let byzantine_b = produce_vote(
+            crate::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash: hash_b,
+                validator_id: byzantine.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &byzantine_key,
+        )
         .unwrap();
-        let honest_b_vote = produce_vote(crate::vote::VoteRequest { height, round, step: VoteStep::Precommit, block_hash: hash_b, validator_id: honest_b.validator_id, snapshot_root: TEST_SNAPSHOT_ROOT, chain_id: TEST_CHAIN_ID }, &honest_b_key)
+        let honest_b_vote = produce_vote(
+            crate::vote::VoteRequest {
+                height,
+                round,
+                step: VoteStep::Precommit,
+                block_hash: hash_b,
+                validator_id: honest_b.validator_id,
+                snapshot_root: TEST_SNAPSHOT_ROOT,
+                chain_id: TEST_CHAIN_ID,
+            },
+            &honest_b_key,
+        )
         .unwrap();
 
         let qc_a = build_qc(

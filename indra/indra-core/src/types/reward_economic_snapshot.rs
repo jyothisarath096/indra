@@ -1,7 +1,7 @@
 //! Canonical epoch-start commission and delegation snapshots for reward payout.
 
 use crate::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
     types::primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
 };
@@ -377,15 +377,13 @@ mod tests {
     fn split_principal_and_commission_invariants_fail_closed() {
         assert!(RewardEconomicDelegatorEntry::new(Bytes32::ZERO, 0, 0).is_err());
         assert!(RewardEconomicDelegatorEntry::new(Bytes32::ZERO, u64::MAX, 1).is_err());
-        assert!(
-            RewardEconomicValidatorEntry::new(
-                Bytes32::from([1; 32]),
-                2_001,
-                vec![delegator(2, 1, 0)],
-                2_000,
-            )
-            .is_err()
-        );
+        assert!(RewardEconomicValidatorEntry::new(
+            Bytes32::from([1; 32]),
+            2_001,
+            vec![delegator(2, 1, 0)],
+            2_000,
+        )
+        .is_err());
         assert!(RewardEconomicSnapshot::new(301, 300, 10_001, vec![validator(1)]).is_err());
     }
 

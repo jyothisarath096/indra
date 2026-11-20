@@ -10,11 +10,11 @@ use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use indra_crypto::sha256;
 
+use crate::error::{StateError, StateResult};
 use crate::smt::{
     AuthTreeProof, CompressedAuthTree, CompressedChildKind, CompressedProof, CompressedProofChild,
     CompressedProofStep, MerkleProof, ProofTerminal, SMT_DEPTH,
 };
-use crate::error::{StateError, StateResult};
 
 /// Immutable, path-copying ordered map.
 #[derive(Debug, Clone, Default)]
@@ -1010,26 +1010,22 @@ fn build_persistent_subtree(
                     site: "persistent::build_persistent_subtree index",
                 })?;
                 let nibbles = key_to_nibbles(key);
-                let child_nibble = nibbles
-                    .iter()
-                    .copied()
-                    .nth(prefix.len())
-                    .ok_or(StateError::InternalInvariant {
+                let child_nibble = nibbles.iter().copied().nth(prefix.len()).ok_or(
+                    StateError::InternalInvariant {
                         site: "persistent::build_persistent_subtree child nibble",
-                    })?;
+                    },
+                )?;
                 let mut end = index + 1;
                 while end < pairs.len() {
                     let (other_key, _) = pairs.get(end).ok_or(StateError::InternalInvariant {
                         site: "persistent::build_persistent_subtree end",
                     })?;
                     let other = key_to_nibbles(other_key);
-                    let other_nibble = other
-                        .iter()
-                        .copied()
-                        .nth(prefix.len())
-                        .ok_or(StateError::InternalInvariant {
+                    let other_nibble = other.iter().copied().nth(prefix.len()).ok_or(
+                        StateError::InternalInvariant {
                             site: "persistent::build_persistent_subtree other nibble",
-                        })?;
+                        },
+                    )?;
                     if other_nibble != child_nibble {
                         break;
                     }
@@ -1112,11 +1108,14 @@ fn persistent_insert(
             let key_nibbles = key_to_nibbles(&key);
             let shared = common_nibble_prefix_len(prefix, &key_nibbles, 0);
             if shared < prefix.len() {
-                let old_nibble = prefix.iter().copied().nth(shared).ok_or(
-                    StateError::InternalInvariant {
-                        site: "persistent::persistent_insert old nibble",
-                    },
-                )?;
+                let old_nibble =
+                    prefix
+                        .iter()
+                        .copied()
+                        .nth(shared)
+                        .ok_or(StateError::InternalInvariant {
+                            site: "persistent::persistent_insert old nibble",
+                        })?;
                 let new_nibble = key_nibbles.iter().copied().nth(shared).ok_or(
                     StateError::InternalInvariant {
                         site: "persistent::persistent_insert new split nibble",
@@ -1932,7 +1931,10 @@ mod tests {
         let entries = pairs(64);
         let mut base = PersistentAuthTree::from_pairs(entries.clone()).unwrap();
         let root = base.root();
-        assert_eq!(base.insert(entries[0].0, entries[0].1), Ok(Some(entries[0].1)));
+        assert_eq!(
+            base.insert(entries[0].0, entries[0].1),
+            Ok(Some(entries[0].1))
+        );
         assert_eq!(base.root(), root, "same key/value replacement is stable");
         assert_eq!(base.delete(entries[0].0), Ok(Some(entries[0].1)));
         assert_ne!(base.root(), root);

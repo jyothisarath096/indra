@@ -922,8 +922,8 @@ pub(crate) fn mutation_count() -> usize {
 }
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::{
         consensus_snapshot::{ConsensusSnapshot, ConsensusSnapshotEntry},
         crypto::HybridPubKey,
@@ -973,10 +973,7 @@ mod tests {
     fn rollback_restores_utxo_root_and_proof_after_mutation_and_error() {
         let height = 1;
         let mut state = ChainState::new_genesis(TEST_CHAIN_ID);
-        let original_id = state
-            .utxos
-            .insert(test_output(0xA1), height, 0, 0)
-            .unwrap();
+        let original_id = state.utxos.insert(test_output(0xA1), height, 0, 0).unwrap();
         let root_before = state.utxos.root_at_height(height);
         let proof_before = state.utxos.prove_at_height(&original_id, height);
 
@@ -985,7 +982,10 @@ mod tests {
             txn.insert_utxo(test_output(0xA2), height, 1, 0).unwrap();
         }
         assert_eq!(state.utxos.root_at_height(height), root_before);
-        assert_eq!(state.utxos.prove_at_height(&original_id, height), proof_before);
+        assert_eq!(
+            state.utxos.prove_at_height(&original_id, height),
+            proof_before
+        );
 
         set_fail_after_mutation(Some(1));
         {
@@ -994,7 +994,10 @@ mod tests {
         }
         set_fail_after_mutation(None);
         assert_eq!(state.utxos.root_at_height(height), root_before);
-        assert_eq!(state.utxos.prove_at_height(&original_id, height), proof_before);
+        assert_eq!(
+            state.utxos.prove_at_height(&original_id, height),
+            proof_before
+        );
     }
 
     #[test]

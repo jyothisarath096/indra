@@ -1077,8 +1077,14 @@ mod tests {
             set.upsert(filler).unwrap();
         }
         set.select_active_set(0, 0);
-        assert_eq!(set.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Active);
-        assert_eq!(set.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Registered);
+        assert_eq!(
+            set.get(&Bytes32::from([0xF0; 32])).unwrap().status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            set.get(&Bytes32::from([0x01; 32])).unwrap().status,
+            ValidatorStatus::Registered
+        );
 
         let mut same_epoch = ValidatorSet::new();
         let mut higher_id = make_validator(0xF0, stake, 4);
@@ -1093,8 +1099,14 @@ mod tests {
             same_epoch.upsert(filler).unwrap();
         }
         same_epoch.select_active_set(0, 0);
-        assert_eq!(same_epoch.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active);
-        assert_eq!(same_epoch.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Registered);
+        assert_eq!(
+            same_epoch.get(&Bytes32::from([0x01; 32])).unwrap().status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            same_epoch.get(&Bytes32::from([0xF0; 32])).unwrap().status,
+            ValidatorStatus::Registered
+        );
     }
 
     #[test]
@@ -1107,24 +1119,28 @@ mod tests {
         set.upsert(earlier).unwrap();
         set.upsert(higher).unwrap();
         for id in 0x02u8..=0x14 {
-            let mut filler = make_validator(id, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2, u64::from(id) + 10);
+            let mut filler =
+                make_validator(id, MINIMUM_ACTIVE_SELF_STAKE_SPARK + 2, u64::from(id) + 10);
             filler.status = ValidatorStatus::Registered;
             set.upsert(filler).unwrap();
         }
         set.select_active_set(0, 0);
-        assert_eq!(set.get(&Bytes32::from([0x01; 32])).unwrap().status, ValidatorStatus::Active);
-        assert_eq!(set.get(&Bytes32::from([0xF0; 32])).unwrap().status, ValidatorStatus::Registered);
+        assert_eq!(
+            set.get(&Bytes32::from([0x01; 32])).unwrap().status,
+            ValidatorStatus::Active
+        );
+        assert_eq!(
+            set.get(&Bytes32::from([0xF0; 32])).unwrap().status,
+            ValidatorStatus::Registered
+        );
     }
 
     #[test]
     fn active_set_selection_is_deterministic_and_respects_phase_one_cap() {
         let mut set = ValidatorSet::new();
         for id in 0u8..=20 {
-            let mut validator = make_validator(
-                id,
-                MINIMUM_ACTIVE_SELF_STAKE_SPARK,
-                u64::from(20 - id),
-            );
+            let mut validator =
+                make_validator(id, MINIMUM_ACTIVE_SELF_STAKE_SPARK, u64::from(20 - id));
             validator.status = ValidatorStatus::Registered;
             set.upsert(validator).unwrap();
         }
@@ -1134,7 +1150,11 @@ mod tests {
         assert_eq!(set, second);
         assert_eq!(set.active_count(), 20);
         for id in 0u8..=20 {
-            let expected = if id >= 1 { ValidatorStatus::Active } else { ValidatorStatus::Registered };
+            let expected = if id >= 1 {
+                ValidatorStatus::Active
+            } else {
+                ValidatorStatus::Registered
+            };
             assert_eq!(set.get(&Bytes32::from([id; 32])).unwrap().status, expected);
         }
     }

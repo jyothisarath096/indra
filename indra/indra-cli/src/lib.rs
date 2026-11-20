@@ -62,24 +62,26 @@ pub mod tx_builder;
 pub mod wallet;
 
 pub use amount::{parse_indra_amount_to_spark, SPARK_PER_INDRA};
-pub use canonical_scan::{scan_canonical_block, scan_canonical_blocks, scan_canonical_blocks_authorized};
+pub use canonical_scan::{
+    scan_canonical_block, scan_canonical_blocks, scan_canonical_blocks_authorized,
+};
 pub use error::{CliError, CliResult};
 pub use genesis_cmd::{
     build_genesis_config, entry_from_keys, entry_from_public_keys, holds_at_least_one_third,
     stake_share_bps, GenesisConfig, GenesisEntry,
 };
 pub use keygen::{
-    cold_hybrid_pubkey, cold_password_source_from_args, encrypt_cold_keys, encrypt_keys,
-    generate_cold_keys_file, generate_cold_share_ceremony, generate_from_master_seed,
-    generate_from_new_mnemonic, generate_from_passphrase, has_secret_value_in_argv,
-    inspect_key_file_public_metadata, inspect_public_metadata, load_cold_keys, load_keys,
-    load_keys_for_cli, password_source_from_args, read_cold_share, reconstruct_cold_shares,
-    recover_from_mnemonic, validate_cold_share_manifest, verify_cold_share,
+    cold_hot_pairing_message, cold_hybrid_pubkey, cold_password_source_from_args,
+    encrypt_cold_keys, encrypt_keys, generate_cold_keys_file, generate_cold_share_ceremony,
+    generate_from_master_seed, generate_from_new_mnemonic, generate_from_passphrase,
+    has_secret_value_in_argv, inspect_key_file_public_metadata, inspect_public_metadata,
+    load_cold_keys, load_keys, load_keys_for_cli, password_source_from_args,
+    public_export_from_cold_key_file, public_export_from_key_file, read_cold_share,
+    reconstruct_cold_shares, recover_from_mnemonic, validate_cold_hot_pairing,
+    validate_cold_share_manifest, validate_public_export, verify_cold_share,
     warn_if_key_file_permissive, write_cold_share_secure, write_keys_file_secure, ColdKeysFile,
     ColdShareCeremony, ColdShareFile, ColdShareManifest, ExpectedColdPublicKey,
-    KeyFilePublicMetadata, KeysFile, PasswordSource, ValidatorKeys,
-    cold_hot_pairing_message, public_export_from_cold_key_file, public_export_from_key_file,
-    validate_cold_hot_pairing, validate_public_export, PublicKeyExport,
+    KeyFilePublicMetadata, KeysFile, PasswordSource, PublicKeyExport, ValidatorKeys,
 };
 pub use query::{rpc_call, QueryResult};
 pub use scan_auth::{
@@ -89,14 +91,14 @@ pub use scan_auth::{
 pub use staking::{
     build_claim_rewards_op, build_cold_authorized_staking_op, build_delegate_op,
     build_exit_stake_position_op, build_register_validator_op_with_cold,
-    build_update_network_address_op, fetch_chain_id, fetch_staking_nonce,
-    fetch_base_fee, fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
+    build_update_network_address_op, fetch_base_fee, fetch_chain_id, fetch_staking_nonce,
+    fetch_validator_cold_replay, reconstruct_keypair, submit_staking_op,
     ColdAuthorizedStakingAction, StakePositionExitSigner,
 };
 pub use tx_builder::{
     build_cold_transaction, build_cold_transaction_with_fee_policy, build_transaction,
     build_transaction_with_fee_policy, default_fee_for_base_fee, required_fee_for_transaction,
-    BuiltStakingOp, BuiltTransaction, ColdTxParams, FEE_SAFETY_MARGIN, TxParams,
+    BuiltStakingOp, BuiltTransaction, ColdTxParams, TxParams, FEE_SAFETY_MARGIN,
 };
 pub use wallet::{seed_wallet_from_genesis, PendingChange, Wallet, WalletEntry};
 

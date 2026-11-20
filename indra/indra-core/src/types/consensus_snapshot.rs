@@ -1,17 +1,17 @@
 //! Canonical, versioned consensus membership and weight snapshots.
 
 use crate::{
-    codec::{ByteReader, Decode, Encode, decode_list, encode_list, list_encoded_len},
+    codec::{decode_list, encode_list, list_encoded_len, ByteReader, Decode, Encode},
     error::{IndraError, IndraResult},
-    sortition::{CertifiedLogInterval, certified_log, validate_mainnet_f},
+    sortition::{certified_log, validate_mainnet_f, CertifiedLogInterval},
     types::{
         block::VrfSuiteV1,
         primitives::{Bytes32, MAX_ACTIVE_VALIDATORS},
     },
 };
 use indra_crypto::{
-    ClassicalPublicKey, PQ_PK_BYTES, PqPublicKey, sha256, validate_classical_public_key,
-    validate_pq_public_key, validate_vrf_public_key,
+    sha256, validate_classical_public_key, validate_pq_public_key, validate_vrf_public_key,
+    ClassicalPublicKey, PqPublicKey, PQ_PK_BYTES,
 };
 
 /// Consensus snapshot wire and root format version.
@@ -335,7 +335,9 @@ fn compute_snapshot_root(input: &SnapshotRootInput<'_>) -> Bytes32 {
     input.source_boundary_height.encode(&mut material);
     encode_list(input.entries, &mut material);
     input.total_weight_spark.encode(&mut material);
-    input.active_slot_coefficient_numerator.encode(&mut material);
+    input
+        .active_slot_coefficient_numerator
+        .encode(&mut material);
     material.extend_from_slice(&input.sortition_log_lo);
     material.extend_from_slice(&input.sortition_log_hi);
     Bytes32::from(sha256(&material))
@@ -560,18 +562,16 @@ mod tests {
         let mut zero = entry(1, 1_000, 11);
         zero.consensus_weight_spark = 0;
         assert!(test_snapshot(301, 300, vec![zero]).is_err());
-        assert!(
-            ConsensusSnapshotEntry::new(
-                Bytes32::from([1; 32]),
-                0,
-                entry(2, 1, 12).classical_vote_pk,
-                entry(2, 1, 12).pq_vote_pk,
-                entry(2, 1, 12).vrf_pk,
-                VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
-                0,
-            )
-            .is_err()
-        );
+        assert!(ConsensusSnapshotEntry::new(
+            Bytes32::from([1; 32]),
+            0,
+            entry(2, 1, 12).classical_vote_pk,
+            entry(2, 1, 12).pq_vote_pk,
+            entry(2, 1, 12).vrf_pk,
+            VrfSuiteV1::EcvrfEdwards25519Sha512Ell2,
+            0,
+        )
+        .is_err());
     }
 
     #[test]

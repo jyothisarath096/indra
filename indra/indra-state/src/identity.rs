@@ -122,8 +122,8 @@ pub fn resolve_delegator_identity_for_redelegation(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{types::crypto::HybridPubKey, VariableBytes};
 
     fn id(byte: u8) -> Bytes32 {

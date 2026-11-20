@@ -8,7 +8,15 @@
     clippy::unimplemented,
     clippy::indexing_slicing
 )]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! INDRA v2 node binary.
 //!
@@ -108,7 +116,8 @@ fn consensus_peer_wait_message(connected: usize) -> String {
     format!(
         "[consensus] t={}ms waiting for peers (have {}, need {})",
         now_ms(),
-        connected, MIN_CONSENSUS_PEERS
+        connected,
+        MIN_CONSENSUS_PEERS
     )
 }
 
@@ -967,6 +976,10 @@ fn clear_dial_failure(peer_addr: &str, failure_counts: &mut HashMap<String, u32>
     failure_counts.remove(peer_addr);
 }
 
+fn desired_outbound_peer_target(candidate_count: usize) -> usize {
+    TARGET_OUTBOUND_PEERS.min(candidate_count)
+}
+
 fn is_configured_self_addr(addr: &SocketAddr, local_p2p_addr: &str) -> bool {
     resolve_peer_addr(local_p2p_addr).is_some_and(|local| *addr == local)
 }
@@ -1814,9 +1827,6 @@ fn start_network_runtime(
 
                         let mut last_peer_save = Instant::now();
                         loop {
-                            let deficit = TARGET_OUTBOUND_PEERS.saturating_sub(
-                                network_bridge.connected_outbound_peer_count(),
-                            );
                             let mut candidates: Vec<(String, PeerSource)> = fatal_lock!(peer_sources, "network.peer_sources.candidates")
                                 .iter()
                                 .map(|(address, source)| (address.clone(), *source))
@@ -1853,6 +1863,10 @@ fn start_network_runtime(
                                 !fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.eligibility")
                                     .blocked_at(&cooldown_key, eligibility_now)
                             });
+                            let target_outbound = desired_outbound_peer_target(candidates.len());
+                            let deficit = target_outbound.saturating_sub(
+                                network_bridge.connected_outbound_peer_count(),
+                            );
                             let mut rng = rand::rngs::OsRng;
                             let all_peers = randomized_diverse_dial_order(
                                 candidates,
@@ -1862,8 +1876,7 @@ fn start_network_runtime(
 
                             for candidate in &all_peers {
                                 let peer_addr_str = &candidate.address;
-                                if network_bridge.connected_outbound_peer_count()
-                                    >= TARGET_OUTBOUND_PEERS
+                                if network_bridge.connected_outbound_peer_count() >= target_outbound
                                 {
                                     break;
                                 }
@@ -2326,11 +2339,11 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let wire = msg.encode_wire()?;
-    let payload = wire.get(4..).ok_or_else(|| {
-        indra_network::NetworkError::DecodeFailed {
+    let payload = wire
+        .get(4..)
+        .ok_or_else(|| indra_network::NetworkError::DecodeFailed {
             reason: "encoded message is shorter than its frame header".to_string(),
-        }
-    })?;
+        })?;
     write_frame_plain(writer, payload).await
 }
 
@@ -8126,14 +8139,8 @@ mod tests {
             rpc_admin_token_status(Some(&admin), Some(admin_token)),
             (true, true)
         );
-        assert!(!rpc_access_token_valid(
-            Some(&access),
-            Some(admin_token)
-        ));
-        assert!(rpc_access_token_valid(
-            Some(&access),
-            Some(access_token)
-        ));
+        assert!(!rpc_access_token_valid(Some(&access), Some(admin_token)));
+        assert!(rpc_access_token_valid(Some(&access), Some(access_token)));
         assert!(check_rpc_method_allowed_with_admin(
             "indra_getStakingStateSummary",
             RpcMode::Full,
@@ -8218,7 +8225,9 @@ mod tests {
                     write!(
                         stream,
                         "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{}\r\n{}",
-                        body.len(), headers, body
+                        body.len(),
+                        headers,
+                        body
                     )
                     .unwrap();
                     stream.shutdown(std::net::Shutdown::Write).unwrap();
@@ -8230,14 +8239,29 @@ mod tests {
             }
             panic!("listener did not bind");
         };
-        let wrong_admin = request("X-Rpc-Token: access-B\r\nX-Admin-Token: access-B\r\n", "indra_getPeerTopology");
+        let wrong_admin = request(
+            "X-Rpc-Token: access-B\r\nX-Admin-Token: access-B\r\n",
+            "indra_getPeerTopology",
+        );
         assert!(wrong_admin.contains("valid X-Admin-Token"), "{wrong_admin}");
-        let right_admin = request("X-Rpc-Token: access-B\r\nX-Admin-Token: admin-A\r\n", "indra_getPeerTopology");
-        assert!(!right_admin.contains("valid X-Admin-Token"), "{right_admin}");
+        let right_admin = request(
+            "X-Rpc-Token: access-B\r\nX-Admin-Token: admin-A\r\n",
+            "indra_getPeerTopology",
+        );
+        assert!(
+            !right_admin.contains("valid X-Admin-Token"),
+            "{right_admin}"
+        );
         let no_access = request("", "indra_getHeight");
-        assert!(no_access.contains("full RPC requires a valid X-Rpc-Token"), "{no_access}");
+        assert!(
+            no_access.contains("full RPC requires a valid X-Rpc-Token"),
+            "{no_access}"
+        );
         let read_with_access = request("X-Rpc-Token: access-B\r\n", "indra_getHeight");
-        assert!(read_with_access.contains("\"height\""), "{read_with_access}");
+        assert!(
+            read_with_access.contains("\"height\""),
+            "{read_with_access}"
+        );
         drop(handle);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -8902,6 +8926,20 @@ mod tests {
         assert!(!discovered_peers.contains(&peer));
         assert!(!cooldowns.blocked_at(&OutboundCooldownKey::Address(peer.clone()), Instant::now()));
         assert!(!failure_counts.contains_key(&peer));
+    }
+
+    #[test]
+    fn outbound_target_is_bounded_by_eligible_candidates() {
+        assert_eq!(desired_outbound_peer_target(0), 0);
+        assert_eq!(desired_outbound_peer_target(2), 2);
+        assert_eq!(
+            desired_outbound_peer_target(TARGET_OUTBOUND_PEERS),
+            TARGET_OUTBOUND_PEERS
+        );
+        assert_eq!(
+            desired_outbound_peer_target(TARGET_OUTBOUND_PEERS + 1),
+            TARGET_OUTBOUND_PEERS
+        );
     }
 
     #[test]

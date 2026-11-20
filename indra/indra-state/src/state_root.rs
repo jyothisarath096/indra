@@ -84,8 +84,8 @@ pub fn compute_validator_set_root_at_height(
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::types::{crypto::HybridPubKey, transaction::OutputV1};
 
     #[test]

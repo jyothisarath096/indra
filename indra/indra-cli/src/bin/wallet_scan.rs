@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Wallet scan — discover outputs owned by this keypair from canonical blocks.
 //!
@@ -12,10 +28,7 @@
 //!                   [--rpc-token-file token.path]
 
 use indra_core::codec::Decode;
-use indra_core::types::{
-    crypto::HybridPubKey,
-    primitives::Bytes32,
-};
+use indra_core::types::{crypto::HybridPubKey, primitives::Bytes32};
 
 const SPARK_PER_INDRA_F64: f64 = 100_000_000.0;
 
@@ -42,16 +55,23 @@ fn main() {
 
     println!("INDRA Wallet Scanner");
     println!("─────────────────────────────────────────");
-    println!("Owner:  {}", get("--owner-pubkey").or_else(|| get("--cold-owner")).unwrap_or_default());
+    println!(
+        "Owner:  {}",
+        get("--owner-pubkey")
+            .or_else(|| get("--cold-owner"))
+            .unwrap_or_default()
+    );
     println!("Wallet: {}", wallet_path);
     println!("Node:   {}", node_url);
     println!("Genesis: {}", genesis_hash);
     println!("─────────────────────────────────────────");
 
-    let owner_hex = get("--owner-pubkey").or_else(|| get("--cold-owner")).unwrap_or_else(|| {
-        eprintln!("Error: --owner-pubkey or --cold-owner is required");
-        std::process::exit(1);
-    });
+    let owner_hex = get("--owner-pubkey")
+        .or_else(|| get("--cold-owner"))
+        .unwrap_or_else(|| {
+            eprintln!("Error: --owner-pubkey or --cold-owner is required");
+            std::process::exit(1);
+        });
 
     let mut wallet = indra_cli::Wallet::load(&wallet_path).unwrap_or_else(|e| {
         eprintln!("Warning: could not load wallet ({}), starting fresh", e);
@@ -184,12 +204,7 @@ fn scan_canonical_blocks(
     owner_pubkeys: &[HybridPubKey],
     expected_genesis_hash: indra_core::types::primitives::Bytes32,
 ) -> Result<usize, String> {
-    indra_cli::scan_canonical_blocks(
-        node_url,
-        wallet,
-        owner_pubkeys,
-        expected_genesis_hash,
-    )
+    indra_cli::scan_canonical_blocks(node_url, wallet, owner_pubkeys, expected_genesis_hash)
 }
 
 #[cfg(test)]

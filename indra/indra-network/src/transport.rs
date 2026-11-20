@@ -85,11 +85,12 @@ impl Connection {
                     break;
                 }
                 Ok(n) => {
-                    self.read_buf.extend_from_slice(scratch.get(..n).ok_or_else(|| {
-                        NetworkError::DecodeFailed {
-                            reason: "invalid transport read length".to_string(),
-                        }
-                    })?);
+                    self.read_buf
+                        .extend_from_slice(scratch.get(..n).ok_or_else(|| {
+                            NetworkError::DecodeFailed {
+                                reason: "invalid transport read length".to_string(),
+                            }
+                        })?);
                     if n < scratch.len() {
                         break;
                     }
@@ -117,19 +118,16 @@ impl Connection {
         }
 
         let len_start = self.read_pos;
-        let length_prefix = self
-            .read_buf
-            .get(len_start..len_start + 4)
-            .ok_or_else(|| NetworkError::DecodeFailed {
+        let length_prefix = self.read_buf.get(len_start..len_start + 4).ok_or_else(|| {
+            NetworkError::DecodeFailed {
                 reason: "truncated length prefix".to_string(),
-            })?;
-        let total_len = u32::from_le_bytes(
-            length_prefix
-                .try_into()
-                .map_err(|_| NetworkError::DecodeFailed {
-                    reason: "invalid length prefix".to_string(),
-                })?,
-        ) as usize;
+            }
+        })?;
+        let total_len = u32::from_le_bytes(length_prefix.try_into().map_err(|_| {
+            NetworkError::DecodeFailed {
+                reason: "invalid length prefix".to_string(),
+            }
+        })?) as usize;
         if total_len > MAX_MSG_BYTES {
             return Err(NetworkError::MessageTooLarge {
                 size: total_len,
@@ -299,8 +297,8 @@ mod tests {
             assert!(matches!(conn.recv().unwrap(), RecvStatus::NoData));
 
             let start = std::time::Instant::now();
-                loop {
-                    match conn.recv().unwrap() {
+            loop {
+                match conn.recv().unwrap() {
                     RecvStatus::Message(msg) => return msg,
                     RecvStatus::NoData => {
                         if start.elapsed() > Duration::from_secs(2) {

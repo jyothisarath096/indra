@@ -109,7 +109,6 @@ fn signed_tx(
         signature_module_id: 1,
         inputs: inputs
             .into_iter()
-            
             .map(|utxo_id| InputV1 { utxo_id })
             .collect(),
         outputs,

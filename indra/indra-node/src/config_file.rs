@@ -1134,5 +1134,4 @@ genesis = "/tmp/indra/genesis.toml"
             assert_eq!(is_valid_addr(value), expected, "case {name}: {value:?}");
         }
     }
-
 }

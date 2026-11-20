@@ -1,6 +1,8 @@
 //! Fail-closed wrappers for node-owned synchronization primitives.
 
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, WaitTimeoutResult};
+use std::sync::{
+    Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, WaitTimeoutResult,
+};
 
 use crate::{supervisor, NodeError, NodeResult};
 
@@ -22,12 +24,18 @@ pub fn lock<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> NodeResult<MutexG
 }
 
 /// Read-lock an RwLock, reporting poison before returning a fatal node error.
-pub fn read<'a, T>(rwlock: &'a RwLock<T>, name: &'static str) -> NodeResult<RwLockReadGuard<'a, T>> {
+pub fn read<'a, T>(
+    rwlock: &'a RwLock<T>,
+    name: &'static str,
+) -> NodeResult<RwLockReadGuard<'a, T>> {
     rwlock.read().map_err(|_| poisoned(name))
 }
 
 /// Write-lock an RwLock, reporting poison before returning a fatal node error.
-pub fn write<'a, T>(rwlock: &'a RwLock<T>, name: &'static str) -> NodeResult<RwLockWriteGuard<'a, T>> {
+pub fn write<'a, T>(
+    rwlock: &'a RwLock<T>,
+    name: &'static str,
+) -> NodeResult<RwLockWriteGuard<'a, T>> {
     rwlock.write().map_err(|_| poisoned(name))
 }
 
@@ -38,7 +46,9 @@ pub fn wait_timeout<'a, T>(
     timeout: std::time::Duration,
     name: &'static str,
 ) -> NodeResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
-    condvar.wait_timeout(guard, timeout).map_err(|_| poisoned(name))
+    condvar
+        .wait_timeout(guard, timeout)
+        .map_err(|_| poisoned(name))
 }
 
 #[cfg(test)]
@@ -62,7 +72,10 @@ mod tests {
         .unwrap_err();
 
         let error = lock(&mutex, "test-mutex").unwrap_err();
-        assert!(matches!(error, NodeError::LockPoisoned { name: "test-mutex" }));
+        assert!(matches!(
+            error,
+            NodeError::LockPoisoned { name: "test-mutex" }
+        ));
         assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 1);
 
         let rwlock = Arc::new(RwLock::new(()));
@@ -75,7 +88,12 @@ mod tests {
         .unwrap_err();
 
         let error = write(&rwlock, "test-rwlock").unwrap_err();
-        assert!(matches!(error, NodeError::LockPoisoned { name: "test-rwlock" }));
+        assert!(matches!(
+            error,
+            NodeError::LockPoisoned {
+                name: "test-rwlock"
+            }
+        ));
         assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 2);
     }
 
@@ -93,7 +111,12 @@ mod tests {
         .unwrap_err();
 
         let task = thread::spawn(move || {
-            matches!(lock(&mutex, "spawned-task-mutex"), Err(NodeError::LockPoisoned { name: "spawned-task-mutex" }))
+            matches!(
+                lock(&mutex, "spawned-task-mutex"),
+                Err(NodeError::LockPoisoned {
+                    name: "spawned-task-mutex"
+                })
+            )
         });
         assert!(task.join().unwrap());
         assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 1);
@@ -121,8 +144,14 @@ mod tests {
         for worker in workers {
             worker.join().unwrap_err();
         }
-        assert!(matches!(lock(&first, "simultaneous-first"), Err(NodeError::LockPoisoned { .. })));
-        assert!(matches!(lock(&second, "simultaneous-second"), Err(NodeError::LockPoisoned { .. })));
+        assert!(matches!(
+            lock(&first, "simultaneous-first"),
+            Err(NodeError::LockPoisoned { .. })
+        ));
+        assert!(matches!(
+            lock(&second, "simultaneous-second"),
+            Err(NodeError::LockPoisoned { .. })
+        ));
         assert!(REPORT_COUNT.load(Ordering::SeqCst) >= 2);
     }
 
@@ -137,7 +166,10 @@ mod tests {
             ("rpc_snapshot.rs", include_str!("rpc_snapshot.rs")),
         ];
         let forbidden = [
-            ".lock().ok(", ".lock().map(", ".lock().unwrap_or", ".read().ok(",
+            ".lock().ok(",
+            ".lock().map(",
+            ".lock().unwrap_or",
+            ".read().ok(",
             ".write().ok(",
         ];
         for (name, source) in sources {
@@ -148,7 +180,10 @@ mod tests {
                 assert!(!production.contains(needle), "{name} contains {needle}");
             }
             for needle in [".lock()", ".read()", ".write()"] {
-                assert!(!production.contains(needle), "{name} contains direct {needle}");
+                assert!(
+                    !production.contains(needle),
+                    "{name} contains direct {needle}"
+                );
             }
         }
     }

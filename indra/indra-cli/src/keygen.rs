@@ -138,15 +138,21 @@ pub fn validate_public_export(json: &str, expected_chain_id: &str) -> CliResult<
     let export: PublicKeyExport = serde_json::from_str(json)
         .map_err(|error| CliError::Genesis(format!("invalid public export: {error}")))?;
     if export.version != 1 && export.version != 2 {
-        return Err(CliError::Genesis("unsupported public export version".into()));
+        return Err(CliError::Genesis(
+            "unsupported public export version".into(),
+        ));
     }
     if (export.kind == "hot" && export.version != 1)
         || (export.kind == "cold" && export.version != 2)
     {
-        return Err(CliError::Genesis("unsupported public export version".into()));
+        return Err(CliError::Genesis(
+            "unsupported public export version".into(),
+        ));
     }
     if export.chain_id != expected_chain_id {
-        return Err(CliError::Genesis("public export chain_id does not match target chain".into()));
+        return Err(CliError::Genesis(
+            "public export chain_id does not match target chain".into(),
+        ));
     }
     for value in [
         export.validator_id.as_deref(),
@@ -172,7 +178,9 @@ pub fn validate_public_export(json: &str, expected_chain_id: &str) -> CliResult<
     if export.kind == "cold"
         && (export.hot_validator_id.is_none() || export.pairing_signature.is_none())
     {
-        return Err(CliError::Genesis("cold export is missing pairing proof".into()));
+        return Err(CliError::Genesis(
+            "cold export is missing pairing proof".into(),
+        ));
     }
     let expected = export_binding(&export).map_err(CliError::Genesis)?;
     if export.binding != expected {
@@ -180,51 +188,101 @@ pub fn validate_public_export(json: &str, expected_chain_id: &str) -> CliResult<
     }
     match export.kind.as_str() {
         "hot" => {
-            let id = export.validator_id.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing validator_id".into()))?;
-            let classical = export.hybrid_classical_pk.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing hybrid_classical_pk".into()))?;
-            let pq = export.hybrid_pq_pk.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing hybrid_pq_pk".into()))?;
-            let vrf = export.vrf_pk.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing vrf_pk".into()))?;
-            let id = hex::decode(id).map_err(|_| CliError::Genesis("hot export validator_id has invalid hex".into()))?;
-            let classical = hex::decode(classical).map_err(|_| CliError::Genesis("hot export hybrid_classical_pk has invalid hex".into()))?;
-            let pq = hex::decode(pq).map_err(|_| CliError::Genesis("hot export hybrid_pq_pk has invalid hex".into()))?;
-            let vrf = hex::decode(vrf).map_err(|_| CliError::Genesis("hot export vrf_pk has invalid hex".into()))?;
-            if id.len() != 32 || classical.len() != 32 || pq.len() != indra_crypto::PQ_PK_BYTES || vrf.len() != 32 {
-                return Err(CliError::Genesis("public export key has wrong length".into()));
+            let id = export
+                .validator_id
+                .as_deref()
+                .ok_or_else(|| CliError::Genesis("hot export is missing validator_id".into()))?;
+            let classical = export.hybrid_classical_pk.as_deref().ok_or_else(|| {
+                CliError::Genesis("hot export is missing hybrid_classical_pk".into())
+            })?;
+            let pq = export
+                .hybrid_pq_pk
+                .as_deref()
+                .ok_or_else(|| CliError::Genesis("hot export is missing hybrid_pq_pk".into()))?;
+            let vrf = export
+                .vrf_pk
+                .as_deref()
+                .ok_or_else(|| CliError::Genesis("hot export is missing vrf_pk".into()))?;
+            let id = hex::decode(id)
+                .map_err(|_| CliError::Genesis("hot export validator_id has invalid hex".into()))?;
+            let classical = hex::decode(classical).map_err(|_| {
+                CliError::Genesis("hot export hybrid_classical_pk has invalid hex".into())
+            })?;
+            let pq = hex::decode(pq)
+                .map_err(|_| CliError::Genesis("hot export hybrid_pq_pk has invalid hex".into()))?;
+            let vrf = hex::decode(vrf)
+                .map_err(|_| CliError::Genesis("hot export vrf_pk has invalid hex".into()))?;
+            if id.len() != 32
+                || classical.len() != 32
+                || pq.len() != indra_crypto::PQ_PK_BYTES
+                || vrf.len() != 32
+            {
+                return Err(CliError::Genesis(
+                    "public export key has wrong length".into(),
+                ));
             }
-            let classical: [u8; 32] = classical.try_into().map_err(|_| CliError::Genesis("public export key has wrong length".into()))?;
-            let pq_key = VariableBytes::from_slice(&pq).map_err(|_| CliError::Genesis("public export key has wrong length".into()))?;
-            let derived = HybridPubKey { classical_pk: Bytes32::from(classical), pq_pk: pq_key }.identity_id();
+            let classical: [u8; 32] = classical
+                .try_into()
+                .map_err(|_| CliError::Genesis("public export key has wrong length".into()))?;
+            let pq_key = VariableBytes::from_slice(&pq)
+                .map_err(|_| CliError::Genesis("public export key has wrong length".into()))?;
+            let derived = HybridPubKey {
+                classical_pk: Bytes32::from(classical),
+                pq_pk: pq_key,
+            }
+            .identity_id();
             if id.as_slice() != derived.0 {
-                return Err(CliError::Genesis("public export validator_id does not match hot key".into()));
+                return Err(CliError::Genesis(
+                    "public export validator_id does not match hot key".into(),
+                ));
             }
         }
         "cold" => {
-            let classical = export.cold_hybrid_classical_pk.as_deref().ok_or_else(|| CliError::Genesis("cold export is missing cold_hybrid_classical_pk".into()))?;
-            let pq = export.cold_hybrid_pq_pk.as_deref().ok_or_else(|| CliError::Genesis("cold export is missing cold_hybrid_pq_pk".into()))?;
-            let classical = hex::decode(classical).map_err(|_| CliError::Genesis("cold export cold_hybrid_classical_pk has invalid hex".into()))?;
-            let pq = hex::decode(pq).map_err(|_| CliError::Genesis("cold export cold_hybrid_pq_pk has invalid hex".into()))?;
+            let classical = export.cold_hybrid_classical_pk.as_deref().ok_or_else(|| {
+                CliError::Genesis("cold export is missing cold_hybrid_classical_pk".into())
+            })?;
+            let pq = export.cold_hybrid_pq_pk.as_deref().ok_or_else(|| {
+                CliError::Genesis("cold export is missing cold_hybrid_pq_pk".into())
+            })?;
+            let classical = hex::decode(classical).map_err(|_| {
+                CliError::Genesis("cold export cold_hybrid_classical_pk has invalid hex".into())
+            })?;
+            let pq = hex::decode(pq).map_err(|_| {
+                CliError::Genesis("cold export cold_hybrid_pq_pk has invalid hex".into())
+            })?;
             if classical.len() != 32 || pq.len() != indra_crypto::PQ_PK_BYTES {
-                return Err(CliError::Genesis("public export key has wrong length".into()));
+                return Err(CliError::Genesis(
+                    "public export key has wrong length".into(),
+                ));
             }
             let hot_id = export
                 .hot_validator_id
                 .as_deref()
                 .ok_or_else(|| CliError::Genesis("cold export is missing pairing proof".into()))?;
-            let hot_id = hex::decode(hot_id)
-                .map_err(|_| CliError::Genesis("cold export hot_validator_id has invalid hex".into()))?;
+            let hot_id = hex::decode(hot_id).map_err(|_| {
+                CliError::Genesis("cold export hot_validator_id has invalid hex".into())
+            })?;
             if hot_id.len() != 32 {
-                return Err(CliError::Genesis("cold export hot_validator_id has wrong length".into()));
+                return Err(CliError::Genesis(
+                    "cold export hot_validator_id has wrong length".into(),
+                ));
             }
             let signature = export
                 .pairing_signature
                 .as_deref()
                 .ok_or_else(|| CliError::Genesis("cold export is missing pairing proof".into()))?;
-            let signature = hex::decode(signature)
-                .map_err(|_| CliError::Genesis("cold export pairing_signature has invalid hex".into()))?;
-            indra_core::types::crypto::HybridSignature::decode_exact(&signature)
-                .map_err(|_| CliError::Genesis("cold export pairing_signature has invalid encoding".into()))?;
+            let signature = hex::decode(signature).map_err(|_| {
+                CliError::Genesis("cold export pairing_signature has invalid hex".into())
+            })?;
+            indra_core::types::crypto::HybridSignature::decode_exact(&signature).map_err(|_| {
+                CliError::Genesis("cold export pairing_signature has invalid encoding".into())
+            })?;
         }
-        _ => return Err(CliError::Genesis("public export kind must be exactly 'hot' or 'cold'".into())),
+        _ => {
+            return Err(CliError::Genesis(
+                "public export kind must be exactly 'hot' or 'cold'".into(),
+            ))
+        }
     }
     Ok(export)
 }
@@ -285,10 +343,7 @@ pub fn cold_hot_pairing_message(
 }
 
 /// Verify the cold export's pairing proof against the supplied hot export.
-pub fn validate_cold_hot_pairing(
-    hot: &PublicKeyExport,
-    cold: &PublicKeyExport,
-) -> CliResult<()> {
+pub fn validate_cold_hot_pairing(hot: &PublicKeyExport, cold: &PublicKeyExport) -> CliResult<()> {
     let hot_id = hot
         .validator_id
         .as_deref()
@@ -306,29 +361,39 @@ pub fn validate_cold_hot_pairing(
         .hybrid_pq_pk
         .as_deref()
         .ok_or_else(|| CliError::Genesis("hot export is missing hybrid_pq_pk".into()))?;
-    let cold_classical = cold
-        .cold_hybrid_classical_pk
-        .as_deref()
-        .ok_or_else(|| CliError::Genesis("cold export is missing cold_hybrid_classical_pk".into()))?;
+    let cold_classical = cold.cold_hybrid_classical_pk.as_deref().ok_or_else(|| {
+        CliError::Genesis("cold export is missing cold_hybrid_classical_pk".into())
+    })?;
     let cold_pq = cold
         .cold_hybrid_pq_pk
         .as_deref()
         .ok_or_else(|| CliError::Genesis("cold export is missing cold_hybrid_pq_pk".into()))?;
     let message = cold_hot_pairing_message(
         &hot.chain_id,
-        &hex::decode(hot_id).map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        &hex::decode(hot_classical).map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        &hex::decode(hot_pq).map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        &hex::decode(cold_classical).map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        &hex::decode(cold_pq).map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
+        &hex::decode(hot_id).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
+        &hex::decode(hot_classical).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
+        &hex::decode(hot_pq).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
+        &hex::decode(cold_classical).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
+        &hex::decode(cold_pq).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
     )?;
     let signature_hex = cold
         .pairing_signature
         .as_deref()
         .ok_or_else(|| CliError::Genesis("cold export is missing pairing proof".into()))?;
     let signature = indra_core::types::crypto::HybridSignature::decode_exact(
-        &hex::decode(signature_hex)
-            .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
+        &hex::decode(signature_hex).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
     )
     .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?;
     let cold_classical_bytes: [u8; 32] = hex::decode(cold_classical)
@@ -337,20 +402,19 @@ pub fn validate_cold_hot_pairing(
         .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?;
     let cold_key = HybridPubKey {
         classical_pk: Bytes32::from(cold_classical_bytes),
-        pq_pk: VariableBytes::from_slice(
-            &hex::decode(cold_pq)
-                .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        )
+        pq_pk: VariableBytes::from_slice(&hex::decode(cold_pq).map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?)
         .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
     };
     indra_crypto::verify_hybrid(
         &message,
-        &signature
-            .to_crypto_sig()
-            .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
-        &cold_key
-            .to_crypto_pubkey()
-            .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))?,
+        &signature.to_crypto_sig().map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
+        &cold_key.to_crypto_pubkey().map_err(|_| {
+            CliError::Genesis("cold pairing proof does not match hot validator".into())
+        })?,
     )
     .map_err(|_| CliError::Genesis("cold pairing proof does not match hot validator".into()))
 }
@@ -364,16 +428,34 @@ pub fn public_export_from_cold_key_file(
 ) -> CliResult<PublicKeyExport> {
     let hot = validate_public_export(hot_json, chain_id)?;
     if hot.kind != "hot" {
-        return Err(CliError::Genesis("cold export requires a hot export".into()));
+        return Err(CliError::Genesis(
+            "cold export requires a hot export".into(),
+        ));
     }
     let cold = load_cold_keys(path, source).map_err(CliError::from)?;
-    let hot_id = hex::decode(hot.validator_id.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing validator_id".into()))?)
-        .map_err(|_| CliError::Genesis("hot export validator_id has invalid hex".into()))?;
-    let hot_classical = hex::decode(hot.hybrid_classical_pk.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing hybrid_classical_pk".into()))?)
+    let hot_id = hex::decode(
+        hot.validator_id
+            .as_deref()
+            .ok_or_else(|| CliError::Genesis("hot export is missing validator_id".into()))?,
+    )
+    .map_err(|_| CliError::Genesis("hot export validator_id has invalid hex".into()))?;
+    let hot_classical =
+        hex::decode(hot.hybrid_classical_pk.as_deref().ok_or_else(|| {
+            CliError::Genesis("hot export is missing hybrid_classical_pk".into())
+        })?)
         .map_err(|_| CliError::Genesis("hot export hybrid_classical_pk has invalid hex".into()))?;
-    let hot_pq = hex::decode(hot.hybrid_pq_pk.as_deref().ok_or_else(|| CliError::Genesis("hot export is missing hybrid_pq_pk".into()))?)
-        .map_err(|_| CliError::Genesis("hot export hybrid_pq_pk has invalid hex".into()))?;
-    let cold_public = cold.reconstruct().map_err(CliError::from)?.public_key().as_complete_hybrid().clone();
+    let hot_pq = hex::decode(
+        hot.hybrid_pq_pk
+            .as_deref()
+            .ok_or_else(|| CliError::Genesis("hot export is missing hybrid_pq_pk".into()))?,
+    )
+    .map_err(|_| CliError::Genesis("hot export hybrid_pq_pk has invalid hex".into()))?;
+    let cold_public = cold
+        .reconstruct()
+        .map_err(CliError::from)?
+        .public_key()
+        .as_complete_hybrid()
+        .clone();
     let message = cold_hot_pairing_message(
         chain_id,
         &hot_id,
@@ -382,7 +464,10 @@ pub fn public_export_from_cold_key_file(
         &cold_public.classical.0,
         &cold_public.pq.0,
     )?;
-    let signed = cold.reconstruct().map_err(CliError::from)?.sign(&message)
+    let signed = cold
+        .reconstruct()
+        .map_err(CliError::from)?
+        .sign(&message)
         .map_err(|error| CliError::Crypto(error.to_string()))?;
     let wire = indra_core::types::crypto::HybridSignature {
         classical_sig: VariableBytes::from_slice(&signed.classical.0)
@@ -664,8 +749,19 @@ mod tests {
             "export-chain",
         )
         .unwrap();
-        assert_eq!(validate_public_export(&serde_json::to_string(&hot_export).unwrap(), "export-chain").unwrap(), hot_export);
-        assert_eq!(validate_public_export(&serde_json::to_string(&cold_export).unwrap(), "export-chain").unwrap(), cold_export);
+        assert_eq!(
+            validate_public_export(&serde_json::to_string(&hot_export).unwrap(), "export-chain")
+                .unwrap(),
+            hot_export
+        );
+        assert_eq!(
+            validate_public_export(
+                &serde_json::to_string(&cold_export).unwrap(),
+                "export-chain"
+            )
+            .unwrap(),
+            cold_export
+        );
         validate_cold_hot_pairing(&hot_export, &cold_export).unwrap();
         let hot_export_json = serde_json::to_string(&hot_export).unwrap();
         assert!(!hot_export_json.contains(&hex::encode(hot.ed25519_seed)));
@@ -673,38 +769,58 @@ mod tests {
         assert!(!hot_export_json.contains(&hex::encode(hot.vrf_seed)));
         assert!(!hot_export_json.contains(&hex::encode(cold.classical_seed)));
         assert!(!hot_export_json.contains(&hex::encode(cold.pq_seed)));
-        assert!(!serde_json::to_string(&cold_export).unwrap().contains(&hex::encode(cold.classical_seed)));
-        assert!(!serde_json::to_string(&cold_export).unwrap().contains(&hex::encode(cold.pq_seed)));
+        assert!(!serde_json::to_string(&cold_export)
+            .unwrap()
+            .contains(&hex::encode(cold.classical_seed)));
+        assert!(!serde_json::to_string(&cold_export)
+            .unwrap()
+            .contains(&hex::encode(cold.pq_seed)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn public_export_binding_rejects_tampered_public_fields() {
         let hot = fixture();
-        let export = public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain").unwrap();
+        let export =
+            public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain")
+                .unwrap();
         for mutate in [
             |value: &mut PublicKeyExport| value.validator_id = Some(hex::encode([1u8; 32])),
             |value: &mut PublicKeyExport| value.hybrid_classical_pk = Some(hex::encode([2u8; 32])),
-            |value: &mut PublicKeyExport| value.hybrid_pq_pk = Some(hex::encode([3u8; indra_crypto::PQ_PK_BYTES])),
+            |value: &mut PublicKeyExport| {
+                value.hybrid_pq_pk = Some(hex::encode([3u8; indra_crypto::PQ_PK_BYTES]))
+            },
             |value: &mut PublicKeyExport| value.vrf_pk = Some(hex::encode([4u8; 32])),
         ] {
             let mut tampered = export.clone();
             mutate(&mut tampered);
-            assert_eq!(validate_public_export(&serde_json::to_string(&tampered).unwrap(), "export-chain").unwrap_err().to_string(), "genesis error: public export binding mismatch");
+            assert_eq!(
+                validate_public_export(&serde_json::to_string(&tampered).unwrap(), "export-chain")
+                    .unwrap_err()
+                    .to_string(),
+                "genesis error: public export binding mismatch"
+            );
         }
     }
 
     #[test]
     fn public_export_binding_has_golden_vector() {
         let hot = fixture();
-        let export = public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain").unwrap();
-        assert_eq!(export.binding, "7d703cbbfe6ee4162b315b3db657f45c0d460e1e70c94ea1752019c24957f2d9");
+        let export =
+            public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain")
+                .unwrap();
+        assert_eq!(
+            export.binding,
+            "7d703cbbfe6ee4162b315b3db657f45c0d460e1e70c94ea1752019c24957f2d9"
+        );
     }
 
     #[test]
     fn public_export_rejects_wrong_chain_kind_and_key_length_exactly() {
         let hot = fixture();
-        let export = public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain").unwrap();
+        let export =
+            public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "export-chain")
+                .unwrap();
         assert_eq!(
             validate_public_export(&serde_json::to_string(&export).unwrap(), "other-chain")
                 .unwrap_err()
@@ -724,9 +840,12 @@ mod tests {
         wrong_length.hybrid_classical_pk = Some("00".into());
         wrong_length.binding = export_binding(&wrong_length).unwrap();
         assert_eq!(
-            validate_public_export(&serde_json::to_string(&wrong_length).unwrap(), "export-chain")
-                .unwrap_err()
-                .to_string(),
+            validate_public_export(
+                &serde_json::to_string(&wrong_length).unwrap(),
+                "export-chain"
+            )
+            .unwrap_err()
+            .to_string(),
             "genesis error: public export key has wrong length"
         );
     }
@@ -734,11 +853,9 @@ mod tests {
     #[test]
     fn cold_pairing_rejects_swapped_and_cross_domain_signatures_exactly() {
         let hot = fixture();
-        let hot_export = public_export_from_key_file(
-            &encrypt_keys(&hot, b"pw").unwrap(),
-            "pairing-chain",
-        )
-        .unwrap();
+        let hot_export =
+            public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "pairing-chain")
+                .unwrap();
         let dir = std::env::temp_dir().join(format!("indra-pairing-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let password_path = dir.join("password");
@@ -780,7 +897,9 @@ mod tests {
         swapped.cold_hybrid_pq_pk = export_a.cold_hybrid_pq_pk.clone();
         swapped.binding = export_binding(&swapped).unwrap();
         assert_eq!(
-            validate_cold_hot_pairing(&hot_export, &swapped).unwrap_err().to_string(),
+            validate_cold_hot_pairing(&hot_export, &swapped)
+                .unwrap_err()
+                .to_string(),
             "genesis error: cold pairing proof does not match hot validator"
         );
         let cold_a_pair = cold_a.reconstruct().unwrap();
@@ -804,12 +923,11 @@ mod tests {
     #[test]
     fn cold_pairing_missing_proof_and_tampering_fail_exactly() {
         let hot = fixture();
-        let hot_export = public_export_from_key_file(
-            &encrypt_keys(&hot, b"pw").unwrap(),
-            "pairing-chain",
-        )
-        .unwrap();
-        let dir = std::env::temp_dir().join(format!("indra-pairing-fields-{}", rand::random::<u64>()));
+        let hot_export =
+            public_export_from_key_file(&encrypt_keys(&hot, b"pw").unwrap(), "pairing-chain")
+                .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("indra-pairing-fields-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let password_path = dir.join("password");
         let cold_path = dir.join("cold.json");
@@ -841,8 +959,12 @@ mod tests {
         for mutate in [
             |value: &mut PublicKeyExport| value.hot_validator_id = Some(hex::encode([0x01; 32])),
             |value: &mut PublicKeyExport| value.pairing_signature = Some(hex::encode([0x02; 64])),
-            |value: &mut PublicKeyExport| value.cold_hybrid_classical_pk = Some(hex::encode([0x03; 32])),
-            |value: &mut PublicKeyExport| value.cold_hybrid_pq_pk = Some(hex::encode([0x04; indra_crypto::PQ_PK_BYTES])),
+            |value: &mut PublicKeyExport| {
+                value.cold_hybrid_classical_pk = Some(hex::encode([0x03; 32]))
+            },
+            |value: &mut PublicKeyExport| {
+                value.cold_hybrid_pq_pk = Some(hex::encode([0x04; indra_crypto::PQ_PK_BYTES]))
+            },
         ] {
             let mut tampered = export.clone();
             mutate(&mut tampered);

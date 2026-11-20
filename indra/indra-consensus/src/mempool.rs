@@ -421,11 +421,12 @@ impl Mempool {
     fn remove_entry(&mut self, tx_id: &Bytes32) -> ConsensusResult<Option<MempoolEntry>> {
         let existing = self.entries.get(tx_id).cloned();
         if let Some(entry) = &existing {
-            let new_total = self.total_encoded_bytes.checked_sub(entry.encoded_size).ok_or(
-                ConsensusError::InternalInvariant {
+            let new_total = self
+                .total_encoded_bytes
+                .checked_sub(entry.encoded_size)
+                .ok_or(ConsensusError::InternalInvariant {
                     detail: "mempool byte accounting underflow",
-                },
-            )?;
+                })?;
             let removed = self.entries.remove(tx_id);
             Self::remove_index_memberships(
                 &mut self.by_utxo,
@@ -577,8 +578,8 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
-    use indra_core::types::primitives::TEST_CHAIN_ID;
     use super::*;
+    use indra_core::types::primitives::TEST_CHAIN_ID;
     use indra_core::{
         types::{
             crypto::HybridSignature,
@@ -1160,7 +1161,9 @@ mod tests {
             validators_changed: BTreeSet::from([Bytes32::from([0xEE; 32])]),
             ..Default::default()
         };
-        targeted.apply_canonical_effects(&state, &unrelated).unwrap();
+        targeted
+            .apply_canonical_effects(&state, &unrelated)
+            .unwrap();
         assert!(targeted.contains(&tx_id));
         let mut inputs = HashSet::new();
         assert!(indra_state::apply::validate_transaction(

@@ -1,6 +1,22 @@
 #![deny(unused_must_use)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! `indra send` — build and submit a transaction to a running node.
 //!
@@ -134,31 +150,39 @@ fn main() {
                     std::process::exit(1);
                 });
         }
-        indra_cli::build_cold_transaction_with_fee_policy(&indra_cli::ColdTxParams {
-            chain_id: &chain_id,
-            recipient_address: &to,
-            amount_spark,
-            fee_spark: requested_fee_spark.unwrap_or(0),
-            wallet: &wallet,
-            keypair: cold_keypair,
-            owner_pubkey: signer_owner.clone(),
-        }, base_fee, requested_fee_spark)
+        indra_cli::build_cold_transaction_with_fee_policy(
+            &indra_cli::ColdTxParams {
+                chain_id: &chain_id,
+                recipient_address: &to,
+                amount_spark,
+                fee_spark: requested_fee_spark.unwrap_or(0),
+                wallet: &wallet,
+                keypair: cold_keypair,
+                owner_pubkey: signer_owner.clone(),
+            },
+            base_fee,
+            requested_fee_spark,
+        )
     } else {
         let Some(keys) = hot_keys.as_ref() else {
             eprintln!("Error: hot keys required when --cold-keys is absent");
             std::process::exit(1);
         };
         let sender_pubkey = signer_owner.clone();
-        indra_cli::build_transaction_with_fee_policy(&indra_cli::tx_builder::TxParams {
-            chain_id: &chain_id,
-            recipient_address: &to,
-            amount_spark,
-            fee_spark: requested_fee_spark.unwrap_or(0),
-            wallet: &wallet,
-            ed25519_seed: keys.ed25519_seed,
-            ml_dsa_seed_bytes: keys.ml_dsa_seed.to_vec(),
-            sender_pubkey,
-        }, base_fee, requested_fee_spark)
+        indra_cli::build_transaction_with_fee_policy(
+            &indra_cli::tx_builder::TxParams {
+                chain_id: &chain_id,
+                recipient_address: &to,
+                amount_spark,
+                fee_spark: requested_fee_spark.unwrap_or(0),
+                wallet: &wallet,
+                ed25519_seed: keys.ed25519_seed,
+                ml_dsa_seed_bytes: keys.ml_dsa_seed.to_vec(),
+                sender_pubkey,
+            },
+            base_fee,
+            requested_fee_spark,
+        )
     }
     .unwrap_or_else(|e| {
         eprintln!("Error building transaction: {}", e);
@@ -169,7 +193,9 @@ fn main() {
     if let Some(given) = requested_fee_spark {
         let default_fee = indra_cli::default_fee_for_base_fee(base_fee).unwrap_or(u64::MAX);
         if given < default_fee {
-            println!("Warning: requested fee may be rejected if the base fee rises before inclusion");
+            println!(
+                "Warning: requested fee may be rejected if the base fee rises before inclusion"
+            );
         }
     }
 
