@@ -5,6 +5,13 @@ set -u
 : "${GENESIS_BIN:?set GENESIS_BIN}"
 : "${KEYGEN_BIN:?set KEYGEN_BIN}"
 
+for tool in awk mkdir printf seq tail sed grep; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf '%s\n' "line_restart_repeat.sh: missing required tool: $tool" >&2
+        exit 2
+    }
+done
+
 RUNS=${RUNS:-6}
 DOWN_SECONDS=${DOWN_SECONDS:-120}
 TARGET_HEIGHT=${TARGET_HEIGHT:-10}
@@ -35,10 +42,14 @@ for run in $(seq 1 "$RUNS"); do
         status=FAIL
         failed=1
     fi
-    result=$(rg '^target_height=' "$output" | tail -1 || true)
+    result=$(grep '^target_height=' "$output" | tail -1 || true)
     recovery=$(printf '%s\n' "$result" | sed -n 's/.*recovery_seconds=\([^ ]*\).*/\1/p')
-    events=$(printf '%s\n' "$result" | sed -n 's/.*post-resume connection events=\([^ ]*\).*/\1/p')
-    printf '%s\t%s\t%s\t%s\t%s\n' "$run" "$status" "${recovery:-}" "${events:-}" "$run_dir"
+    events=$(grep -E '^\| [0-3] \|' "$output" | awk -F'|' '{gsub(/[[:space:]]/, "", $7); total += $7} END {if (NR > 0) print total}' || true)
+    if [ -z "$result" ] || [ -z "$recovery" ] || [ -z "$events" ]; then
+        status=FAIL
+        failed=1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$run" "$status" "${recovery:-MISSING}" "${events:-MISSING}" "$run_dir"
 done
 
 exit "$failed"

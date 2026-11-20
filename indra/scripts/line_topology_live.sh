@@ -19,6 +19,12 @@ ROOT=${1:-"$(mktemp -d /tmp/indra-line-topology.XXXXXX)"}
 mkdir -p "$ROOT"
 command -v curl >/dev/null || { echo 'curl is required' >&2; exit 2; }
 command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 2; }
+for tool in awk cat date grep kill mkdir mktemp printf sleep tail tee tr; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf '%s\n' "line_topology_live.sh: missing required tool: $tool" >&2
+        exit 2
+    }
+done
 
 PIDS=()
 timestamp_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
@@ -332,7 +338,14 @@ fi
     done
 } | tee "$ROOT/summary.md"
 
-if [ "$reached" -eq 1 ] && [ "$same_tip" -eq 1 ] && [ "$panics" -eq 0 ] && \
+summary_line=$(grep '^target_height=' "$ROOT/summary.md" | tail -1 || true)
+result_valid=1
+[ -n "$summary_line" ] || result_valid=0
+if [ "$STOP_SECONDS" -gt 0 ] || [ "$RESTART_MODE" -eq 1 ]; then
+    printf '%s\n' "$summary_line" | grep -Eq 'recovery_seconds=[^ ]+' || result_valid=0
+fi
+
+if [ "$result_valid" -eq 1 ] && [ "$reached" -eq 1 ] && [ "$same_tip" -eq 1 ] && [ "$panics" -eq 0 ] && \
     [ "${stale:-0}" -eq 0 ] && [ "$exits_ok" -eq 1 ] && [ "$peer_counts_ok" -eq 1 ]; then
     printf 'PASS\n'
     exit 0
