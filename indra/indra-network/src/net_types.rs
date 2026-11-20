@@ -76,6 +76,8 @@ pub enum PeerDisconnectReason {
     DuplicateConnection,
     /// The peer was disconnected after a ban or invalid-message decision.
     Ban,
+    /// The peer was disconnected after sustained rate-limit abuse.
+    RateLimitDisconnect,
     /// The local operator explicitly requested a disconnect.
     Operator,
 }
@@ -89,6 +91,7 @@ impl std::fmt::Display for PeerDisconnectReason {
             Self::Timeout => "timeout",
             Self::DuplicateConnection => "duplicate connection dropped by tie-break",
             Self::Ban => "ban",
+            Self::RateLimitDisconnect => "rate_limit_disconnect",
             Self::Operator => "operator disconnect",
         };
         formatter.write_str(text)

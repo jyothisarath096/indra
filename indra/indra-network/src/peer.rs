@@ -77,6 +77,8 @@ pub struct PeerInfo {
     pub messages_received: u64,
     /// Total invalid messages received.
     pub invalid_messages: u64,
+    /// Total messages dropped by the rate limiter for this peer.
+    pub rate_limit_drops: u64,
 }
 
 impl PeerInfo {
@@ -92,6 +94,7 @@ impl PeerInfo {
             last_seen: None,
             messages_received: 0,
             invalid_messages: 0,
+            rate_limit_drops: 0,
         }
     }
 
@@ -122,6 +125,11 @@ impl PeerInfo {
             self.status = PeerStatus::Banned;
             self.ban_until = Some(Instant::now() + ban_duration);
         }
+    }
+
+    /// Count a bounded rate-limit drop for peer status and diagnostics.
+    pub fn record_rate_limit_drop(&mut self) {
+        self.rate_limit_drops = self.rate_limit_drops.saturating_add(1);
     }
 }
 

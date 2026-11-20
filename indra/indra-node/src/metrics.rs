@@ -31,6 +31,7 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{locks, ConsensusDriver, NodeEngine, NodeResult};
+use indra_network::{MessageClass, RateLimitMetrics};
 
 /// Default Prometheus metrics endpoint for validator/full nodes.
 pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9615";
@@ -54,6 +55,8 @@ pub enum MetricsError {
 
 /// Shared metrics state for cumulative values.
 pub struct MetricsState {
+    /// Shared authenticated-network rate-limit counters.
+    pub rate_limit_metrics: Arc<RateLimitMetrics>,
     /// Total slash events detected since node start.
     pub slash_events_total: Arc<AtomicU64>,
     /// Total blocks committed since node start.
@@ -122,6 +125,7 @@ impl MetricsState {
     /// Create a fresh metrics state for this node process.
     pub fn new() -> Self {
         Self {
+            rate_limit_metrics: Arc::new(RateLimitMetrics::new()),
             slash_events_total: Arc::new(AtomicU64::new(0)),
             blocks_committed_total: Arc::new(AtomicU64::new(0)),
             rpc_requests_total: Arc::new(AtomicU64::new(0)),
@@ -761,6 +765,24 @@ fn render_snapshot(
         "RPC limiter capacity or idle-TTL evictions",
         rpc_limiter_evictions,
     );
+    let _ = writeln!(
+        buf,
+        "# HELP indra_p2p_rate_limit_drops Messages dropped by the authenticated-network rate limiter\n# TYPE indra_p2p_rate_limit_drops counter"
+    );
+    for class in MessageClass::ALL {
+        let _ = writeln!(
+            buf,
+            "indra_p2p_rate_limit_drops_total{{class=\"{}\"}} {}",
+            class.metric_name(),
+            metrics_state.rate_limit_metrics.drops_for(class),
+        );
+    }
+    counter(
+        &mut buf,
+        "indra_p2p_rate_limit_disconnects",
+        "Connections disconnected after sustained rate-limit abuse",
+        metrics_state.rate_limit_metrics.disconnects(),
+    );
     counter(
         &mut buf,
         "indra_rpc_write_failures",
@@ -1043,6 +1065,8 @@ mod tests {
         assert!(output.contains("indra_handler_panics_total{component=\"none\"} 0"));
         assert!(output.contains("indra_stale_sync_responses_total{kind=\"qc_response\"} 0"));
         assert!(output.contains("indra_stale_sync_responses_total{kind=\"certificate\"} 0"));
+        assert!(output.contains("indra_p2p_rate_limit_drops_total{class=\"vote\"} 0"));
+        assert!(output.contains("indra_p2p_rate_limit_disconnects_total 0"));
     }
 
     #[test]

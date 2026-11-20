@@ -2,8 +2,12 @@
 
 use std::{
     collections::HashMap,
-    time::{Duration, Instant},
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
+    time::Instant,
 };
+
+#[cfg(test)]
+use std::time::Duration;
 
 use crate::message::Message;
 
@@ -100,6 +104,38 @@ pub enum MessageClass {
 }
 
 impl MessageClass {
+    /// Stable class order used by metrics and bounded internal arrays.
+    pub const ALL: [Self; 11] = [
+        Self::Vote,
+        Self::BlockOrProposal,
+        Self::Status,
+        Self::PeerList,
+        Self::BlockRequest,
+        Self::Tx,
+        Self::StakingOp,
+        Self::GovernanceOp,
+        Self::PingPong,
+        Self::BlockResponse,
+        Self::QCResponse,
+    ];
+
+    /// Stable Prometheus label for this message class.
+    pub const fn metric_name(self) -> &'static str {
+        match self {
+            Self::Vote => "vote",
+            Self::BlockOrProposal => "block_or_proposal",
+            Self::Status => "status",
+            Self::PeerList => "peer_list",
+            Self::BlockRequest => "block_request",
+            Self::Tx => "tx",
+            Self::StakingOp => "staking_op",
+            Self::GovernanceOp => "governance_op",
+            Self::PingPong => "ping_pong",
+            Self::BlockResponse => "block_response",
+            Self::QCResponse => "qc_response",
+        }
+    }
+
     /// Classify a protocol message.
     pub fn from_message(msg: &Message) -> Self {
         match msg {
@@ -150,42 +186,62 @@ impl MessageClass {
     }
 }
 
-/// Escalating strike counter with simple time-based decay.
-#[derive(Debug, Clone)]
-pub struct StrikeCounter {
-    count: u32,
-    last_violation: Option<Instant>,
+/// Process-wide counters for bounded, non-punitive rate-limit drops.
+#[derive(Debug)]
+pub struct RateLimitMetrics {
+    drops_by_class: [Arc<AtomicU64>; 11],
+    disconnects_total: Arc<AtomicU64>,
 }
 
-impl StrikeCounter {
-    /// Create an empty strike counter.
+impl RateLimitMetrics {
+    fn counter_for(&self, class: MessageClass) -> &AtomicU64 {
+        let [vote, block_or_proposal, status, peer_list, block_request, tx, staking_op,
+            governance_op, ping_pong, block_response, qc_response] = &self.drops_by_class;
+        match class {
+            MessageClass::Vote => vote,
+            MessageClass::BlockOrProposal => block_or_proposal,
+            MessageClass::Status => status,
+            MessageClass::PeerList => peer_list,
+            MessageClass::BlockRequest => block_request,
+            MessageClass::Tx => tx,
+            MessageClass::StakingOp => staking_op,
+            MessageClass::GovernanceOp => governance_op,
+            MessageClass::PingPong => ping_pong,
+            MessageClass::BlockResponse => block_response,
+            MessageClass::QCResponse => qc_response,
+        }
+    }
+
+    /// Create empty network rate-limit counters.
     pub fn new() -> Self {
         Self {
-            count: 0,
-            last_violation: None,
+            drops_by_class: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            disconnects_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Record a violation and return the score penalty.
-    pub fn record(&mut self) -> i32 {
-        if self
-            .last_violation
-            .map(|t| t.elapsed() > Duration::from_secs(60))
-            .unwrap_or(false)
-        {
-            self.count = self.count.saturating_sub(self.count / 2 + 1);
-        }
-        self.count = self.count.saturating_add(1);
-        self.last_violation = Some(Instant::now());
-        match self.count {
-            1 => 2,
-            2..=5 => 5,
-            _ => 10,
-        }
+    /// Record one dropped message by its stable class.
+    pub fn record_drop(&self, class: MessageClass) {
+        self.counter_for(class).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one sustained-flood disconnect.
+    pub fn record_disconnect(&self) {
+        self.disconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read a class counter for metrics rendering.
+    pub fn drops_for(&self, class: MessageClass) -> u64 {
+        self.counter_for(class).load(Ordering::Relaxed)
+    }
+
+    /// Read the sustained-flood disconnect counter.
+    pub fn disconnects(&self) -> u64 {
+        self.disconnects_total.load(Ordering::Relaxed)
     }
 }
 
-impl Default for StrikeCounter {
+impl Default for RateLimitMetrics {
     fn default() -> Self {
         Self::new()
     }
@@ -196,7 +252,6 @@ impl Default for StrikeCounter {
 pub struct PeerRateLimiter {
     count_buckets: HashMap<MessageClass, TokenBucket>,
     per_peer_byte_bucket: TokenBucket,
-    strikes: StrikeCounter,
 }
 
 /// Why a message exceeded the rate limiter.
@@ -213,8 +268,6 @@ pub enum RateLimitReason {
 pub struct RateLimitViolation {
     /// Message class that exceeded a limiter.
     pub class: MessageClass,
-    /// Score penalty suggested by the strike escalation schedule.
-    pub penalty: i32,
     /// Which limiter was exhausted.
     pub reason: RateLimitReason,
 }
@@ -271,7 +324,6 @@ impl PeerRateLimiter {
         Self {
             count_buckets,
             per_peer_byte_bucket: TokenBucket::new_bytes(33_554_432, 67_108_864),
-            strikes: StrikeCounter::new(),
         }
     }
 
@@ -295,14 +347,12 @@ impl PeerRateLimiter {
         if !byte_ok {
             return Some(RateLimitViolation {
                 class,
-                penalty: self.strikes.record(),
                 reason: RateLimitReason::Byte,
             });
         }
         if !count_ok {
             return Some(RateLimitViolation {
                 class,
-                penalty: self.strikes.record(),
                 reason: RateLimitReason::Count,
             });
         }
@@ -482,26 +532,6 @@ mod tests {
     fn test_byte_bucket_single_large_message() {
         let mut bucket = TokenBucket::new_bytes(1024, 2048);
         assert!(!bucket.try_consume_bytes(4096));
-    }
-
-    #[test]
-    fn test_strike_escalation() {
-        let mut strikes = StrikeCounter::new();
-        assert_eq!(strikes.record(), 2);
-        assert_eq!(strikes.record(), 5);
-        assert_eq!(strikes.record(), 5);
-        assert_eq!(strikes.record(), 5);
-        assert_eq!(strikes.record(), 5);
-        assert_eq!(strikes.record(), 10);
-    }
-
-    #[test]
-    fn test_strike_decay() {
-        let mut strikes = StrikeCounter::new();
-        let _ = strikes.record();
-        let _ = strikes.record();
-        strikes.last_violation = Some(Instant::now() - Duration::from_secs(61));
-        assert_eq!(strikes.record(), 2);
     }
 
     #[test]

@@ -1532,6 +1532,7 @@ fn start_network_runtime(
                     event_tx: async_event_tx,
                     command_buffer: 1024,
                     ban_store_path,
+                    rate_limit_metrics: Arc::clone(&metrics.rate_limit_metrics),
                 });
                 let _ = handle_tx.send(peer_manager.clone());
 
@@ -8339,6 +8340,7 @@ mod tests {
             event_tx,
             command_buffer: 1,
             ban_store_path: dir.join("rpc-token-ban-store.bin"),
+            rate_limit_metrics: Arc::new(indra_network::RateLimitMetrics::new()),
         });
         let gossip = Arc::new(NetworkBridge::new(
             peer_handle,
@@ -8512,6 +8514,7 @@ mod tests {
             event_tx,
             command_buffer: 1,
             ban_store_path: dir.join("rpc-read-only-ban-store.bin"),
+            rate_limit_metrics: Arc::new(indra_network::RateLimitMetrics::new()),
         });
         let gossip = Arc::new(NetworkBridge::new(
             handle,

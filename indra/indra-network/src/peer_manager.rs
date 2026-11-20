@@ -41,7 +41,7 @@ use crate::{
     policy::{BanStore, BoundedTtlSet},
     rate_limit::{
         GlobalRateLimiter, MessageClass, PeerRateLimiter,
-        RateLimitViolation as RateLimitViolationInfo,
+        RateLimitMetrics, RateLimitViolation as RateLimitViolationInfo,
     },
 };
 
@@ -64,6 +64,14 @@ const MAX_BLOCK_RELAY_FANOUT: usize = 24;
 /// Active validators are identified by their authenticated validator ID and
 /// are bounded by the active validator set plus the global peer-table cap.
 const MAX_NON_VALIDATOR_PEERS_PER_IP: usize = 3;
+/// A sustained flood is three consecutive ten-second windows over this count.
+/// The NET_11 900-second freeze produced 382 drops in its busiest one-second
+/// burst, so one honest freeze burst cannot trip this policy.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+const RATE_LIMIT_DROPS_PER_WINDOW: u64 = 400;
+const RATE_LIMIT_SUSTAINED_WINDOWS: u8 = 3;
+/// One summary line per peer/class per second bounds attacker-controlled logs.
+const RATE_LIMIT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 fn unix_time_millis() -> u128 {
     SystemTime::now()
@@ -120,6 +128,9 @@ struct PeerManagerActor {
     scores_by_validator: HashMap<Bytes32, i32>,
     global_limiter: GlobalRateLimiter,
     limiters_by_validator: HashMap<Bytes32, PeerRateLimiter>,
+    rate_limit_abuse: HashMap<Bytes32, RateLimitAbuseState>,
+    rate_limit_logs: HashMap<(Bytes32, MessageClass), RateLimitLogState>,
+    rate_limit_metrics: Arc<RateLimitMetrics>,
     qc_response_seen: BoundedTtlSet<Bytes32>,
     transport_slash_detector: Arc<Mutex<SlashDetector>>,
     last_tie_break_log: HashMap<Bytes32, Instant>,
@@ -135,6 +146,65 @@ struct PeerManagerActor {
     block_relay_slots: HashMap<BlockRelaySlotKey, Bytes32>,
     relay_metrics: HashMap<RelayMessageClass, RelayMetrics>,
     dandelion: DandelionState,
+}
+
+struct RateLimitAbuseState {
+    window_started: Instant,
+    window_drops: u64,
+    sustained_windows: u8,
+}
+
+impl RateLimitAbuseState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            window_drops: 0,
+            sustained_windows: 0,
+        }
+    }
+
+    fn record(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.window_started) >= RATE_LIMIT_WINDOW {
+            if self.window_drops > RATE_LIMIT_DROPS_PER_WINDOW {
+                self.sustained_windows = self
+                    .sustained_windows
+                    .saturating_add(1)
+                    .min(RATE_LIMIT_SUSTAINED_WINDOWS);
+            } else {
+                self.sustained_windows = 0;
+            }
+            self.window_started = now;
+            self.window_drops = 0;
+        }
+        self.window_drops = self.window_drops.saturating_add(1);
+        self.sustained_windows >= RATE_LIMIT_SUSTAINED_WINDOWS
+    }
+}
+
+struct RateLimitLogState {
+    window_started: Instant,
+    drops: u64,
+}
+
+impl RateLimitLogState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            drops: 0,
+        }
+    }
+
+    fn record(&mut self, now: Instant) -> Option<u64> {
+        self.drops = self.drops.saturating_add(1);
+        if now.duration_since(self.window_started) >= RATE_LIMIT_LOG_INTERVAL {
+            let dropped = self.drops;
+            self.window_started = now;
+            self.drops = 0;
+            Some(dropped)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -500,16 +570,18 @@ fn message_queue(msg: &Message) -> QueueType {
 fn format_rate_limit_log(
     addr: SocketAddr,
     validator_id: Bytes32,
-    violation: RateLimitViolationInfo,
+    class: MessageClass,
+    reason: crate::rate_limit::RateLimitReason,
+    dropped: u64,
 ) -> String {
     format!(
-        "[p2p] t={}ms rate_limit_drop: dropped {:?} message from {} (validator {}), reason={:?}, observed_penalty=-{}",
+        "[p2p] t={}ms rate_limit_drop: dropped {} {:?} messages from {} (validator {}), reason={:?}, no score penalty",
         unix_time_millis(),
-        violation.class,
+        dropped,
+        class,
         addr,
         short_validator_id(&validator_id),
-        violation.reason,
-        violation.penalty,
+        reason,
     )
 }
 
@@ -530,10 +602,50 @@ impl PeerManagerActor {
         addr: SocketAddr,
         violation: RateLimitViolationInfo,
     ) {
-        eprintln!(
-            "{} — no score penalty and connection retained",
-            format_rate_limit_log(addr, validator_id, violation)
-        );
+        let now = Instant::now();
+        self.rate_limit_metrics.record_drop(violation.class);
+        if let Some(peer) = self.peer_table.get_mut(&addr) {
+            peer.record_rate_limit_drop();
+        }
+
+        let log_key = (validator_id, violation.class);
+        let log_state = self
+            .rate_limit_logs
+            .entry(log_key)
+            .or_insert_with(|| RateLimitLogState::new(now));
+        if let Some(dropped) = log_state.record(now) {
+            eprintln!(
+                "{}",
+                format_rate_limit_log(
+                    addr,
+                    validator_id,
+                    violation.class,
+                    violation.reason,
+                    dropped,
+                )
+            );
+        }
+
+        let sustained = self
+            .rate_limit_abuse
+            .entry(validator_id)
+            .or_insert_with(|| RateLimitAbuseState::new(now))
+            .record(now);
+        if sustained {
+            self.rate_limit_metrics.record_disconnect();
+            eprintln!(
+                "[p2p] t={}ms rate_limit_disconnect: validator {} at {} exceeded {} drops in {} consecutive {}s windows; no score change",
+                unix_time_millis(),
+                short_validator_id(&validator_id),
+                addr,
+                RATE_LIMIT_DROPS_PER_WINDOW,
+                RATE_LIMIT_SUSTAINED_WINDOWS,
+                RATE_LIMIT_WINDOW.as_secs(),
+            );
+            self.rate_limit_abuse.remove(&validator_id);
+            self.drop_peer(validator_id, addr, PeerDisconnectReason::RateLimitDisconnect)
+                .await;
+        }
     }
 
     fn increment_relay_metric(
@@ -1065,11 +1177,15 @@ impl PeerManagerActor {
                 if MessageClass::needs_global_byte_limit(&msg)
                     && !self.global_limiter.check_large_payload(msg_size)
                 {
-                    eprintln!(
-                        "[p2p] t={}ms rate_limit_drop: dropped large payload from {} — no score penalty and connection retained",
-                        unix_time_millis(),
-                        addr
-                    );
+                    self.handle_rate_limit_violation(
+                        validator_id,
+                        addr,
+                        RateLimitViolationInfo {
+                            class: MessageClass::from_message(&msg),
+                            reason: crate::rate_limit::RateLimitReason::Byte,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 if let Some(key) = qc_response_key {
@@ -1326,6 +1442,9 @@ impl PeerManagerActor {
             }
         }
         self.validator_by_addr.remove(&addr);
+        self.rate_limit_abuse.remove(&validator_id);
+        self.rate_limit_logs
+            .retain(|(peer_id, _), _| *peer_id != validator_id);
         self.peer_table.mark_disconnected(&addr);
         self.connected_peers
             .store(self.peers_by_validator.len(), Ordering::Relaxed);
@@ -1459,6 +1578,8 @@ pub struct PeerManagerConfig {
     pub command_buffer: usize,
     /// Node-local path for restart-persistent validator identity bans.
     pub ban_store_path: PathBuf,
+    /// Shared Prometheus counters for rate-limit drops and disconnects.
+    pub rate_limit_metrics: Arc<RateLimitMetrics>,
 }
 
 /// Handle returned to callers that need to enqueue network commands or attach peers.
@@ -1545,6 +1666,9 @@ pub fn spawn_peer_manager(config: PeerManagerConfig) -> PeerManagerHandle {
         scores_by_validator: HashMap::new(),
         global_limiter: GlobalRateLimiter::new(),
         limiters_by_validator: HashMap::new(),
+        rate_limit_abuse: HashMap::new(),
+        rate_limit_logs: HashMap::new(),
+        rate_limit_metrics: config.rate_limit_metrics,
         qc_response_seen: BoundedTtlSet::new(QC_RESPONSE_DEDUP_CAPACITY, CONSENSUS_SEEN_TTL),
         transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
         last_tie_break_log: HashMap::new(),
@@ -1618,6 +1742,9 @@ mod tests {
             scores_by_validator: HashMap::new(),
             global_limiter: GlobalRateLimiter::new(),
             limiters_by_validator: HashMap::new(),
+            rate_limit_abuse: HashMap::new(),
+            rate_limit_logs: HashMap::new(),
+            rate_limit_metrics: Arc::new(RateLimitMetrics::new()),
             qc_response_seen: BoundedTtlSet::new(QC_RESPONSE_DEDUP_CAPACITY, CONSENSUS_SEEN_TTL),
             transport_slash_detector: Arc::new(Mutex::new(SlashDetector::new())),
             last_tie_break_log: HashMap::new(),
@@ -3671,7 +3798,6 @@ mod tests {
                 addr,
                 RateLimitViolationInfo {
                     class: MessageClass::Status,
-                    penalty: 10,
                     reason: RateLimitReason::Count,
                 },
             )
@@ -3687,9 +3813,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:32002".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(16);
         let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
-        actor.peer_table.add(addr).unwrap();
-        actor.peer_table.set_validator_id(&addr, validator);
-        actor.peer_table.mark_connected(&addr);
+        let _receivers = add_test_peer_receivers(&mut actor, validator, 32002);
         let before = actor.peer_table.get(&addr).unwrap().score;
 
         for _ in 0..20 {
@@ -3699,7 +3823,6 @@ mod tests {
                     addr,
                     RateLimitViolationInfo {
                         class: MessageClass::BlockRequest,
-                        penalty: 10,
                         reason: RateLimitReason::Count,
                     },
                 )
@@ -3725,7 +3848,6 @@ mod tests {
                 addr,
                 RateLimitViolationInfo {
                     class: MessageClass::BlockResponse,
-                    penalty: 10,
                     reason: RateLimitReason::Byte,
                 },
             )
@@ -3752,7 +3874,6 @@ mod tests {
                     addr,
                     RateLimitViolationInfo {
                         class: MessageClass::Tx,
-                        penalty: 10,
                         reason: RateLimitReason::Count,
                     },
                 )
@@ -3774,14 +3895,56 @@ mod tests {
         let line = format_rate_limit_log(
             addr,
             validator,
-            RateLimitViolationInfo {
-                class: MessageClass::PingPong,
-                penalty: 5,
-                reason: RateLimitReason::Count,
-            },
+            MessageClass::PingPong,
+            RateLimitReason::Count,
+            3,
         );
         assert!(line.contains("PingPong"));
-        assert!(line.contains("penalty=-5"));
+        assert!(line.contains("3"));
+    }
+
+    #[test]
+    fn honest_freeze_burst_does_not_trigger_sustained_disconnect() {
+        let start = Instant::now();
+        let mut state = RateLimitAbuseState::new(start);
+        for _ in 0..RATE_LIMIT_DROPS_PER_WINDOW {
+            assert!(!state.record(start));
+        }
+        assert!(!state.record(start + RATE_LIMIT_WINDOW));
+        assert_eq!(state.sustained_windows, 0);
+    }
+
+    #[test]
+    fn sustained_flood_triggers_after_three_over_limit_windows() {
+        let start = Instant::now();
+        let mut state = RateLimitAbuseState::new(start);
+        for _ in 0..=RATE_LIMIT_DROPS_PER_WINDOW {
+            assert!(!state.record(start));
+        }
+        let second = start + RATE_LIMIT_WINDOW;
+        assert!(!state.record(second));
+        for _ in 0..RATE_LIMIT_DROPS_PER_WINDOW {
+            assert!(!state.record(second));
+        }
+        let third = second + RATE_LIMIT_WINDOW;
+        assert!(!state.record(third));
+        for _ in 0..RATE_LIMIT_DROPS_PER_WINDOW {
+            assert!(!state.record(third));
+        }
+        assert!(state.record(third + RATE_LIMIT_WINDOW));
+    }
+
+    #[test]
+    fn rate_limit_log_state_bounds_million_violation_records() {
+        let start = Instant::now();
+        let mut state = RateLimitLogState::new(start);
+        let mut summaries = 0u64;
+        for index in 0..1_000_000u64 {
+            if state.record(start + Duration::from_millis(index)).is_some() {
+                summaries += 1;
+            }
+        }
+        assert!(summaries <= 1_000);
     }
 
     #[tokio::test]

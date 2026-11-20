@@ -88,6 +88,6 @@ pub use peer::{PeerInfo, PeerStatus, PeerTable, BAN_DURATION};
 pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
 pub use policy::{BanStore, BoundedCooldownTracker, BoundedTtlSet, CooldownTracker, NetworkGroup};
 pub use rate_limit::{
-    GlobalRateLimiter, MessageClass, PeerRateLimiter, StrikeCounter, TokenBucket,
+    GlobalRateLimiter, MessageClass, PeerRateLimiter, RateLimitMetrics, TokenBucket,
 };
 pub use transport::{Connection, Transport};
