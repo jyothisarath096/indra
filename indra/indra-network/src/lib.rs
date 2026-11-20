@@ -84,7 +84,7 @@ pub use observer::{
     perform_observer_handshake_initiator, perform_observer_handshake_responder, read_frame_plain,
     read_frame_plain_limited, write_frame_plain, ObserverFrameLimiter, ObserverHandshakeResult,
 };
-pub use peer::{PeerInfo, PeerStatus, PeerTable};
+pub use peer::{PeerInfo, PeerStatus, PeerTable, BAN_DURATION};
 pub use peer_manager::{spawn_peer_manager, PeerManagerConfig, PeerManagerHandle};
 pub use policy::{BanStore, BoundedCooldownTracker, BoundedTtlSet, CooldownTracker, NetworkGroup};
 pub use rate_limit::{

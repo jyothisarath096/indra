@@ -8192,7 +8192,7 @@ fn wrong_snapshot_vote_is_not_collapsed_into_exact_replay() {
         from: "127.0.0.1:9296".parse().unwrap(),
         vote: wrong,
     });
-    assert!(rejected
+    assert!(!rejected
         .iter()
         .any(|action| matches!(action, DriverAction::DisconnectInvalidConsensusPeer { .. })));
     assert_eq!(
@@ -8211,6 +8211,23 @@ fn wrong_snapshot_vote_is_not_collapsed_into_exact_replay() {
     );
     assert_eq!(driver.vote_admission_metrics.collector_insertions, 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vote_penalty_classification_distinguishes_local_state_from_crypto_faults() {
+    assert!(!super::provably_invalid_vote_error(
+        &indra_consensus::error::ConsensusError::CryptoError {
+            detail: "vote snapshot root mismatch".to_string(),
+        }
+    ));
+    assert!(super::provably_invalid_vote_error(
+        &indra_consensus::error::ConsensusError::CryptoError {
+            detail: "invalid hybrid signature".to_string(),
+        }
+    ));
+    assert!(super::provably_invalid_vote_error(
+        &indra_consensus::error::ConsensusError::UnknownVoter
+    ));
 }
 
 #[test]

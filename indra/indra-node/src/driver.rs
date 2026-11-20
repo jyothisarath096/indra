@@ -28,6 +28,14 @@ use indra_core::types::{
 };
 use indra_storage::{PersistedConsensusLock, VoteSafetyLoadResult, VoteSafetyStore};
 
+fn provably_invalid_vote_error(error: &ConsensusError) -> bool {
+    match error {
+        ConsensusError::UnknownVoter | ConsensusError::InvalidRound { .. } => true,
+        ConsensusError::CryptoError { detail } => !detail.contains("snapshot root mismatch"),
+        _ => false,
+    }
+}
+
 use crate::{
     consensus_authority::vrf_authority_from_snapshot,
     engine::NodeEngine,
@@ -1703,11 +1711,10 @@ impl ConsensusDriver {
             match self.engine.state.snapshot_for_consensus_height(vote.height) {
                 Ok(snapshot) => snapshot.snapshot_root,
                 Err(error) => {
-                    actions.push(DriverAction::DisconnectInvalidConsensusPeer {
-                        from,
-                        validator_id: vote.validator_id,
-                        reason: format!("Vote snapshot unavailable: {error}"),
-                    });
+                    eprintln!(
+                        "[vote] dropping vote from {} at height={} round={}: governing snapshot unavailable: {}",
+                        from, vote.height, vote.round, error
+                    );
                     return actions;
                 }
             };
@@ -1721,13 +1728,19 @@ impl ConsensusDriver {
             &governing_snapshot_root,
             &self.registered_voters,
         )
-        .map_err(|error| error.to_string())
         {
-            actions.push(DriverAction::DisconnectInvalidConsensusPeer {
-                from,
-                validator_id: vote.validator_id,
-                reason: format!("Vote validation failed: {err}"),
-            });
+            if provably_invalid_vote_error(&err) {
+                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
+                    from,
+                    validator_id: vote.validator_id,
+                    reason: format!("Vote validation failed: {err}"),
+                });
+            } else {
+                eprintln!(
+                    "[vote] dropping locally unverifiable vote from {} at height={} round={}: {}",
+                    from, vote.height, vote.round, err
+                );
+            }
             return actions;
         }
         #[cfg(test)]
@@ -1943,11 +1956,10 @@ impl ConsensusDriver {
                     vote.round,
                     err,
                 );
-                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
-                    from,
-                    validator_id: vote.validator_id,
-                    reason: format!("Vote validation failed: {err}"),
-                });
+                eprintln!(
+                    "[vote] dropping collector-local rejection from {} at height={} round={}: {}",
+                    from, vote.height, vote.round, err
+                );
             }
         }
         actions
@@ -2081,11 +2093,10 @@ impl ConsensusDriver {
                     vote.round,
                     err,
                 );
-                actions.push(DriverAction::DisconnectInvalidConsensusPeer {
-                    from,
-                    validator_id: vote.validator_id,
-                    reason: format!("Vote validation failed: {err}"),
-                });
+                eprintln!(
+                    "[vote] dropping collector-local rejection from {} at height={} round={}: {}",
+                    from, vote.height, vote.round, err
+                );
             }
         }
 

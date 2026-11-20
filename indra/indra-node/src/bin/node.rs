@@ -52,6 +52,7 @@ use indra_network::{
     read_frame_plain_limited, spawn_peer_manager, write_frame_plain, BoundedCooldownTracker,
     BoundedTtlSet, CooldownTracker, HandshakeConfig, NetworkCommand, NetworkEvent, NetworkGroup,
     ObserverFrameLimiter, PeerManagerConfig, PeerManagerHandle, RelayValidatorKey, TokenBucket,
+    BAN_DURATION,
 };
 use indra_node::{
     config::{default_governance_mempool_capacity, DEFAULT_STAKING_MEMPOOL_CAPACITY},
@@ -1470,6 +1471,7 @@ fn start_network_runtime(
     let authenticated_peer_addrs = Arc::new(Mutex::new(HashSet::<String>::new()));
     let authenticated_addr_validators =
         Arc::new(Mutex::new(HashMap::<String, indra_core::Bytes32>::new()));
+    let banned_validators = Arc::new(Mutex::new(HashMap::<indra_core::Bytes32, Instant>::new()));
     let connected_validator_ids = Arc::new(Mutex::new(HashSet::<indra_core::Bytes32>::new()));
     let bootstrap_peer_addrs =
         Arc::new(bootstrap_peers.iter().cloned().collect::<HashSet<String>>());
@@ -1511,6 +1513,7 @@ fn start_network_runtime(
         let peer_sources = Arc::clone(&peer_sources);
         let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
         let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+        let banned_validators = Arc::clone(&banned_validators);
         let connected_validator_ids = Arc::clone(&connected_validator_ids);
         let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
         let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
@@ -1542,6 +1545,7 @@ fn start_network_runtime(
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
                     let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+                    let banned_validators = Arc::clone(&banned_validators);
                     let connected_validator_ids = Arc::clone(&connected_validator_ids);
                     let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                     let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
@@ -1600,7 +1604,11 @@ fn start_network_runtime(
                                         });
                                     }
                                 }
-                                NetworkEvent::PeerDisconnected { validator_id, addr, is_outbound, reason: _ } => {
+                                NetworkEvent::PeerDisconnected { validator_id, addr, is_outbound, reason } => {
+                                    if *reason == indra_network::PeerDisconnectReason::Ban {
+                                        fatal_lock!(banned_validators, "network.banned_validators.disconnected")
+                                            .insert(*validator_id, Instant::now() + BAN_DURATION);
+                                    }
                                     if !is_outbound {
                                         fatal_lock!(inbound_cooldowns, "network.inbound_cooldowns.disconnected")
                                             .post_auth
@@ -1633,8 +1641,10 @@ fn start_network_runtime(
                                     fatal_lock!(peer_addrs, "network.peer_addrs.disconnected").remove(validator_id);
                                     fatal_lock!(addr_validators, "network.addr_validators.disconnected").remove(addr);
                                     fatal_lock!(connected_validator_ids, "network.connected_validator_ids.disconnected").remove(validator_id);
-                                    fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.disconnected")
-                                        .retain(|_, mapped_validator| mapped_validator != validator_id);
+                                    if *reason != indra_network::PeerDisconnectReason::Ban {
+                                        fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.disconnected")
+                                            .retain(|_, mapped_validator| mapped_validator != validator_id);
+                                    }
                                 }
                                 NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
@@ -1767,6 +1777,7 @@ fn start_network_runtime(
                     let discovered_peers = Arc::clone(&discovered_peers);
                     let authenticated_peer_addrs = Arc::clone(&authenticated_peer_addrs);
                     let authenticated_addr_validators = Arc::clone(&authenticated_addr_validators);
+                    let banned_validators = Arc::clone(&banned_validators);
                     let connected_validator_ids = Arc::clone(&connected_validator_ids);
                     let bootstrap_peer_addrs = Arc::clone(&bootstrap_peer_addrs);
                     let genesis_peer_addrs = Arc::clone(&genesis_peer_addrs);
@@ -1959,6 +1970,32 @@ fn start_network_runtime(
 
                             for candidate in &all_peers {
                                 let peer_addr_str = &candidate.address;
+                                let known_validator = fatal_lock!(
+                                    authenticated_addr_validators,
+                                    "network.authenticated_addr_validators.ban_check"
+                                )
+                                .get(peer_addr_str)
+                                .copied();
+                                if let Some(validator_id) = known_validator {
+                                    let ban_until = {
+                                        let mut bans = fatal_lock!(
+                                            banned_validators,
+                                            "network.banned_validators.dial"
+                                        );
+                                        let now = Instant::now();
+                                        bans.retain(|_, expiry| *expiry > now);
+                                        bans.get(&validator_id).copied()
+                                    };
+                                    if let Some(until) = ban_until {
+                                        log_dial_skip(
+                                            &mut last_dial_skip_logs,
+                                            peer_addr_str,
+                                            &format!("banned until={}", now_ms() + until.saturating_duration_since(Instant::now()).as_millis()),
+                                            Instant::now(),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 let Some(addr) = resolve_peer_addr(peer_addr_str) else {
                                     eprintln!("[dialer] invalid addr: {}", peer_addr_str);
                                     continue;
