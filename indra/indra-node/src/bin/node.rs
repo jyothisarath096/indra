@@ -81,9 +81,11 @@ const PRECOMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 const NETWORK_DRIVER_EVENT_CAPACITY: usize = 1_024;
 const MIN_BLOCK_INTERVAL_SECS: u64 = 6;
 const DIAL_RETRY: Duration = Duration::from_secs(5);
+const DIAL_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const STATUS_INTERVAL: Duration = Duration::from_secs(6);
 const PROPOSAL_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_DISCOVERED_PEERS: usize = 256;
+const AUTHENTICATED_ADDR_VALIDATOR_CAPACITY: usize = MAX_DISCOVERED_PEERS;
 const OP_RELAY_SEEN_CAPACITY: usize = 16_384;
 const TX_RELAY_SEEN_CAPACITY: usize = 16_384;
 const PEER_LIST_SEEN_CAPACITY: usize = 10_000;
@@ -953,6 +955,54 @@ fn should_skip_dial_for_connected_validator(
         .is_some_and(|validator_id| connected_validator_ids.contains(validator_id))
 }
 
+fn remember_authenticated_addr_validator(
+    authenticated_addr_validators: &mut HashMap<String, indra_core::Bytes32>,
+    address: String,
+    validator_id: indra_core::Bytes32,
+) {
+    if authenticated_addr_validators.len() >= AUTHENTICATED_ADDR_VALIDATOR_CAPACITY
+        && !authenticated_addr_validators.contains_key(&address)
+    {
+        if let Some(evict) = authenticated_addr_validators.keys().next().cloned() {
+            authenticated_addr_validators.remove(&evict);
+        }
+    }
+    authenticated_addr_validators.insert(address, validator_id);
+}
+
+fn configured_outbound_count(
+    authenticated_peer_addrs: &HashSet<String>,
+    bootstrap_peer_addrs: &HashSet<String>,
+    genesis_peer_addrs: &HashSet<String>,
+) -> usize {
+    authenticated_peer_addrs
+        .iter()
+        .filter(|address| {
+            bootstrap_peer_addrs.contains(*address) || genesis_peer_addrs.contains(*address)
+        })
+        .count()
+}
+
+fn log_dial_skip(
+    last_logs: &mut HashMap<String, Instant>,
+    address: &str,
+    reason: &str,
+    now: Instant,
+) {
+    let should_log = last_logs
+        .get(address)
+        .is_none_or(|last| now.duration_since(*last) >= DIAL_SKIP_LOG_INTERVAL);
+    if should_log {
+        last_logs.insert(address.to_string(), now);
+        eprintln!(
+            "[dialer] t={}ms skip {} reason={}",
+            now_ms(),
+            address,
+            reason
+        );
+    }
+}
+
 fn record_dial_failure(
     peer_addr: &str,
     discovered_peers: &mut HashSet<String>,
@@ -1124,11 +1174,9 @@ fn record_peer_connected_event(
         locks::lock(peer_addrs, "network.peer_addrs")?.insert(validator_id, addr);
         locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?
             .insert(addr.to_string());
-        locks::lock(
-            authenticated_addr_validators,
-            "network.authenticated_addr_validators",
-        )?
-        .insert(addr.to_string(), validator_id);
+        let mut known_addresses =
+            locks::lock(authenticated_addr_validators, "network.authenticated_addr_validators")?;
+        remember_authenticated_addr_validator(&mut known_addresses, addr.to_string(), validator_id);
         let authenticated =
             locks::lock(authenticated_peer_addrs, "network.authenticated_peer_addrs")?.clone();
         let mut discovered = locks::lock(discovered_peers, "network.discovered_peers")?;
@@ -1357,6 +1405,7 @@ struct NetworkRuntime {
     gossip: Arc<NetworkBridge>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
     authenticated_peer_addrs: Arc<Mutex<HashSet<String>>>,
+    authenticated_addr_validators: Arc<Mutex<HashMap<String, indra_core::Bytes32>>>,
     peer_sources: Arc<Mutex<HashMap<String, PeerSource>>>,
     network_events: std::sync::mpsc::Receiver<NetworkEvent>,
 }
@@ -1584,6 +1633,8 @@ fn start_network_runtime(
                                     fatal_lock!(peer_addrs, "network.peer_addrs.disconnected").remove(validator_id);
                                     fatal_lock!(addr_validators, "network.addr_validators.disconnected").remove(addr);
                                     fatal_lock!(connected_validator_ids, "network.connected_validator_ids.disconnected").remove(validator_id);
+                                    fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.disconnected")
+                                        .retain(|_, mapped_validator| mapped_validator != validator_id);
                                 }
                                 NetworkEvent::Message { .. } | NetworkEvent::SlashDetected(_) => {}
                             }
@@ -1826,6 +1877,7 @@ fn start_network_runtime(
                         eprintln!("[discovery] {} DNS seed peers discovered", dns_peers.len());
 
                         let mut last_peer_save = Instant::now();
+                        let mut last_dial_skip_logs = HashMap::<String, Instant>::new();
                         loop {
                             let mut candidates: Vec<(String, PeerSource)> = fatal_lock!(peer_sources, "network.peer_sources.candidates")
                                 .iter()
@@ -1853,33 +1905,60 @@ fn start_network_runtime(
                                 {
                                     return false;
                                 }
-                                let cooldown_key = fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.cooldown")
-                                    .get(peer)
-                                    .copied()
-                                    .map(OutboundCooldownKey::Validator)
-                                    .unwrap_or_else(|| {
-                                        OutboundCooldownKey::Address(peer.clone())
-                                    });
+                                let is_configured = bootstrap_peer_addrs.contains(peer)
+                                    || genesis_peer_addrs.contains(peer);
+                                let cooldown_key = if is_configured {
+                                    OutboundCooldownKey::Address(peer.clone())
+                                } else {
+                                    fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.cooldown")
+                                        .get(peer)
+                                        .copied()
+                                        .map(OutboundCooldownKey::Validator)
+                                        .unwrap_or_else(|| OutboundCooldownKey::Address(peer.clone()))
+                                };
                                 !fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.eligibility")
                                     .blocked_at(&cooldown_key, eligibility_now)
                             });
-                            let target_outbound = desired_outbound_peer_target(candidates.len());
-                            let deficit = target_outbound.saturating_sub(
-                                network_bridge.connected_outbound_peer_count(),
-                            );
                             let mut rng = rand::rngs::OsRng;
-                            let all_peers = randomized_diverse_dial_order(
-                                candidates,
-                                deficit,
+                            let (configured_candidates, discovered_candidates): (Vec<_>, Vec<_>) =
+                                candidates.into_iter().partition(|(peer, _)| {
+                                    bootstrap_peer_addrs.contains(peer)
+                                        || genesis_peer_addrs.contains(peer)
+                                });
+                            // Configured peers are liveness obligations, not members of the
+                            // discovered-peer target budget. This is what keeps a configured
+                            // line edge alive when another outbound peer already fills target 8.
+                            let configured_order = randomized_diverse_dial_order(
+                                configured_candidates,
+                                usize::MAX,
                                 &mut rng,
                             );
+                            let authenticated = fatal_lock!(
+                                authenticated_peer_addrs,
+                                "network.authenticated_peer_addrs.target"
+                            )
+                            .clone();
+                            let configured_connected = configured_outbound_count(
+                                &authenticated,
+                                &bootstrap_peer_addrs,
+                                &genesis_peer_addrs,
+                            );
+                            let discovered_connected = network_bridge
+                                .connected_outbound_peer_count()
+                                .saturating_sub(configured_connected);
+                            let discovered_target = desired_outbound_peer_target(
+                                discovered_candidates.len(),
+                            );
+                            let discovered_order = randomized_diverse_dial_order(
+                                discovered_candidates,
+                                discovered_target.saturating_sub(discovered_connected),
+                                &mut rng,
+                            );
+                            let mut all_peers = configured_order;
+                            all_peers.extend(discovered_order);
 
                             for candidate in &all_peers {
                                 let peer_addr_str = &candidate.address;
-                                if network_bridge.connected_outbound_peer_count() >= target_outbound
-                                {
-                                    break;
-                                }
                                 let Some(addr) = resolve_peer_addr(peer_addr_str) else {
                                     eprintln!("[dialer] invalid addr: {}", peer_addr_str);
                                     continue;
@@ -1896,21 +1975,45 @@ fn start_network_runtime(
                                     &*fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.connected"),
                                     &*fatal_lock!(connected_validator_ids, "network.connected_validator_ids.connected"),
                                 ) {
+                                    log_dial_skip(
+                                        &mut last_dial_skip_logs,
+                                        peer_addr_str,
+                                        "connected-validator",
+                                        Instant::now(),
+                                    );
                                     fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.connected_validator").reset(
                                         &OutboundCooldownKey::Address(peer_addr_str.clone()),
                                     );
                                     continue;
                                 }
-                                let cooldown_key = fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.dial")
-                                    .get(peer_addr_str)
-                                    .copied()
-                                    .map(OutboundCooldownKey::Validator)
-                                    .unwrap_or_else(|| OutboundCooldownKey::Address(peer_addr_str.clone()));
+                                let is_configured = bootstrap_peer_addrs.contains(peer_addr_str)
+                                    || genesis_peer_addrs.contains(peer_addr_str);
+                                let cooldown_key = if is_configured {
+                                    OutboundCooldownKey::Address(peer_addr_str.clone())
+                                } else {
+                                    fatal_lock!(authenticated_addr_validators, "network.authenticated_addr_validators.dial")
+                                        .get(peer_addr_str)
+                                        .copied()
+                                        .map(OutboundCooldownKey::Validator)
+                                        .unwrap_or_else(|| OutboundCooldownKey::Address(peer_addr_str.clone()))
+                                };
                                 if fatal_lock!(outbound_cooldowns, "network.outbound_cooldowns.dial")
                                     .blocked_at(&cooldown_key, Instant::now())
                                 {
+                                    log_dial_skip(
+                                        &mut last_dial_skip_logs,
+                                        peer_addr_str,
+                                        "backoff",
+                                        Instant::now(),
+                                    );
                                     continue;
                                 }
+                                eprintln!(
+                                    "[dialer] t={}ms dial {} source={:?}",
+                                    now_ms(),
+                                    peer_addr_str,
+                                    candidate.source
+                                );
                                 match tokio::net::TcpStream::connect(addr).await {
                                     Ok(stream) => {
                                         let permit = match handshake_sem.clone().try_acquire_owned() {
@@ -2044,6 +2147,7 @@ fn start_network_runtime(
         gossip: bridge,
         discovered_peers,
         authenticated_peer_addrs,
+        authenticated_addr_validators,
         peer_sources,
         network_events: event_rx,
     })
@@ -2778,6 +2882,7 @@ fn run() -> indra_node::NodeResult<()> {
         gossip,
         discovered_peers,
         authenticated_peer_addrs,
+        authenticated_addr_validators,
         peer_sources,
         network_events,
     } = match start_network_runtime(
@@ -3243,6 +3348,17 @@ fn run() -> indra_node::NodeResult<()> {
                                     let Some(addr) = resolve_peer_addr(&entry.addr) else {
                                         continue;
                                     };
+                                    if let Some(entry_validator_id) = entry.validator_id {
+                                        let mut known_addresses = supervised_lock!(
+                                            authenticated_addr_validators,
+                                            "network.authenticated_addr_validators.peer_list"
+                                        );
+                                        remember_authenticated_addr_validator(
+                                            &mut known_addresses,
+                                            addr.to_string(),
+                                            entry_validator_id,
+                                        );
+                                    }
                                     let connected = match gossip.connected_addrs() {
                                         Ok(addrs) => addrs,
                                         Err(error) => {
@@ -8940,6 +9056,46 @@ mod tests {
             desired_outbound_peer_target(TARGET_OUTBOUND_PEERS + 1),
             TARGET_OUTBOUND_PEERS
         );
+    }
+
+    #[test]
+    fn configured_peers_are_counted_outside_discovered_target() {
+        let configured = HashSet::from(["127.0.0.1:30301".to_string()]);
+        let genesis = HashSet::new();
+        let authenticated = HashSet::from([
+            "127.0.0.1:30301".to_string(),
+            "127.0.0.1:30302".to_string(),
+            "127.0.0.1:30303".to_string(),
+            "127.0.0.1:30304".to_string(),
+            "127.0.0.1:30305".to_string(),
+            "127.0.0.1:30306".to_string(),
+            "127.0.0.1:30307".to_string(),
+            "127.0.0.1:30308".to_string(),
+            "127.0.0.1:30309".to_string(),
+        ]);
+
+        assert_eq!(configured_outbound_count(&authenticated, &configured, &genesis), 1);
+        assert_eq!(desired_outbound_peer_target(1), 1);
+        // A pending configured edge remains eligible even when eight discovered
+        // outbound connections already fill the discovered target.
+        assert_eq!(
+            authenticated.len()
+                - configured_outbound_count(&authenticated, &configured, &genesis),
+            TARGET_OUTBOUND_PEERS
+        );
+    }
+
+    #[test]
+    fn learned_authenticated_addresses_are_bounded() {
+        let mut learned = HashMap::new();
+        for index in 0..=AUTHENTICATED_ADDR_VALIDATOR_CAPACITY {
+            remember_authenticated_addr_validator(
+                &mut learned,
+                format!("127.0.0.1:{}", 30_000 + index),
+                indra_core::Bytes32::from([index as u8; 32]),
+            );
+        }
+        assert_eq!(learned.len(), AUTHENTICATED_ADDR_VALIDATOR_CAPACITY);
     }
 
     #[test]
