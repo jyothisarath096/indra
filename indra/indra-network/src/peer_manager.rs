@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -35,7 +35,7 @@ use crate::{
     message::Message,
     net_types::{NetworkCommand, NetworkEvent, PeerDisconnectReason, RelayValidatorKey},
     peer::{
-        PeerTable, ScoreEvent, BAN_DURATION, BAN_DURATION_RATE_LIMIT, BAN_SCORE, INITIAL_SCORE,
+        PeerTable, ScoreEvent, BAN_DURATION, BAN_SCORE, INITIAL_SCORE,
         MAX_SCORE,
     },
     policy::{BanStore, BoundedTtlSet},
@@ -64,6 +64,13 @@ const MAX_BLOCK_RELAY_FANOUT: usize = 24;
 /// Active validators are identified by their authenticated validator ID and
 /// are bounded by the active validator set plus the global peer-table cap.
 const MAX_NON_VALIDATOR_PEERS_PER_IP: usize = 3;
+
+fn unix_time_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
 
 #[derive(Clone)]
 struct OutboundMessage {
@@ -496,7 +503,8 @@ fn format_rate_limit_log(
     violation: RateLimitViolationInfo,
 ) -> String {
     format!(
-        "[p2p] rate limit: dropped {:?} message from {} (validator {}), reason={:?}, penalty=-{}",
+        "[p2p] t={}ms rate_limit_drop: dropped {:?} message from {} (validator {}), reason={:?}, observed_penalty=-{}",
+        unix_time_millis(),
         violation.class,
         addr,
         short_validator_id(&validator_id),
@@ -522,39 +530,10 @@ impl PeerManagerActor {
         addr: SocketAddr,
         violation: RateLimitViolationInfo,
     ) {
-        if violation.class.is_protocol_necessary_for_validators() {
-            eprintln!(
-                "[p2p] dropping excess {:?} from authenticated validator {} ({}) — no score penalty",
-                violation.class,
-                short_validator_id(&validator_id),
-                addr,
-            );
-            return;
-        }
-        self.adjust_validator_score(validator_id, -violation.penalty, BAN_DURATION_RATE_LIMIT)
-            .await;
-        if self
-            .peer_table
-            .get(&addr)
-            .map(|peer| peer.is_banned())
-            .unwrap_or(false)
-        {
-            if let Err(error) = self.ban_store.ban_until(
-                validator_id,
-                BanStore::unix_now().saturating_add(BAN_DURATION_RATE_LIMIT.as_secs()),
-            ) {
-                eprintln!("[p2p] failed to persist rate-limit ban: {error}");
-            }
-            eprintln!(
-                "[p2p] peer {} ({}) banned 10min for sustained rate limit violations",
-                short_validator_id(&validator_id),
-                addr,
-            );
-            self.drop_peer(validator_id, addr, PeerDisconnectReason::Ban)
-                .await;
-        } else {
-            eprintln!("{}", format_rate_limit_log(addr, validator_id, violation));
-        }
+        eprintln!(
+            "{} — no score penalty and connection retained",
+            format_rate_limit_log(addr, validator_id, violation)
+        );
     }
 
     fn increment_relay_metric(
@@ -1087,11 +1066,10 @@ impl PeerManagerActor {
                     && !self.global_limiter.check_large_payload(msg_size)
                 {
                     eprintln!(
-                        "[p2p] global rate limit: dropped large payload from {}",
+                        "[p2p] t={}ms rate_limit_drop: dropped large payload from {} — no score penalty and connection retained",
+                        unix_time_millis(),
                         addr
                     );
-                    self.peer_table
-                        .adjust_score_with_duration(&addr, -1, BAN_DURATION_RATE_LIMIT);
                     return;
                 }
                 if let Some(key) = qc_response_key {
@@ -1126,7 +1104,8 @@ impl PeerManagerActor {
             .is_banned_at(&peer_validator_id, BanStore::unix_now())
         {
             eprintln!(
-                "[p2p] rejected actively banned validator {} from {}",
+                "[p2p] t={}ms banned_inbound_rejected: actively banned validator {} from {}",
+                unix_time_millis(),
                 short_validator_id(&peer_validator_id),
                 addr
             );
@@ -3753,6 +3732,39 @@ mod tests {
             .await;
 
         assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
+    }
+
+    #[tokio::test]
+    async fn authenticated_validator_non_consensus_rate_limit_flood_is_not_banned() {
+        let validator = Bytes32::from([0xAE; 32]);
+        let addr: SocketAddr = "127.0.0.1:32005".parse().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut actor = test_actor(event_tx, Bytes32::from([0x01; 32]));
+        actor.peer_table.add(addr).unwrap();
+        actor.peer_table.set_validator_id(&addr, validator);
+        actor.peer_table.mark_connected(&addr);
+        let before = actor.peer_table.get(&addr).unwrap().score;
+
+        for _ in 0..32 {
+            actor
+                .handle_rate_limit_violation(
+                    validator,
+                    addr,
+                    RateLimitViolationInfo {
+                        class: MessageClass::Tx,
+                        penalty: 10,
+                        reason: RateLimitReason::Count,
+                    },
+                )
+                .await;
+        }
+
+        assert_eq!(actor.peer_table.get(&addr).unwrap().score, before);
+        assert!(!actor.peer_table.get(&addr).unwrap().is_banned());
+        assert_eq!(
+            actor.peer_table.get(&addr).unwrap().status,
+            PeerStatus::Connected
+        );
     }
 
     #[test]

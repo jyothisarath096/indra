@@ -41,9 +41,6 @@ pub const BAN_SCORE: i32 = 0;
 pub const MAX_SCORE: i32 = 200;
 /// How long a banned peer stays banned.
 pub const BAN_DURATION: Duration = Duration::from_secs(3600); // 1 hour
-/// Shorter ban duration for rate-limit violations.
-pub const BAN_DURATION_RATE_LIMIT: Duration = Duration::from_secs(600); // 10 minutes
-
 /// Current status of a peer connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerStatus {
